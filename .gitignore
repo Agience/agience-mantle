@@ -1,0 +1,60 @@
+# --- Secrets & env (NEVER COMMIT) ---
+.env
+.env.*
+!.env*.example
+*.token
+keys/
+secrets/
+compose/secrets/
+
+# --- Runtime data / volumes ---
+.data/
+.data-*/
+*.sqlite
+*.sqlite3
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+sdist/
+wheels/
+*.egg-info/
+*.egg
+*.whl
+MANIFEST
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.cover
+
+# --- Node / frontend ---
+node_modules/
+.vite/
+.next/
+.docusaurus/
+.cache/
+*.tsbuildinfo
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
