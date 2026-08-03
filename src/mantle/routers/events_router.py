@@ -1,4 +1,4 @@
-﻿"""Unified /events WebSocket — Phase 2, Enterprise Eventing refactor.
+"""Unified /events WebSocket — Phase 2, Enterprise Eventing refactor.
 
 Single bidirectional channel for all real-time artifact and operation events.
 Clients can hold multiple subscriptions on one connection, each with its own
@@ -63,9 +63,11 @@ from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from starlette.websockets import WebSocketState
 
-from agience_core import event_bus
-from services.dependencies import get_arango_db
-from services.dependencies import (
+from mantle import event_bus
+from mantle.entities.grant import grant_is_deny
+from mantle.services.acting_principal import acting_from_auth, set_acting_principal
+from mantle.services.dependencies import get_store_db
+from mantle.services.dependencies import (
     AuthContext,
     _check_grant_permission,
     get_auth,
@@ -81,7 +83,7 @@ router = APIRouter(tags=["Events"])
 # is infrastructure (e.g. the content-type gateway driving event-driven
 # describers); any ACTION taken in response still runs under a delegation rooted
 # to the change's actor (a person). Keep this list tight.
-_SYSTEM_EVENT_CONSUMERS = {"bridge"}
+_SYSTEM_EVENT_CONSUMERS = {"crystal"}
 
 
 # ---------------------------------------------------------------------------
@@ -184,9 +186,24 @@ def _event_visible_to(
         grants, "read", resource_id=event.container_id
     ):
         return True
-    # Unscoped read grant (rare; platform-wide viewers)
-    if _check_grant_permission(grants, "read"):
-        return True
+    # Unscoped read grant (rare; platform-wide viewers).
+    #
+    # ⛔ THIS USED TO BE `_check_grant_permission(grants, "read")` WITH NO
+    # resource_id. That helper skips the resource comparison entirely when
+    # resource_id is None (`if resource_id and ...`), so the check did not mean
+    # "the caller holds an unscoped grant" — it meant "the caller holds ANY read
+    # grant". A user with a read grant on one artifact they legitimately own
+    # matched EVERY event on the platform, i.e. every other tenant's stream.
+    #
+    # The platform-wide-viewer concept is deliberate (see
+    # test_acl_allowed_for_unscoped_read_grant), so it is kept — but it now
+    # requires a grant that is genuinely unscoped, rather than being a side
+    # effect of holding any grant at all.
+    for g in grants:
+        if grant_is_deny(g):
+            continue
+        if getattr(g, "can_read", False) and not getattr(g, "resource_id", None):
+            return True
     return False
 
 
@@ -195,7 +212,7 @@ async def _pump_subscription(
     ws: WebSocket,
     auth: AuthContext,
     send_lock: asyncio.Lock,
-    arango_db: Any = None,
+    store_db: Any = None,
 ) -> None:
     """Forward events from a subscription's queue to the WebSocket.
 
@@ -211,12 +228,12 @@ async def _pump_subscription(
         """Cache-through grant check for a container."""
         if container_id in accessible_containers:
             return True
-        if not arango_db or not auth.user_id:
+        if not store_db or not auth.user_id:
             return False
         try:
-            from db.arango import get_active_grants_for_principal_resource
+            from mantle.db.backend import get_active_grants_for_principal_resource
             grants = get_active_grants_for_principal_resource(
-                arango_db, grantee_id=auth.user_id,
+                store_db, grantee_id=auth.user_id,
                 resource_id=container_id,
             )
             if any(getattr(g, "can_read", False) for g in grants):
@@ -256,7 +273,7 @@ async def _pump_subscription(
 async def _authenticate_ws(ws: WebSocket) -> tuple:
     """Authenticate a WebSocket connection via Bearer header or ?access_token query param.
 
-    Returns (AuthContext, arango_db) on success, or (None, None) if auth
+    Returns (AuthContext, store_db) on success, or (None, None) if auth
     fails (the socket is closed with an appropriate code).
     """
     token: Optional[str] = None
@@ -270,20 +287,30 @@ async def _authenticate_ws(ws: WebSocket) -> tuple:
         return None, None
 
     try:
-        arango_db = next(get_arango_db())
+        store_db = next(get_store_db())
     except Exception as exc:
         logger.error("events WS could not acquire db session: %s", exc)
         await ws.close(code=1011, reason="Database unavailable")
         return None, None
 
     try:
-        auth = resolve_auth(token, arango_db, request=None)
+        auth = resolve_auth(token, store_db, request=None)
     except Exception as exc:
         logger.info("events WS auth rejected: %s", exc)
         await ws.close(code=4401, reason="Invalid token")
         return None, None
 
-    return auth, arango_db
+    # Publish the acting principal, exactly as `get_auth` does for HTTP routes.
+    # This socket authenticates by calling `resolve_auth` DIRECTLY rather than
+    # through `Depends(get_auth)`, so it does not inherit that wiring — without this
+    # the connection is authenticated yet has no principal in scope, and anything it
+    # does that touches artifact content or the index fails closed. Set on the
+    # connection's own task, so it covers the whole socket lifetime including the
+    # subscription pump spawned from here.
+    if auth.principal_id or auth.user_id:
+        set_acting_principal(acting_from_auth(auth))
+
+    return auth, store_db
 
 
 @router.websocket("/events")
@@ -293,7 +320,7 @@ async def events_ws(websocket: WebSocket) -> None:
     Accepts JSON messages matching the protocol documented at the top of
     this module.
     """
-    auth, arango_db = await _authenticate_ws(websocket)
+    auth, store_db = await _authenticate_ws(websocket)
     if auth is None:
         return
 
@@ -340,7 +367,7 @@ async def events_ws(websocket: WebSocket) -> None:
                 queue = await event_bus.subscribe_filtered(event_filter)
                 sub = _Subscription(client_id, event_filter, queue)
                 sub.task = asyncio.create_task(
-                    _pump_subscription(sub, websocket, auth, send_lock, arango_db)
+                    _pump_subscription(sub, websocket, auth, send_lock, store_db)
                 )
                 subscriptions[client_id] = sub
 

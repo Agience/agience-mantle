@@ -1,9 +1,9 @@
-﻿"""
+"""
 Secrets Service -- Generic encrypted credential storage.
 
 Replaces the LLM-specific key storage that used to live in mantle's
 `llm_service` (now at `chorus/verso/llm.py`) with a general-purpose secrets
-keeper backed by `person.preferences.secrets` in ArangoDB.
+keeper backed by `person.preferences.secrets` in the lattice.
 
 Storage shape:
     person.preferences.secrets = [
@@ -20,11 +20,12 @@ Storage shape:
     ]
 
 Encryption:
-    Symmetric Fernet (AES-128-CBC + HMAC-SHA256) using PLATFORM_ENCRYPTION_KEY
-    from the environment.  Set PLATFORM_ENCRYPTION_KEY to the output of:
-        python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-    PLATFORM_ENCRYPTION_KEY is held exclusively by Core; servers receive secrets wrapped
-    via JWE (RSA-OAEP-256 + AES-256-GCM) for the requesting server's registered public key.
+    Symmetric Fernet (AES-128-CBC + HMAC-SHA256) using the platform KEK, loaded at
+    startup from ``KEYS_DIR/encryption.key`` via ``origin.key_manager`` (a Fernet key;
+    generate with
+    ``python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"``).
+    The KEK is held exclusively by Core; servers receive secrets wrapped via JWE
+    (RSA-OAEP-256 + AES-256-GCM) for the requesting server's registered public key.
 """
 
 from __future__ import annotations
@@ -35,10 +36,10 @@ from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 from cryptography.fernet import Fernet
-from arango.database import StandardDatabase
+from mantle.db.store import Database
 
-from agience_core.key_manager import get_encryption_key
-from db import arango_identity as arango_ws
+from prism.trust.key_manager import get_encryption_key
+from mantle.db import identity_backend as identity_store
 
 logger = logging.getLogger(__name__)
 
@@ -140,12 +141,12 @@ class SecretConfig:
 
 
 
-def _load_prefs(db: StandardDatabase, user_id: str) -> dict:
+def _load_prefs(db: Database, user_id: str) -> dict:
     """
     Load user preferences.
     Returns the prefs dict.
     """
-    person = arango_ws.get_person_by_id(db, user_id)
+    person = identity_store.get_person_by_id(db, user_id)
     prefs: dict = (person.get("preferences") if person else {}) or {}
     return prefs
 
@@ -155,7 +156,7 @@ def _load_prefs(db: StandardDatabase, user_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def list_secrets(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     secret_type: Optional[str] = None,
     provider: Optional[str] = None,
@@ -166,7 +167,7 @@ def list_secrets(
     List stored secrets for a user (encrypted values not decrypted here).
 
     Args:
-        db: ArangoDB database handle
+        db: the lattice database handle
         user_id: Authenticated user ID
         secret_type: Filter by type, e.g. "llm_key" or "github_token"
         provider: Filter by provider, e.g. "openai" or "github"
@@ -193,7 +194,7 @@ def list_secrets(
 
 
 def add_secret(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     secret_type: str,
     provider: str,
@@ -232,21 +233,21 @@ def add_secret(
     )
     secrets.append(new_secret.to_dict())
     prefs["secrets"] = secrets
-    arango_ws.update_person_preferences(db, user_id, prefs)
+    identity_store.update_person_preferences(db, user_id, prefs)
 
     return [SecretConfig.from_dict(s) for s in secrets]
 
 
-def delete_secret(db: StandardDatabase, user_id: str, secret_id: str) -> List[SecretConfig]:
+def delete_secret(db: Database, user_id: str, secret_id: str) -> List[SecretConfig]:
     """Delete a secret by ID. Returns updated list."""
     prefs = _load_prefs(db, user_id)
     secrets = [s for s in prefs.get("secrets", []) if s.get("id") != secret_id]
     prefs["secrets"] = secrets
-    arango_ws.update_person_preferences(db, user_id, prefs)
+    identity_store.update_person_preferences(db, user_id, prefs)
     return [SecretConfig.from_dict(s) for s in secrets]
 
 
-def set_default_secret(db: StandardDatabase, user_id: str, secret_id: str) -> List[SecretConfig]:
+def set_default_secret(db: Database, user_id: str, secret_id: str) -> List[SecretConfig]:
     """
     Set a secret as the default for its (type, provider) combination.
     Clears the existing default for that combination first.
@@ -271,7 +272,7 @@ def set_default_secret(db: StandardDatabase, user_id: str, secret_id: str) -> Li
             s["is_default"] = s.get("id") == secret_id
 
     prefs["secrets"] = secrets
-    arango_ws.update_person_preferences(db, user_id, prefs)
+    identity_store.update_person_preferences(db, user_id, prefs)
     return [SecretConfig.from_dict(s) for s in secrets]
 
 
@@ -326,7 +327,7 @@ def wrap_secret_for_server(plaintext: str, public_jwk: dict) -> dict:
 
 
 def get_secret_value(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     secret_type: str,
     provider: Optional[str] = None,
@@ -361,22 +362,34 @@ def get_secret_value(
     if target is None:
         target = secrets[0]
 
+    # Enforce expiry — an expired secret must not be handed out (bearer tokens etc.).
+    if target.expires_at:
+        try:
+            exp = datetime.fromisoformat(str(target.expires_at).replace("Z", "+00:00"))
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) > exp:
+                logger.info("secret %s is expired (expires_at=%s) — withholding", target.id, target.expires_at)
+                return None
+        except (ValueError, TypeError):
+            logger.warning("secret %s has unparseable expires_at=%r — treating as non-expiring", target.id, target.expires_at)
+
     return decrypt_value(target.encrypted_value)
 
 
 # ---------------------------------------------------------------------------
-# Secrets-as-artifacts: material custody lives in ORIGIN (root of trust)
+# Secrets-as-artifacts: material custody is LOCAL to Mantle (sovereign)
 # ---------------------------------------------------------------------------
 # A `vnd.agience.secret+json` artifact carries metadata only; its material lives
-# in ORIGIN's secret vault keyed by the artifact id. (Mantle's person vault is
-# not used: in the four-container model identity — and secret custody — belong to
-# Origin; Mantle's `people` is a shim.) `set_secret_material` stores via Origin;
-# `fetch_secret_material` is the type's `fetch` op handler — the dispatcher has
-# already enforced the caller's `read` grant on the secret artifact, so Mantle
-# resolves the material from Origin for the (trusted) platform process.
+# in Mantle's own encrypted store (platform_settings, Fernet-encrypted) keyed by
+# the artifact id — no Origin round-trip, so a standalone Origin-off Mantle works.
+# `set_secret_material` stores it; `fetch_secret_material` is the type's `fetch`
+# op handler — the dispatcher has already enforced the caller's `read` grant on
+# the secret artifact, so Mantle decrypts + returns the material.
+_SECRET_MATERIAL_PREFIX = "secret.material."
 
 def set_secret_material(
-    db: StandardDatabase,
+    db: Database,
     owner_id: str,
     *,
     secret_id: str,
@@ -386,13 +399,32 @@ def set_secret_material(
     label: str = "",
     authorizer_id: str = "",
 ) -> None:
-    """Store/replace the material for a secret artifact in Origin's vault, keyed
-    by the secret artifact's id (so `fetch_secret_material` can resolve it)."""
-    del db, owner_id, provider, label, authorizer_id  # custody is in Origin, keyed by secret_id
-    from clients.origin_client import get_origin_client
+    """Store/replace the material for a secret artifact in Mantle's own encrypted
+    store (platform_settings), keyed by the secret artifact's id (so
+    `fetch_secret_material` can resolve it). No Origin dependency."""
+    del owner_id, provider, label, authorizer_id  # material is keyed by secret_id
+    from mantle.services.platform_settings_service import settings as platform_settings
 
-    if not get_origin_client().store_secret_material(secret_id, value, category=secret_type or "secret"):
-        raise RuntimeError(f"Failed to store secret material for {secret_id} in Origin vault")
+    platform_settings.set_setting(
+        db,
+        key=f"{_SECRET_MATERIAL_PREFIX}{secret_id}",
+        value=value,
+        category=secret_type or "secret",
+        is_secret=True,
+    )
+
+
+def get_secret_material_by_id(secret_id: str) -> Optional[str]:
+    """Resolve a secret artifact's material (plaintext) from Mantle's own encrypted store,
+    keyed by the secret artifact id. Returns None if no material is stored.
+
+    The Mantle-native counterpart to ``fetch_secret_material`` (the op-dispatch handler): callers
+    that have already authorized the read out-of-band (e.g. the delegated ``/secrets/reveal``
+    endpoint, which verifies the user owns the artifact) use this directly — no Chorus/crystal
+    op-dispatcher, no Seraph type handler in the path."""
+    from mantle.services.platform_settings_service import settings as platform_settings
+
+    return platform_settings.get_secret(f"{_SECRET_MATERIAL_PREFIX}{secret_id}")
 
 
 def fetch_secret_material(artifact: dict, body: dict, ctx: Any) -> dict:
@@ -401,17 +433,17 @@ def fetch_secret_material(artifact: dict, body: dict, ctx: Any) -> dict:
     Native dispatch handler: signature ``(artifact, body, ctx)``. The operation
     dispatcher has already enforced ``requires_grant: "read"`` on this secret
     artifact, so reaching here means the caller is authorized to use it. The
-    material is resolved from Origin's vault (custody of secret material lives in
-    Origin), keyed by the secret artifact id.
+    material is resolved from Mantle's own encrypted store, keyed by the secret
+    artifact id.
     """
     del body, ctx
-    from clients.origin_client import get_origin_client
+    from mantle.services.platform_settings_service import settings as platform_settings
 
     secret_id = artifact.get("root_id") or artifact.get("_key") or artifact.get("id")
     if not secret_id:
         raise RuntimeError("secret artifact missing root_id")
 
-    material = get_origin_client().resolve_secret_material(str(secret_id))
+    material = platform_settings.get_secret(f"{_SECRET_MATERIAL_PREFIX}{secret_id}")
     if material is None:
         raise RuntimeError(f"No material stored for secret artifact {secret_id}")
     return {"secret_id": secret_id, "material": material}

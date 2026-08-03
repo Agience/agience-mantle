@@ -1,7 +1,7 @@
 # entities/collection_artifact.py
 
 from typing import Optional, Dict, Any
-from entities.base import BaseEntity
+from .base import BaseEntity
 
 class CollectionArtifact(BaseEntity):
     """

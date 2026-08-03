@@ -50,9 +50,9 @@ async def run_search(artifact: Dict[str, Any], body: Dict[str, Any], ctx: Any) -
     feature = run.get("requires_feature")
 
     if feature:
-        from services import gate_service
+        from mantle.services import gate_service
 
-        db = getattr(ctx, "arango_db", None)
+        db = getattr(ctx, "store_db", None)
         user_id = getattr(ctx, "user_id", None)
         if not (user_id and db is not None and gate_service.has_feature(db, user_id, feature)):
             raise HTTPException(
@@ -69,7 +69,7 @@ async def run_search(artifact: Dict[str, Any], body: Dict[str, Any], ctx: Any) -
         if not server or not tool:
             return {"error": "premium search run block missing 'server' or 'tool'"}
 
-        from services import chorus_client, platform_topology, server_registry
+        from mantle.services import chorus_client, platform_topology, server_registry
 
         # chorus_client.call_tool needs the server artifact UUID, not a name/slug.
         # Resolve in order: namespace/slug (external add-ons like Beacon) → persona
@@ -101,13 +101,13 @@ async def standard_search(artifact: Dict[str, Any], body: Dict[str, Any], ctx: A
     Runs for the invoking user (light-cone enforced inside the accessor) and
     returns ranked hits. Zero dependency on any premium add-on.
     """
-    from search.types import SearchQuery
-    from search.mantle.wiring import VALID_SEGMENTS, build_sse_search_accessor
+    from mantle.search.types import SearchQuery
+    from mantle.search.mantle.wiring import VALID_SEGMENTS, build_sse_search_accessor
 
     user_id = getattr(ctx, "user_id", None) or ""
-    arango_db = getattr(ctx, "arango_db", None)
-    if arango_db is None:
-        raise ValueError("standard_search requires ctx.arango_db")
+    store_db = getattr(ctx, "store_db", None)
+    if store_db is None:
+        raise ValueError("standard_search requires ctx.store_db")
 
     body = body or {}
     segment = str(body.get("state") or "committed").lower()
@@ -119,14 +119,13 @@ async def standard_search(artifact: Dict[str, Any], body: Dict[str, Any], ctx: A
         user_id=user_id,
         scope=body.get("scope"),
         use_hybrid=body.get("use_hybrid"),
-        aperture=0.75,
         from_=int(body.get("from", 0) or 0),
         size=int(body.get("size", 20) or 20),
         sort="relevance",
         highlight=False,
     )
 
-    accessor = build_sse_search_accessor(arango_db, segment=segment)
+    accessor = build_sse_search_accessor(store_db, segment=segment)
     if accessor is None:
         return {"error": "encrypted search unavailable", "hits": [], "total": 0, "flavor": "standard"}
 

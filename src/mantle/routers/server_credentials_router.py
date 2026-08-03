@@ -1,4 +1,4 @@
-﻿"""Mantle-side slim — only the server JWK upload endpoint.
+"""Mantle-side slim — only the server JWK upload endpoint.
 
 CRUD for server credentials moved to Origin in 1.1c. The JWK endpoint stays
 here because the JWK is consumed by Mantle's secret encryption flow (encrypts
@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import logging
 
-from arango.database import StandardDatabase
+from mantle.db.store import Database
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
-from services.dependencies import get_arango_db
-from db.arango import upsert_server_jwk
-from services import auth_service
+from mantle.services.dependencies import get_store_db
+from mantle.db.backend import upsert_server_jwk
+from mantle.services import auth_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/server-credentials", tags=["Server Credentials"])
@@ -32,7 +32,7 @@ def register_server_jwk(
     client_id: str,
     payload: _RegisterJwkRequest,
     request: Request,
-    db: StandardDatabase = Depends(get_arango_db),
+    db: Database = Depends(get_store_db),
 ):
     """Register or update a server's RSA public JWK.
 

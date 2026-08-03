@@ -14,14 +14,18 @@ from .activate import activate_vector
 from .anchorset import (
     Anchor, AnchorSet, L0, L1, L2, CANDIDATE, WORKING, CANONICAL,
 )
-from .bootstrap import bootstrap_anchorset, gather_seed_corpus
+from .seed_corpus import gather_seed_corpus
 from .crosswalk import Crosswalk, CrosswalkRegistry, fit_crosswalk
 from .density import DensityZoom
-from .grow import propose_anchor
+from .grow import GrowthDecision, propose_anchor, propose_anchor_decided
 from .reconciler import Reconciler, SparseCode
-from .routing import route_query, route_vector
-from .repo import AnchorRepo, ArangoAnchorRepo, InMemoryAnchorRepo
+from .routing import (
+    QueryRoute, RouteDecision, route_query, route_query_scored, route_vector,
+    route_vector_scored,
+)
+from .repo import AnchorRepo, StoreAnchorRepo, InMemoryAnchorRepo
 from .store import (
+    AnchorSetNotProvisioned,
     get_anchor_repo,
     get_crosswalks,
     get_density_zoom,
@@ -33,13 +37,14 @@ from .store import (
 )
 
 __all__ = [
-    "activate_vector", "propose_anchor",
+    "activate_vector", "propose_anchor", "propose_anchor_decided", "GrowthDecision",
     "Anchor", "AnchorSet", "Reconciler", "SparseCode", "DensityZoom",
     "Crosswalk", "CrosswalkRegistry", "fit_crosswalk",
     "L0", "L1", "L2", "CANDIDATE", "WORKING", "CANONICAL",
-    "route_query", "route_vector",
-    "bootstrap_anchorset", "gather_seed_corpus",
-    "AnchorRepo", "ArangoAnchorRepo", "InMemoryAnchorRepo",
+    "route_query", "route_vector", "route_query_scored", "route_vector_scored",
+    "RouteDecision", "QueryRoute",
+    "gather_seed_corpus", "AnchorSetNotProvisioned",
+    "AnchorRepo", "StoreAnchorRepo", "InMemoryAnchorRepo",
     "get_anchor_repo", "set_anchor_repo",
     "get_live_anchorset", "require_live_anchorset",
     "get_density_zoom", "get_crosswalks",

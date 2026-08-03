@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import List, Optional, Set, TYPE_CHECKING, Any, Dict, Mapping, Sequence, cast
 
-import agience_core.event_bus as event_bus
+import mantle.event_bus as event_bus
 
 try:
     from fastapi import HTTPException, status  # type: ignore
@@ -24,26 +24,23 @@ except Exception:
 
     status = _Status()
 if TYPE_CHECKING:
-    from arango.database import StandardDatabase  # type: ignore
+    from mantle.db.store import Database
 else:
-    StandardDatabase = Any
+    Database = Any
 
-# arango may not be installed in all environments (static analysis, tests, etc.).
-# Try to import the specific exception and fall back to a local definition if unavailable.
-try:
-    from arango.exceptions import DocumentInsertError  # type: ignore
-except Exception:
-    class DocumentInsertError(Exception):
-        """Fallback when arango.exceptions is not available."""
-        pass
+# ⚠ AN `store.exceptions` IMPORT LIVED HERE, guarded by a try/except that defined a local
+# fallback class. Neither the imported name nor the fallback was ever raised or caught anywhere in
+# this tree (grep: two hits, both of them this block). It was dead in the most durable way — a
+# dependency that no test could notice was unused, because the fallback made it always succeed.
+# Removed 2026-07-23 [John: "We shouldn't be using the legacy store at all."]
 
-from entities.artifact import Artifact as ArtifactEntity
-from entities.collection import Collection as CollectionEntity
-from entities.commit import Commit as CommitEntity
-from entities.commit_item import CommitItem as CommitItemEntity
-from entities.grant import Grant as GrantEntity
+from mantle.entities.artifact import Artifact as ArtifactEntity
+from mantle.entities.collection import Collection as CollectionEntity
+from mantle.entities.commit import Commit as CommitEntity
+from mantle.entities.commit_item import CommitItem as CommitItemEntity
+from mantle.entities.grant import Grant as GrantEntity
 
-from db.arango import (
+from mantle.db.backend import (
     # Collections
     create_collection as db_create_collection,
     get_collection_by_id as db_get_collection_by_id,
@@ -55,7 +52,6 @@ from db.arango import (
 
     # Artifacts (unified store)
     create_artifact as db_create_artifact,
-    create_artifacts_batch as db_create_artifacts_batch,
     get_artifact as db_get_artifact,
     get_artifacts_by_creator_id as db_get_artifacts_by_creator_id,
     get_draft_artifact as db_get_draft_artifact,
@@ -103,38 +99,26 @@ def db_get_artifact_by_collection_id_and_root_id(db, collection_id, root_id):
 
 
 def db_get_artifacts_by_collection_id(db, collection_id):
-    from entities.artifact import Artifact
+    from mantle.entities.artifact import Artifact
     rows = db_list_collection_artifacts(db, collection_id)
     return [Artifact.from_dict(r) for r in rows]
-
-
-def db_add_cards_to_collection_batch(db, collection_id, root_ids):
-    """Batch-insert collection_artifacts edges for the given root IDs."""
-    prev = _db_get_last_order_key(db, collection_id)
-    edges = []
-    for rid in root_ids:
-        prev = _db_after_key(prev)
-        edges.append((rid, prev))
-    return _db_add_edges_batch(db, collection_id, edges)
 
 
 def db_delete_collection_artifact_by_collection_and_root(db, collection_id, root_id):
     return _db_remove_edge(db, collection_id, root_id)
 
-from search.ingest.pipeline_unified import (  # noqa: E402
+from mantle.search.ingest.pipeline_unified import (  # noqa: E402
     index_artifact,
-    enqueue_index_artifact,
-    enqueue_index_artifacts_batch,
     delete_artifact_from_index,
 )
-from services.content_service import generate_signed_url  # noqa: E402
+from mantle.services.content_service import generate_signed_url  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 
 def _emit(collection_id: str, name: str, payload: dict, *, actor_id: Optional[str] = None) -> None:
     # artifact.created / artifact.updated are emitted at the db chokepoint
-    # (db.arango) so every write is covered exactly once; only forward the rest.
+    # (db.store) so every write is covered exactly once; only forward the rest.
     if name in ("artifact.created", "artifact.updated"):
         return
     try:
@@ -143,11 +127,12 @@ def _emit(collection_id: str, name: str, payload: dict, *, actor_id: Optional[st
         logger.debug("event bus emit failed", exc_info=True)
 
 
-def ensure_collection_descriptor(db: StandardDatabase, collection: CollectionEntity) -> CollectionEntity:
-    """Ensure container artifacts are searchable in OpenSearch.
+def ensure_collection_descriptor(db: Database, collection: CollectionEntity) -> CollectionEntity:
+    """Ensure container artifacts are searchable.
 
     Container-as-artifact means we index the container artifact itself
     (workspace/collection), not a separate descriptor artifact.
+
     """
     try:
         index_artifact(collection, collection.id, is_head=True)
@@ -155,7 +140,7 @@ def ensure_collection_descriptor(db: StandardDatabase, collection: CollectionEnt
         logger.warning("Failed to index container artifact %s: %s", collection.id, e)
     return collection
 
-def _attach_committed_collection_ids(db: StandardDatabase, artifacts: Sequence[ArtifactEntity]) -> None:
+def _attach_committed_collection_ids(db: Database, artifacts: Sequence[ArtifactEntity]) -> None:
     """Populate committed_collection_ids on each artifact entity."""
     if not artifacts:
         return
@@ -197,7 +182,7 @@ def _attach_committed_collection_ids(db: StandardDatabase, artifacts: Sequence[A
         setattr(artifact, "committed_collection_ids", sorted(dict.fromkeys(committed)))
 
 
-def attach_committed_collection_ids(db: StandardDatabase, artifacts: Sequence[ArtifactEntity]) -> None:
+def attach_committed_collection_ids(db: Database, artifacts: Sequence[ArtifactEntity]) -> None:
     """Public API: populate committed_collection_ids on a list of artifacts."""
     _attach_committed_collection_ids(db, artifacts)
 
@@ -205,7 +190,7 @@ def attach_committed_collection_ids(db: StandardDatabase, artifacts: Sequence[Ar
 # === Collection CRUD ===
 
 def create_new_collection(
-    db: StandardDatabase,
+    db: Database,
     owner_id: str,
     name: str,
     description: str,
@@ -217,7 +202,7 @@ def create_new_collection(
     artifact created in a workspace becomes a member of it. A collection IS an
     artifact, so a collection created in a workspace shows up in that workspace
     like anything else. Without ``container_id`` it is created top-level."""
-    from entities.collection import COLLECTION_CONTENT_TYPE
+    from mantle.entities.collection import COLLECTION_CONTENT_TYPE
     now = datetime.now(timezone.utc).isoformat()
     entity = CollectionEntity(
         id=owner_id if is_personal else str(uuid.uuid4()),
@@ -234,7 +219,7 @@ def create_new_collection(
     ensure_collection_descriptor(db, created)
 
     # Issue explicit full-CRUDEASIO grant to the creator.
-    from db.arango import upsert_user_collection_grant as db_upsert_creator_grant
+    from mantle.db.backend import upsert_user_collection_grant as db_upsert_creator_grant
     db_upsert_creator_grant(
         db,
         user_id=owner_id,
@@ -253,14 +238,14 @@ def create_new_collection(
     # Make it a member of its container (origin edge) so it appears there, just
     # like any other artifact created in that workspace/collection.
     if container_id:
-        from db.arango import add_artifact_to_collection as db_add_to_container
+        from mantle.db.backend import add_artifact_to_collection as db_add_to_container
         db_add_to_container(db, container_id, created.root_id or created.id, origin=True)
 
     return created
 
 
 def get_collections_for_user(
-    db: StandardDatabase,
+    db: Database,
     user_id: Optional[str],
     grant_key: Optional[GrantEntity] = None,
 ) -> List[CollectionEntity]:
@@ -268,7 +253,7 @@ def get_collections_for_user(
     Get collections accessible to user/grant key.
     Includes: owned collections + grant-accessible collections + grant_key collection.
     """
-    from db.arango import get_containers_for_user as db_get_containers_for_user
+    from mantle.db.backend import get_containers_for_user as db_get_containers_for_user
     owned = db_get_containers_for_user(db, user_id) if user_id else []
     seen_ids: Set[str] = {c.id for c in owned}
 
@@ -305,7 +290,7 @@ def get_collections_for_user(
 
 
 def get_collection_for_user(
-    db: StandardDatabase,
+    db: Database,
     user_id: Optional[str],
     collection_id: str,
 ) -> CollectionEntity:
@@ -316,7 +301,7 @@ def get_collection_for_user(
 
 
 def update_user_collection(
-    db: StandardDatabase,
+    db: Database,
     user_id: Optional[str],
     collection_id: str,
     name: Optional[str],
@@ -326,7 +311,7 @@ def update_user_collection(
     if not collection:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
 
-    from db.arango import get_active_grants_for_principal_resource
+    from mantle.db.backend import get_active_grants_for_principal_resource
     grants = get_active_grants_for_principal_resource(
         db, grantee_id=user_id, resource_id=collection_id,
     ) if user_id else []
@@ -344,7 +329,7 @@ def update_user_collection(
     return updated
 
 
-def delete_user_collection(db: StandardDatabase, user_id: Optional[str], collection_id: str) -> None:
+def delete_user_collection(db: Database, user_id: Optional[str], collection_id: str) -> None:
     """
     Delete a collection and clean up references:
     - Remove links from all artifacts to this collection
@@ -355,7 +340,7 @@ def delete_user_collection(db: StandardDatabase, user_id: Optional[str], collect
     if not collection:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
 
-    from db.arango import get_active_grants_for_principal_resource
+    from mantle.db.backend import get_active_grants_for_principal_resource
     grants = get_active_grants_for_principal_resource(
         db, grantee_id=user_id, resource_id=collection_id,
     ) if user_id else []
@@ -381,7 +366,7 @@ def delete_user_collection(db: StandardDatabase, user_id: Optional[str], collect
         # Remove unified index doc for this (collection, root, version)
         if version_id:
             try:
-                delete_artifact_from_index(version_id, root_id)
+                delete_artifact_from_index(version_id, root_id, collection_id=collection_id)
             except Exception:
                 logger.exception("Failed to delete index for version %s (root %s)", version_id, root_id)
 
@@ -391,15 +376,22 @@ def delete_user_collection(db: StandardDatabase, user_id: Optional[str], collect
         except Exception:
             memberships = []
         if not memberships:
-            # Delete all versions for this root and remove their index docs
+            # Delete all versions for this root and remove their index docs.
+            # 2026-07-22 hardening: this was a silent `deleted_versions = []` placeholder — the
+            # ONE spot in the delete path that reported success while doing nothing, so a root
+            # leaving its last collection leaked every version and its index docs forever.
+            # `delete_artifacts_by_root` (db/lattice_api.py) is the hard-delete this docstring
+            # promises; failure is LOGGED, never swallowed into a fake empty result.
             try:
-                # deleted_versions = [] db_delete_artifact_versions_by_root(db, root_id)  # type: ignore[attr-defined]        
-                deleted_versions = [] # Placeholder
+                from mantle.db.backend import delete_artifacts_by_root as db_delete_artifacts_by_root
+                deleted_versions = db_delete_artifacts_by_root(db, root_id)
             except Exception:
+                logger.exception("Failed deleting versions for root %s (last membership gone)",
+                                 root_id)
                 deleted_versions = []
             for vid in deleted_versions:
                 try:
-                    delete_artifact_from_index(vid, root_id)
+                    delete_artifact_from_index(vid, root_id, collection_id=collection_id)
                 except Exception:
                     logger.exception("Failed to delete index for version %s (root %s)", vid, root_id)
 
@@ -410,10 +402,10 @@ def delete_user_collection(db: StandardDatabase, user_id: Optional[str], collect
 
 # === Artifact Operations ===
 
-def create_new_artifact(db: StandardDatabase, user_id: str, context: str, content: str) -> ArtifactEntity:
+def create_new_artifact(db: Database, user_id: str, context: str, content: str) -> ArtifactEntity:
     """
     Create a new artifact VERSION document only. Root and linking are handled separately.
-    EXACT 1:1 mapping - no modified_by/modified_time (don't exist in ArangoDB schema).
+    EXACT 1:1 mapping - no modified_by/modified_time (don't exist in the lattice schema).
     """
     now = datetime.now(timezone.utc).isoformat()
     artifact = ArtifactEntity(
@@ -425,138 +417,11 @@ def create_new_artifact(db: StandardDatabase, user_id: str, context: str, conten
     )
     created = db_create_artifact(db, artifact)
     _attach_committed_collection_ids(db, [created])
-    _attach_committed_collection_ids(db, [created])
-    return created
-
-
-def create_and_add_artifact(
-    db: StandardDatabase,
-    user_id: str,
-    collection_id: str,
-    context: str,
-    content: str,
-    *,
-    record: bool = True,
-    actor_id: Optional[str] = None,
-) -> ArtifactEntity:
-    """
-    Create a brand-new ROOT and VERSION and link them into the collection.
-    """
-    now = datetime.now(timezone.utc).isoformat()
-    root_id = str(uuid.uuid4())
-    version_id = str(uuid.uuid4())
-
-    artifact = ArtifactEntity(
-        id=version_id,
-        root_id=root_id,
-        context=context,
-        content=content,
-        created_by=actor_id or user_id,
-        created_time=now,
-    )
-    created = db_create_artifact(db, artifact)
-
-    db_add_artifact_to_collection(db, collection_id, root_id, created.id)
-
-    if record:
-        record_collection_commit(
-            db, user_id, collection_id,
-            adds=[created.id],
-            message=f"Added artifact version {created.id}",
-            author_id=actor_id or user_id,
-        )
-
-    # Index to unified search
-    try:
-        enqueue_index_artifact(created, collection_id, is_head=True, tenant_id=user_id)
-    except Exception as e:
-        logger.warning(f"Failed to enqueue indexing for collection artifact {created.id}: {e}")
-
-    _emit(collection_id, "artifact.created", {
-        "artifact": {**created.to_dict(), "collection_id": collection_id}
-    }, actor_id=actor_id or user_id)
-    return created
-
-
-def create_and_add_artifacts_batch(
-    db: StandardDatabase,
-    user_id: str,
-    collection_id: str,
-    artifacts: List[tuple[str, str]],
-    *,
-    record: bool = True,
-    actor_id: Optional[str] = None,
-) -> List[ArtifactEntity]:
-    """
-    Efficiently create multiple brand-new ROOT+VERSION artifacts and link them into the collection.
-    - Creates all versions and CollectionArtifact links
-    - Records a single commit with all adds (when record=True)
-    - Indexes each head version into unified search (async via queue)
-
-    artifacts: list of (context_json, content_str)
-    """
-    if not artifacts:
-        return []
-
-    created: List[ArtifactEntity] = []
-    add_version_ids: List[str] = []
-
-    # Build entities first to enable true batch insertion
-    now = datetime.now(timezone.utc).isoformat()
-    for context, content in artifacts:
-        root_id = str(uuid.uuid4())
-        version_id = str(uuid.uuid4())
-        created.append(ArtifactEntity(
-            id=version_id,
-            root_id=root_id,
-            context=context,
-            content=content,
-            created_by=actor_id or user_id,
-            created_time=now,
-        ))
-        add_version_ids.append(version_id)
-
-    # Batch insert versions
-    created = db_create_artifacts_batch(db, created) or []
-
-    # Batch link all artifacts to the collection (brand-new roots)
-    root_ids = [str(c.root_id) for c in created]
-    db_add_cards_to_collection_batch(db, collection_id, root_ids)
-
-    if record and add_version_ids:
-        record_collection_commit(
-            db,
-            user_id,
-            collection_id,
-            adds=add_version_ids,
-            message=f"Added {len(add_version_ids)} artifact versions",
-            author_id=actor_id or user_id,
-        )
-
-    # Index to unified search (batch enqueued to async worker)
-    if created:
-        logger.info(f"[{datetime.now(timezone.utc).isoformat()}] [outbox] Enqueueing {len(created)} artifacts for indexing...")
-        enqueue_start = time.time()
-        try:
-            enqueue_index_artifacts_batch(created, collection_id, is_head=True, tenant_id=user_id)
-        except Exception as e:
-            logger.error(f"Failed to enqueue batch indexing for {len(created)} artifacts: {e}")
-            raise
-        logger.info(f"[{datetime.now(timezone.utc).isoformat()}] [ok]... Enqueued in {time.time() - enqueue_start:.3f}s")
-
-    attach_start = time.time()
-    _attach_committed_collection_ids(db, created)
-    logger.info(f"[{datetime.now(timezone.utc).isoformat()}] [ok]... Attached collection IDs in {time.time() - attach_start:.3f}s")
-
-    for artifact in created:
-        _emit(collection_id, "artifact.created", {
-            "artifact": {**artifact.to_dict(), "collection_id": collection_id}
-        }, actor_id=user_id)
     return created
 
 
 def edit_artifact_in_collection(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     collection_id: str,
     root_id: str,
@@ -619,7 +484,7 @@ def edit_artifact_in_collection(
     # Delete old version from unified search index
     if prev_version_id:
         try:
-            delete_artifact_from_index(prev_version_id, root_id)
+            delete_artifact_from_index(prev_version_id, root_id, collection_id=collection_id)
         except Exception as e:
             logger.warning(f"Failed to delete old collection artifact from search {prev_version_id}: {e}")
     
@@ -639,7 +504,7 @@ def edit_artifact_in_collection(
 
 
 def remove_artifact_from_collection_by_version(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     collection_id: str,
     *,
@@ -692,7 +557,7 @@ def remove_artifact_from_collection_by_version(
     # Delete from unified search index if this was the linked version
     if linked_version_id and linked_version_id == version_id:
         try:
-            delete_artifact_from_index(version_id, root_id)
+            delete_artifact_from_index(version_id, root_id, collection_id=collection_id)
         except Exception as e:
             logger.warning(f"Failed to delete collection artifact from search {version_id}: {e}")
 
@@ -701,7 +566,7 @@ def remove_artifact_from_collection_by_version(
     }, actor_id=user_id)
 
 
-def get_unattached_artifacts(db: StandardDatabase, user_id: str) -> List[ArtifactEntity]:
+def get_unattached_artifacts(db: Database, user_id: str) -> List[ArtifactEntity]:
     """
     Return artifacts created by `user_id` that have no CollectionArtifact link.
     We check link existence per root. If a version lacks a visible root_id field,
@@ -725,7 +590,7 @@ def get_unattached_artifacts(db: StandardDatabase, user_id: str) -> List[Artifac
         rid = getattr(c, "root_id", None)
         if not rid:
             continue
-        # Use the arango helper to get collection ids linked to this root.
+        # Use the store helper to get collection ids linked to this root.
         linked_ids = db_get_collection_ids_for_root(db, rid) or []
         if not linked_ids:
             unattached.append(c)
@@ -734,41 +599,14 @@ def get_unattached_artifacts(db: StandardDatabase, user_id: str) -> List[Artifac
     return unattached
 
 
-def get_artifacts_for_user(db: StandardDatabase, user_id: str) -> List[ArtifactEntity]:
+def get_artifacts_for_user(db: Database, user_id: str) -> List[ArtifactEntity]:
     artifacts = db_get_artifacts_by_creator_id(db, user_id)
     _attach_committed_collection_ids(db, artifacts)
     return artifacts
 
 
-def get_artifact_by_id_for_user(
-    db: StandardDatabase,
-    user_id: Optional[str],
-    artifact_root_id: str,
-) -> ArtifactEntity:
-    latest = db_get_latest_artifact_version_by_root_id(db, artifact_root_id)
-    if latest:
-        parent_id = getattr(latest, "collection_id", None)
-        if parent_id and user_id:
-            from db.arango import get_active_grants_for_principal_resource
-            grants = get_active_grants_for_principal_resource(
-                db, grantee_id=user_id, resource_id=parent_id,
-            )
-            if any(getattr(g, "can_read", False) for g in grants):
-                _attach_committed_collection_ids(db, [latest])
-                return latest
-
-    linked_collection_ids = db_get_collection_ids_for_root(db, artifact_root_id)
-    for col_id in linked_collection_ids:
-        artifact = db_get_artifact_by_collection_id_and_root_id(db, col_id, artifact_root_id)
-        if artifact:
-            _attach_committed_collection_ids(db, [artifact])
-            return artifact
-
-    raise HTTPException(status.HTTP_404_NOT_FOUND, "Artifact not found")
-
-
 def get_collection_artifact(
-    db: StandardDatabase,
+    db: Database,
     user_id: Optional[str],
     collection_id: str,
     artifact_root_id: str,
@@ -781,7 +619,7 @@ def get_collection_artifact(
 
 
 def get_collection_artifact_content_url(
-    db: StandardDatabase,
+    db: Database,
     user_id: Optional[str],
     collection_id: str,
     artifact_root_id: str,
@@ -817,7 +655,10 @@ def get_collection_artifact_content_url(
     if ctx.get("content_source") != "agience-content":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Not an agience-hosted file")
 
-    key = ctx.get("content_key") or f"{collection.created_by}/{artifact_root_id}.content"
+    # Validated, not trusted — see `workspace_service._safe_content_key`. Unchecked, a caller who
+    # can author an artifact's `context` mints a signed download URL for ANOTHER tenant's object.
+    from mantle.services.workspace_service import _safe_content_key
+    key = _safe_content_key(ctx, artifact_root_id, default_prefix=str(collection.created_by))
     filename = ctx.get("filename", "download")
     content_type = ctx.get("content_type", "application/octet-stream")
     url = generate_signed_url(
@@ -834,7 +675,7 @@ def get_collection_artifact_content_url(
 
 
 def get_collection_artifacts_batch(
-    db: StandardDatabase,
+    db: Database,
     user_id: Optional[str],
     collection_id: str,
     artifact_root_ids: List[str],
@@ -850,7 +691,7 @@ def get_collection_artifacts_batch(
 
 
 def get_collection_artifacts_batch_global(
-    db: StandardDatabase,
+    db: Database,
     user_id: Optional[str],
     artifact_root_ids: List[str],
 ) -> List[ArtifactEntity]:
@@ -883,7 +724,7 @@ def get_collection_artifacts_batch_global(
 
 
 def get_collection_artifacts(
-    db: StandardDatabase,
+    db: Database,
     user_id: Optional[str],
     collection_id: str,
 ) -> List[ArtifactEntity]:
@@ -894,7 +735,7 @@ def get_collection_artifacts(
 
 
 def add_artifact_to_collection_with_access_check(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     collection_id: str,
     version_id: str,
@@ -939,7 +780,7 @@ def add_artifact_to_collection_with_access_check(
     return artifact
 
 
-def archive_artifact_by_version_id(db: StandardDatabase, user_id: str, version_id: str) -> bool:
+def archive_artifact_by_version_id(db: Database, user_id: str, version_id: str) -> bool:
     """
     Archives an artifact by its version ID.
     """
@@ -952,7 +793,7 @@ def archive_artifact_by_version_id(db: StandardDatabase, user_id: str, version_i
 
 # === Commit ===
 
-def create_commit(db: StandardDatabase, user_id: str, commit: CommitEntity) -> CommitEntity:
+def create_commit(db: Database, user_id: str, commit: CommitEntity) -> CommitEntity:
     """
     Handles explicit commit creation from the API.
     """
@@ -973,7 +814,7 @@ def create_commit(db: StandardDatabase, user_id: str, commit: CommitEntity) -> C
     return commit
 
 
-def get_commit(db: StandardDatabase, user_id: str, commit_id: str) -> CommitEntity:
+def get_commit(db: Database, user_id: str, commit_id: str) -> CommitEntity:
     """Fetch a commit by id and convert it to a domain entity."""
     raw = db_get_commit_by_id(db, commit_id)
     if not raw:
@@ -990,7 +831,7 @@ def get_commit(db: StandardDatabase, user_id: str, commit_id: str) -> CommitEnti
     return CommitEntity.from_dict(data)
 
 
-def get_commits_for_collection(db: StandardDatabase, user_id: str, collection_id: str) -> List[CommitEntity]:
+def get_commits_for_collection(db: Database, user_id: str, collection_id: str) -> List[CommitEntity]:
     """Return commits associated with a collection."""
     records = db_get_commits_for_collection(db, collection_id) or []
     entities: List[CommitEntity] = []
@@ -1009,7 +850,7 @@ def get_commits_for_collection(db: StandardDatabase, user_id: str, collection_id
 # === Provenance helper ===
 
 def record_collection_commit(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     collection_id: str,
     *,
@@ -1098,16 +939,16 @@ async def dispatch_create_collection(artifact: dict, body: dict, ctx: Any) -> di
 
     if container_id and ctx.user_id:
         try:
-            from services.dependencies import AuthContext, check_access
+            from mantle.services.dependencies import AuthContext, check_access
             check_access(
                 AuthContext(principal_id=ctx.user_id, principal_type="user", user_id=ctx.user_id),
-                container_id, "create", ctx.arango_db,
+                container_id, "create", ctx.store_db,
             )
         except Exception:
             container_id = None  # not allowed → create top-level instead
 
     coll = create_new_collection(
-        ctx.arango_db, ctx.user_id, name, description, container_id=container_id
+        ctx.store_db, ctx.user_id, name, description, container_id=container_id
     )
     return coll.to_dict()
 

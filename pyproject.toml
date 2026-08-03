@@ -1,0 +1,117 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agience-mantle"
+version = "0.1.0"
+description = "Agience Mantle — the standalone data store: SQLite + encrypted content-addressed filesystem, artifacts/collections with immutable version lineage, CRUDEASIO access grants, and a Merkle-synced mesh. Runs with zero external database processes. Import name is `mantle`."
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Ikailo Inc." }]
+readme = "README.md"
+
+# ⛔ THE BASE INSTALL IS THE STORE, AND ITS DEPENDENCY SET IS DELIBERATELY ONE PACKAGE.
+#
+# `pip install agience-mantle` gives you artifacts, collections, version lineage, access grants,
+# the encrypted local content tier, and FTS — the whole embeddable surface — on stdlib plus
+# `cryptography`. Nothing else. That is the product claim ("Mantle IS the standalone data store"),
+# so it is expressed here as an install contract rather than a README sentence, and it is
+# ENFORCED by `src/mantle/db/lattice/test_embeddable_surface.py` (AST + runtime + functional).
+# That test lives under db/lattice/ rather than tests/ because `src/mantle/tests/conftest.py`
+# imports `origin` — a check that cannot run without the package it exists to prove unnecessary
+# would prove nothing.
+#
+# MEASURED, not assumed: an AST scan of the store subtree finds ZERO module-level third-party
+# imports and zero imports of any sibling Agience package. `cryptography` itself is imported
+# lazily inside functions; it is a hard dependency anyway because the store encrypts at rest, and
+# declaring it optional would make "can this store open its own content" an install-shape lottery.
+dependencies = [
+    "cryptography>=42",
+]
+
+[project.optional-dependencies]
+# The DURABLE tier (S3/R2/any bucket + CDN read path). Only needed to mirror content off-box;
+# a node whose working set is local answers with the backing unreachable, by design.
+s3 = ["boto3>=1.34"]
+
+# The NAS/SMB carrier for the mesh plane.
+smb = ["smbprotocol>=1.12"]
+
+# Lexical + vector retrieval over the store.
+# ⚠ `numpy` is the vector arm's, not the store's. The encrypted lexical (SSE/BM25) path is much
+# lighter, but is not yet separable — see MANTLE-REQUESTS-FROM-EREA.md §5. Until it is, asking for
+# retrieval pulls the vector arm's weight too, and saying so here is more honest than shipping a
+# `search` extra that quietly means "and numpy".
+search = ["numpy>=1.24", "pyyaml>=6.0"]
+
+# Mantle as a DEPLOYED SERVICE — the FastAPI app, routers, OIDC, seed provisioning.
+# ⚠ `agience-origin` is a hard dependency of THIS SURFACE ONLY, and that is why the service surface
+# cannot be part of the base install: an embedding consumer would inherit a requirement for code it
+# never calls. Measured 2026-07-30 — the 31 `origin` import sites in this repo are all in the server
+# layer (`main.py`, `manage_seed.py`, `routers/`, `search/`); `db/lattice/` has none, so the
+# standalone-store claim above still holds and `test_embeddable_surface.py` still passes.
+#
+# It is now DECLARED rather than described. Until 2026-07-30 agience-origin had no packaging
+# metadata at all, so this comment could only say "install it from the sibling checkout" — an edge
+# satisfied by PYTHONPATH, which meant a bare `pytest` in this repo did not merely fail: it
+# collected `site-packages/tests` (blimpy's) and started downloading that project's test data. A
+# dependency that cannot be named is one nothing can check. Still not on PyPI — resolve it from the
+# sibling checkout (`pip install -e ../agience-origin`) or a pinned git ref.
+service = [
+    "agience-mantle[s3,search]",
+    "agience-origin",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.30",
+    "starlette>=0.37",
+    "pydantic>=2.7",
+    "email-validator>=2.2",
+    "python-jose[cryptography]>=3.3",
+    "python-multipart>=0.0.9",
+    "python-dotenv>=1.0",
+    "httpx>=0.27",
+    "authlib>=1.3",
+    "bcrypt",
+    "itsdangerous",
+    "pyyaml>=6.0",
+]
+
+dev = ["pytest>=8.0"]
+
+all = ["agience-mantle[s3,smb,search,service,dev]"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+mantle = ["*.json", "*.sql"]
+
+[tool.pytest.ini_options]
+# ⛔ THE ONE PYTEST CONFIG FOR THIS REPO (consolidated 2026-07-30).
+#
+# There were TWO, and which one applied depended on how you invoked pytest:
+#
+#   python -m pytest              -> rootdir agience-mantle,          configfile pyproject.toml
+#   python -m pytest src/mantle   -> rootdir agience-mantle/src/mantle, configfile src/mantle/pytest.ini
+#
+# They did not agree. The inner file carried `asyncio_mode = auto` and `pythonpath = . ..`; this one
+# carried neither. So the same tree, on the same commit, reported 1684 passed one way and 87 failed
+# the other — and the 87 were async tests losing auto mode, not a defect in anything they tested.
+# Two configs is worse than either config: a green run stops being evidence about the code and
+# becomes evidence about the command line, and the failing invocation is the SHORTER one that a
+# newcomer types first.
+#
+# `pythonpath = ["src"]` is what makes an uninstalled checkout work; it no longer has to put
+# `src/mantle` on the path to rescue `from tests.helpers import …`, because those 19 imports are now
+# fully qualified as `mantle.tests.*`. That mattered: a bare top-level `tests` resolved to blimpy's
+# package in site-packages, whose `__init__` shells out to `download_data.sh` — a third-party test
+# suite silently substituted for this one, exactly the failure the workspace has been bitten by
+# before.
+# ⚠ TWO ROOTS SINCE 2026-07-31: the unit suite moved OUT of the package to `tests/` (John), while
+# `src/mantle/db/lattice/` keeps its own tests in-tree — deliberately, because they prove the
+# embeddable surface and a check that cannot run without the package it exists to prove
+# unnecessary would prove nothing.
+testpaths = ["tests", "src/mantle"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

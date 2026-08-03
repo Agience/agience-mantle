@@ -1,4 +1,4 @@
-﻿"""Storage protocols for MANTLE encrypted search (Step 2.2b.iii).
+"""Storage protocols for MANTLE encrypted search (Step 2.2b.iii).
 
 One abstract store that the indexer + query engine talk to:
 

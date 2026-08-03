@@ -1,0 +1,50 @@
+"""E2E harness configuration — all knobs come from the environment so the same
+suite runs against a local `docker compose` stack or a remote deployment.
+
+Nothing here imports mantle/origin/core: this is a true blackbox client.
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+# --- endpoints --------------------------------------------------------------
+ORIGIN_URL = os.getenv("E2E_ORIGIN_URL", "http://localhost:8080").rstrip("/")
+MANTLE_URL = os.getenv("E2E_MANTLE_URL", "http://localhost:8081").rstrip("/")
+
+# The `aud` Origin stamps on user tokens (AUTHORITY_ISSUER). Mantle verifies
+# Origin-signed tokens against this; a few flows echo it back.
+AUTHORITY_ISSUER = os.getenv("E2E_AUTHORITY_ISSUER", "http://origin:8080")
+
+# --- bootstrap --------------------------------------------------------------
+# The init container writes a single-use bootstrap token to
+# <data>/keys/bootstrap.token. When the suite runs on the same host as the
+# compose stack it can read it directly; otherwise pass E2E_BOOTSTRAP_TOKEN.
+_DEFAULT_DATA = (
+    Path(__file__).resolve().parents[2] / "agience-beam" / ".data-local"
+)
+DATA_DIR = Path(os.getenv("E2E_DATA_DIR", str(_DEFAULT_DATA)))
+BOOTSTRAP_TOKEN_ENV = os.getenv("E2E_BOOTSTRAP_TOKEN", "")
+
+# --- regime flags -----------------------------------------------------------
+# Set to "1" when the stack is running with MANTLE_LAZY_INDEX=on so the
+# first-observation (lazy materialization) assertions are meaningful.
+LAZY_INDEX = os.getenv("E2E_LAZY_INDEX", "") not in ("", "0", "false", "False")
+
+# The remote embeddings provider (prism) is usually absent locally; semantic
+# search degrades to lexical. Skip semantic-only assertions unless told.
+HAS_EMBEDDINGS = os.getenv("E2E_HAS_EMBEDDINGS", "") not in ("", "0", "false", "False")
+
+HTTP_TIMEOUT = float(os.getenv("E2E_HTTP_TIMEOUT", "15"))
+
+
+def bootstrap_token() -> str | None:
+    """Resolve the single-use bootstrap token: env override first, else the
+    on-disk token the init container wrote. Returns None if neither is present
+    (already claimed, or running against a remote stack without the override)."""
+    if BOOTSTRAP_TOKEN_ENV:
+        return BOOTSTRAP_TOKEN_ENV.strip()
+    tok = DATA_DIR / "keys" / "bootstrap.token"
+    if tok.is_file():
+        return tok.read_text(encoding="utf-8").strip()
+    return None

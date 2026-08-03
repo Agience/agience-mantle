@@ -1,4 +1,4 @@
-﻿"""Cell encryption + serialization (Step 2.2b.i).
+"""Cell encryption + serialization (Step 2.2b.i).
 
 A MANTLE *cell* is the unit of encrypted storage that holds a set of indexed
 artifact chunks for one ``(principal_id, collection_id, cluster_id)`` tuple.
@@ -144,7 +144,16 @@ def serialize_chunks(chunks: List[dict]) -> bytes:
     serializes to the same bytes — useful when callers want to cache or
     fingerprint cell contents.
     """
-    return json.dumps(chunks, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    # `ensure_ascii=False` is required, not stylistic: the docstring above offers these bytes for
+    # FINGERPRINTING, and RFC 8785 canonical JSON emits raw UTF-8. With the default `ensure_ascii=True`
+    # a non-ASCII chunk serializes to `\uXXXX` escapes, so the same logical input produces different
+    # bytes here than under the canonicaliser of record (`prism/canonical.py`) — i.e. two different
+    # fingerprints for one input, the divergence class that already existed inside this workspace.
+    # Reading is unaffected: `deserialize_chunks` uses `json.loads`, which accepts both spellings, so
+    # blobs written before this change still decode. (Contract Builder, 2026-07-29 — this line was
+    # invisible to `canonical_json_check.py` until its BOM blind spot was fixed.)
+    return json.dumps(chunks, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
 
 
 def deserialize_chunks(plaintext: bytes) -> List[dict]:

@@ -1,4 +1,4 @@
-﻿"""Mantle-side person service — thin HTTP shim to Origin.
+"""Mantle-side person service — thin HTTP shim to Origin.
 
 After 1.1e, Person records live in Origin's Postgres. Mantle only needs
 `get_user_by_id` (used by `services.dependencies.get_person`) and the
@@ -14,8 +14,8 @@ from typing import Optional
 
 import httpx
 
-from clients.origin_client import get_origin_client
-from entities.person import Person as PersonEntity
+from mantle.clients.origin_client import get_origin_client
+from mantle.entities.person import Person as PersonEntity
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ def get_user_by_id(db, id: str) -> Optional[PersonEntity]:  # noqa: A002 — kee
     """Resolve a Person by ID via Origin's `/internal/persons/{id}` endpoint.
 
     `db` is unused — Origin owns identity. Kept for signature compatibility
-    with the historical Arango-backed function.
+    with the historical the lattice-backed function.
     """
     del db
     if not id:

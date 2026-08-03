@@ -1,10 +1,10 @@
 # entities/commit.py
 from typing import Optional, List, Dict, Any
-from entities.base import BaseEntity
+from .base import BaseEntity
 
 class Commit(BaseEntity):
     """
-    Mirrors ArangoDB `Commit`:
+    Mirrors the lattice `Commit`:
       - message: string
       - timestamp: ISO8601 string
       - author_id: string
@@ -29,7 +29,7 @@ class Commit(BaseEntity):
         confirmation: str = "human_affirmed",
         changeset_type: str = "manual",
         item_ids: Optional[List[str]] = None,
-        # BaseEntity fields (kept for local bookkeeping; not written to ArangoDB schema)
+        # BaseEntity fields (kept for local bookkeeping; not written to the lattice schema)
         created_time: Optional[str] = None,
         modified_time: Optional[str] = None,
     ):
@@ -51,8 +51,8 @@ class Commit(BaseEntity):
 
     def to_dict(self) -> Dict[str, Any]:
         """
-        Shape expected by db/arango writers and schema.
-        Note: ArangoDB schema uses `timestamp`, not `created_time`.
+        Shape expected by db/lattice writers and schema.
+        Note: the lattice schema uses `timestamp`, not `created_time`.
         """
         base = self.to_dict_base()
         base.update({

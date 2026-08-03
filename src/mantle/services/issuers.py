@@ -31,7 +31,7 @@ _PASSTHROUGH = ("audience", "jwks", "jwks_uri", "namespace", "role")
 
 def _system_principal_id() -> Optional[str]:
     try:
-        from services.peer_signing import get_system_principal_id
+        from mantle.services.peer_signing import get_system_principal_id
         return get_system_principal_id()
     except Exception:
         return None
@@ -53,8 +53,8 @@ def load_issuer_configs(db: Any) -> List[Dict[str, Any]]:
         )
         return []
     try:
-        from db import arango as db_arango
-        arts = db_arango.list_committed_artifacts_by_context_content_type(
+        from mantle.db import backend as db_store
+        arts = db_store.list_committed_artifacts_by_context_content_type(
             db, ISSUER_CONTENT_TYPE, created_by=system_id,
         )
     except Exception:
@@ -90,7 +90,7 @@ def load_issuer_configs(db: Any) -> List[Dict[str, Any]]:
 # The privileged path that materializes a trusted issuer. The artifact is owned by
 # the SYSTEM principal (so the loader trusts it) but records the authorizing admin
 # in context (provenance roots to a person — never an unattributed service write).
-# Creation goes through arango.create_artifact so it fires the db-chokepoint event
+# Creation goes through store.create_artifact so it fires the db-chokepoint event
 # the watcher reacts to: an admin adds an IdP and it's live immediately.
 # ---------------------------------------------------------------------------
 
@@ -114,6 +114,10 @@ def create_issuer_artifact(
         raise ValueError("jwks or jwks_uri is required")
     if role not in ("external", "platform"):
         raise ValueError("role must be 'external' or 'platform'")
+    if role == "external" and not audience:
+        # Fail fast: an external tenant IdP MUST bind an audience, or Mantle's verifier
+        # rejects its tokens (confused-deputy across tenants — see OidcVerifier.verify).
+        raise ValueError("an external issuer must bind an 'audience'")
     system_id = _system_principal_id()
     if not system_id:
         raise RuntimeError("system principal unavailable — cannot own issuer artifact")
@@ -131,14 +135,14 @@ def create_issuer_artifact(
     if namespace is not None:
         ctx["namespace"] = namespace
 
-    from db import arango as db_arango
-    from entities.artifact import Artifact
+    from mantle.db import backend as db_store
+    from mantle.entities.artifact import Artifact
     art = Artifact(
         id=str(uuid.uuid4()), collection_id="", state="committed",
         created_by=system_id, modified_by=system_id, context=json.dumps(ctx),
         content_type=ISSUER_CONTENT_TYPE, name=issuer,
     )
-    db_arango.create_artifact(db, art)  # emits artifact.created -> watcher refreshes
+    db_store.create_artifact(db, art)  # emits artifact.created -> watcher refreshes
     logger.info("issuer create: %s (authorized_by=%s)", issuer, authorized_by)
     return art
 
@@ -148,8 +152,8 @@ def list_issuer_artifacts(db: Any) -> List[Any]:
     system_id = _system_principal_id()
     if db is None or not system_id:
         return []
-    from db import arango as db_arango
-    return db_arango.list_committed_artifacts_by_context_content_type(
+    from mantle.db import backend as db_store
+    return db_store.list_committed_artifacts_by_context_content_type(
         db, ISSUER_CONTENT_TYPE, created_by=system_id,
     )
 
@@ -185,8 +189,8 @@ def seed_platform_issuer_artifacts(db: Any) -> int:
         if isinstance(ctx, dict) and ctx.get("issuer"):
             existing.add(ctx["issuer"])
 
-    from agience_core import config
-    from services.oidc import _read_authority_manifest
+    from origin import config
+    from mantle.services.oidc import _read_authority_manifest
 
     desired: List[Dict[str, Any]] = []
     manifest = _read_authority_manifest()
@@ -231,8 +235,8 @@ def revoke_issuer_artifact(db: Any, artifact_id: str, *, by: str) -> bool:
     """Revoke trust in an issuer by archiving its artifact (the loader reads only
     committed). Returns False if not an issuer artifact. Emits artifact.updated ->
     the watcher drops it from the trust set."""
-    from db import arango as db_arango
-    art = db_arango.get_artifact(db, artifact_id)
+    from mantle.db import backend as db_store
+    art = db_store.get_artifact(db, artifact_id)
     if art is None:
         return False
     try:
@@ -243,7 +247,7 @@ def revoke_issuer_artifact(db: Any, artifact_id: str, *, by: str) -> bool:
         return False
     art.state = "archived"
     art.modified_by = by
-    db_arango.update_artifact(db, art)  # emits artifact.updated -> watcher refreshes
+    db_store.update_artifact(db, art)  # emits artifact.updated -> watcher refreshes
     logger.info("issuer revoke: %s (by=%s)", artifact_id, by)
     return True
 
@@ -270,9 +274,9 @@ _ISSUER_EVENT_NAMES = [
 def _handle_issuer_event(event: Any, get_db: Any = None) -> None:
     """Reload the verifier's trust set in response to an issuer-artifact event."""
     try:
-        from services.oidc import get_oidc_verifier
+        from mantle.services.oidc import get_oidc_verifier
         if get_db is None:
-            from services.dependencies import get_arango_db as get_db
+            from mantle.services.dependencies import get_store_db as get_db
         db = next(get_db())
         get_oidc_verifier().refresh_from_db(db)
         logger.info("issuer watch: trust refreshed on %s", getattr(event, "name", "?"))
@@ -285,7 +289,7 @@ async def watch_issuer_changes() -> None:
 
     Runs for the app's lifetime (started in the lifespan). The throttled
     refresh-on-miss in ``resolve_auth`` is the fallback for missed events."""
-    from agience_core import event_bus
+    from mantle import event_bus
     flt = event_bus.EventFilter(
         content_type=ISSUER_CONTENT_TYPE, event_names=_ISSUER_EVENT_NAMES,
     )

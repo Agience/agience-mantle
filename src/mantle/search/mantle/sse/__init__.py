@@ -1,8 +1,8 @@
-﻿"""MANTLE-SSE — encrypted lexical search (Step 2.6 scaffolding).
+"""MANTLE-SSE — encrypted lexical search (Step 2.6 scaffolding).
 
-Per `.dev/features/mantle-sse-lexical-index.md`. Replaces OpenSearch BM25 with
+Per `.dev/features/mantle-sse-lexical-index.md`. Replaces the legacy BM25 index with
 blind-token posting lists encrypted in S3. Once 2.6 lands fully, the
-`search` (OpenSearch) container can be retired entirely — completing the
+`search` (the legacy lexical index) container can be retired entirely — completing the
 four-container reduction.
 
 Design summary:
@@ -44,9 +44,9 @@ SSE is the canonical lexical backend. Phasing reference (historical):
 - **2.6.6** — Indexer + commit-path hook (parallel to ``MantleIndexer``).
 - **2.6.7** — Query engine (constant-width batch lookup, BM25 scoring).
 - **2.6.8** — Unified accessor (RRF fusion of MANTLE vector + SSE lexical;
-  no OpenSearch arm).
+  no the legacy lexical index arm).
 - **2.6.9** — Migration: re-index existing artifacts via SSE; retire
-  OpenSearch; drop ``search`` service from compose. Done 2026-05-09.
+  the legacy lexical index; drop ``search`` service from compose. Done 2026-05-09.
 """
 
 from __future__ import annotations
@@ -90,9 +90,7 @@ from .posting import (
 )
 from .indexer import SseIndexer
 from .query import SseHit, SseQueryEngine
-from .router_accessor import MantleSseSearchAccessor
 from .s3_stores import S3PostingStore, S3StatsStore
-from .unified import MantleUnifiedAccessor, HitSource, UnifiedHit
 from .scorer import (
     DEFAULT_B,
     DEFAULT_FIELD_BOOST,
@@ -117,8 +115,6 @@ from .stats import (
     unpack_stats,
 )
 from .tokenizer import (
-    STOP_WORDS,
-    is_stop_word,
     porter_stem,
     split_words,
     strip_possessive,
@@ -127,8 +123,6 @@ from .tokenizer import (
 
 __all__ = [
     # Tokenizer
-    "STOP_WORDS",
-    "is_stop_word",
     "porter_stem",
     "split_words",
     "strip_possessive",
@@ -204,3 +198,39 @@ __all__ = [
     # Router-shape adapter (Step 2.6.9)
     "MantleSseSearchAccessor",
 ]
+
+
+# ── the entangled two, made LAZY (PEP 562) ───────────────────────────────────────────────────────
+# ⛔ WHY: EAGERLY IMPORTING THESE MADE THE LEXICAL ARM UNSHIPPABLE, AND HID IT.
+#
+# `router_accessor` needs `embeddings` + `..lightcone` + `..oracle`; `unified` needs `..engine` +
+# `services.acting_principal`. They are the VECTOR-arm and custody integration — precisely what an
+# embedding consumer does not want (EREA §5: "Not requested: the vector arm. Model-dependent, and a
+# data store does no reasoning"). While this package imported them at module scope, `import
+# ...sse.tokenizer` pulled in numpy and the whole custody hierarchy, so the ten dependency-clean
+# modules could not be imported — let alone shipped — without the two that are not.
+#
+# It also created a genuine CYCLE once `oracle` began importing `.sse.keys` (the key contract):
+# oracle → sse/__init__ → router_accessor → oracle, partially initialized.
+#
+# PEP 562 `__getattr__` keeps the public API EXACTLY as it was — `from ...sse import
+# MantleUnifiedAccessor` still works — while making the cost land only on the caller who asks. The
+# names stay in `__all__` because they are still exported; what changed is WHEN they are resolved.
+_LAZY = {
+    "MantleSseSearchAccessor": ".router_accessor",
+    "MantleUnifiedAccessor": ".unified",
+    "HitSource": ".unified",
+    "UnifiedHit": ".unified",
+}
+
+
+def __getattr__(name):
+    target = _LAZY.get(name)
+    if target is None:
+        raise AttributeError("module %r has no attribute %r" % (__name__, name))
+    from importlib import import_module
+    return getattr(import_module(target, __name__), name)
+
+
+def __dir__():
+    return sorted(list(globals()) + list(_LAZY))

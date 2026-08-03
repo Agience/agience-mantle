@@ -1,9 +1,9 @@
-﻿"""MantleUnifiedAccessor — RRF fusion of MANTLE vector + SSE lexical (Step 2.6.8).
+"""MantleUnifiedAccessor — RRF fusion of MANTLE vector + SSE lexical (Step 2.6.8).
 
-The canonical search backend after OpenSearch retirement (Step 2.6.9
+The canonical search backend after the lexical-backend retirement (Step 2.6.9
 part 2, 2026-05-09). The two arms are:
 
-- :class:`SseQueryEngine` — encrypted lexical (replaces OpenSearch BM25).
+- :class:`SseQueryEngine` — encrypted lexical (replaces the legacy BM25 index).
 - :class:`MantleQueryEngine` — encrypted vector (unchanged).
 
 Fusion uses standard Reciprocal Rank Fusion (k=60 default, matching the
@@ -17,9 +17,9 @@ collection context for downstream metadata hydration.
 Because neither SSE nor MANTLE stores plaintext text (encryption-at-rest
 is the whole point), the unified accessor does *not* hydrate
 title/description/content here. The consumer (the search router in
-2.6.9) reads those from Arango by ``artifact_id`` after fusion, the same
+2.6.9) reads those from the lattice by ``artifact_id`` after fusion, the same
 way it'd read any artifact's metadata. Keeping hydration outside the
-accessor keeps the fusion logic pure and testable without an Arango
+accessor keeps the fusion logic pure and testable without the lattice
 fixture.
 
 See ``.dev/features/mantle-sse-lexical-index.md`` § Query Flow.
@@ -31,7 +31,10 @@ import logging
 from dataclasses import dataclass
 from typing import Iterable, Literal, Optional, Sequence, Tuple
 
-from ..engine import MantleHit, MantleQueryEngine
+from ..engine import MantleHit, MantleQueryEngine, SystemicKeyFailure
+from mantle.services.acting_principal import KeyCustodyDenied
+
+from ..oracle import KeyRequest
 from .query import SseHit, SseQueryEngine
 
 logger = logging.getLogger(__name__)
@@ -197,7 +200,7 @@ class MantleUnifiedAccessor:
     embedding model to use.
 
     Returns ``UnifiedHit`` records ordered by descending RRF score, ready
-    for the consumer to hydrate from Arango.
+    for the consumer to hydrate from the lattice.
     """
 
     def __init__(
@@ -217,6 +220,7 @@ class MantleUnifiedAccessor:
         self,
         query_text: str,
         authorized_contexts: Iterable[Tuple[str, str]],
+        request: KeyRequest,
         *,
         query_embedding: Optional[Sequence[float]] = None,
         top_k: int = 50,
@@ -246,7 +250,7 @@ class MantleUnifiedAccessor:
 
         # SSE arm.
         sse_hits = self._sse.search(
-            query_text, contexts,
+            query_text, contexts, request,
             top_k=max(top_k * sse_top_k_multiplier, 20),
             fields=sse_field_overrides,
         )
@@ -256,9 +260,26 @@ class MantleUnifiedAccessor:
         if self._mantle is not None and query_embedding is not None:
             try:
                 mantle_hits = self._mantle.search(
-                    query_embedding, contexts,
+                    query_embedding, contexts, request,
                     top_k=max(top_k * mantle_top_k_multiplier, 20),
                 )
+            except (KeyCustodyDenied, SystemicKeyFailure):
+                # ⛔ DO NOT SWALLOW THESE. The blanket `except Exception` below
+                # exists so a flaky vector arm degrades to SSE-only, which is the
+                # right call for a numeric/storage error. It is the WRONG call for
+                # these two: "you are not authorized" and "the master key is gone"
+                # would both be converted into a quietly narrower result set — the
+                # exact silent-failure shape FIX 1/2 exist to remove. Re-raise so
+                # the caller sees the real fault.
+                #
+                # ⚠ MATCHES THE BASE CLASS, NOT A LIST OF SUBCLASSES. This read
+                # `GrantDenied` until the acting-principal work added a second
+                # refusal type (`NoActingPrincipal`), which — being outside the
+                # tuple — fell straight through to the blanket clause and was
+                # SWALLOWED: an unauthenticated vector arm silently degraded to
+                # SSE-only instead of failing. Catch the base so the next refusal
+                # type is covered on the day it is written.
+                raise
             except Exception:  # noqa: BLE001 — vector-arm errors must not fail search
                 logger.exception(
                     "MantleUnifiedAccessor: vector arm raised; falling back to SSE-only"

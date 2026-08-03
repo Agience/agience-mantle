@@ -1,11 +1,20 @@
 # /entities/api_key.py
 
 from typing import Optional, Dict, Any, List
-from entities.base import BaseEntity
+from .base import BaseEntity
+
+# The permission set an API key falls back to when its `resource_filters` are
+# empty. Mirrors `api_keys_router.DEFAULT_RESOURCE_FILTERS` deliberately: an
+# empty filter map must never be broader than the default a new key would get.
+_IMPLICIT_DEFAULT_RESOURCE_FILTERS = {
+    "workspaces": "*",
+    "collections": "*",
+}
+
 
 class APIKey(BaseEntity):
     """
-    Domain entity for an ArangoDB API Key.
+    Domain entity for the lattice API Key.
     Scoped API keys for programmatic access to Agience MCP and collections.
     
     Scope Format: [type]:[contentType]:[action][:anonymous]
@@ -98,7 +107,7 @@ class APIKey(BaseEntity):
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "APIKey":
-        """Deserialize from ArangoDB document."""
+        """Deserialize from the lattice document."""
         base = cls.from_dict_base(data)
         return cls(
             id=base["id"],
@@ -134,8 +143,29 @@ class APIKey(BaseEntity):
 
         Returns:
             True if the key has a matching scope
+
+        ⚠ THIS ONE METHOD IS PLATFORM-ONLY; THE ENTITY IS NOT.
+        The APIKey *record* is store data and belongs to the embeddable surface. Scope STRINGS
+        (``resource:text/markdown:read``) are the deployed platform's authorization grammar, and
+        parsing them lives in ``origin``. So the import is guarded rather than the file excluded:
+        an embedding consumer can read, write and version APIKey artifacts with only
+        ``cryptography`` installed, and only calling *this* method needs ``[service]``.
+
+        Embedding consumers want CRUDEASIO grants (``entities/grant.py`` — ``can_read`` &c.), which
+        are the store's own access model and need nothing beyond stdlib. Scopes are a different,
+        HTTP-facing mechanism; do not reach for this method expecting the grant light cone.
         """
-        from agience_core.scopes import parse_scope, content_type_matches
+        try:
+            from origin.scopes import parse_scope, content_type_matches
+        except ImportError as e:                   # pragma: no cover - install-shape diagnostic
+            raise ImportError(
+                "APIKey.has_scope() evaluates the PLATFORM scope grammar, which lives in `origin` "
+                "(agience-origin) and is not part of the embeddable store install. Use "
+                "`pip install agience-mantle[service]`, or — if you are embedding the store — use "
+                "the CRUDEASIO grant light cone instead (mantle.db.lattice_api: "
+                "get_active_collection_ids_for_user / get_active_grants_for_grantee), which is "
+                "the store's own access model and needs no extra. (%s)" % e
+            ) from e
 
         for scope_str in self.scopes:
             try:
@@ -174,7 +204,29 @@ class APIKey(BaseEntity):
         }
         """
         if not self.resource_filters:
-            return True  # No filters = access to all
+            # ⛔ THIS USED TO `return True` — access to EVERY resource type.
+            #
+            # `__init__` coerces `None` to `{}`, so "never configured" and
+            # "configured empty" are indistinguishable once stored, and a caller
+            # could send `resource_filters: {}` explicitly to get a key strictly
+            # BROADER than the documented default (which lists only workspaces
+            # and collections, and therefore denies every other type).
+            #
+            # Flipping empty to "deny everything" would revoke every existing
+            # key, since `{}` is also what legacy keys hold. So empty now means
+            # the conservative implicit default below rather than a blanket
+            # yes: workspace/collection access keeps working, and the
+            # "every resource type" hole closes.
+            #
+            # NOTE: a full fix — distinguishing unset from empty — needs a data
+            # migration to backfill explicit filters. Tracked in §2.9.
+            filter_value = _IMPLICIT_DEFAULT_RESOURCE_FILTERS.get(resource_type)
+            if filter_value is None:
+                return False
+            return filter_value == "*" or (
+                isinstance(filter_value, list)
+                and (resource_id is None or resource_id in filter_value)
+            )
 
         filter_value = self.resource_filters.get(resource_type)
         if filter_value is None:

@@ -1,4 +1,4 @@
-﻿"""Internal gate endpoints — called by platform MCP servers only.
+"""Internal gate endpoints — called by platform MCP servers only.
 
 Ophan pushes numeric limits after Stripe subscription events.
 Ophan reads usage for the billing settings UI.
@@ -16,12 +16,12 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
-from arango.database import StandardDatabase
+from mantle.db.store import Database
 from jose.exceptions import JWTError
 
-from services import server_registry
-from services.dependencies import get_arango_db
-from services import gate_service
+from mantle.services import server_registry
+from mantle.services.dependencies import get_store_db
+from mantle.services import gate_service
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ def _require_platform_server(
 
     # Generic verifier (knows the manifest's chorus anchor). Then enforce the
     # platform-service shape: iss=chorus, aud=mantle, principal_type=service.
-    from services.oidc import get_oidc_verifier
+    from mantle.services.oidc import get_oidc_verifier
 
     payload = get_oidc_verifier().verify(credentials.credentials, expected_audience="mantle")
     if payload is None or payload.get("iss") != "chorus":
@@ -77,7 +77,7 @@ class SetLimitsRequest(BaseModel):
 @gate_router.post("/set-limits", status_code=204)
 def set_limits(
     body: SetLimitsRequest,
-    db: StandardDatabase = Depends(get_arango_db),
+    db: Database = Depends(get_store_db),
     _caller: str = Depends(_require_platform_server),
 ):
     """Upsert entitlement limits for a person. Called by Ophan after Stripe events."""
@@ -98,7 +98,7 @@ def set_limits(
 @gate_router.get("/usage/{person_id}")
 def get_usage(
     person_id: str,
-    db: StandardDatabase = Depends(get_arango_db),
+    db: Database = Depends(get_store_db),
     _caller: str = Depends(_require_platform_server),
 ):
     """Return limits + current usage for a person. Called by Ophan for the billing UI."""

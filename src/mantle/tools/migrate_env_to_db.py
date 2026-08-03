@@ -1,4 +1,4 @@
-﻿"""
+"""
 mantle/tools/migrate_env_to_db.py
 
 One-time migration script for existing deployments.
@@ -17,22 +17,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 # Mapping: env var name -> (setting key, category, is_secret)
+# 2026-07-22 hardening: the legacy-store block is GONE (the lattice reads MANTLE_LATTICE_PATH from
+# env directly — a store location is not a platform setting), and the AI/embeddings block is
+# GONE with the no-models rule (there are no provider keys to migrate; see mantle/embeddings.py
+# for the tombstone). What remains to migrate is auth, storage, search, branding, platform.
 ENV_TO_SETTING = {
-    # AI — provider keys (BYOK or platform-default)
-    "ANTHROPIC_API_KEY": ("ai.anthropic_api_key", "ai", True),
-    "GOOGLE_API_KEY": ("ai.google_api_key", "ai", True),
-
-    # Embeddings — Agience HTTP server
-    "EMBEDDINGS_URI": ("embeddings.uri", "ai", False),
-    "EMBEDDINGS_API_KEY": ("embeddings.api_key", "ai", True),
-
-    # ArangoDB
-    "ARANGO_HOST": ("db.arango.host", "db", False),
-    "ARANGO_PORT": ("db.arango.port", "db", False),
-    "ARANGO_USERNAME": ("db.arango.username", "db", False),
-    "ARANGO_ROOT_PASSWORD": ("db.arango.password", "db", True),
-    "ARANGO_DATABASE": ("db.arango.database", "db", False),
-
     # Google OAuth
     "GOOGLE_OAUTH_CLIENT_ID": ("auth.google.client_id", "auth", False),
     "GOOGLE_OAUTH_CLIENT_SECRET": ("auth.google.client_secret", "auth", True),
@@ -66,12 +55,11 @@ ENV_TO_SETTING = {
     "CONTENT_URI": ("storage.content_uri", "storage", False),
     "CONTENT_BUCKET": ("storage.content_bucket", "storage", False),
 
-    # OpenSearch retired in Step 2.6.9 — no env vars to migrate.
+    # the legacy lexical index retired in Step 2.6.9 — no env vars to migrate.
 
     # Search tuning
-    "SEARCH_CHUNK_SIZE": ("search.chunk_size", "search", False),
-    "SEARCH_CHUNK_OVERLAP": ("search.chunk_overlap", "search", False),
-    "SEARCH_FIELD_WEIGHTS_PRESET": ("search.field_weights_preset", "search", False),
+    "SEARCH_CHUNK_SIZE": ("mantle.search.chunk_size", "search", False),
+    "SEARCH_CHUNK_OVERLAP": ("mantle.search.chunk_overlap", "search", False),
 
     # Branding
     "FACET_URI": ("branding.facet_uri", "branding", False),
@@ -136,16 +124,17 @@ def main():
         return
 
     # Initialize keys and connect to DB
-    from agience_core.key_manager import init_encryption_key
+    from prism.trust.key_manager import init_encryption_key
     init_encryption_key()
 
-    from agience_core.config import load_bootstrap_settings
+    from origin.config import load_bootstrap_settings
     load_bootstrap_settings()
 
-    from schemas.arango.loader import init_arango_db
-    arango_db = init_arango_db()
+    # THE FLIP (2026-07-22): the lattice handle is the one store.
+    from mantle.db import backend
+    store_db = backend.store_handle()
 
-    from services.platform_settings_service import settings as platform_settings
+    from mantle.services.platform_settings_service import settings as platform_settings
 
     # Mark setup as complete
     settings_to_write.append({
@@ -155,8 +144,8 @@ def main():
         "is_secret": False,
     })
 
-    count = platform_settings.set_many(arango_db, settings_to_write)
-    print(f"\nWritten {count} settings to platform_settings ArangoDB collection.")
+    count = platform_settings.set_many(store_db, settings_to_write)
+    print(f"\nWritten {count} settings to the platform_settings table.")
     print("Setup marked as complete.")
     print("\nYou can now remove your .env file. All settings are in the database.")
 

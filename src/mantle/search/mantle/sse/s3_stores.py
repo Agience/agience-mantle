@@ -1,4 +1,4 @@
-﻿"""S3-backed :class:`PostingStore` + :class:`StatsStore` adapters (Step 2.6.9).
+"""S3-backed :class:`PostingStore` + :class:`StatsStore` adapters (Step 2.6.9).
 
 Production wiring of the in-memory stores from :mod:`posting` and
 :mod:`stats`. Encrypted blobs persist in S3 (or any S3-compatible store

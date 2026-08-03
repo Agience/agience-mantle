@@ -13,7 +13,7 @@ See: .dev/features/unified-artifact-api.md
 """
 
 from typing import Optional, Dict, Any
-from entities.base import BaseEntity
+from .base import BaseEntity
 
 
 class Grant(BaseEntity):
@@ -39,6 +39,7 @@ class Grant(BaseEntity):
     # Valid effects
     EFFECT_ALLOW = "allow"
     EFFECT_DENY = "deny"
+    VALID_EFFECTS = {EFFECT_ALLOW, EFFECT_DENY}
 
     # Role presets --- named permission bundles for the share/invite flow.
     #
@@ -138,7 +139,9 @@ class Grant(BaseEntity):
         self.grantee_type = grantee_type
         self.grantee_id = grantee_id
         self.granted_by = granted_by
-        self.effect = effect
+        # Normalized at construction so storage can never hold a casing variant.
+        # See `is_deny` / `is_allow` for why a raw comparison was dangerous.
+        self.effect = (effect or "").strip().lower() or self.EFFECT_ALLOW
         # CRUDEASIO
         self.can_create = can_create
         self.can_read = can_read
@@ -169,6 +172,14 @@ class Grant(BaseEntity):
         self.accepted_at = accepted_at
         self.revoked_by = revoked_by
         self.revoked_at = revoked_at
+
+    def is_deny(self) -> bool:
+        """True when this grant DENIES. See :func:`grant_is_deny`."""
+        return grant_is_deny(self)
+
+    def is_allow(self) -> bool:
+        """True only for an explicit, recognized allow. See :func:`grant_is_allow`."""
+        return grant_is_allow(self)
 
     def is_active(self) -> bool:
         return self.state == self.STATE_ACTIVE
@@ -258,3 +269,39 @@ class Grant(BaseEntity):
             created_time=base["created_time"],
             modified_time=base["modified_time"],
         )
+
+
+# ---------------------------------------------------------------------------
+# Effect predicates — module-level, duck-typed on purpose
+# ---------------------------------------------------------------------------
+#
+# ⛔ ENFORCEMENT USED TO BE ASYMMETRIC: `== "deny"` to detect a deny, but
+# `!= "deny"` to detect an allow. Any value that was not exactly the lowercase
+# string "deny" therefore fell through BOTH checks and counted as an ALLOW — so
+# a grant stored as "DENY", "Deny", or " deny" did the precise opposite of what
+# it says. A deny grant that silently allows is worse than no deny grant at all,
+# because it reads as protection in the data.
+#
+# These are FUNCTIONS, not just entity methods, because grant-like objects reach
+# the enforcement path from several producers (entities, AQL row shims, test
+# doubles). Requiring a specific class here would make authorization depend on
+# which producer happened to build the object.
+
+
+def _effect_of(grant: Any) -> str:
+    return str(getattr(grant, "effect", None) or "").strip().lower()
+
+
+def grant_is_deny(grant: Any) -> bool:
+    """True when *grant* denies."""
+    return _effect_of(grant) == Grant.EFFECT_DENY
+
+
+def grant_is_allow(grant: Any) -> bool:
+    """True only for an explicit, recognized allow.
+
+    Deliberately NOT ``not grant_is_deny(...)``: an unrecognized effect is
+    neither an allow nor a deny and must confer nothing. Positive matching is
+    what makes an unknown value fail closed instead of open.
+    """
+    return _effect_of(grant) == Grant.EFFECT_ALLOW

@@ -1,4 +1,4 @@
-﻿"""Production wiring for MANTLE encrypted search (Step 2.5 + 2.6.9).
+"""Production wiring for MANTLE encrypted search (Step 2.5 + 2.6.9).
 
 Centralizes construction of the MANTLE + SSE pipeline so the router and
 the commit-hook indexer share one definition. Each builder pulls the
@@ -7,8 +7,8 @@ the only fork.
 
 Wiring decisions:
 
-- **Master key store**: :class:`~.oracle.ArangoMasterKeyStore` — per-principal
-  DEKs wrapped by the platform KEK and persisted in Arango so they survive
+- **Master key store**: :class:`~.oracle.LatticeMasterKeyStore` — per-principal
+  DEKs wrapped by the platform KEK and persisted in the lattice so they survive
   restarts. KEK custody is pluggable via :mod:`.key_provider` (local file |
   cloud KMS | Vault); a future Shamir-threshold backend is just another provider.
 - **Cell storage**: :class:`S3CellStore` over Mantle's edge S3 client
@@ -20,7 +20,7 @@ Wiring decisions:
 
 Builders return ``None`` if production stores cannot be constructed
 (missing S3 client, missing encryption key). The router treats ``None``
-as 503 — no plaintext fallback after OpenSearch retirement.
+as 503 — no plaintext fallback after the lexical-backend retirement.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ from .stores import CellStore
 logger = logging.getLogger(__name__)
 
 # Process-level oracle singleton — caches unwrapped master keys for the process
-# lifetime. The keys themselves are persisted durably by ArangoMasterKeyStore, so
+# lifetime. The keys themselves are persisted durably by LatticeMasterKeyStore, so
 # (unlike the old in-memory store) they survive restarts; the singleton only avoids
 # re-unwrapping on every call within one process.
 _oracle_singleton: Optional[OracleService] = None
@@ -70,7 +70,6 @@ def _build_oracle() -> Optional[OracleService]:
 
         try:
             from .key_provider import build_key_provider
-            from .oracle import ArangoMasterKeyStore
         except Exception as exc:
             logger.warning("MANTLE oracle imports failed: %s", exc)
             return None
@@ -83,30 +82,67 @@ def _build_oracle() -> Optional[OracleService]:
             logger.warning("MANTLE oracle: KEK provider unavailable: %s", exc)
             return None
 
-        # Durable, Arango-backed master key store: per-principal DEKs are
-        # Fernet-wrapped by the platform KEK and persisted in `mantle_master_keys`,
-        # so they survive a mantle restart. The in-process FernetMasterKeyStore
-        # lost them on every restart, orphaning all encrypted cells (search → empty).
-        from agience_core import config as _config
-        from schemas.arango.initialize import get_arangodb_connection
-
-        _db_cache: dict = {}
+        # Durable master key store: per-principal DEKs are Fernet-wrapped by the
+        # platform KEK and persisted in the lattice so they survive a mantle restart
+        # (the in-process FernetMasterKeyStore lost them on every restart, orphaning
+        # all encrypted cells — search → empty).
+        from mantle.db import backend as _backend
+        from .oracle import LatticeMasterKeyStore as _KeyStore
 
         def _master_key_db():
-            db = _db_cache.get("db")
-            if db is None:
-                db = get_arangodb_connection(
-                    _config.ARANGO_HOST,
-                    _config.ARANGO_PORT,
-                    _config.ARANGO_USERNAME,
-                    _config.ARANGO_PASSWORD,
-                    _config.ARANGO_DATABASE,
-                )
-                _db_cache["db"] = db
-            return db
+            return _backend.store_handle()
 
-        _oracle_singleton = OracleService(ArangoMasterKeyStore(kek, _master_key_db))
+        # Key issuance is coupled to the grant check (canonical plan §5.3): the
+        # oracle verifies every request against the SAME light cone the query path
+        # uses to build its authorized context list. Wired here, at the single
+        # place the process-wide oracle is constructed, so there is no oracle in
+        # this process that can issue keys without a grant.
+        #
+        # The verifier gets its own store handle from the same factory as the key
+        # store; if that handle is unavailable the verifier cannot answer, and
+        # `_authorize` fails CLOSED rather than assuming authorization.
+        from .oracle import LightConeGrantVerifier
+
+        _oracle_singleton = OracleService(
+            _KeyStore(kek, _master_key_db),
+            grant_verifier=LightConeGrantVerifier(_LazyDb(_master_key_db)),
+        )
         return _oracle_singleton
+
+
+def invalidate_grant_cache(requester_id: Optional[str] = None) -> None:
+    """Drop the oracle's memoized light-cone decisions — CALL AFTER EVERY GRANT MUTATION.
+
+    The verifier memoizes (requester, type, action) → authorized-contexts for its TTL. Without
+    this, a freshly granted principal keeps being DENIED keys until the TTL lapses — on the fast
+    path (create workspace → immediately write content) that is a hard failure, not a delay.
+    Best-effort and layered: services call this; the db layer never imports search."""
+    o = _oracle_singleton
+    if o is not None:
+        try:
+            v = getattr(o, "_verifier", None)
+            if v is not None and hasattr(v, "invalidate"):
+                v.invalidate(requester_id)
+        except Exception:
+            logger.debug("grant-cache invalidation failed", exc_info=True)
+
+
+class _LazyDb:
+    """Defers the store handle until the verifier actually needs it.
+
+    ``LightConeGrantVerifier`` is constructed while the oracle singleton is being
+    built, which can happen before the database is reachable. Connecting eagerly
+    there would make oracle construction fail (→ `None` → search silently
+    unwired), so the handle is resolved on first attribute access instead.
+    """
+
+    __slots__ = ("_factory",)
+
+    def __init__(self, factory) -> None:
+        self._factory = factory
+
+    def __getattr__(self, name):
+        return getattr(self._factory(), name)
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +169,55 @@ def _segment_prefixes(segment: str) -> tuple[str, str]:
     return f"mantle-cells-{segment}", f"mantle-sse-{segment}"
 
 
+_EDGE_S3_REACHABLE: dict = {}          # (id(client), bucket) -> bool, probed once per process
+
+
+def edge_s3_if_reachable(what: str):
+    """The edge S3 `(client, bucket)` if it can ACTUALLY be reached, else `(None, None)`.
+
+    ⛔ EXISTENCE IS NOT CAPABILITY, AND THE DIFFERENCE COST 11.7 GB OF LOG. Both index builders
+    tested `s3_client is None` and treated a non-None object as a working store. A boto3 client
+    CONSTRUCTS FINE WITH NO CREDENTIALS — it fails on first use — so on a node with no AWS
+    credentials the guard passed, the indexer was built, and every artifact failed at write time
+    with a traceback instead of the arm being skipped once.
+
+    MEASURED 2026-08-01 on 71, during a reindex of 1,450,252 artifacts:
+        WARNING content_service  Could not access or create content bucket: Unable to locate credentials
+        WARNING s3_stores        S3PostingStore get failed for mantle-sse/stage.0.lexicon/sse/manifest
+        ... per artifact, with a stack, on a disk with 46 GB free.
+
+    So the coupling is MEASURED — one `head_bucket` answers "can this client reach this bucket" —
+    and memoised per (client, bucket) so the cost is one round trip per process, not one per call.
+    A False answer is an honest state: the arm is off, the caller skips it, and the log says so
+    ONCE. [[gauge-is-an-artifact-coupling-is-measured]], [[verification-that-cannot-fail]]"""
+    try:
+        from mantle.services import content_service
+    except Exception as exc:
+        logger.warning("%s: content_service import failed: %s", what, exc)
+        return None, None
+
+    s3_client = getattr(content_service, "_s3_edge_internal", None)
+    bucket = getattr(content_service, "_EDGE_BUCKET", None)
+    if s3_client is None or not bucket:
+        logger.warning("%s: edge S3 client or bucket not initialized", what)
+        return None, None
+
+    key = (id(s3_client), str(bucket))
+    ok = _EDGE_S3_REACHABLE.get(key)
+    if ok is None:
+        try:
+            s3_client.head_bucket(Bucket=bucket)
+            ok = True
+        except Exception as exc:
+            ok = False
+            logger.warning(
+                "%s: edge S3 bucket %r is NOT reachable (%s: %s) — this index arm is OFF. "
+                "Search stays lexical-only until the bucket is reachable; this is reported once, "
+                "not once per artifact.", what, bucket, type(exc).__name__, exc)
+        _EDGE_S3_REACHABLE[key] = ok
+    return (s3_client, bucket) if ok else (None, None)
+
+
 def _build_cell_store(segment: str = "committed") -> Optional[CellStore]:
     """Construct the S3-backed cell store for one index segment.
 
@@ -141,18 +226,8 @@ def _build_cell_store(segment: str = "committed") -> Optional[CellStore]:
     distinct prefix so listing the content bucket doesn't tangle with
     artifact uploads.
     """
-    try:
-        from services import content_service
-    except Exception as exc:
-        logger.warning("MANTLE cell store: content_service import failed: %s", exc)
-        return None
-
-    s3_client = getattr(content_service, "_s3_edge_internal", None)
-    bucket = getattr(content_service, "_EDGE_BUCKET", None)
-    if s3_client is None or not bucket:
-        logger.warning(
-            "MANTLE cell store: edge S3 client or bucket not initialized"
-        )
+    s3_client, bucket = edge_s3_if_reachable("MANTLE cell store")
+    if s3_client is None:
         return None
 
     cell_prefix, _ = _segment_prefixes(segment)
@@ -165,7 +240,7 @@ def _build_cell_store(segment: str = "committed") -> Optional[CellStore]:
 
 
 def build_indexer(
-    arango_db: object, *, segment: str = "committed"
+    store_db: object, *, segment: str = "committed"
 ) -> Optional[MantleIndexer]:
     """Construct a production-wired :class:`MantleIndexer` for one index segment."""
     oracle = _build_oracle()
@@ -190,18 +265,8 @@ def _build_sse_stores(
     and content artifacts. Returns ``None`` if the S3 client / bucket
     aren't initialized — same fallback policy as :func:`_build_cell_store`.
     """
-    try:
-        from services import content_service
-    except Exception as exc:
-        logger.warning("MANTLE-SSE stores: content_service import failed: %s", exc)
-        return None
-
-    s3_client = getattr(content_service, "_s3_edge_internal", None)
-    bucket = getattr(content_service, "_EDGE_BUCKET", None)
-    if s3_client is None or not bucket:
-        logger.warning(
-            "MANTLE-SSE stores: edge S3 client or bucket not initialized"
-        )
+    s3_client, bucket = edge_s3_if_reachable("MANTLE-SSE stores")
+    if s3_client is None:
         return None
 
     _, sse_prefix = _segment_prefixes(segment)
@@ -212,7 +277,7 @@ def _build_sse_stores(
 
 
 def build_sse_indexer(
-    arango_db: object, *, segment: str = "committed"
+    store_db: object, *, segment: str = "committed"
 ) -> Optional[SseIndexer]:
     """Construct a production-wired :class:`SseIndexer` for one index segment.
 
@@ -229,7 +294,7 @@ def build_sse_indexer(
 
 
 def build_unified_accessor(
-    arango_db: object,
+    store_db: object,
     *,
     segment: str = "committed",
     field_boosts: Optional[dict] = None,
@@ -268,7 +333,7 @@ def build_unified_accessor(
 
 
 def build_sse_search_accessor(
-    arango_db: object,
+    store_db: object,
     *,
     segment: str = "committed",
     field_boosts: Optional[dict] = None,
@@ -278,19 +343,19 @@ def build_sse_search_accessor(
 
     ``segment`` selects which per-state index to query — ``committed`` (default),
     ``draft``, or ``archived``. Composes :func:`build_unified_accessor` with the
-    light-cone resolver and a ``SearchHit`` hydrator over Arango. This is the
-    canonical search backend the artifacts router uses after OpenSearch retirement.
+    light-cone resolver and a ``SearchHit`` hydrator over the lattice. This is the
+    canonical search backend the artifacts router uses after the lexical-backend retirement.
 
     Returns ``None`` if SSE prerequisites are missing — the router
     converts that to 503 (no plaintext fallback by design).
     """
     unified = build_unified_accessor(
-        arango_db, segment=segment, field_boosts=field_boosts, rrf_k=rrf_k,
+        store_db, segment=segment, field_boosts=field_boosts, rrf_k=rrf_k,
     )
     if unified is None:
         return None
-    resolver = LightConeResolver(arango_db)
-    return MantleSseSearchAccessor(unified, resolver, arango_db=arango_db)
+    resolver = LightConeResolver(store_db)
+    return MantleSseSearchAccessor(unified, resolver, store_db=store_db)
 
 
 __all__ = [

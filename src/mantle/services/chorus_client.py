@@ -1,4 +1,4 @@
-﻿"""Outbound MCP-tool calls from mantle to chorus.
+"""Outbound MCP-tool calls from mantle to chorus.
 
 Replaces the in-process `mcp_service.invoke_tool` path. Mantle publishes no
 MCP surface itself; tool dispatch goes over the network to Chorus's
@@ -24,8 +24,8 @@ from typing import Any, Dict
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
-from agience_core import config
-from services import peer_signing
+from origin import config
+from mantle.services import peer_signing
 
 logger = logging.getLogger(__name__)
 

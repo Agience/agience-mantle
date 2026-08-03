@@ -1,4 +1,4 @@
-﻿"""Mantle auth service — verifier-only after 1.1e.
+"""Mantle auth service — verifier-only after 1.1e.
 
 Origin owns all token issuance, password hashing, and OAuth flows. Mantle
 retains:
@@ -28,11 +28,11 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from arango.database import StandardDatabase
+from mantle.db.store import Database
 from jose import JWTError, jwt
 
-from agience_core import config
-from entities.api_key import APIKey as APIKeyEntity
+from origin import config
+from mantle.entities.api_key import APIKey as APIKeyEntity
 
 logger = logging.getLogger(__name__)
 
@@ -51,14 +51,14 @@ def verify_token(token: str, expected_audience: Optional[str] = None) -> Optiona
     — the database depends on no trust LIBRARY, only the manifest's inline JWKS that
     it reads itself. The verifier knows, uniformly:
     - the authority manifest's service anchors (platform-service JWTs:
-      `iss ∈ {origin, mantle, chorus, bridge}`),
+      `iss ∈ {origin, mantle, chorus, crystal}`),
     - the Origin issuer (user tokens + delegations: `iss == AUTHORITY_ISSUER`),
     - and any configured external OIDC IdP (Entra/Auth0/Okta/...).
 
     The token's `iss` selects the JWKS; signature/iss/aud/exp are checked. Per-
     principal audience + claim-chain rules live in `services.dependencies`.
     """
-    from services.oidc import get_oidc_verifier
+    from mantle.services.oidc import get_oidc_verifier
 
     payload = get_oidc_verifier().verify(token, expected_audience=expected_audience)
     if payload is None:
@@ -69,16 +69,16 @@ def verify_token(token: str, expected_audience: Optional[str] = None) -> Optiona
     return payload
 
 
-def verify_api_key(db: StandardDatabase, api_key: str) -> Optional[APIKeyEntity]:
-    """Verify a raw `agc_xxx` token via Origin (1.1c onward).
+def verify_api_key(db: Database, api_key: str) -> Optional[APIKeyEntity]:
+    """Verify a raw `agc_xxx` token via the pluggable authz backend.
 
-    The `db` parameter is unused — kept for signature compat with callers
-    in `services.dependencies.resolve_auth`. Origin owns the api_keys table.
+    `local` (default) verifies against Mantle's own api_keys in the lattice (`db`);
+    `origin` delegates to Origin. Returns the APIKey entity (grants dropped here;
+    callers that need grants use the backend's `verify_api_key` directly).
     """
-    del db
-    from clients.origin_client import get_origin_client
+    from mantle.services.grant_store import get_apikey_backend
 
-    result = get_origin_client().verify_api_key(api_key)
+    result = get_apikey_backend().verify_api_key(db, api_key)
     if result is None:
         return None
     api_key_entity, _grants = result

@@ -1,8 +1,9 @@
-﻿"""SseQueryEngine — blind-token lookup + BM25 scoring (Step 2.6.7).
+"""SseQueryEngine — blind-token lookup + BM25 scoring (Step 2.6.7).
 
 The query-time inverse of :class:`SseIndexer`. Composes:
 
-- :class:`OracleService` — derives owner SSE keys
+- :class:`SseKeyProvider` (``.keys``) — derives owner SSE keys. The PROTOCOL, not the
+  platform's ``OracleService``, which merely satisfies it.
 - :mod:`tokenizer` — same analysis pipeline as index time (must match)
 - :mod:`blind_tokens` — per-owner / per-field / per-term blind tokens
 - :class:`PostingStore` + :class:`StatsStore` — opaque storage
@@ -65,7 +66,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Optional, Tuple
+from typing import Any, Iterable, Mapping, Optional, Tuple
 
 from . import posting as posting_mod
 from . import stats as stats_mod
@@ -86,7 +87,9 @@ from .scorer import (
 )
 from .stats import Stats, StatsStore
 from .tokenizer import bigrams as _stem_bigrams, tokenize
-from ..oracle import OracleService
+# The key contract only — see `indexer.py` for why this is not `..oracle`. `MasterKeyMissing` is the
+# SAME class object the platform's oracle re-exports, so the narrow catch below still matches.
+from .keys import MasterKeyMissing, SseKeyProvider
 
 logger = logging.getLogger(__name__)
 
@@ -217,7 +220,7 @@ class SseQueryEngine:
 
     def __init__(
         self,
-        oracle: OracleService,
+        oracle: SseKeyProvider,
         posting_store: PostingStore,
         stats_store: StatsStore,
         *,
@@ -243,6 +246,7 @@ class SseQueryEngine:
         self,
         query: str,
         authorized_contexts: Iterable[Tuple[str, str]],
+        request: Any,          # the PROVIDER's policy object (oracle.KeyRequest in the platform)
         *,
         top_k: int = 50,
         fields: Optional[Iterable[str]] = None,
@@ -299,7 +303,7 @@ class SseQueryEngine:
         for principal_id, collection_ids in scope.items():
             hits = self._score_owner(
                 principal_id, collection_ids, stems, target_fields,
-                is_phrase=is_phrase,
+                is_phrase=is_phrase, request=request,
             )
             all_hits.extend(hits)
 
@@ -336,8 +340,25 @@ class SseQueryEngine:
         target_fields: list[str],
         *,
         is_phrase: bool = False,
+        request: Any = None,   # the PROVIDER's policy object; see `.keys.SseKeyProvider`
     ) -> list[SseHit]:
-        owner_sse_key = self._oracle.derive_sse_key(principal_id)
+        try:
+            owner_sse_key = self._oracle.derive_sse_key(principal_id, request)
+        except MasterKeyMissing:
+            # This principal has never been written to, so it has no master key and
+            # therefore no index — nothing to score. Equivalent to the `owner_stats
+            # is None` case just below, and reached for the same reason.
+            #
+            # ⚠ NARROWLY `MasterKeyMissing`, NOT `MasterKeyUnavailable` and NOT
+            # `GrantDenied`. Its parent means a key EXISTS but could not be read,
+            # which must stay a hard failure rather than silently degrade to "no
+            # results" — that is precisely what `MasterKeyUnavailable` was created to
+            # prevent. And a denial must never be reported as an empty result set.
+            logger.debug(
+                "SSE: principal %s has no master key (never indexed); skipping",
+                principal_id,
+            )
+            return []
 
         # Decrypt corpus stats — without these BM25 has no IDF.
         owner_stats = self._load_stats(principal_id, owner_sse_key)

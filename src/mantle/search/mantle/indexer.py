@@ -1,4 +1,4 @@
-﻿"""MantleIndexer — commit-path AES-256-GCM cell encryption + S3 upload.
+"""MantleIndexer — commit-path AES-256-GCM cell encryption + S3 upload.
 
 Step 2.2b.iii implementation. Combines:
 
@@ -24,7 +24,7 @@ import logging
 from typing import Iterable, List
 
 from . import cell as cell_mod
-from .oracle import OracleService
+from .oracle import KeyRequest, OracleService
 from .stores import CellStore
 
 logger = logging.getLogger(__name__)
@@ -50,6 +50,7 @@ class MantleIndexer:
         principal_id: str,
         collection_id: str,
         artifact_chunks: Iterable[dict],
+        request: KeyRequest,
     ) -> int:
         """Upsert every chunk into the collection's cell and write.
 
@@ -84,8 +85,8 @@ class MantleIndexer:
         # The AnchorSet is mandatory (bootstrapped from the seed corpus on first
         # use); routing has no flat fallback. Re-routing after an AnchorSet
         # change is handled by a full reindex, not here.
-        from search.anchors.routing import route_vector
-        from search.anchors.store import require_live_anchorset
+        from mantle.search.anchors.routing import route_vector
+        from mantle.search.anchors.store import require_live_anchorset
 
         anchorset = require_live_anchorset()
         groups: dict[str, List[dict]] = {}
@@ -94,7 +95,9 @@ class MantleIndexer:
             groups.setdefault(cluster, []).append(chunk)
 
         for cluster_id, records in groups.items():
-            self._upsert_into_cell(principal_id, collection_id, records, cluster_id)
+            self._upsert_into_cell(
+                principal_id, collection_id, records, cluster_id, request
+            )
         return len(groups)
 
     def _upsert_into_cell(
@@ -103,9 +106,12 @@ class MantleIndexer:
         collection_id: str,
         records: List[dict],
         cluster_id: str = "",
+        request: KeyRequest = None,  # type: ignore[assignment]
     ) -> None:
         """Read-modify-write one (owner, collection, cluster) cell."""
-        key = self._oracle.derive_cell_key(principal_id, collection_id, cluster_id)
+        key = self._oracle.derive_cell_key(
+            principal_id, collection_id, cluster_id, request
+        )
         aad = cell_mod.cell_aad(collection_id, cluster_id)
         existing_blob = self._cells.get(principal_id, collection_id, cluster_id)
         existing_chunks = (
@@ -121,7 +127,8 @@ class MantleIndexer:
     # ------------------------------------------------------------------
 
     def remove_artifact(
-        self, principal_id: str, collection_id: str, artifact_id: str
+        self, principal_id: str, collection_id: str, artifact_id: str,
+        request: KeyRequest,
     ) -> int:
         """Strip every chunk record for ``artifact_id`` from the collection cell.
 
@@ -137,7 +144,9 @@ class MantleIndexer:
             blob = self._cells.get(principal_id, collection_id, cluster_id)
             if not blob:
                 continue
-            key = self._oracle.derive_cell_key(principal_id, collection_id, cluster_id)
+            key = self._oracle.derive_cell_key(
+                principal_id, collection_id, cluster_id, request
+            )
             aad = cell_mod.cell_aad(collection_id, cluster_id)
             chunks = cell_mod.unpack_cell(blob, key, collection_id=aad)
             before = len(chunks)
@@ -165,7 +174,8 @@ class MantleIndexer:
         return self._cells.list_cells(principal_id)
 
     def chunks_in_cell(
-        self, principal_id: str, collection_id: str, cluster_id: str = ""
+        self, principal_id: str, collection_id: str, cluster_id: str = "",
+        request: KeyRequest = None,  # type: ignore[assignment]
     ) -> List[dict]:
         """Decrypt a single (owner, collection, cluster) cell and return its
         chunk records. Convenience for tests + admin tooling; production callers
@@ -174,12 +184,15 @@ class MantleIndexer:
         blob = self._cells.get(principal_id, collection_id, cluster_id)
         if blob is None:
             return []
-        key = self._oracle.derive_cell_key(principal_id, collection_id, cluster_id)
+        key = self._oracle.derive_cell_key(
+            principal_id, collection_id, cluster_id, request
+        )
         aad = cell_mod.cell_aad(collection_id, cluster_id)
         return cell_mod.unpack_cell(blob, key, collection_id=aad)
 
     def collection_chunks(
-        self, principal_id: str, collection_id: str
+        self, principal_id: str, collection_id: str,
+        request: KeyRequest,
     ) -> List[dict]:
         """Decrypt every cell of a collection (all routing anchors) and return
         the union of chunk records. An artifact's chunks may span several anchor
@@ -188,5 +201,7 @@ class MantleIndexer:
         """
         out: List[dict] = []
         for cluster_id in self._cells.list_clusters(principal_id, collection_id):
-            out.extend(self.chunks_in_cell(principal_id, collection_id, cluster_id))
+            out.extend(
+                self.chunks_in_cell(principal_id, collection_id, cluster_id, request)
+            )
         return out

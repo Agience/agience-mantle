@@ -3,11 +3,14 @@
 Replaces the imperative ``services/seed_provisioning/*.py`` modules with a
 data-driven seed pipeline:
 
-    seed_from_artifacts(arango_db, Path("/app/package/seeds")) → SeedReport
+    seed_from_artifacts(store_db, Path(os.environ["AGIENCE_SEEDS_ROOT"])) → SeedReport
 
-Each YAML/JSON file under ``package/seeds/<namespace>/`` declares a single
-artifact (with optional ``edges:`` for containment + typed relations) or a
-single grant. UUIDs derive deterministically from
+Mantle bundles NO seed corpus — it is bare. The seed tree is supplied by the
+INSTALL PACKAGE at deploy time via ``AGIENCE_SEEDS_ROOT`` (see
+``services.seed_provisioning.user_provisioning._seeds_base``); when unset, no
+seeds are applied. Each YAML/JSON file under ``<seeds-root>/<namespace>/``
+declares a single artifact (with optional ``edges:`` for containment + typed
+relations) or a single grant. UUIDs derive deterministically from
 ``uuid5(instance_namespace, f"{namespace}/{slug}")`` so cross-artifact
 references resolve without operator-typed UUIDs.
 
@@ -26,9 +29,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 import yaml
-from arango.database import StandardDatabase
+from mantle.db.store import Database
 
-from db.arango import (
+from mantle.db.backend import (
     add_artifact_to_collection as db_add_artifact_to_collection,
     create_artifact as db_create_artifact,
     create_collection as db_create_collection,
@@ -37,11 +40,11 @@ from db.arango import (
     get_edge as db_get_edge,
     upsert_user_collection_grant as db_upsert_user_collection_grant,
 )
-from entities.artifact import Artifact as ArtifactEntity
-from entities.collection import Collection as CollectionEntity, COLLECTION_CONTENT_TYPE
-from agience_core import config
-from agience_core.config import AGIENCE_PLATFORM_USER_ID
-from services.platform_topology import get_id_optional, register_id
+from mantle.entities.artifact import Artifact as ArtifactEntity
+from mantle.entities.collection import Collection as CollectionEntity, COLLECTION_CONTENT_TYPE
+from origin import config
+from origin.config import AGIENCE_PLATFORM_USER_ID
+from mantle.services.platform_topology import get_id_optional, register_id
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +111,7 @@ def _keys_dir() -> Path:
     val = os.getenv("KEYS_DIR")
     if val:
         return Path(val)
-    from agience_core import config
+    from origin import config
     return config.KEYS_DIR
 
 
@@ -135,16 +138,16 @@ def derive_uuid(instance_namespace: uuid.UUID, namespace: str, slug: str) -> str
     return str(uuid.uuid5(instance_namespace, f"{namespace}/{slug}"))
 
 
-def _persist_seed_ids(arango_db: StandardDatabase, id_by_slug: dict[str, str]) -> None:
+def _persist_seed_ids(store_db: Database, id_by_slug: dict[str, str]) -> None:
     """Persist freshly-derived slug→UUID mappings to ``platform_settings``
     (``platform.id.<slug>``), mirroring ``pre_resolve_platform_ids``. No-op when
     there is nothing new — keeps idempotent re-runs from touching the DB."""
     if not id_by_slug:
         return
-    from services.platform_settings_service import settings as _settings
+    from mantle.services.platform_settings_service import settings as _settings
 
     _settings.set_many(
-        arango_db,
+        store_db,
         [{"key": f"platform.id.{slug}", "value": uid, "category": "platform"}
          for slug, uid in id_by_slug.items()],
     )
@@ -156,7 +159,7 @@ def _persist_seed_ids(arango_db: StandardDatabase, id_by_slug: dict[str, str]) -
 
 # Directive syntax: {{directive.arg}} or {{directive:arg}} (both accepted).
 # Examples:
-#   {{config.AUTHORITY_ISSUER}}       — agience_core.config attribute
+#   {{config.AUTHORITY_ISSUER}}       — origin.config attribute
 #   {{file:manifest.json}}            — entire parsed file
 #   {{file:manifest.json:trust_anchors}} — one key from the parsed file
 _TEMPLATE_RE = re.compile(r"^\{\{(?P<directive>[a-z_]+)(?:[.:](?P<arg>[^}]+))?\}\}$")
@@ -190,7 +193,7 @@ def _resolve_directive(
     if directive == "config":
         attr = arg.strip()
         if not hasattr(config, attr):
-            logger.warning("Template {{config.%s}} unresolved — agience_core.config has no such attr", attr)
+            logger.warning("Template {{config.%s}} unresolved — origin.config has no such attr", attr)
             return None
         return getattr(config, attr)
 
@@ -340,7 +343,7 @@ def _primary_collection_id(body: dict) -> Optional[str]:
 
 
 def _apply_artifact_card(
-    arango_db: StandardDatabase,
+    store_db: Database,
     artifact: _RawArtifact,
     artifact_uuid: str,
     report: SeedReport,
@@ -357,7 +360,7 @@ def _apply_artifact_card(
     now = datetime.now(timezone.utc).isoformat()
 
     if _is_collection_content_type(content_type):
-        existing = db_get_collection_by_id(arango_db, artifact_uuid)
+        existing = db_get_collection_by_id(store_db, artifact_uuid)
         if existing:
             report.artifacts_skipped += 1
             return
@@ -372,7 +375,7 @@ def _apply_artifact_card(
                 created_time=now,
                 modified_time=now,
             )
-            db_create_collection(arango_db, collection)
+            db_create_collection(store_db, collection)
             report.artifacts_added += 1
             logger.info("Seeded collection %s/%s (id=%s)", namespace, slug, artifact_uuid)
         except Exception as exc:
@@ -381,7 +384,7 @@ def _apply_artifact_card(
         return
 
     # Artifact path
-    existing = db_get_artifact(arango_db, artifact_uuid)
+    existing = db_get_artifact(store_db, artifact_uuid)
     if existing:
         report.artifacts_skipped += 1
         return
@@ -397,7 +400,7 @@ def _apply_artifact_card(
             created_by=AGIENCE_PLATFORM_USER_ID,
             created_time=now,
         )
-        db_create_artifact(arango_db, artifact)
+        db_create_artifact(store_db, artifact)
         report.artifacts_added += 1
         logger.info("Seeded artifact %s/%s (id=%s)", namespace, slug, artifact_uuid)
     except Exception as exc:
@@ -406,7 +409,7 @@ def _apply_artifact_card(
 
 
 def _apply_edges(
-    arango_db: StandardDatabase,
+    store_db: Database,
     artifact: _RawArtifact,
     artifact_uuid: str,
     refs: dict[str, str],
@@ -443,12 +446,12 @@ def _apply_edges(
         # Idempotency + order_key preservation: never overwrite an existing edge
         # (add_artifact_to_collection upserts with overwrite=True, which would
         # reset order_key and clobber user/operator reordering on re-seed).
-        if db_get_edge(arango_db, container, child):
+        if db_get_edge(store_db, container, child):
             report.edges_skipped += 1
             continue
         try:
             db_add_artifact_to_collection(
-                arango_db, container, child, order_key,
+                store_db, container, child, order_key,
                 origin=origin, propagate=propagate, relationship=relationship,
             )
             report.edges_added += 1
@@ -499,7 +502,7 @@ def _resolve_grant_card(
 
 
 def _apply_accumulated_grants(
-    arango_db: StandardDatabase,
+    store_db: Database,
     accumulated: dict,
     report: SeedReport,
 ) -> None:
@@ -507,7 +510,7 @@ def _apply_accumulated_grants(
     for (principal, resource), spec in accumulated.items():
         try:
             _grant, changed = db_upsert_user_collection_grant(
-                arango_db,
+                store_db,
                 user_id=principal,
                 collection_id=resource,
                 granted_by=AGIENCE_PLATFORM_USER_ID,
@@ -527,7 +530,7 @@ def _apply_accumulated_grants(
 
 
 def seed_from_artifacts(
-    arango_db: StandardDatabase,
+    store_db: Database,
     seeds_root: Path,
     *,
     user: Optional[UserContext] = None,
@@ -598,7 +601,7 @@ def seed_from_artifacts(
     # Persist freshly-derived slug→UUID mappings to platform_settings so the
     # loader is the durable ID authority (pre_resolve_platform_ids reloads them
     # on the next boot, and the per-user run resolves platform refs via them).
-    _persist_seed_ids(arango_db, new_ids)
+    _persist_seed_ids(store_db, new_ids)
 
     # Second pass: resolve templates + references in artifact bodies, then apply.
     for artifact in artifact_cards:
@@ -606,14 +609,14 @@ def seed_from_artifacts(
         slug = artifact.body["slug"]
         artifact_uuid = refs[f"{ns}/{slug}"]
         artifact.body = _walk_resolve(artifact.body, instance_namespace, refs, user)
-        _apply_artifact_card(arango_db, artifact, artifact_uuid, report)
+        _apply_artifact_card(store_db, artifact, artifact_uuid, report)
 
     # Third pass: apply edges (artifacts now exist).
     for artifact in artifact_cards:
         ns = artifact.body["namespace"]
         slug = artifact.body["slug"]
         artifact_uuid = refs[f"{ns}/{slug}"]
-        _apply_edges(arango_db, artifact, artifact_uuid, refs, report)
+        _apply_edges(store_db, artifact, artifact_uuid, refs, report)
 
     # Fourth pass: grants. Resolve each card, then accumulate by
     # (principal, resource) with flag UNION — grants are grants, so a principal's
@@ -631,7 +634,7 @@ def seed_from_artifacts(
                 spec["name"] = spec["name"] or name
             else:
                 accumulated[key] = {"flags": dict(flags), "name": name}
-    _apply_accumulated_grants(arango_db, accumulated, report)
+    _apply_accumulated_grants(store_db, accumulated, report)
 
     logger.info("Seed report: %s", report.summary())
     if report.errors:

@@ -1,12 +1,12 @@
 # /entities/server_credential.py
 
 from typing import Optional, Dict, Any, List
-from entities.base import BaseEntity
+from .base import BaseEntity
 
 
 class ServerCredential(BaseEntity):
     """
-    Domain entity for a registered server credential in ArangoDB.
+    Domain entity for a registered server credential in the lattice.
 
     Platform servers authenticate via OAuth 2.0 client_credentials grant.
     Each server has a well-known client_id and a bcrypt-hashed client_secret.

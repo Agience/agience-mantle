@@ -1,10 +1,10 @@
 # entities/commit_item.py
 from typing import Optional, List, Dict, Any
-from entities.base import BaseEntity
+from .base import BaseEntity
 
 class CommitItem(BaseEntity):
     """
-    Mirrors ArangoDB `CommitItem`:
+    Mirrors the lattice `CommitItem`:
       - item_type: "add" | "remove" | "relate"
       - collection_id: optional (MVP always sets it)
       - artifact_version_ids: list of version ids affected

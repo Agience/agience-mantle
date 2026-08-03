@@ -4,7 +4,7 @@
 # (it supersedes the archived unified-artifact-store + container-as-artifact docs).
 
 from typing import Optional, Dict, Any
-from entities.base import BaseEntity
+from .base import BaseEntity
 
 # Re-export container content-type constants so importers can get them here.
 WORKSPACE_CONTENT_TYPE = "application/vnd.agience.workspace+json"
@@ -20,7 +20,7 @@ class Artifact(BaseEntity):
     `content_type`. A container IS an artifact — same table, same entity.
 
     Ordering is NOT stored on the artifact — it lives on the
-    `collection_artifacts` edge (see db/arango.py).
+    `collection_artifacts` edge (see db/lattice.py).
     """
 
     PREFIX = "Artifact"
@@ -45,6 +45,25 @@ class Artifact(BaseEntity):
         name: Optional[str] = None,
         description: Optional[str] = None,
         content_type: Optional[str] = None,
+        # True while `content` still holds ciphertext — i.e. the read path could
+        # not decrypt it. Modeled here so the flag SURVIVES the storage round
+        # trip: without it, a failed decrypt handed ciphertext to the entity,
+        # the flag was dropped, and saving re-encrypted the ciphertext and
+        # destroyed the original irrecoverably.
+        content_encrypted: bool = False,
+        # The collection's IMMUTABLE ORIGIN ROOT — the key root for this artifact's
+        # content, and the same principal MANTLE cells are keyed under.
+        #
+        # Modeled here for the same reason as `content_encrypted` above: it must
+        # SURVIVE the storage round trip. A key root that a `from_dict` silently
+        # dropped would be recomputed — or defaulted — on the next save, re-keying
+        # content whose ciphertext was written under the old value.
+        #
+        # It is INHERITED, never walked: a root artifact is its own origin root, a
+        # child takes its parent's. That keeps it O(1) at creation and means no read
+        # path ever needs a lineage traversal — the field travels with the row, like
+        # the lattice store's `(_origin, _seq)`.
+        origin_root: Optional[str] = None,
     ):
         super().__init__(id=id, created_time=created_time, modified_time=modified_time)
 
@@ -55,8 +74,15 @@ class Artifact(BaseEntity):
         # and is the stable target of `collection_artifacts` edges.
         self.root_id = root_id or self.id
         self.collection_id = collection_id
+        # A top-level artifact (no parent collection) IS its own origin root. A child
+        # is stamped from its parent at create time (`db.lattice.create_artifact`);
+        # leaving it None here rather than guessing `self.id` means an unstamped
+        # child is VISIBLE as unstamped instead of silently claiming to be a root —
+        # which would give it its own key tree and orphan it from its collection.
+        self.origin_root = origin_root or (self.id if not collection_id else None)
         self.context = context
         self.content = content
+        self.content_encrypted = content_encrypted
         self.state = state
         self.created_by = created_by
         self.modified_by = modified_by
@@ -80,6 +106,7 @@ class Artifact(BaseEntity):
             "created_time": self.created_time,
             "modified_by": self.modified_by,
             "modified_time": self.modified_time,
+            "origin_root": self.origin_root,
         }
         if self.name is not None:
             d["name"] = self.name
@@ -87,6 +114,11 @@ class Artifact(BaseEntity):
             d["description"] = self.description
         if self.content_type is not None:
             d["content_type"] = self.content_type
+        # Emitted only when True. The trailing filter drops None but keeps False,
+        # and a stray `content_encrypted: false` on every artifact would be noise;
+        # what matters is that True is never lost.
+        if self.content_encrypted:
+            d["content_encrypted"] = True
         return {k: v for k, v in d.items() if v is not None}
 
     @classmethod
@@ -102,7 +134,9 @@ class Artifact(BaseEntity):
             created_time=data.get("created_time"),
             modified_by=data.get("modified_by"),
             modified_time=data.get("modified_time"),
+            origin_root=data.get("origin_root"),
             name=data.get("name"),
             description=data.get("description"),
             content_type=data.get("content_type"),
+            content_encrypted=bool(data.get("content_encrypted", False)),
         )

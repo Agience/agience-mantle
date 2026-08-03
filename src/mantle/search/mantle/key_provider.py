@@ -1,6 +1,6 @@
 """Pluggable KEK (key-encryption-key) custody for MANTLE master keys.
 
-The master-key store (:class:`search.mantle.oracle.ArangoMasterKeyStore`) persists
+The master-key store (:class:`search.mantle.oracle.LatticeMasterKeyStore`) persists
 per-principal DEKs WRAPPED by the platform KEK. A ``KeyProvider`` abstracts HOW the
 wrap/unwrap happens, so the KEK's custody can climb the maturity ladder — local
 file → secrets manager → cloud KMS → HSM — WITHOUT changing the search/crypto path.
@@ -137,7 +137,7 @@ def build_key_provider() -> KeyProvider:
 
     if kind == "local":
         from cryptography.fernet import Fernet
-        from agience_core.key_manager import get_encryption_key
+        from prism.trust.key_manager import get_encryption_key
         return LocalKeyProvider(Fernet(get_encryption_key()))
 
     if kind == "kms":

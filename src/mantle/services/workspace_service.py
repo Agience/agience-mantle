@@ -8,8 +8,8 @@
 # {draft, committed, archived}. Commit is a state flip; no data copies.
 #
 # Consumers still call `workspace_service.*` with `workspace_id` — that id
-# is the collection_id. `db` and `arango_db` / `workspace_db` / `collection_db`
-# parameters are all the same ArangoDB handle.
+# is the collection_id. `db` and `store_db` / `workspace_db` / `collection_db`
+# parameters are all the same the lattice handle.
 
 import hashlib
 import hmac
@@ -22,10 +22,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from arango.database import StandardDatabase
+from mantle.db.store import Database
 from fastapi import HTTPException, status
 
-from api.workspaces.commit import (
+from mantle.api.workspaces.commit import (
     ArtifactCommitChange,
     CommitActorSummary,
     CollectionChangeSummary,
@@ -33,17 +33,18 @@ from api.workspaces.commit import (
     WorkspaceCommitPlanSummary,
     WorkspaceCommitResponse,
 )
-from entities.artifact import Artifact as ArtifactEntity
-from entities.collection import (
+from mantle.entities.grant import grant_is_allow, grant_is_deny
+from mantle.entities.artifact import Artifact as ArtifactEntity
+from mantle.entities.collection import (
     Collection as CollectionEntity,
     WORKSPACE_CONTENT_TYPE,
     COLLECTION_CONTENT_TYPE,
 )
-from entities.api_key import APIKey as APIKeyEntity
+from mantle.entities.api_key import APIKey as APIKeyEntity
 
-import db.arango as arango
-from db.arango import after_key, mid_key
-import agience_core.event_bus as event_bus
+import mantle.db.backend as store
+from mantle.db.backend import after_key, mid_key
+import mantle.event_bus as event_bus
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +148,7 @@ def _safe_parse_context(context_json: Optional[str]) -> Dict[str, Any]:
 
 def _emit_event(collection_id: str, name: str, payload: dict, *, actor_id: Optional[str] = None) -> None:
     # artifact.created / artifact.updated are now emitted at the db chokepoint
-    # (db.arango), so every write — raw or service — is covered exactly once.
+    # (db.store), so every write — raw or service — is covered exactly once.
     # This helper only forwards events the db path doesn't (deletes carry the
     # container context the db delete path lacks).
     if name in ("artifact.created", "artifact.updated"):
@@ -159,7 +160,7 @@ def _emit_event(collection_id: str, name: str, payload: dict, *, actor_id: Optio
 
 
 def _dispatch_handlers(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     collection_id: str,
     event_type: str,
@@ -184,7 +185,7 @@ def _dispatch_handlers(
 # ---------------------------------------------------------------------------
 
 def create_container(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     content_type: Optional[str] = None,
     name: Optional[str] = None,
@@ -215,13 +216,14 @@ def create_container(
         created_time=_now_iso(),
         modified_time=_now_iso(),
     )
-    arango.create_collection(db, entity)
-
-    from services.collection_service import ensure_collection_descriptor
-    ensure_collection_descriptor(db, entity)
+    store.create_collection(db, entity)
 
     # Issue explicit full-CRUDEASIO grant to the creator.
-    arango.upsert_user_collection_grant(
+    # ⚠ BEFORE the descriptor index below, deliberately: indexing encrypts cells under the
+    # container's key principal, and the oracle only mints that key for a caller whose grants
+    # reach it. Indexing first meant the creator's very first index attempt was 'update'-DENIED
+    # (the grant didn't exist yet) and the container's DEK went unminted until the async retry.
+    store.upsert_user_collection_grant(
         db,
         user_id=user_id,
         collection_id=container_id,
@@ -237,11 +239,24 @@ def create_container(
         can_admin=True,
     )
 
+    # The oracle memoizes light-cone decisions; without this, the creator keeps being
+    # DENIED content keys on their brand-new container until the TTL lapses.
+    try:
+        from mantle.search.mantle.wiring import invalidate_grant_cache
+        invalidate_grant_cache(user_id)
+    except Exception:
+        logger.debug("grant-cache invalidation failed", exc_info=True)
+
+    # Index AFTER grant + cache-invalidation so the descriptor's cell encryption can mint
+    # the container's DEK on the first attempt (see the ordering note above).
+    from mantle.services.collection_service import ensure_collection_descriptor
+    ensure_collection_descriptor(db, entity)
+
     return entity
 
 
 def create_workspace(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     name: str,
 ) -> CollectionEntity:
@@ -250,40 +265,69 @@ def create_workspace(
     Thin convenience wrapper over :func:`create_container` — workspaces are
     regular container artifacts, each with a fresh UUID and no ID-pinning.
     """
+    from mantle.services.gate_service import enforce_create_quota
+    enforce_create_quota(db, user_id, kind="workspace")
     return create_container(
         db, user_id, content_type=WORKSPACE_CONTENT_TYPE, name=name,
     )
 
 
-def list_workspaces(db: StandardDatabase, user_id: str) -> List[CollectionEntity]:
-    return arango.get_collections_by_owner_and_type(db, user_id, WORKSPACE_CONTENT_TYPE)
+def list_workspaces(db: Database, user_id: str) -> List[CollectionEntity]:
+    return store.get_collections_by_owner_and_type(db, user_id, WORKSPACE_CONTENT_TYPE)
 
 
-def get_workspace(db: StandardDatabase, user_id: str, workspace_id: str) -> CollectionEntity:
-    entity = arango.get_collection_by_id(db, workspace_id)
+def get_workspace(
+    db: Database,
+    user_id: str,
+    workspace_id: str,
+    required: str = "read",
+) -> CollectionEntity:
+    """Load a workspace, authorizing the caller for *required* (a CRUDEASIO verb).
+
+    ⛔ THIS USED TO AUTHORIZE EVERYTHING ON `can_read`.
+    It is the ONLY authorization in front of `update_workspace`,
+    `delete_workspace`, `update_workspace_context`, binding and key-rotation —
+    so read-only access to a workspace conferred the right to rewrite or destroy
+    it. `required` now names the verb, and every call site declares its own.
+
+    Deny grants are also honoured now; the old check was
+    `any(g.can_read for g in grants)`, which ignored `effect` entirely, so an
+    explicit deny did nothing here.
+
+    Still a 404 (never 403) on refusal — not leaking existence is deliberate.
+    """
+    entity = store.get_collection_by_id(db, workspace_id)
     if not entity:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Workspace not found")
-    grants = arango.get_active_grants_for_principal_resource(
+
+    flag = f"can_{required}"
+    grants = store.get_active_grants_for_principal_resource(
         db, grantee_id=user_id, resource_id=workspace_id
     )
-    if not any(getattr(g, "can_read", False) for g in grants):
+
+    # An explicit deny on this verb wins over any allow.
+    for g in grants:
+        if grant_is_deny(g) and getattr(g, flag, False):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Workspace not found")
+
+    if not any(grant_is_allow(g) and getattr(g, flag, False) for g in grants):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Workspace not found")
     return entity
 
 
-def get_workspace_unsafe(db: StandardDatabase, workspace_id: str) -> Optional[CollectionEntity]:
-    return arango.get_collection_by_id(db, workspace_id)
+def get_workspace_unsafe(db: Database, workspace_id: str) -> Optional[CollectionEntity]:
+    return store.get_collection_by_id(db, workspace_id)
 
 
 def update_workspace(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     name: Optional[str],
     description: Optional[str],
     context: Optional[str] = None,
 ) -> CollectionEntity:
-    ws = get_workspace(db, user_id, workspace_id)
+    ws = get_workspace(db, user_id, workspace_id, required="update")
     changed = False
     if name is not None and name != ws.name:
         ws.name = name
@@ -293,61 +337,76 @@ def update_workspace(
         changed = True
     if changed:
         ws.modified_time = _now_iso()
-        arango.update_collection(db, ws)
+        store.update_collection(db, ws)
 
-        from services.collection_service import ensure_collection_descriptor
+        from mantle.services.collection_service import ensure_collection_descriptor
         ensure_collection_descriptor(db, ws)
 
     if context is not None:
         parsed = _safe_parse_context(context) if isinstance(context, str) else context
         update_workspace_context(db, user_id, workspace_id, parsed)
-        ws = get_workspace(db, user_id, workspace_id)
+        ws = get_workspace(db, user_id, workspace_id, required="update")
 
     return ws
 
 
-def delete_workspace(db: StandardDatabase, user_id: str, workspace_id: str) -> None:
-    get_workspace(db, user_id, workspace_id)
+def delete_workspace(db: Database, user_id: str, workspace_id: str) -> None:
+    get_workspace(db, user_id, workspace_id, required="delete")
 
     # Drop all artifacts in the workspace + their edges + search index docs.
-    rows = arango.list_collection_artifacts(db, workspace_id, include_archived=True)
+    rows = store.list_collection_artifacts(db, workspace_id, include_archived=True)
     for row in rows:
         art_id = row.get("id")
         root_id = row.get("root_id") or art_id
         if art_id:
             try:
-                from search.ingest.pipeline_unified import delete_artifact_from_index
-                delete_artifact_from_index(art_id, root_id)
+                from mantle.search.ingest.pipeline_unified import delete_artifact_from_index
+                delete_artifact_from_index(art_id, root_id, collection_id=workspace_id)
             except Exception:
                 logger.debug("index delete failed", exc_info=True)
-            arango.delete_artifacts_by_root(db, root_id)
-            arango.remove_all_edges_for_root(db, root_id)
 
-    arango.delete_collection(db, workspace_id)
+            # ⛔ THIS USED TO DELETE BY ROOT UNCONDITIONALLY.
+            # `delete_artifacts_by_root` + `remove_all_edges_for_root` destroy the
+            # artifact EVERYWHERE, not just here. An artifact linked into several
+            # containers (which `_link_source_artifact` exists to do) would be
+            # destroyed for every other container too — including containers the
+            # caller has no rights over. Deleting your own workspace should never
+            # reach into someone else's.
+            shared_elsewhere = store.count_other_containers_for_root(
+                db, root_id, workspace_id
+            ) > 0
+            if shared_elsewhere:
+                # Evict from THIS container only; the artifact survives elsewhere.
+                store.remove_artifact_from_collection(db, workspace_id, root_id)
+            else:
+                store.delete_artifacts_by_root(db, root_id)
+                store.remove_all_edges_for_root(db, root_id)
+
+    store.delete_collection(db, workspace_id)
 
 
-def get_workspace_context(db: StandardDatabase, user_id: str, workspace_id: str) -> dict:
-    ws = get_workspace(db, user_id, workspace_id)
+def get_workspace_context(db: Database, user_id: str, workspace_id: str) -> dict:
+    ws = get_workspace(db, user_id, workspace_id, required="read")
     parsed = _safe_parse_context(ws.context) if isinstance(ws.context, str) else (ws.context or {})
     parsed.setdefault("collections", [])
     return parsed
 
 
 def update_workspace_context(
-    db: StandardDatabase, user_id: str, workspace_id: str, context: dict
+    db: Database, user_id: str, workspace_id: str, context: dict
 ) -> dict:
-    ws = get_workspace(db, user_id, workspace_id)
+    ws = get_workspace(db, user_id, workspace_id, required="update")
     if not isinstance(context, dict):
         context = {}
     context.setdefault("collections", [])
     ws.context = json.dumps(context)
     ws.modified_time = _now_iso()
-    arango.update_collection(db, ws)
+    store.update_collection(db, ws)
     return context
 
 
 def apply_workspace_card_actions(
-    db: StandardDatabase, user_id: str, workspace_id: str, actions: List[dict]
+    db: Database, user_id: str, workspace_id: str, actions: List[dict]
 ) -> dict:
     current = get_workspace_context(db, user_id, workspace_id)
     coll_by_id = {c.get("collection_id"): c for c in current.get("collections", []) if isinstance(c, dict)}
@@ -388,13 +447,13 @@ def _extract_bindings(context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _user_can_read_collection(
-    db: StandardDatabase, user_id: str, collection_id: str
+    db: Database, user_id: str, collection_id: str
 ) -> bool:
     """Return ``True`` if *user_id* has at least read access to *collection_id*."""
-    col = arango.get_collection_by_id(db, collection_id)
+    col = store.get_collection_by_id(db, collection_id)
     if not col:
         return False
-    grants = arango.get_active_grants_for_principal_resource(
+    grants = store.get_active_grants_for_principal_resource(
         db, grantee_id=user_id, resource_id=collection_id,
     )
     return any(getattr(g, "can_read", False) for g in grants)
@@ -425,7 +484,7 @@ def _resolve_binding_multi_from(
 
 
 def resolve_binding(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     role: str,
@@ -459,7 +518,7 @@ def resolve_binding(
 
 
 def resolve_all_bindings(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     *,
@@ -510,7 +569,7 @@ KNOWN_BINDING_ROLES = SINGLE_BINDING_ROLES | MULTI_BINDING_ROLES
 
 
 def resolve_binding_multi(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     role: str,
@@ -538,7 +597,7 @@ def resolve_binding_multi(
 # ---------------------------------------------------------------------------
 
 def set_binding(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     role: str,
@@ -578,7 +637,7 @@ def set_binding(
 
 
 def clear_binding(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     role: str,
@@ -601,49 +660,49 @@ def clear_binding(
 # ---------------------------------------------------------------------------
 
 def list_workspace_artifacts(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
 ) -> List[ArtifactEntity]:
-    get_workspace(db, user_id, workspace_id)
-    rows = arango.list_collection_artifacts(db, workspace_id)
+    get_workspace(db, user_id, workspace_id, required="read")
+    rows = store.list_collection_artifacts(db, workspace_id)
     return [ArtifactEntity.from_dict(r) for r in rows]
 
 
 def get_workspace_artifact(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     artifact_id: str,
 ) -> ArtifactEntity:
-    get_workspace(db, user_id, workspace_id)
-    artifact = arango.get_artifact(db, artifact_id)
+    get_workspace(db, user_id, workspace_id, required="read")
+    artifact = store.get_artifact(db, artifact_id)
     if not artifact or artifact.collection_id != workspace_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Artifact not found")
     return artifact
 
 
-def get_artifact_unsafe_by_id(db: StandardDatabase, artifact_id: str) -> Optional[ArtifactEntity]:
-    return arango.get_artifact(db, artifact_id)
+def get_artifact_unsafe_by_id(db: Database, artifact_id: str) -> Optional[ArtifactEntity]:
+    return store.get_artifact(db, artifact_id)
 
 
 def get_workspace_artifacts_batch(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     artifact_ids: List[str],
 ) -> List[ArtifactEntity]:
-    get_workspace(db, user_id, workspace_id)
+    get_workspace(db, user_id, workspace_id, required="read")
     out: List[ArtifactEntity] = []
     for aid in artifact_ids:
-        a = arango.get_artifact(db, aid)
+        a = store.get_artifact(db, aid)
         if a and a.collection_id == workspace_id:
             out.append(a)
     return out
 
 
 def get_workspace_artifacts_batch_global(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     artifact_ids: List[str],
 ) -> List[ArtifactEntity]:
@@ -651,20 +710,60 @@ def get_workspace_artifacts_batch_global(
     workspaces = {w.id for w in list_workspaces(db, user_id)}
     out: List[ArtifactEntity] = []
     for aid in artifact_ids:
-        a = arango.get_artifact(db, aid)
+        a = store.get_artifact(db, aid)
         if a and a.collection_id in workspaces:
             out.append(a)
     return out
+
+
+def _safe_content_key(ctx: dict, artifact_id: str, *, default_prefix: str = "artifacts") -> str:
+    """The object-store key for `artifact_id`, refusing any caller-supplied key that names a
+    DIFFERENT artifact.
+
+    ⛔⛔ `content_key` CAME STRAIGHT OUT OF CALLER-SUPPLIED `context` AND WAS USED VERBATIM
+    TO READ, OVERWRITE, AND DELETE OBJECTS. `context` is a caller-authored JSON blob (it is
+    persisted unchanged on create, and `update_upload_status(context_patch=...)` merges raw caller
+    keys into it), and nothing checked that the key belonged to this artifact or this tenant.
+    Three separate paths consumed it, and the destructive ones need no read access at all:
+
+      • WRITE — create an artifact in YOUR OWN container with
+        `context = {"content_key": "<victim>/<their-artifact>.content"}`; `_store_content_in_s3`
+        then calls `put_text_direct` on the victim's key, overwriting their object with bytes
+        encrypted under YOUR master key. Their next read fails to decrypt. Unrecoverable.
+      • DELETE — the same trick with a throwaway artifact: `delete_object(content_key)` removes
+        the victim's object from BOTH the edge and durable buckets.
+      • READ — a signed URL, or the content endpoint, minted for someone else's key.
+
+    Found independently by two naive audits on disjoint scopes (the router pass and the service
+    pass), which is why it is fixed rather than argued about.
+
+    The binding: a legitimate key always ends `/{artifact_id}.content` — the server derives either
+    `artifacts/{id}.content` (here) or `{tenant}/{id}.content` (`initiate_upload_and_create_artifact`).
+    Tying the key to ITS OWN artifact id therefore accepts every legitimately-derived key, including
+    every one already stored, and rejects exactly the cross-artifact case. A stored key that fails
+    the check is discarded in favour of the derived one rather than honoured."""
+    derived = f"{default_prefix}/{artifact_id}.content"
+    claimed = ctx.get("content_key")
+    if not claimed or not isinstance(claimed, str):
+        return derived
+    if claimed == derived or claimed.endswith(f"/{artifact_id}.content"):
+        return claimed
+    logger.warning(
+        "refusing caller-supplied content_key %r on artifact %s — it names a different artifact; "
+        "using the derived key instead", claimed, artifact_id,
+    )
+    return derived
 
 
 def _store_content_in_s3(
     artifact_id: str,
     content: str,
     context_str: str,
+    owner_id: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Upload inline content to S3 and return (content_key, inline_content).
 
-    For small text (< 128 KB), the content is also kept inline in ArangoDB as a
+    For small text (< 128 KB), the content is also kept inline in the lattice as a
     fallback so the artifact remains readable even if S3 is temporarily
     unreachable.  Large content (>= 128 KB) is cleared from inline to keep the
     document store lean.
@@ -672,7 +771,7 @@ def _store_content_in_s3(
     Derives the content_type from the artifact context if present.
     Falls back to text/plain. Idempotent — safe to call on every create/update.
     """
-    from services.content_service import put_text_direct
+    from mantle.services.content_service import put_text_direct
 
     try:
         ctx = json.loads(context_str) if context_str else {}
@@ -680,10 +779,10 @@ def _store_content_in_s3(
         ctx = {}
 
     content_type = ctx.get("content_type") or "text/plain"
-    content_key = ctx.get("content_key") or f"artifacts/{artifact_id}.content"
+    content_key = _safe_content_key(ctx, artifact_id)
 
     try:
-        put_text_direct(content_key, content, content_type)
+        put_text_direct(content_key, content, content_type, owner_id=owner_id)
     except Exception:
         logger.warning("Failed to upload artifact content to S3 for %s — keeping inline", artifact_id, exc_info=True)
         return content_key, content  # degrade gracefully: keep inline
@@ -695,7 +794,7 @@ def _store_content_in_s3(
 
 
 def _link_to_target_collections(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     artifact: ArtifactEntity,
@@ -714,7 +813,7 @@ def _link_to_target_collections(
                     user_id, target_id,
                 )
                 continue
-            arango.add_artifact_to_collection(db, target_id, artifact.root_id)
+            store.add_artifact_to_collection(db, target_id, artifact.root_id)
             event_bus.emit("workspace.target_collection.linked", {
                 "workspace_id": workspace_id,
                 "target_collection_id": target_id,
@@ -728,7 +827,7 @@ def _link_to_target_collections(
 
 
 def create_workspace_artifact(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     context: str,
@@ -739,8 +838,11 @@ def create_workspace_artifact(
     dispatch_handlers: bool = True,
     name: Optional[str] = None,
     content_type: Optional[str] = None,
+    index: Optional[str] = None,
 ) -> ArtifactEntity:
-    get_workspace(db, user_id, workspace_id)
+    get_workspace(db, user_id, workspace_id, required="create")
+    from mantle.services.gate_service import enforce_create_quota
+    enforce_create_quota(db, user_id, kind="artifact")
 
     now = _now_iso()
     artifact_id = str(uuid.uuid4())
@@ -748,7 +850,7 @@ def create_workspace_artifact(
     # Store content in S3; update context with content_key.
     resolved_content = content
     if content:
-        content_key, resolved_content = _store_content_in_s3(artifact_id, content, context)
+        content_key, resolved_content = _store_content_in_s3(artifact_id, content, context, owner_id=user_id)
         # Inject content_key into context JSON if not already present.
         try:
             ctx_obj = json.loads(context) if context else {}
@@ -772,12 +874,12 @@ def create_workspace_artifact(
         name=name,
         content_type=content_type,
     )
-    arango.create_artifact(db, artifact)
+    store.create_artifact(db, artifact)
 
     # Insert the stable collection_artifacts edge pointing at root_id.
     if order_key is None:
-        order_key = after_key(arango.get_last_order_key(db, workspace_id))
-    arango.add_artifact_to_collection(db, workspace_id, artifact.root_id, order_key)
+        order_key = after_key(store.get_last_order_key(db, workspace_id))
+    store.add_artifact_to_collection(db, workspace_id, artifact.root_id, order_key)
 
     # Wire target_collections binding: create collection_artifacts edges to
     # each target collection so the draft artifact is associated immediately.
@@ -789,7 +891,7 @@ def create_workspace_artifact(
     # collection is just an artifact with child edges. (The container edge still
     # propagates the collection's grants to OTHER members for sharing; see `origin`.)
     try:
-        arango.upsert_user_collection_grant(
+        store.upsert_user_collection_grant(
             db, user_id=user_id, collection_id=artifact.root_id, granted_by=user_id,
             can_create=True, can_read=True, can_update=True, can_delete=True,
             can_evict=True, can_invoke=True, can_add=True, can_share=True, can_admin=True,
@@ -797,10 +899,14 @@ def create_workspace_artifact(
     except Exception:
         logger.debug("owner grant on create failed", exc_info=True)
 
-    if enqueue_index:
+    # WHERE index: eager (default) or deferred to first access (lazy). A latent
+    # write skips indexing and carries no materialization marker (WHO+WHEN only).
+    from mantle.search.lazy import resolve_lazy
+    if enqueue_index and not resolve_lazy(index):
         try:
-            from search.ingest.pipeline_unified import enqueue_index_artifact
+            from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
             enqueue_index_artifact(artifact, artifact.collection_id, tenant_id=user_id)
+            store.mark_materialized(db, artifact.id)
         except Exception:
             logger.debug("index enqueue failed", exc_info=True)
 
@@ -811,14 +917,68 @@ def create_workspace_artifact(
     return artifact
 
 
+def materialize_on_access(db, *, artifact_id, collection_id, tenant_id=None, artifact=None) -> None:
+    """Lazy indexing: materialize a latent vertex on first authorized access —
+    enqueue its WHERE index and mark it. No-op when lazy indexing is off or the
+    vertex is already materialized. Best-effort; never raises into the read path."""
+    from mantle.search.lazy import lazy_index_default
+    if not lazy_index_default():
+        return
+    try:
+        if not artifact_id or not collection_id or store.is_materialized(db, artifact_id):
+            return
+        if artifact is None:
+            raw = store.get_artifact(db, artifact_id)
+            if not raw:
+                return
+            artifact = ArtifactEntity.from_dict(raw) if isinstance(raw, dict) else raw
+        from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
+        enqueue_index_artifact(artifact, collection_id, is_head=True, tenant_id=tenant_id)
+        store.mark_materialized(db, artifact_id)
+    except Exception:
+        logger.warning("materialize-on-access failed for %s", artifact_id, exc_info=True)
+
+
+def warm_collection(db, collection_id, *, tenant_id=None) -> int:
+    """Warm-sweep guardrail: materialize every latent artifact in a collection so
+    it is searchable up front (for corpora that must not wait for first access).
+    Returns the count newly materialized. Idempotent — safe to re-run."""
+    n = 0
+    seen: set = set()
+    try:
+        from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
+        # Members regardless of state: committed (dicts, drafts of this workspace
+        # made visible via draft_workspace_id) plus the workspace's own drafts.
+        items = []
+        for raw in (store.list_collection_artifacts(db, collection_id, draft_workspace_id=collection_id) or []):
+            items.append(ArtifactEntity.from_dict(raw) if isinstance(raw, dict) else raw)
+        items.extend(store.list_draft_artifacts(db, collection_id) or [])
+        for art in items:
+            aid = getattr(art, "id", None)
+            if not aid or aid in seen:
+                continue
+            seen.add(aid)
+            if store.is_materialized(db, aid):
+                continue
+            try:
+                enqueue_index_artifact(art, collection_id, is_head=True, tenant_id=tenant_id)
+                store.mark_materialized(db, aid)
+                n += 1
+            except Exception:
+                logger.warning("warm_collection: materialize %s failed", aid, exc_info=True)
+    except Exception:
+        logger.warning("warm_collection(%s) failed", collection_id, exc_info=True)
+    return n
+
+
 def create_workspace_artifacts_bulk(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     items: Sequence[Union[Tuple[str, str], Tuple[str, str, Optional[Sequence[str]]], Dict[str, Any]]],
     dispatch_handlers: bool = True,
 ) -> List[ArtifactEntity]:
-    get_workspace(db, user_id, workspace_id)
+    get_workspace(db, user_id, workspace_id, required="create")
 
     out: List[ArtifactEntity] = []
     for raw in items:
@@ -851,14 +1011,14 @@ def create_workspace_artifacts_bulk(
 
 
 def _ensure_draft(
-    db: StandardDatabase, user_id: str, committed: ArtifactEntity
+    db: Database, user_id: str, committed: ArtifactEntity
 ) -> ArtifactEntity:
     """
     Edit-after-commit: create a new draft record with the same root_id
     containing a copy of the committed content, leaving the committed
     version untouched.
     """
-    existing_draft = arango.get_draft_artifact(db, committed.root_id, committed.collection_id)
+    existing_draft = store.get_draft_artifact(db, committed.root_id, committed.collection_id)
     if existing_draft:
         return existing_draft
 
@@ -877,7 +1037,7 @@ def _ensure_draft(
         created_time=now,
         modified_time=now,
     )
-    arango.create_artifact(db, draft)
+    store.create_artifact(db, draft)
     return draft
 
 
@@ -892,7 +1052,7 @@ def _reindex_after_state_change(
     vacates exactly the old segment(s) — never a blanket purge, since a root may
     legitimately keep a committed version while a draft is also indexed."""
     try:
-        from search.ingest.pipeline_unified import enqueue_index_artifact
+        from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
         enqueue_index_artifact(
             artifact, artifact.collection_id, tenant_id=user_id, vacate=vacate,
         )
@@ -901,7 +1061,7 @@ def _reindex_after_state_change(
 
 
 def update_artifact(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     artifact_id: str,
@@ -912,15 +1072,15 @@ def update_artifact(
     reindex: bool = True,
     dispatch_handlers: bool = True,
 ) -> ArtifactEntity:
-    get_workspace(db, user_id, workspace_id)
+    get_workspace(db, user_id, workspace_id, required="update")
 
-    target = arango.get_artifact(db, artifact_id)
+    target = store.get_artifact(db, artifact_id)
     if target is not None and target.collection_id != workspace_id:
         target = None
     if target is None:
-        target = arango.get_draft_artifact(db, artifact_id, workspace_id)
+        target = store.get_draft_artifact(db, artifact_id, workspace_id)
     if target is None:
-        target = arango.get_latest_committed_artifact(db, artifact_id, workspace_id)
+        target = store.get_latest_committed_artifact(db, artifact_id, workspace_id)
     if target is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Artifact not found")
 
@@ -929,7 +1089,7 @@ def update_artifact(
         target.state = ArtifactEntity.STATE_ARCHIVED
         target.modified_by = user_id
         target.modified_time = _now_iso()
-        if arango.update_artifact(db, target) is None:
+        if store.update_artifact(db, target) is None:
             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to persist artifact update")
         # Archive: index into the archived segment and vacate committed + draft
         # (an archived root has no live committed/draft entry).
@@ -942,7 +1102,7 @@ def update_artifact(
         target.state = ArtifactEntity.STATE_DRAFT
         target.modified_by = user_id
         target.modified_time = _now_iso()
-        if arango.update_artifact(db, target) is None:
+        if store.update_artifact(db, target) is None:
             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to persist artifact update")
         # Unarchive: index into draft and vacate the archived segment.
         if reindex:
@@ -959,7 +1119,7 @@ def update_artifact(
             target.state = ArtifactEntity.STATE_COMMITTED
             target.modified_by = user_id
             target.modified_time = _now_iso()
-            if arango.update_artifact(db, target) is None:
+            if store.update_artifact(db, target) is None:
                 raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to persist artifact update")
             # Index into the committed segment and vacate the draft segment (the
             # draft just became the committed version).
@@ -984,7 +1144,7 @@ def update_artifact(
     if content is not None and content != target.content:
         # Store new content in S3; update target.context with content_key.
         if content:
-            content_key, stored_content = _store_content_in_s3(target.id, content, target.context)
+            content_key, stored_content = _store_content_in_s3(target.id, content, target.context, owner_id=target.created_by)
             try:
                 ctx_obj = json.loads(target.context) if target.context else {}
             except (json.JSONDecodeError, TypeError):
@@ -1000,13 +1160,13 @@ def update_artifact(
 
     target.modified_by = user_id
     target.modified_time = _now_iso()
-    result = arango.update_artifact(db, target)
+    result = store.update_artifact(db, target)
     if result is None:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to persist artifact update")
 
     if reindex:
         try:
-            from search.ingest.pipeline_unified import enqueue_index_artifact
+            from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
             enqueue_index_artifact(target, target.collection_id, tenant_id=user_id)
         except Exception:
             logger.debug("reindex failed", exc_info=True)
@@ -1019,34 +1179,38 @@ def update_artifact(
 
 
 def delete_artifact(
-    db: StandardDatabase, user_id: str, workspace_id: str, artifact_id: str
+    db: Database, user_id: str, workspace_id: str, artifact_id: str
 ) -> None:
     artifact = get_workspace_artifact(db, user_id, workspace_id, artifact_id)
 
     # S3 cleanup — read the content_key straight from context (spec § delete fix).
     try:
         ctx = _safe_parse_context(artifact.context)
-        content_key = ctx.get("content_key")
+        # Validated, not trusted: an unchecked key here deletes ANOTHER tenant's object from both
+        # the edge and durable buckets, and needs no read access to that artifact whatsoever.
+        content_key = _safe_content_key(ctx, artifact_id)
         if content_key:
-            from services.content_service import delete_object
+            from mantle.services.content_service import delete_object
             delete_object(content_key)
     except Exception:
         logger.debug("S3 cleanup failed", exc_info=True)
 
     # If this was the only version for the root, drop all edges too.
     other_versions = [
-        v for v in arango.list_version_history(db, artifact.root_id) if v.id != artifact_id
+        v for v in store.list_version_history(db, artifact.root_id) if v.id != artifact_id
     ]
-    draft = arango.get_draft_artifact(db, artifact.root_id, workspace_id)
+    draft = store.get_draft_artifact(db, artifact.root_id, workspace_id)
 
-    arango.delete_artifact(db, artifact_id)
+    store.delete_artifact(db, artifact_id)
 
     if not other_versions and (draft is None or draft.id == artifact_id):
-        arango.remove_all_edges_for_root(db, artifact.root_id)
+        store.remove_all_edges_for_root(db, artifact.root_id)
 
     try:
-        from search.ingest.pipeline_unified import delete_artifact_from_index
-        delete_artifact_from_index(artifact_id, artifact.root_id)
+        from mantle.search.ingest.pipeline_unified import delete_artifact_from_index
+        # collection_id is REQUIRED for the removal to happen at all — without it both arms
+        # no-op and the deleted artifact's chunks (with their plaintext text) stay searchable.
+        delete_artifact_from_index(artifact_id, artifact.root_id, collection_id=workspace_id)
     except Exception:
         logger.debug("search delete failed", exc_info=True)
 
@@ -1055,7 +1219,7 @@ def delete_artifact(
 
 
 def remove_artifact_from_container(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     container_id: str,
     artifact_id: str,
@@ -1069,35 +1233,35 @@ def remove_artifact_from_container(
     """
     # Resolve the root_id: the caller may pass a version id or a root_id.
     root_id = artifact_id
-    artifact = arango.get_artifact(db, artifact_id)
+    artifact = store.get_artifact(db, artifact_id)
     if artifact:
         root_id = artifact.root_id or artifact.id
 
     # The edge is the canonical link. If there's no edge, the artifact
     # is not in this container.
-    edge = arango.get_edge(db, container_id, root_id)
+    edge = store.get_edge(db, container_id, root_id)
     if not edge:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Artifact not found")
 
-    arango.remove_artifact_from_collection(db, container_id, root_id)
+    store.remove_artifact_from_collection(db, container_id, root_id)
 
     # If a draft version is owned by this container, clean it up.
-    local = arango.get_current_in_collection(db, container_id, root_id)
+    local = store.get_current_in_collection(db, container_id, root_id)
     if local and local.state == ArtifactEntity.STATE_DRAFT and local.collection_id == container_id:
-        arango.delete_artifact(db, local.id)
+        store.delete_artifact(db, local.id)
         try:
-            from search.ingest.pipeline_unified import delete_artifact_from_index
-            delete_artifact_from_index(local.id, local.root_id)
+            from mantle.search.ingest.pipeline_unified import delete_artifact_from_index
+            delete_artifact_from_index(local.id, local.root_id, collection_id=container_id)
         except Exception:
             logger.debug("search delete failed", exc_info=True)
 
     _emit_event(container_id, "artifact.deleted", {"artifact_id": artifact_id}, actor_id=user_id)
-    return artifact or arango.get_artifact(db, root_id) or ArtifactEntity(id=root_id, root_id=root_id)
+    return artifact or store.get_artifact(db, root_id) or ArtifactEntity(id=root_id, root_id=root_id)
 
 
 def revert_artifact(
-    workspace_db: StandardDatabase,
-    collection_db: StandardDatabase,
+    workspace_db: Database,
+    collection_db: Database,
     user_id: str,
     workspace_id: str,
     artifact_id: str,
@@ -1106,24 +1270,24 @@ def revert_artifact(
     Revert: drop the current draft, leaving the committed version in place.
     Returns the surviving committed version (or None if none exists).
     """
-    get_workspace(workspace_db, user_id, workspace_id)
-    target = arango.get_artifact(workspace_db, artifact_id)
+    get_workspace(workspace_db, user_id, workspace_id, required="update")
+    target = store.get_artifact(workspace_db, artifact_id)
     if not target or target.collection_id != workspace_id:
         return None
 
     if target.state != ArtifactEntity.STATE_DRAFT:
         return target
 
-    committed = arango.get_latest_committed_artifact(
+    committed = store.get_latest_committed_artifact(
         workspace_db, target.root_id, workspace_id
     )
     if not committed:
         return None
 
-    arango.delete_artifact(workspace_db, target.id)
+    store.delete_artifact(workspace_db, target.id)
 
     try:
-        from search.ingest.pipeline_unified import enqueue_index_artifact
+        from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
         enqueue_index_artifact(committed, committed.collection_id, tenant_id=user_id)
     except Exception:
         logger.debug("reindex failed", exc_info=True)
@@ -1134,8 +1298,8 @@ def revert_artifact(
 
 
 def add_artifact_to_workspace(
-    workspace_db: StandardDatabase,
-    collection_db: StandardDatabase,
+    workspace_db: Database,
+    collection_db: Database,
     user_id: str,
     workspace_id: str,
     artifact_root_id: str,
@@ -1146,38 +1310,38 @@ def add_artifact_to_workspace(
     This is the "publish" action from the spec — it does not create a new
     artifact record.
     """
-    get_workspace(workspace_db, user_id, workspace_id)
+    get_workspace(workspace_db, user_id, workspace_id, required="add")
 
     # Must resolve to a committed version somewhere.
-    committed = arango.get_latest_committed_artifact(workspace_db, artifact_root_id)
+    committed = store.get_latest_committed_artifact(workspace_db, artifact_root_id)
     if not committed:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Artifact not readable")
 
-    order_key = after_key(arango.get_last_order_key(workspace_db, workspace_id))
-    arango.add_artifact_to_collection(workspace_db, workspace_id, artifact_root_id, order_key)
+    order_key = after_key(store.get_last_order_key(workspace_db, workspace_id))
+    store.add_artifact_to_collection(workspace_db, workspace_id, artifact_root_id, order_key)
     return committed
 
 
 def move_artifact_between_containers(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     source_container_id: str,
     target_container_id: str,
     artifact_id: str,
 ) -> ArtifactEntity:
     """Move an artifact from one container to another. P2 — type-blind."""
-    artifact = arango.get_artifact(db, artifact_id)
+    artifact = store.get_artifact(db, artifact_id)
     if not artifact or artifact.collection_id != source_container_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Artifact not found")
 
     artifact.collection_id = target_container_id
     artifact.modified_by = user_id
     artifact.modified_time = _now_iso()
-    arango.update_artifact(db, artifact)
+    store.update_artifact(db, artifact)
 
-    arango.remove_artifact_from_collection(db, source_container_id, artifact.root_id)
-    order_key = after_key(arango.get_last_order_key(db, target_container_id))
-    arango.add_artifact_to_collection(db, target_container_id, artifact.root_id, order_key)
+    store.remove_artifact_from_collection(db, source_container_id, artifact.root_id)
+    order_key = after_key(store.get_last_order_key(db, target_container_id))
+    store.add_artifact_to_collection(db, target_container_id, artifact.root_id, order_key)
 
     _emit_event(source_container_id, "artifact.deleted", {"artifact_id": artifact_id}, actor_id=user_id)
     _emit_event(target_container_id, "artifact.created", {"artifact": artifact.to_dict()}, actor_id=user_id)
@@ -1185,7 +1349,7 @@ def move_artifact_between_containers(
 
 
 def move_workspace_artifact(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     artifact_id: str,
@@ -1193,8 +1357,8 @@ def move_workspace_artifact(
     after_id: Optional[str],
     expected_version: Optional[int] = None,
 ) -> int:
-    get_workspace(db, user_id, workspace_id)
-    artifact = arango.get_artifact(db, artifact_id)
+    get_workspace(db, user_id, workspace_id, required="update")
+    artifact = store.get_artifact(db, artifact_id)
     if not artifact:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Artifact not found")
     root_id = artifact.root_id
@@ -1202,19 +1366,19 @@ def move_workspace_artifact(
     before_key = None
     after_key_str = None
     if before_id:
-        before = arango.get_edge(db, workspace_id, before_id) or {}
+        before = store.get_edge(db, workspace_id, before_id) or {}
         before_key = before.get("order_key")
     if after_id:
-        after_rec = arango.get_edge(db, workspace_id, after_id) or {}
+        after_rec = store.get_edge(db, workspace_id, after_id) or {}
         after_key_str = after_rec.get("order_key")
 
     new_key = mid_key(before_key, after_key_str)
-    arango.set_edge_order_key(db, workspace_id, root_id, new_key)
+    store.set_edge_order_key(db, workspace_id, root_id, new_key)
     return 0
 
 
-def get_artifacts_order_version(db: StandardDatabase, user_id: str, workspace_id: str) -> int:
-    get_workspace(db, user_id, workspace_id)
+def get_artifacts_order_version(db: Database, user_id: str, workspace_id: str) -> int:
+    get_workspace(db, user_id, workspace_id, required="read")
     return 0  # no longer tracked — edges are authoritative
 
 
@@ -1223,8 +1387,8 @@ def get_artifacts_order_version(db: StandardDatabase, user_id: str, workspace_id
 # ---------------------------------------------------------------------------
 
 def commit_workspace_to_collections(
-    workspace_db: StandardDatabase,
-    collection_db: StandardDatabase,
+    workspace_db: Database,
+    collection_db: Database,
     user_id: str,
     workspace_id: str,
     *,
@@ -1239,10 +1403,10 @@ def commit_workspace_to_collections(
     membership deltas. `artifact_ids` optionally narrows to a subset;
     `dry_run` returns the planned changes without mutating state.
     """
-    get_workspace(workspace_db, user_id, workspace_id)
+    get_workspace(workspace_db, user_id, workspace_id, required="update")
 
     # Collect candidate drafts.
-    drafts = arango.list_draft_artifacts(workspace_db, workspace_id)
+    drafts = store.list_draft_artifacts(workspace_db, workspace_id)
     if artifact_ids:
         wanted = set(artifact_ids)
         # Accept either version id or root id.
@@ -1300,7 +1464,7 @@ def commit_workspace_to_collections(
 
     # Apply: single AQL UPDATE for the whole batch.
     now = _now_iso()
-    committed_count = arango.batch_commit_drafts(
+    committed_count = store.batch_commit_drafts(
         workspace_db,
         collection_id=workspace_id,
         artifact_ids=[d.id for d in drafts],
@@ -1310,7 +1474,7 @@ def commit_workspace_to_collections(
 
     # Provenance record.
     try:
-        from entities.commit import Commit as CommitEntity, CommitItem
+        from mantle.entities.commit import Commit as CommitEntity, CommitItem
         commit_entity = CommitEntity(
             collection_id=workspace_id,
             author_id=user_id,
@@ -1318,8 +1482,8 @@ def commit_workspace_to_collections(
             timestamp=now,
             item_ids=[d.id for d in drafts],
         )
-        arango.create_commit(collection_db, commit_entity)
-        arango.create_commit_items(
+        store.create_commit(collection_db, commit_entity)
+        store.create_commit_items(
             collection_db,
             [
                 CommitItem(
@@ -1337,7 +1501,7 @@ def commit_workspace_to_collections(
     # Re-index each committed artifact into the committed segment, and vacate the
     # draft segment (the draft just became the committed version).
     try:
-        from search.ingest.pipeline_unified import enqueue_index_artifact
+        from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
         for d in drafts:
             d.state = ArtifactEntity.STATE_COMMITTED
             enqueue_index_artifact(
@@ -1372,13 +1536,13 @@ def commit_workspace_to_collections(
 # File upload helpers
 # ---------------------------------------------------------------------------
 
-def _tenant_prefix_for_workspace(db: StandardDatabase, user_id: str, workspace_id: str) -> str:
-    ws = get_workspace(db, user_id, workspace_id)
+def _tenant_prefix_for_workspace(db: Database, user_id: str, workspace_id: str) -> str:
+    ws = get_workspace(db, user_id, workspace_id, required="read")
     return f"{ws.created_by}"
 
 
 def initiate_upload_and_create_artifact(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     filename: str,
@@ -1387,8 +1551,8 @@ def initiate_upload_and_create_artifact(
     order_key: Optional[str] = None,
     context: Optional[dict] = None,
 ):
-    from services.content_service import presign_put_or_multipart, get_content_storage_mode
-    from services.ingest_runner_service import describe_content_processing
+    from mantle.services.content_service import presign_put_or_multipart, get_content_storage_mode
+    from mantle.services.ingest_runner_service import describe_content_processing
 
     tenant = _tenant_prefix_for_workspace(db, user_id, workspace_id)
 
@@ -1417,15 +1581,15 @@ def initiate_upload_and_create_artifact(
     )
 
     key = f"{tenant}/{artifact.id}.content"
-    presign = presign_put_or_multipart(key, content_type, size)
 
     patched_ctx = _safe_parse_context(artifact.context)
     patched_ctx["content_key"] = key
     up = patched_ctx.setdefault("upload", {})
-    up["mode"] = presign["mode"]
+    # Proxied upload: the client PUTs bytes to Mantle, which envelope-encrypts them on
+    # the byte path before writing to the object store. No presigned S3 URL — storage
+    # is invisible to callers and never receives plaintext.
+    up["mode"] = "proxied"
     up["s3_key"] = key
-    if presign["mode"] == "multipart":
-        up["multipart_id"] = presign["uploadId"]
 
     updated = update_artifact(
         db, user_id, workspace_id, artifact.id,
@@ -1437,9 +1601,9 @@ def initiate_upload_and_create_artifact(
     return (
         {
             "upload_id": updated.id,
-            "mode": presign["mode"],
-            "url": presign.get("url"),
-            "uploadId": presign.get("uploadId"),
+            "mode": "proxied",
+            "url": f"/artifacts/{updated.id}/content",
+            "method": "PUT",
             "key": key,
         },
         updated,
@@ -1447,7 +1611,7 @@ def initiate_upload_and_create_artifact(
 
 
 def update_upload_status(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     upload_id: str,
@@ -1456,12 +1620,12 @@ def update_upload_status(
     parts: Optional[List[Dict]] = None,
     context_patch: Optional[Dict] = None,
 ):
-    from services.content_service import (
+    from mantle.services.content_service import (
         complete_multipart,
         head_object,
         persist_object_to_durable,
     )
-    from services.ingest_runner_service import describe_content_processing
+    from mantle.services.ingest_runner_service import describe_content_processing
 
     artifact = get_workspace_artifact(db, user_id, workspace_id, upload_id)
     ctx = _safe_parse_context(artifact.context)
@@ -1566,14 +1730,14 @@ _KEY_CONTEXT_MAP: Dict[str, Tuple[str, str, str]] = {
 
 
 def rotate_artifact_key(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     artifact_id: str,
-    arango_db: StandardDatabase,
+    store_db: Database,
     key_context: str,
 ) -> Dict[str, str]:
-    from services import auth_service
+    from mantle.services import auth_service
     binding = _KEY_CONTEXT_MAP.get(key_context)
     if not binding:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Unknown key_context: {key_context}")
@@ -1586,7 +1750,7 @@ def rotate_artifact_key(
     old_key_id = section_cfg.get(key_id_field)
     if isinstance(old_key_id, str) and old_key_id.strip():
         try:
-            arango.delete_api_key(arango_db, old_key_id)
+            store.delete_api_key(store_db, old_key_id)
         except Exception:
             pass
 
@@ -1609,7 +1773,7 @@ def rotate_artifact_key(
         last_used_at=None,
         is_active=True,
     )
-    created = arango.create_api_key(arango_db, api_key)
+    created = store.create_api_key(store_db, api_key)
 
     section_cfg[key_id_field] = created.id
     ctx[context_section] = section_cfg
@@ -1624,15 +1788,15 @@ def rotate_artifact_key(
 
 
 def resolve_card_api_key(
-    db: StandardDatabase,
+    db: Database,
     artifact_id: str,
     token: str,
-    arango_db: StandardDatabase,
+    store_db: Database,
     key_context: Optional[str] = None,
 ) -> Tuple[ArtifactEntity, CollectionEntity, str]:
-    from services import auth_service
+    from mantle.services import auth_service
 
-    artifact = arango.get_artifact(db, artifact_id)
+    artifact = store.get_artifact(db, artifact_id)
     if not artifact:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
 
@@ -1640,15 +1804,15 @@ def resolve_card_api_key(
     if not token.startswith("agc_"):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
 
-    api_key = auth_service.verify_api_key(arango_db, token)
+    api_key = auth_service.verify_api_key(store_db, token)
     if not api_key or not api_key.user_id:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
 
-    ws = arango.get_collection_by_id(db, workspace_id)
+    ws = store.get_collection_by_id(db, workspace_id)
     if not ws:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
 
-    grants = arango.get_active_grants_for_principal_resource(
+    grants = store.get_active_grants_for_principal_resource(
         db, grantee_id=api_key.user_id, resource_id=workspace_id,
     )
     if not any(getattr(g, "can_read", False) for g in grants):
@@ -1671,17 +1835,17 @@ def resolve_card_api_key(
 
 
 def receive_card_inbound_message(
-    db: StandardDatabase,
+    db: Database,
     artifact_id: str,
     token: str,
     text: str,
     channel: Optional[str] = None,
     context: Optional[dict] = None,
     metadata: Optional[dict] = None,
-    arango_db: Optional[StandardDatabase] = None,
+    store_db: Optional[Database] = None,
 ) -> Tuple[str, str]:
     source_artifact, ws, owner_id = resolve_card_api_key(
-        db, artifact_id, token, arango_db or db, key_context="inbound"
+        db, artifact_id, token, store_db or db, key_context="inbound"
     )
     card_ctx: Dict[str, Any] = {
         "source_artifact_id": artifact_id,
@@ -1707,7 +1871,7 @@ def receive_card_inbound_message(
 async def dispatch_create_workspace(artifact: dict, body: dict, ctx: Any) -> dict:
     """Create a workspace via the ``create`` operation on workspace type."""
     name = (body or {}).get("name", "New Workspace")
-    ws = create_workspace(ctx.arango_db, ctx.user_id, name)
+    ws = create_workspace(ctx.store_db, ctx.user_id, name)
     return ws.to_dict()
 
 
@@ -1716,8 +1880,8 @@ async def dispatch_commit(artifact: dict, body: dict, ctx: Any) -> dict:
     workspace_id = artifact.get("_key") or artifact.get("id")
     artifact_ids = (body or {}).get("artifact_ids")
     result = commit_workspace_to_collections(
-        workspace_db=ctx.arango_db,
-        collection_db=ctx.arango_db,
+        workspace_db=ctx.store_db,
+        collection_db=ctx.store_db,
         user_id=ctx.user_id,
         workspace_id=workspace_id,
         artifact_ids=artifact_ids,
@@ -1731,8 +1895,8 @@ async def dispatch_commit_preview(artifact: dict, body: dict, ctx: Any) -> dict:
     workspace_id = artifact.get("_key") or artifact.get("id")
     artifact_ids = (body or {}).get("artifact_ids")
     result = commit_workspace_to_collections(
-        workspace_db=ctx.arango_db,
-        collection_db=ctx.arango_db,
+        workspace_db=ctx.store_db,
+        collection_db=ctx.store_db,
         user_id=ctx.user_id,
         workspace_id=workspace_id,
         artifact_ids=artifact_ids,

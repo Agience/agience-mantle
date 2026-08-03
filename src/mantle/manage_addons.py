@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """manage_addons.py — register an external add-on's artifact manifest.
 
-An *add-on* is a service external to agience-core (e.g. the closed Beacon
+An *add-on* is a service external to agience-beam (e.g. the closed Beacon
 premium service) that contributes artifacts/edges/grants to the platform DB. Its
 manifest is a directory of seed-format cards — the SAME declarative format as
 `package/seeds/` — so it is applied through the canonical loader
@@ -123,10 +123,12 @@ def action_register(manifest: str, sets: list[str], dry_run: bool) -> None:
         if unresolved:
             raise SystemExit("Refusing to apply with unresolved ${...} tokens.")
 
-        from schemas.arango.loader import init_arango_db
-        from services.seed_provisioning import seed_from_artifacts
+        # THE FLIP (2026-07-22): `schemas.lattice.loader` is deleted; the lattice handle is the
+        # one store, opened exactly as manage_seed.py does it.
+        from mantle.db import backend
+        from mantle.services.seed_provisioning import seed_from_artifacts
 
-        db = init_arango_db()
+        db = backend.store_handle()
         report = seed_from_artifacts(db, tmp_root, user=None)
         logger.info("Registered: %s", report.summary())
         for err in report.errors:
@@ -143,8 +145,13 @@ def main() -> None:
     reg.add_argument("--set", action="append", default=[], help="Substitution KEY=VALUE (repeatable).")
     reg.add_argument("--dry-run", action="store_true", help="Substitute + list cards, do not apply.")
     args = parser.parse_args()
-    if args.action == "register":
-        action_register(args.manifest, args.set, args.dry_run)
+    # CLI: no request context. Seeding writes artifacts, which requires an acting
+    # principal for content-key issuance.
+    from mantle.services.system_identity import system_acting_context
+
+    with system_acting_context(scope="platform.manage-addons"):
+        if args.action == "register":
+            action_register(args.manifest, args.set, args.dry_run)
 
 
 if __name__ == "__main__":

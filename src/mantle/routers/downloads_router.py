@@ -13,7 +13,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
 
-from agience_core import config
+from origin import config
 
 
 router = APIRouter(tags=["Downloads"])

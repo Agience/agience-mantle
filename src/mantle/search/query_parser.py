@@ -181,8 +181,9 @@ class QueryParser:
         "created_at", "updated_at", "owner_id", "collection_id"
     }
     
-    # Stopwords for term counting (simplified)
-    STOPWORDS = {"a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for"}
+    # ⛔ `STOPWORDS` REMOVED 2026-07-30 — a hand-authored claim about which words carry no
+    # information, and it had ZERO consumers. [John: "we shouldnt have a stopword list. that's a
+    # bogus algorithm in itself."] Information is measured by the corpus (IDF), not declared.
     
     def __init__(self):
         self.corrections = []

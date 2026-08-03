@@ -2,11 +2,11 @@
 #
 # Container-as-artifact: a workspace IS a collection IS an artifact.
 # The Collection class is an alias for Artifact. All container docs
-# live in the `artifacts` ArangoDB collection, discriminated by content_type.
+# live in the `artifacts` the lattice collection, discriminated by content_type.
 #
 # See .dev/features/universal-artifact-model.md.
 
-from entities.artifact import (
+from .artifact import (
     Artifact,
     WORKSPACE_CONTENT_TYPE,
     COLLECTION_CONTENT_TYPE,

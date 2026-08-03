@@ -26,9 +26,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from arango.database import StandardDatabase
+from mantle.db.store import Database
 
-from db.arango import (
+from mantle.db.backend import (
     add_artifact_to_collection as db_add_artifact_to_collection,
     create_artifact as db_create_artifact,
     create_collection as db_create_collection,
@@ -42,12 +42,16 @@ from db.arango import (
     update_artifact as db_update_artifact,
     upsert_user_collection_grant as db_upsert_user_collection_grant,
 )
-from entities.artifact import Artifact as ArtifactEntity
-from entities.collection import Collection as CollectionEntity, COLLECTION_CONTENT_TYPE
-from entities.grant import Grant as GrantEntity
-from agience_core.config import AGIENCE_PLATFORM_USER_ID
-from services.bootstrap_types import INBOX_MATERIALIZATION_SLUGS, PEOPLE_COLLECTION_SLUG
-from services.platform_topology import get_id_optional, register_id
+from mantle.entities.artifact import Artifact as ArtifactEntity
+from mantle.entities.collection import Collection as CollectionEntity, COLLECTION_CONTENT_TYPE
+from mantle.entities.grant import Grant as GrantEntity
+from origin.config import AGIENCE_PLATFORM_USER_ID
+from mantle.services.bootstrap_types import (
+    AUTHORITY_COLLECTION_SLUG,
+    INBOX_MATERIALIZATION_SLUGS,
+    PEOPLE_COLLECTION_SLUG,
+)
+from mantle.services.platform_topology import get_id_optional, register_id
 from .loader import (
     UserContext,
     derive_uuid,
@@ -83,25 +87,28 @@ def person_artifact_id(user_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"agience://person/{user_id}"))
 
 
-def _seeds_base() -> Path:
+def _seeds_base() -> Optional[Path]:
+    """Root of the platform SEED corpus, or None when Mantle runs BARE.
+
+    Mantle bundles NO seed content — it is a bare encrypted data plane. The
+    Agience platform seed corpus is an INSTALL-PACKAGE artifact (it lives in
+    agience-beam, not in the Mantle image), provided at deploy time by pointing
+    ``AGIENCE_SEEDS_ROOT`` at the mounted seeds. Unset ⇒ no seed application
+    (bare) — the runtime provisioners (People/Authorities collections, Person
+    cards, issuers) still run; only the declarative grant seeds are skipped."""
     env = os.getenv("AGIENCE_SEEDS_ROOT")
-    if env:
-        return Path(env)
-    # BASE_DIR is /app in Docker and the repo root in local dev, so the
-    # seed tree resolves correctly in both without an env override.
-    from agience_core import config
-    return config.BASE_DIR / "package" / "seeds"
+    return Path(env) if env else None
 
 
-def _is_platform_admin(arango_db: StandardDatabase, user_id: str) -> bool:
+def _is_platform_admin(store_db: Database, user_id: str) -> bool:
     """The designated platform admin is the user in ``platform.operator_id``."""
-    from services.platform_settings_service import settings
+    from mantle.services.platform_settings_service import settings
 
     return bool(user_id) and settings.get("platform.operator_id") == user_id
 
 
 def provision_user(
-    arango_db: StandardDatabase,
+    store_db: Database,
     user_id: str,
     *,
     email: Optional[str] = None,
@@ -128,44 +135,47 @@ def provision_user(
     # pre-signup leads by email. Non-fatal: degrades to no email.
     if email is None or name is None:
         try:
-            from services import person_service
-            person = person_service.get_user_by_id(arango_db, user_id)
+            from mantle.services import person_service
+            person = person_service.get_user_by_id(store_db, user_id)
             if person is not None:
                 email = email or getattr(person, "email", None)
                 name = name or getattr(person, "name", None)
         except Exception:
             logger.debug("provision_user (%s): could not resolve person email/name", user_id, exc_info=True)
 
-    inbox_id = _ensure_inbox_workspace(arango_db, user_id)
+    inbox_id = _ensure_inbox_workspace(store_db, user_id)
     ctx = UserContext(id=user_id, email=email, name=name, inbox_id=inbox_id, tenant=tenant)
 
-    _apply_grant_set(arango_db, base / "user", ctx, user_id)
-    if _is_platform_admin(arango_db, user_id):
-        _apply_grant_set(arango_db, base / "admin", ctx, user_id)
+    # Declarative grant seeds are applied ONLY when the install package supplies a
+    # seed corpus (AGIENCE_SEEDS_ROOT). Bare Mantle has none — skip cleanly.
+    if base is not None:
+        _apply_grant_set(store_db, base / "user", ctx, user_id)
+        if _is_platform_admin(store_db, user_id):
+            _apply_grant_set(store_db, base / "admin", ctx, user_id)
 
     if inbox_id:
-        _materialize_inbox(arango_db, user_id, inbox_id)
+        _materialize_inbox(store_db, user_id, inbox_id)
 
     # Identity linkage: give the user a Person artifact and attach any pre-signup
     # leads (contact form, newsletter) that share their email — so the lead's
     # history rolls up to the user. Both idempotent + non-fatal.
     created_person = False
     try:
-        created_person = _ensure_person_artifact(arango_db, ctx)
+        created_person = _ensure_person_artifact(store_db, ctx)
     except Exception:
         logger.warning("provision_user (%s): Person artifact creation failed", user_id, exc_info=True)
     try:
-        _convert_leads_for_person(arango_db, user_id, email)
+        _convert_leads_for_person(store_db, user_id, email)
     except Exception:
         logger.warning("provision_user (%s): lead conversion failed", user_id, exc_info=True)
     if created_person:  # genuine first login → one-time welcome
         try:
-            _send_welcome_email(arango_db, ctx)
+            _send_welcome_email(store_db, ctx)
         except Exception:
             logger.warning("provision_user (%s): welcome email failed", user_id, exc_info=True)
 
 
-def _ensure_people_collection(arango_db: StandardDatabase) -> str:
+def _ensure_people_collection(store_db: Database) -> str:
     """Idempotently ensure the platform **People** collection exists, creating it
     at RUNTIME. Returns its deterministic id.
 
@@ -182,9 +192,9 @@ def _ensure_people_collection(arango_db: StandardDatabase) -> str:
     register_id(PEOPLE_COLLECTION_SLUG, people_id)
     register_id(f"agience/{PEOPLE_COLLECTION_SLUG}", people_id)
 
-    if db_get_collection_by_id(arango_db, people_id) is None:
+    if db_get_collection_by_id(store_db, people_id) is None:
         now = datetime.now(timezone.utc).isoformat()
-        db_create_collection(arango_db, CollectionEntity(
+        db_create_collection(store_db, CollectionEntity(
             id=people_id,
             name="People",
             description=(
@@ -196,16 +206,16 @@ def _ensure_people_collection(arango_db: StandardDatabase) -> str:
             state=CollectionEntity.STATE_COMMITTED,
             created_time=now, modified_time=now,
         ))
-        _persist_seed_ids(arango_db, {PEOPLE_COLLECTION_SLUG: people_id})
+        _persist_seed_ids(store_db, {PEOPLE_COLLECTION_SLUG: people_id})
         logger.info("Created People collection %s at runtime", people_id)
 
     # Platform/admin manageability (idempotent): the operator manages the directory.
-    from services.platform_settings_service import settings
+    from mantle.services.platform_settings_service import settings
     operator_id = settings.get("platform.operator_id")
     if operator_id:
         try:
             db_upsert_user_collection_grant(
-                arango_db, user_id=operator_id, collection_id=people_id,
+                store_db, user_id=operator_id, collection_id=people_id,
                 granted_by=AGIENCE_PLATFORM_USER_ID, name="People (admin management)",
                 can_read=True, can_create=True, can_update=True, can_delete=True,
                 can_evict=True, can_add=True, can_invoke=True, can_admin=True,
@@ -215,7 +225,37 @@ def _ensure_people_collection(arango_db: StandardDatabase) -> str:
     return people_id
 
 
-def _ensure_person_owner_grant(arango_db: StandardDatabase, person_id: str, user_id: str) -> None:
+def ensure_authority_collection(store_db: Database) -> str:
+    """Idempotently ensure the platform **authority** collection exists (runtime),
+    returning its deterministic id.
+
+    This is the canonical resource platform-admin roots to: a user holding an
+    active ``can_admin``/``can_update`` grant on it IS a platform admin (see
+    ``services.dependencies.require_platform_admin``). It MUST exist unconditionally
+    (not only when a seed corpus is loaded) so multi-admin management works on any
+    node — created here the same deterministic-id, create-if-missing way as People.
+    """
+    authority_id = derive_uuid(get_instance_namespace(), "agience", AUTHORITY_COLLECTION_SLUG)
+    register_id(AUTHORITY_COLLECTION_SLUG, authority_id)
+    register_id(f"agience/{AUTHORITY_COLLECTION_SLUG}", authority_id)
+
+    if db_get_collection_by_id(store_db, authority_id) is None:
+        now = datetime.now(timezone.utc).isoformat()
+        db_create_collection(store_db, CollectionEntity(
+            id=authority_id,
+            name="Authorities",
+            description="Platform authority root — platform-admin grants live here.",
+            created_by=AGIENCE_PLATFORM_USER_ID,
+            content_type=COLLECTION_CONTENT_TYPE,
+            state=CollectionEntity.STATE_COMMITTED,
+            created_time=now, modified_time=now,
+        ))
+        _persist_seed_ids(store_db, {AUTHORITY_COLLECTION_SLUG: authority_id})
+        logger.info("Created Authorities collection %s at runtime", authority_id)
+    return authority_id
+
+
+def _ensure_person_owner_grant(store_db: Database, person_id: str, user_id: str) -> None:
     """Grant the user read+update on their OWN Person card (idempotent).
 
     People is a platform collection — members get only ``read`` on it, so the
@@ -223,10 +263,10 @@ def _ensure_person_owner_grant(arango_db: StandardDatabase, person_id: str, user
     the person whose card it is (granted_by == the user). See
     ``feedback_authority_roots_to_person``.
     """
-    existing = db_get_grants_for_principal_resource(arango_db, user_id, person_id)
+    existing = db_get_grants_for_principal_resource(store_db, user_id, person_id)
     if any(getattr(g, "can_update", False) for g in existing):
         return
-    db_create_grant(arango_db, GrantEntity(
+    db_create_grant(store_db, GrantEntity(
         resource_id=person_id, grantee_type="user", grantee_id=user_id,
         granted_by=user_id, can_read=True, can_update=True,
         name="Own profile (read + edit)",
@@ -234,25 +274,25 @@ def _ensure_person_owner_grant(arango_db: StandardDatabase, person_id: str, user
 
 
 def _migrate_person_home(
-    arango_db: StandardDatabase, ctx: UserContext, person_id: str, people_id: Optional[str]
+    store_db: Database, ctx: UserContext, person_id: str, people_id: Optional[str]
 ) -> None:
     """One-time self-heal: move an existing Person card out of the legacy Inbox
     home into the People collection. No-op once migrated. Safe to run every login.
     """
     if not people_id:
         return
-    if not db_get_edge(arango_db, people_id, person_id):
-        db_add_artifact_to_collection(arango_db, people_id, person_id, origin=True)
-    if ctx.inbox_id and db_get_edge(arango_db, ctx.inbox_id, person_id):
-        db_remove_artifact_from_collection(arango_db, ctx.inbox_id, person_id)
-        entity = db_get_artifact(arango_db, person_id)
+    if not db_get_edge(store_db, people_id, person_id):
+        db_add_artifact_to_collection(store_db, people_id, person_id, origin=True)
+    if ctx.inbox_id and db_get_edge(store_db, ctx.inbox_id, person_id):
+        db_remove_artifact_from_collection(store_db, ctx.inbox_id, person_id)
+        entity = db_get_artifact(store_db, person_id)
         if entity is not None and getattr(entity, "collection_id", None) != people_id:
             entity.collection_id = people_id
-            db_update_artifact(arango_db, entity)
+            db_update_artifact(store_db, entity)
         logger.info("Migrated Person %s out of inbox into People", person_id)
 
 
-def _ensure_person_artifact(arango_db: StandardDatabase, ctx: UserContext) -> bool:
+def _ensure_person_artifact(store_db: Database, ctx: UserContext) -> bool:
     """Create the user's Person artifact on first login (idempotent).
 
     The card is homed in the platform **People** collection (the directory /
@@ -262,13 +302,14 @@ def _ensure_person_artifact(arango_db: StandardDatabase, ctx: UserContext) -> bo
     off the Inbox. Returns True only when it creates the card this call.
     """
     pid = person_artifact_id(ctx.id)
-    # People is created at runtime (not seeded) — ensure it before homing the card.
-    people_id = _ensure_people_collection(arango_db)
+    # People + Authorities are created at runtime (not seeded) — ensure both.
+    people_id = _ensure_people_collection(store_db)
+    ensure_authority_collection(store_db)
 
-    if db_get_artifact(arango_db, pid):
+    if db_get_artifact(store_db, pid):
         # Already exists — self-heal its home + owner grant, then report no-create.
-        _migrate_person_home(arango_db, ctx, pid, people_id)
-        _ensure_person_owner_grant(arango_db, pid, ctx.id)
+        _migrate_person_home(store_db, ctx, pid, people_id)
+        _ensure_person_owner_grant(store_db, pid, ctx.id)
         return False
 
     display_name = (ctx.name or "").strip()
@@ -285,7 +326,7 @@ def _ensure_person_artifact(arango_db: StandardDatabase, ctx: UserContext) -> bo
         "email": ctx.email or "",
     }
     now = datetime.now(timezone.utc).isoformat()
-    db_create_artifact(arango_db, ArtifactEntity(
+    db_create_artifact(store_db, ArtifactEntity(
         id=pid, root_id=pid, collection_id=people_id,
         state=ArtifactEntity.STATE_COMMITTED,
         context=json.dumps(context, separators=(",", ":")),
@@ -293,17 +334,17 @@ def _ensure_person_artifact(arango_db: StandardDatabase, ctx: UserContext) -> bo
         name=display_name, description="Platform member profile.",
         created_by=ctx.id, created_time=now,
     ))
-    if not db_get_edge(arango_db, people_id, pid):
+    if not db_get_edge(store_db, people_id, pid):
         # origin edge: the operator's People grant propagates to cards (admin sees
         # all); members have no People grant, so nothing propagates to them — they
         # reach only their own card via its owner grant.
-        db_add_artifact_to_collection(arango_db, people_id, pid, origin=True)
-    _ensure_person_owner_grant(arango_db, pid, ctx.id)
+        db_add_artifact_to_collection(store_db, people_id, pid, origin=True)
+    _ensure_person_owner_grant(store_db, pid, ctx.id)
     logger.info("Created Person artifact %s for user %s (People)", pid, ctx.id)
     return True
 
 
-def _send_welcome_email(arango_db: StandardDatabase, ctx: UserContext) -> None:
+def _send_welcome_email(store_db: Database, ctx: UserContext) -> None:
     """Send a one-time welcome email to a newly-provisioned user.
 
     Sent AS the platform operator (who holds read on the platform email secrets,
@@ -312,8 +353,8 @@ def _send_welcome_email(arango_db: StandardDatabase, ctx: UserContext) -> None:
     """
     if not ctx.email:
         return
-    from services.platform_settings_service import settings
-    from services import chorus_client, server_registry
+    from mantle.services.platform_settings_service import settings
+    from mantle.services import chorus_client, server_registry
 
     operator_id = settings.get("platform.operator_id")
     iris_id = server_registry.resolve_name_to_id("iris")
@@ -336,7 +377,7 @@ def _send_welcome_email(arango_db: StandardDatabase, ctx: UserContext) -> None:
     logger.info("Sent welcome email to %s", ctx.email)
 
 
-def _convert_leads_for_person(arango_db: StandardDatabase, user_id: str, email: Optional[str]) -> int:
+def _convert_leads_for_person(store_db: Database, user_id: str, email: Optional[str]) -> int:
     """Link unclaimed leads matching the user's email to their new Person.
 
     Sets context.person_id + status=converted on each matching lead artifact in
@@ -350,7 +391,7 @@ def _convert_leads_for_person(arango_db: StandardDatabase, user_id: str, email: 
         return 0
 
     try:
-        rows = db_list_collection_artifacts(arango_db, col_id) or []
+        rows = db_list_collection_artifacts(store_db, col_id) or []
     except Exception:
         logger.exception("convert_leads: failed listing leads collection %s", col_id)
         return 0
@@ -362,7 +403,7 @@ def _convert_leads_for_person(arango_db: StandardDatabase, user_id: str, email: 
         ).strip()
         if not rid:
             continue
-        entity = db_get_artifact(arango_db, rid)
+        entity = db_get_artifact(store_db, rid)
         if entity is None:
             continue
         ctxd = _parse_json_obj(getattr(entity, "context", ""))
@@ -376,7 +417,7 @@ def _convert_leads_for_person(arango_db: StandardDatabase, user_id: str, email: 
         ctxd["status"] = "converted"
         ctxd["converted_at"] = datetime.now(timezone.utc).isoformat()
         entity.context = json.dumps(ctxd, separators=(",", ":"))
-        db_update_artifact(arango_db, entity)
+        db_update_artifact(store_db, entity)
         converted += 1
 
     if converted:
@@ -385,27 +426,27 @@ def _convert_leads_for_person(arango_db: StandardDatabase, user_id: str, email: 
 
 
 def _apply_grant_set(
-    arango_db: StandardDatabase, root: Path, ctx: UserContext, user_id: str
+    store_db: Database, root: Path, ctx: UserContext, user_id: str
 ) -> None:
-    report = seed_from_artifacts(arango_db, root, user=ctx)
+    report = seed_from_artifacts(store_db, root, user=ctx)
     for err in report.errors:
         logger.warning("provision_user (%s): %s", user_id, err)
 
 
-def _ensure_inbox_workspace(arango_db: StandardDatabase, user_id: str) -> Optional[str]:
+def _ensure_inbox_workspace(store_db: Database, user_id: str) -> Optional[str]:
     """Return the user's primary (oldest) workspace id, creating an "Inbox"
     workspace on first login. ``create_workspace`` issues the owner grant."""
-    from services import workspace_service
+    from mantle.services import workspace_service
 
-    existing = workspace_service.list_workspaces(arango_db, user_id)
+    existing = workspace_service.list_workspaces(store_db, user_id)
     if existing:
         primary = min(existing, key=lambda w: getattr(w, "created_time", "") or "")
         return primary.id
-    new_ws = workspace_service.create_workspace(arango_db, user_id, "Inbox")
+    new_ws = workspace_service.create_workspace(store_db, user_id, "Inbox")
     return new_ws.id
 
 
-def _materialize_inbox(arango_db: StandardDatabase, user_id: str, inbox_workspace_id: str) -> None:
+def _materialize_inbox(store_db: Database, user_id: str, inbox_workspace_id: str) -> None:
     """Link curated platform seed artifacts into the user's Inbox workspace.
 
     Skips artifacts already linked so user/operator reordering (``order_key``) is
@@ -417,7 +458,7 @@ def _materialize_inbox(arango_db: StandardDatabase, user_id: str, inbox_workspac
         if not col_id:
             continue
         try:
-            artifacts = db_list_collection_artifacts(arango_db, col_id)
+            artifacts = db_list_collection_artifacts(store_db, col_id)
         except Exception:
             logger.exception("Failed loading seed artifacts from collection %s", slug)
             continue
@@ -432,10 +473,10 @@ def _materialize_inbox(arango_db: StandardDatabase, user_id: str, inbox_workspac
             seen.add(root_id)
 
             # Skip if already linked — avoids resetting order_key on every login.
-            if db_get_edge(arango_db, inbox_workspace_id, root_id):
+            if db_get_edge(store_db, inbox_workspace_id, root_id):
                 continue
             try:
-                db_add_artifact_to_collection(arango_db, inbox_workspace_id, root_id)
+                db_add_artifact_to_collection(store_db, inbox_workspace_id, root_id)
             except Exception:
                 logger.exception(
                     "Failed importing seed artifact root %s into inbox workspace %s",

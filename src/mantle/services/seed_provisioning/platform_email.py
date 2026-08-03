@@ -33,19 +33,19 @@ import logging
 import os
 from datetime import datetime, timezone
 
-from arango.database import StandardDatabase
+from mantle.db.store import Database
 
-from db.arango import (
+from mantle.db.backend import (
     add_artifact_to_collection as db_add_edge,
     create_artifact as db_create_artifact,
     get_artifact as db_get_artifact,
     update_artifact as db_update_artifact,
     upsert_user_collection_grant as db_upsert_user_collection_grant,
 )
-from entities.artifact import Artifact as ArtifactEntity
-from services import secrets_service
-from services.platform_topology import register_id
-from services.seed_provisioning.loader import derive_uuid, get_instance_namespace
+from mantle.entities.artifact import Artifact as ArtifactEntity
+from mantle.services import secrets_service
+from mantle.services.platform_topology import register_id
+from mantle.services.seed_provisioning.loader import derive_uuid, get_instance_namespace
 
 logger = logging.getLogger(__name__)
 
@@ -63,23 +63,16 @@ _GMAIL_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 _GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
 
-def _operator_id(db: StandardDatabase) -> str:
-    """The designated platform admin — created_by + grantee of the email graph."""
-    from services.platform_settings_service import settings as platform_settings
+def _operator_id(db: Database) -> str:
+    """The designated platform admin — created_by + grantee of the email graph.
+    Sovereign-capable resolution (Mantle setting → env → Origin fallback)."""
+    from mantle.services.operator import resolve_operator_id
 
-    op = platform_settings.get("platform.operator_id")
-    if op:
-        return str(op)
-    try:
-        from clients.origin_client import get_origin_client
-        return str(get_origin_client().get_operator_id() or "")
-    except Exception:
-        logger.debug("platform_email: operator_id unavailable (non-fatal)", exc_info=True)
-        return ""
+    return resolve_operator_id(db)
 
 
 def _ensure_artifact(
-    db: StandardDatabase, artifact_id: str, *, content_type: str, name: str,
+    db: Database, artifact_id: str, *, content_type: str, name: str,
     description: str, context: dict, content: str, owner: str,
 ) -> bool:
     """Upsert a committed artifact, CONVERGING its content/context to the current
@@ -110,7 +103,7 @@ def _ensure_artifact(
     return False
 
 
-def ensure_platform_email_sender(db: StandardDatabase) -> bool:
+def ensure_platform_email_sender(db: Database) -> bool:
     """Provision the platform email operator graph + inject secret material.
 
     Idempotent and order-agnostic — safe to run any time, regardless of what is
@@ -225,7 +218,7 @@ def ensure_platform_email_sender(db: StandardDatabase) -> bool:
         #    system principal (webhook/background sends act AS this principal).
         #    Both are `granted_by` the operator — that provenance is what roots
         #    the system principal's authority to a person.
-        from services.peer_signing import get_system_principal_id
+        from mantle.services.peer_signing import get_system_principal_id
 
         grantees = [operator]
         system_principal = get_system_principal_id()

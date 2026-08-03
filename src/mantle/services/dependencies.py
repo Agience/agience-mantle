@@ -1,4 +1,4 @@
-﻿# /services/dependencies.py
+# /services/dependencies.py
 #
 # Unified auth dependency layer.
 #
@@ -20,21 +20,21 @@ from fastapi import HTTPException, Depends, Security, Request
 from fastapi.security import (
     OAuth2AuthorizationCodeBearer,
 )
-from arango.database import StandardDatabase
+from mantle.db.store import Database
 
 from typing import Generator
 
-from clients.origin_client import get_origin_client
-from agience_core import config
-from schemas.arango.initialize import get_arangodb_connection
-from services.person_service import get_user_by_id  # now expects StandardDatabase
-from services.auth_service import verify_token
-from db import arango as db_arango
-from services.bootstrap_types import AUTHORITY_COLLECTION_SLUG
-from services.platform_topology import get_id
-from entities.person import Person
-from entities.api_key import APIKey as APIKeyEntity
-from entities.grant import Grant as GrantEntity
+from mantle.clients.origin_client import get_origin_client
+from origin import config
+from mantle.services.acting_principal import acting_from_auth, set_acting_principal
+from mantle.services.person_service import get_user_by_id  # now expects Database
+from mantle.services.auth_service import verify_token
+from mantle.db import backend as db_store
+from mantle.services.bootstrap_types import AUTHORITY_COLLECTION_SLUG
+from mantle.services.platform_topology import get_id
+from mantle.entities.person import Person
+from mantle.entities.api_key import APIKey as APIKeyEntity
+from mantle.entities.grant import Grant as GrantEntity, grant_is_allow, grant_is_deny
 
 logger = logging.getLogger(__name__)
 
@@ -44,25 +44,14 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def get_arango_db() -> Generator[StandardDatabase, None, None]:
-    """ArangoDB connection for FastAPI dependency injection.
+def get_store_db() -> Generator[Database, None, None]:
+    """The store handle for FastAPI dependency injection — backend-selected (see `db.backend`).
 
-    Was previously at `platform/dependencies.py`, but the implementation
-    imports mantle's `schemas.arango.initialize`, so its platform placement
-    leaked the boundary. Lives here now alongside the other FastAPI
-    dependencies that depend on the same DB.
+    Yields Mantle's OWN store (`db.lattice_api.LatticeDatabase`, one SQLite file opened once
+    per process — THE STANDALONE DB; the same handle startup uses).
     """
-    db = get_arangodb_connection(
-        host=config.ARANGO_HOST,
-        port=config.ARANGO_PORT,
-        username=config.ARANGO_USERNAME,
-        password=config.ARANGO_PASSWORD,
-        db_name=config.ARANGO_DATABASE,
-    )
-    try:
-        yield db
-    finally:
-        pass  # ArangoDB client handles connection pooling
+    from mantle.db import backend
+    yield backend.store_handle()
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +145,7 @@ def _validate_aud_for_principal(payload: dict) -> None:
         # External OIDC IdP tokens carry the IdP's own audience (already validated
         # by the OidcVerifier against the configured client id), not AUTHORITY_ISSUER
         # — so don't re-check it here.
-        from services.oidc import get_oidc_verifier
+        from mantle.services.oidc import get_oidc_verifier
         if get_oidc_verifier().is_trusted(payload.get("iss", "")):
             return
         if aud != config.AUTHORITY_ISSUER:
@@ -171,7 +160,7 @@ def _check_grant_permission(grants: List[GrantEntity], action: str, resource_id:
     """
     perm_attr = f"can_{action}"
     for grant in grants:
-        if getattr(grant, "effect", "allow") == "deny":
+        if grant_is_deny(grant):
             continue
         if not getattr(grant, perm_attr, False):
             continue
@@ -203,7 +192,7 @@ async def get_end_user_claims(
 
 def resolve_auth(
     token: str,
-    arango_db: StandardDatabase,
+    store_db: Database,
     request: Optional[Request] = None,
 ) -> AuthContext:
     """Core auth resolution — usable from both FastAPI deps and ASGI middleware.
@@ -229,8 +218,11 @@ def resolve_auth(
 
     # --- API key path ---
     if raw_token.startswith("agc_"):
-        # Origin owns api_keys post-1.1c — verify + grants come back together.
-        verify_result = get_origin_client().verify_api_key(raw_token)
+        # Pluggable authz backend (Sovereign-Stack): `local` (default) verifies
+        # against Mantle's own api_keys + grants in the lattice — no Origin call;
+        # `origin` delegates to Origin. Verify + grants come back together.
+        from mantle.services.grant_store import get_apikey_backend
+        verify_result = get_apikey_backend().verify_api_key(store_db, raw_token)
         if verify_result is None:
             raise HTTPException(status_code=401, detail="Invalid API key")
         api_key_entity, grants = verify_result
@@ -252,8 +244,8 @@ def resolve_auth(
         # artifact the verifier hasn't loaded yet — refresh trust from the store
         # (throttled, fail-open) and retry once.
         try:
-            from services.oidc import get_oidc_verifier
-            if get_oidc_verifier().refresh_if_unknown_iss(arango_db, raw_token):
+            from mantle.services.oidc import get_oidc_verifier
+            if get_oidc_verifier().refresh_if_unknown_iss(store_db, raw_token):
                 payload = verify_token(raw_token)
         except Exception:
             logger.debug("issuer refresh-on-miss failed", exc_info=True)
@@ -320,7 +312,7 @@ def resolve_auth(
         # so namespace it by (tenant, sub) to keep tenants isolated. Origin's own
         # user tokens already carry a globally-unique Agience UUID as `sub`, so
         # they pass through unchanged (external_user_id returns None for them).
-        from services.oidc import get_oidc_verifier
+        from mantle.services.oidc import get_oidc_verifier
 
         _oidc = get_oidc_verifier()
         ext_uid = _oidc.external_user_id(payload)
@@ -346,7 +338,7 @@ def resolve_auth(
         )
 
     # --- Grant key in Bearer slot ---
-    key_grants = db_arango.get_active_grants_by_key(arango_db, raw_token)
+    key_grants = db_store.get_active_grants_by_key(store_db, raw_token)
     if key_grants:
         grant = key_grants[0]
         return AuthContext(
@@ -366,23 +358,42 @@ def resolve_auth(
 
 async def get_auth(
     token: str = Security(oauth2_scheme),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
     request: Request = None,
 ) -> AuthContext:
-    """Single auth dependency for all endpoints."""
+    """Single auth dependency for all endpoints.
+
+    Also publishes the authenticated caller to the acting-principal contextvar, which
+    is what lets the key oracle check WHO is asking (see
+    :mod:`services.acting_principal`). Before this, every layer below the router
+    re-derived a "principal" from the data it was handling, so the oracle's grant
+    check compared two caller-supplied values.
+
+    Set HERE rather than in an ASGI middleware because this dependency is where the
+    caller is actually resolved, and ``test_auth_policy_matrix`` already asserts every
+    critical route depends on it. A route that does NOT use it publishes nothing, and
+    key issuance then fails closed rather than running under a stale or absent
+    identity.
+    """
     auth = resolve_auth(
         token=token or "",
-        arango_db=arango_db,
+        store_db=store_db,
         request=request,
     )
     if request is not None and auth.user_id:
         request.state.user_id = auth.user_id
+
+    # Each request runs in its own task with its own context copy, so this cannot
+    # leak into another request; it is deliberately not reset, because it must stay
+    # readable for the whole handler including anything it awaits.
+    if auth.principal_id or auth.user_id:
+        set_acting_principal(acting_from_auth(auth))
     return auth
 
 
 async def get_person(
     auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
 ) -> Person:
     """Load the Person entity for the authenticated user.
 
@@ -391,7 +402,7 @@ async def get_person(
     """
     if not auth.user_id:
         raise HTTPException(status_code=401, detail="User identification required")
-    person = get_user_by_id(db=arango_db, id=auth.user_id)
+    person = get_user_by_id(db=store_db, id=auth.user_id)
     if not person:
         raise HTTPException(status_code=404, detail="User not found")
     return person
@@ -401,7 +412,7 @@ async def get_person(
 # Post-auth guards
 # ---------------------------------------------------------------------------
 
-def _authority_bootstrap_complete(arango_db: StandardDatabase) -> bool:
+def _authority_bootstrap_complete(store_db: Database) -> bool:
     """True once an admin grant exists on the authority collection.
 
     The bootstrap window (during which the ``platform.operator_id`` config fast-path
@@ -410,12 +421,12 @@ def _authority_bootstrap_complete(arango_db: StandardDatabase) -> bool:
     the canonical grant check still gates everyone else.
     """
     try:
-        grants = db_arango.get_grants_for_collection(
-            arango_db, get_id(AUTHORITY_COLLECTION_SLUG)
+        grants = db_store.get_grants_for_collection(
+            store_db, get_id(AUTHORITY_COLLECTION_SLUG)
         )
         return any(
             getattr(g, "state", "active") == "active"
-            and getattr(g, "effect", "allow") != "deny"
+            and grant_is_allow(g)
             and (getattr(g, "can_admin", False) or getattr(g, "can_update", False))
             for g in grants
         )
@@ -425,7 +436,7 @@ def _authority_bootstrap_complete(arango_db: StandardDatabase) -> bool:
 
 
 def require_platform_admin(
-    auth: AuthContext, arango_db: StandardDatabase
+    auth: AuthContext, store_db: Database
 ) -> str:
     """Post-auth guard: require platform admin.
 
@@ -449,26 +460,28 @@ def require_platform_admin(
     # keeps the operator out of the STANDING runtime trust boundary: genesis (writing
     # the manifest) is irreducible, but the config-flag bypass must self-retire once
     # the grant system can serve them. See .dev/features/issuer-merge-bootstrap.md §3b.
-    from services.platform_settings_service import settings as platform_settings
-    stored_operator_id = platform_settings.get("platform.operator_id")
+    # Operator resolution is sovereign-capable: Mantle setting → env
+    # (AGIENCE_OPERATOR_ID, for standalone) → Origin fallback (full platform).
+    from mantle.services.operator import resolve_operator_id
+    stored_operator_id = resolve_operator_id(store_db)
     if (
         stored_operator_id
         and auth.user_id == stored_operator_id
-        and not _authority_bootstrap_complete(arango_db)
+        and not _authority_bootstrap_complete(store_db)
     ):
         return auth.user_id
 
-    # Canonical check: write grant on the authority collection — via Arango.
+    # Canonical check: write grant on the authority collection — via lattice.
     try:
-        grants = db_arango.get_active_grants_for_principal_resource(
-            arango_db,
+        grants = db_store.get_active_grants_for_principal_resource(
+            store_db,
             grantee_id=auth.user_id,
             resource_id=get_id(AUTHORITY_COLLECTION_SLUG),
         )
-        if any(g.effect != "deny" and g.can_update for g in grants):
+        if any(grant_is_allow(g) and g.can_update for g in grants):
             return auth.user_id
     except Exception:
-        logger.debug("Arango grant check failed in require_platform_admin", exc_info=True)
+        logger.debug("the lattice grant check failed in require_platform_admin", exc_info=True)
 
     raise HTTPException(status_code=403, detail="Platform admin access required")
 
@@ -490,8 +503,17 @@ _ACTION_FLAG_MAP = {
     "admin": "can_admin",
 }
 
-# Maximum origin-chain depth for grant inheritance (bounded traversal).
-_MAX_ORIGIN_DEPTH = 10
+# ⛔ `_MAX_ORIGIN_DEPTH = 10` REMOVED 2026-07-30. It was a bare claim that grants never inherit
+# from more than 10 ancestors, and exceeding it fell through to `raise HTTPException(404)` — a
+# SILENT FALSE DENY on an artifact the principal is genuinely granted, indistinguishable from
+# "no such artifact". Unlike the other depth caps this walk had NO cycle guard, so the cap was
+# doing double duty. Termination is now `visited` (each ancestor once, over a finite graph).
+#
+# What remains is an OPERATIONAL bound, not a claim about lattice shape: a malformed store that
+# returns an endless chain of fresh ids would hang an auth request. It is deliberately far above
+# any real chain and it RAISES 500 — the point of the fix is that "you are not granted" (404) and
+# "this lattice did not terminate" (500) are different answers, and the old cap collapsed them.
+_ORIGIN_WALK_CEILING = 10_000
 
 
 def _grant_from_check_response(response: dict) -> GrantEntity:
@@ -522,15 +544,70 @@ def _grant_from_check_response(response: dict) -> GrantEntity:
     )
 
 
+# CRUDEASIO action -> the API-key scope action that must also permit it.
+# `read` covers the read-ish verbs; everything that mutates maps to `write`
+# unless it has a dedicated scope action. An action absent from this map is
+# treated as requiring `admin`, i.e. it fails closed for ordinary keys.
+_ACTION_TO_SCOPE_ACTION = {
+    "read": "read",
+    "list": "read",
+    "search": "search",
+    "invoke": "invoke",
+    "create": "create",
+    "add": "create",
+    "update": "write",
+    "delete": "delete",
+    "evict": "write",
+    "share": "admin",
+    "admin": "admin",
+}
+
+
+def _enforce_api_key_ceiling(auth: AuthContext, action: str) -> None:
+    """Require the API key's OWN scopes to permit *action*.
+
+    No-op for non-api_key principals. For an api_key principal this is a hard
+    ceiling on top of whatever the owning user is granted — the key can only
+    ever narrow, never widen.
+
+    Fails closed on an unmapped action and on a missing key entity: if we cannot
+    establish what the key is allowed to do, it is allowed to do nothing.
+    """
+    if auth.principal_type != "api_key":
+        return
+
+    key_entity = auth.api_key_entity
+    if key_entity is None:
+        raise HTTPException(status_code=403, detail="API key scope unavailable")
+
+    scope_action = _ACTION_TO_SCOPE_ACTION.get(action)
+    if scope_action is None:
+        raise HTTPException(
+            status_code=403, detail=f"API keys may not perform '{action}'"
+        )
+
+    try:
+        permitted = key_entity.has_scope("resource", "*", scope_action)
+    except Exception:
+        logger.warning("api key scope evaluation failed; denying", exc_info=True)
+        raise HTTPException(status_code=403, detail="API key scope check failed")
+
+    if not permitted:
+        raise HTTPException(
+            status_code=403,
+            detail=f"API key is not scoped for '{action}'",
+        )
+
+
 def check_access(
     auth: AuthContext,
     artifact_id: str,
     action: str,
-    arango_db: StandardDatabase,
+    store_db: Database,
 ) -> GrantEntity:
     """Verify *auth* has permission to perform *action* on *artifact_id*.
 
-    CRUDEASIO lives in Mantle (Arango grants collection). Light-cone
+    CRUDEASIO lives in Mantle (the lattice grants collection). Light-cone
     traversal: direct grant first, then walk origin edges upward checking
     propagated grants at each parent. Workspace IS A Collection IS An
     Artifact — all addressed by artifact _key.
@@ -540,7 +617,8 @@ def check_access(
         raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
 
     try:
-        doc = arango_db.collection("artifacts").get(artifact_id)
+        from mantle.db.backend import get_raw_artifact
+        doc = get_raw_artifact(store_db, artifact_id)
     except Exception:
         doc = None
     if not doc:
@@ -549,40 +627,108 @@ def check_access(
     if not auth.user_id:
         raise HTTPException(status_code=404, detail="Not found")
 
+    # ⛔ AN API KEY USED TO INHERIT ITS OWNER'S FULL AUTHORITY.
+    # Grants below resolve against `auth.user_id`, which for an api_key principal
+    # is the OWNING USER — and the key's own scopes were never consulted. So a
+    # read-only integration key handed to a third party carried the owner's
+    # entire CRUDEASIO. The key's scoping was decorative.
+    #
+    # The key is a CEILING, applied before the owner's grant is even looked up:
+    # effective permission = (owner's grant) ∩ (key's scopes). Checked first so a
+    # scope-exceeding call cannot be witnessed as "allowed" by the audit path.
+    _enforce_api_key_ceiling(auth, action)
+
+    # --- Access-audit "force": witness this authorization decision (allow OR deny) ---
+    # Emitted here in the authz layer so auditability is a property of access itself.
+    # Wrapped so a failure in the audit path can NEVER deny or break legitimate access.
+    _audit_ctx = {
+        "via": auth.principal_type,
+        "principal_id": auth.principal_id or None,
+        "api_key_id": auth.api_key_id,
+        "tenant": auth.authority,
+    }
+
+    def _witness(result: str, reason: Optional[str] = None) -> None:
+        try:
+            from mantle.services import audit_service
+            ctx = dict(_audit_ctx)
+            if reason:
+                ctx["reason"] = reason
+            audit_service.record_access(
+                principal_id=auth.user_id,
+                artifact_id=artifact_id,
+                action=action,
+                result=result,
+                context=ctx,
+            )
+        except Exception:  # auditing must never break access
+            logger.debug("access witness failed", exc_info=True)
+
     def _check_grants(resource_id: str) -> Optional[GrantEntity]:
-        grants = db_arango.get_active_grants_for_principal_resource(
-            arango_db, grantee_id=auth.user_id, resource_id=resource_id
+        grants = db_store.get_active_grants_for_principal_resource(
+            store_db, grantee_id=auth.user_id, resource_id=resource_id
         )
         for g in grants:
-            if g.effect == "deny" and getattr(g, flag_attr, False):
+            if grant_is_deny(g) and getattr(g, flag_attr, False):
+                _witness("denied", "deny_grant")
                 raise HTTPException(status_code=404, detail="Not found")
         for g in grants:
-            if g.effect != "deny" and getattr(g, flag_attr, False):
+            if grant_is_allow(g) and getattr(g, flag_attr, False):
                 return g
         return None
 
     # --- Direct grant on the target ---
     direct = _check_grants(artifact_id)
     if direct is not None:
+        _witness("allowed")
         return direct
+
+    # --- Grant on the artifact's ROOT ---
+    # ⛔ THIS RUNG WAS MISSING. The direct check above uses `artifact_id` (a
+    # VERSION id) and the traversal below starts at `root_id` but only ever
+    # checks that node's PARENTS — so a grant written on `root_id` itself was
+    # never consulted when reading any non-root version. Ownership grants are
+    # written against the root, so the owner of a versioned artifact could be
+    # refused their own artifact.
+    #
+    # This is a fail-CLOSED gap (a false denial, not an escalation), which is why
+    # it survived: it degrades availability, not confidentiality.
+    root_id = doc.get("root_id")
+    if root_id and root_id != artifact_id:
+        at_root = _check_grants(root_id)
+        if at_root is not None:
+            _witness("allowed")
+            return at_root
 
     # --- Light-cone: walk origin edges upward ---
     cursor_id = doc.get("root_id") or artifact_id
-    for _ in range(_MAX_ORIGIN_DEPTH):
-        parent = db_arango.get_origin_parent(arango_db, cursor_id)
+    visited = {cursor_id}
+    while True:
+        if len(visited) > _ORIGIN_WALK_CEILING:
+            _witness("denied", "origin_chain_did_not_terminate")
+            raise HTTPException(
+                status_code=500,
+                detail="origin chain did not terminate; the lattice is malformed",
+            )
+        parent = db_store.get_origin_parent(store_db, cursor_id)
         if parent is None:
             break
         parent_id, propagate_mask = parent
+        if not parent_id or parent_id in visited:
+            break
 
         if propagate_mask is not None and action not in propagate_mask:
             break
 
         inherited = _check_grants(parent_id)
         if inherited is not None:
+            _witness("allowed")
             return inherited
 
+        visited.add(parent_id)
         cursor_id = parent_id
 
+    _witness("denied", "no_grant")
     raise HTTPException(status_code=404, detail="Not found")
 
 
@@ -601,8 +747,8 @@ def check_inbound_nonce(request: Request, auth: AuthContext) -> None:
     if not key_entity or not getattr(key_entity, "requires_nonce", False):
         return
 
-    from services.auth_service import verify_nonce as _verify_nonce
-    from agience_core import config
+    from mantle.services.auth_service import verify_nonce as _verify_nonce
+    from origin import config
 
     nonce = request.headers.get("X-Agience-Challenge", "")
     if not nonce:

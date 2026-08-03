@@ -13,14 +13,14 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
-from arango.database import StandardDatabase
+from mantle.db.store import Database
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from services import issuers as issuers_svc
-from services.dependencies import (
+from mantle.services import issuers as issuers_svc
+from mantle.services.dependencies import (
     AuthContext,
-    get_arango_db,
+    get_store_db,
     get_auth,
     require_platform_admin,
 )
@@ -41,13 +41,13 @@ class IssuerCreateRequest(BaseModel):
 async def create_issuer(
     body: IssuerCreateRequest,
     auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
 ):
     """Add a trusted issuer (admin-only). Takes effect immediately."""
-    admin_id = require_platform_admin(auth, arango_db)
+    admin_id = require_platform_admin(auth, store_db)
     try:
         art = issuers_svc.create_issuer_artifact(
-            arango_db, issuer=body.issuer, authorized_by=admin_id,
+            store_db, issuer=body.issuer, authorized_by=admin_id,
             jwks=body.jwks, jwks_uri=body.jwks_uri, audience=body.audience,
             namespace=body.namespace, role=body.role,
         )
@@ -61,12 +61,12 @@ async def create_issuer(
 @issuers_router.get("")
 async def list_issuers(
     auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
 ):
     """List trusted issuers (admin-only)."""
-    require_platform_admin(auth, arango_db)
+    require_platform_admin(auth, store_db)
     out: List[dict] = []
-    for a in issuers_svc.list_issuer_artifacts(arango_db):
+    for a in issuers_svc.list_issuer_artifacts(store_db):
         try:
             ctx = json.loads(a.context) if isinstance(a.context, str) else (a.context or {})
         except (json.JSONDecodeError, TypeError):
@@ -83,10 +83,10 @@ async def list_issuers(
 async def revoke_issuer(
     artifact_id: str,
     auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
 ):
     """Revoke trust in an issuer (admin-only). Takes effect immediately."""
-    admin_id = require_platform_admin(auth, arango_db)
-    if not issuers_svc.revoke_issuer_artifact(arango_db, artifact_id, by=admin_id):
+    admin_id = require_platform_admin(auth, store_db)
+    if not issuers_svc.revoke_issuer_artifact(store_db, artifact_id, by=admin_id):
         raise HTTPException(status_code=404, detail="Trusted issuer not found")
     return {"revoked": artifact_id}

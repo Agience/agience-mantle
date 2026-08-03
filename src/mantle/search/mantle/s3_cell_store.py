@@ -1,4 +1,4 @@
-﻿"""S3-backed :class:`CellStore` adapter (MANTLE Step 2.5).
+"""S3-backed :class:`CellStore` adapter (MANTLE Step 2.5).
 
 Production wiring of the in-memory :class:`InMemoryCellStore` from
 ``mantle/search/mantle/stores.py``. Encrypted cell blobs persist in S3 (or

@@ -2,7 +2,7 @@
 Platform topology: runtime ID registry.
 
 All platform-owned collections and artifacts use random UUIDs as their
-primary IDs (_key in ArangoDB). Slugs (defined in bootstrap_types) are
+primary IDs (_key in the lattice). Slugs (defined in bootstrap_types) are
 human-readable keys that map to those UUIDs.
 
 The slug→UUID mappings are persisted in the ``platform_settings`` collection
@@ -16,19 +16,17 @@ On first boot the UUIDs are generated, registered in-memory, and written to
 import logging
 from typing import Optional
 
-from arango.database import StandardDatabase
+from mantle.db.store import Database
 
-from services.bootstrap_types import (
+from mantle.services.bootstrap_types import (
     AGIENCE_CORE_SLUG,
     ALL_PLATFORM_COLLECTION_SLUGS,
     AUTHORITY_ARTIFACT_SLUG,
     HOST_ARTIFACT_SLUG,
     AGENCY_ARTIFACT_SLUG,
     AGENT_ARTIFACT_SLUG_PREFIX,
-    LLM_CONNECTION_SLUG_PREFIX,
     SERVER_ARTIFACT_SLUG_PREFIX,
     PLATFORM_AGENT_SLUGS,
-    PLATFORM_LLM_CONNECTION_SLUGS,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,19 +83,18 @@ def clear_registry() -> None:
 
 def _all_platform_slugs() -> list[str]:
     """Return every slug that needs an ID mapping."""
-    from services import server_registry
+    from mantle.services import server_registry
 
     slugs: list[str] = []
     slugs.extend(ALL_PLATFORM_COLLECTION_SLUGS)
     slugs.extend([AUTHORITY_ARTIFACT_SLUG, HOST_ARTIFACT_SLUG, AGENCY_ARTIFACT_SLUG])
     slugs.append(AGIENCE_CORE_SLUG)
     slugs.extend(f"{AGENT_ARTIFACT_SLUG_PREFIX}{s}" for s in PLATFORM_AGENT_SLUGS)
-    slugs.extend(f"{LLM_CONNECTION_SLUG_PREFIX}{s}" for s in PLATFORM_LLM_CONNECTION_SLUGS)
     slugs.extend(f"{SERVER_ARTIFACT_SLUG_PREFIX}{name}" for name in server_registry.all_names())
     return slugs
 
 
-def pre_resolve_platform_ids(arango_db: StandardDatabase) -> None:
+def pre_resolve_platform_ids(store_db: Database) -> None:
     """
     Load already-persisted platform slug→UUID mappings from settings into the
     in-memory registry at startup. Fallback-only: this does NOT mint IDs.
@@ -114,7 +111,7 @@ def pre_resolve_platform_ids(arango_db: StandardDatabase) -> None:
       1. Already in registry (e.g. test setup) → skip
       2. Persisted in platform_settings (``platform.id.<slug>``) → register
     """
-    from services.platform_settings_service import settings as _settings
+    from mantle.services.platform_settings_service import settings as _settings
 
     for slug in _all_platform_slugs():
         if slug in _registry:

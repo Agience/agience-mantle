@@ -10,9 +10,18 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 import base64
 
-from agience_core import config
+from origin import config
 
 logger = logging.getLogger(__name__)
+
+
+class ContentUrlSigningError(RuntimeError):
+    """Raised when a signed content URL cannot be produced.
+
+    Deliberately fatal: the signature is the access control, so a caller must
+    never silently receive an unsigned link in its place.
+    """
+
 
 # S3 supports single PUT up to 5GB
 # For files >5GB, multipart is required
@@ -153,7 +162,7 @@ def reinit_edge_clients() -> None:
     """
     global _s3_edge_internal, _s3_edge_public, _s3_edge_server, _BUCKET_CHECKED, _CORS_APPLIED, _CORS_UNSUPPORTED
     try:
-        from agience_core.key_manager import get_minio_pass
+        from prism.trust.key_manager import get_minio_pass
         secret_key = get_minio_pass()
     except RuntimeError:
         return
@@ -285,30 +294,103 @@ def ensure_content_bucket() -> None:
     _ensure_bucket_exists_once()
 
 
-def put_text_direct(content_key: str, text: str, content_type: str = "text/plain") -> None:
+class ContentEncryptionError(RuntimeError):
+    """Raised when S3 object content cannot be encrypted for storage."""
+
+
+class ContentDecryptionError(RuntimeError):
+    """Raised when a stored S3 object cannot be decrypted for a read."""
+
+
+def put_bytes_encrypted(content_key: str, data: bytes, content_type: str, owner_id: Optional[str]) -> None:
+    """Write raw bytes to the edge store, envelope-encrypted for *owner_id*.
+
+    The object store only ever sees ciphertext (``MEC1‖nonce‖ct`` raw bytes).
+
+    ⛔ THIS USED TO WARN AND THEN WRITE THE OBJECT IN PLAINTEXT.
+    A security control that is skipped when it is unavailable is not a control —
+    it is a control-shaped comment. And this particular fail-open was
+    IRREVERSIBLE AND UNDETECTABLE: a blob with no ``MEC1`` magic reads back as
+    "legacy plaintext" (``content_crypto.decrypt_content``), so a fail-open object
+    is byte-for-byte indistinguishable from an intentionally-legacy one. There was
+    no flag, no marker, and no way to enumerate which objects were affected after
+    the fact — you could not even answer "what leaked?".
+
+    Now it RAISES and nothing is written. Failing a write is recoverable: the
+    caller retries once the oracle is back. Silently persisting plaintext to an
+    object store is not.
+
+    This matches the precedent already set on the artifact path in
+    ``db.store._encrypt_artifact_content``, which fixed this exact shape.
+    """
+    _ensure_bucket_exists_once()
+    body = data
+    if owner_id:
+        try:
+            from mantle.services import content_crypto
+            body = content_crypto.encrypt_content(owner_id, data)
+        except Exception as exc:
+            logger.error(
+                "content encryption failed for S3 object %s — refusing to store plaintext",
+                content_key, exc_info=True,
+            )
+            raise ContentEncryptionError(
+                f"content encryption unavailable for {content_key!r}; refusing to "
+                f"persist plaintext to the object store"
+            ) from exc
+    _s3_edge_internal.put_object(Bucket=_EDGE_BUCKET, Key=content_key, Body=body, ContentType=content_type)
+
+
+def get_bytes_decrypted(content_key: str, owner_id: Optional[str]) -> bytes:
+    """Read raw bytes from the edge store, decrypting for *owner_id*.
+
+    Legacy plaintext objects (no ``MEC1`` magic) pass through unchanged — that
+    check happens inside ``decrypt_content`` and is not a failure path.
+
+    ⛔ THIS USED TO RETURN THE RAW CIPHERTEXT AS THOUGH IT WERE THE CONTENT.
+    On any decrypt failure it logged and fell through, handing the caller a
+    buffer of ciphertext bytes typed as data. Callers cannot tell the difference:
+    ``get_text_direct`` decodes it as UTF-8, so an operator config, authorizer
+    config or agent payload becomes garbage that is then parsed, stored, or
+    re-encrypted — the same double-encryption destruction chain documented in
+    ``db.store._decrypt_artifact_content``.
+
+    Now it RAISES. The caller gets an error instead of ciphertext dressed as
+    plaintext.
+    """
+    response = _s3_edge_internal.get_object(Bucket=_EDGE_BUCKET, Key=content_key)
+    raw = response["Body"].read()
+    if owner_id:
+        try:
+            from mantle.services import content_crypto
+            raw = content_crypto.decrypt_content(owner_id, raw)
+        except Exception as exc:
+            logger.error("failed to decrypt S3 content %s", content_key, exc_info=True)
+            raise ContentDecryptionError(
+                f"stored object {content_key!r} could not be decrypted; refusing to "
+                f"return ciphertext as content"
+            ) from exc
+    return raw
+
+
+def put_text_direct(content_key: str, text: str, content_type: str = "text/plain", *, owner_id: Optional[str] = None) -> None:
     """Write a text/bytes payload directly to the edge store (server-side, no presigned URL).
 
     Used when the backend itself is the uploader — e.g. auto-migrating inline
-    artifact content to S3 on create/update.
+    artifact content to S3 on create/update. Envelope-encrypted per ``owner_id``.
     """
-    _ensure_bucket_exists_once()
-    _s3_edge_internal.put_object(
-        Bucket=_EDGE_BUCKET,
-        Key=content_key,
-        Body=text.encode("utf-8") if isinstance(text, str) else text,
-        ContentType=content_type,
-    )
+    data = text.encode("utf-8") if isinstance(text, str) else text
+    put_bytes_encrypted(content_key, data, content_type, owner_id)
 
 
-def get_text_direct(content_key: str) -> str:
+def get_text_direct(content_key: str, *, owner_id: Optional[str] = None) -> str:
     """Fetch a text object directly from the edge store (server-side, no presigned URL).
 
     Used by agents and MCP server tools that need the raw content of an artifact
     (operator config JSON, authorizer config, etc.) when artifact.content is empty
-    because it was stored in S3.
+    because it was stored in S3. Decrypts per ``owner_id``; legacy plaintext passes through.
     """
-    response = _s3_edge_internal.get_object(Bucket=_EDGE_BUCKET, Key=content_key)
-    return response["Body"].read().decode("utf-8")
+    return get_bytes_decrypted(content_key, owner_id).decode("utf-8")
 
 
 def _durable_store_enabled() -> bool:
@@ -443,11 +525,17 @@ def generate_signed_url(
             ExpiresIn=expires_in,
         )
     except Exception as exc:
-        logger.warning("Error generating edge presigned URL for %s: %s", key, exc)
-        u = urlparse(config.CONTENT_URI)
-        scheme = u.scheme or "https"
-        host = u.netloc or u.path
-        return f"{scheme}://{host}/{key}"
+        # ⛔ THIS USED TO RETURN AN UNSIGNED URL:
+        #     return f"{scheme}://{host}/{key}"
+        # The signature IS the access control on content. Falling back to a bare
+        # object URL when signing fails hands out a link with no authorization
+        # and no expiry — the §1.B shape again: the control was unavailable, so
+        # it was skipped. A caller that receives a URL has no way to tell a
+        # signed one from an unsigned one, so the failure was invisible.
+        logger.error("Error generating edge presigned URL for %s: %s", key, exc)
+        raise ContentUrlSigningError(
+            f"could not generate a signed content URL for {key}"
+        ) from exc
 
 
 def _generate_cloudfront_signed_url(

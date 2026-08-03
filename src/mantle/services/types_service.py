@@ -30,13 +30,32 @@ def _normalize_content_type(content_type: str) -> str:
 
 
 def _repo_root() -> Path:
-    # backend/services/types_service.py -> backend -> repo root
+    # `src/mantle/services/types_service.py` -> parents[3] is the agience-mantle repo root.
+    # (The old comment said "backend/services/… -> backend -> repo root" — the PRE-SPLIT layout, from the
+    # era `features/transport-bound-auth.md` documents. The depth still happens to be right; the naming
+    # was not, and a comment describing a tree that no longer exists is how the reader below was misled.)
     return Path(__file__).resolve().parents[3]
 
 
-def _builtin_types_root() -> Path:
-    """Builtin type manifests live under `package/types/`."""
-    return _repo_root() / "package" / "types"
+# ⛔ THE BUILTIN TYPES ROOT IS GONE (2026-07-30, John's ruling: *"package/types and SEEDS_ROOT seem old
+# and stale. better to get rid of it."*). `_builtin_types_root()` — and the `AGIENCE_TYPES_ROOT` env hook
+# added a day earlier to make it supplyable — are removed, along with the `AGIENCE_TYPES_DISABLE_BUILTIN`
+# flag whose ONLY job was to switch it off.
+#
+# MEASURED, so this is a removal of something proven dead rather than a tidy-up:
+#   · `agience-mantle/package/types` DOES NOT EXIST. The tree is at `agience-bundle/package/types`.
+#   · Deployment sets `AGIENCE_SEEDS_ROOT` in three compose files and bind-mounts `seeds` — and sets
+#     and mounts NOTHING for `types`. So the builtin root resolved to a nonexistent directory on every
+#     node, and mantle has served **no builtin types in production, ever**, silently: a missing
+#     directory yields an empty scan, not an error.
+#   · The mechanism is SUPERSEDED, not merely unwired. Servers SELF-REGISTER the types they own via
+#     `register_runtime_type` (Mantle stays passive) — which is exactly why `_default_server_ui_roots`
+#     below is deprecated-and-always-empty. Wiring the builtin root up would have resurrected a
+#     retired mechanism; that is the option this removal closes.
+#
+# WHAT REMAINS: `AGIENCE_TYPES_PATHS` (explicit local roots, still honoured) and the runtime overlay.
+# Filesystem type resolution is now opt-in by naming a path, which is the honest state — nothing is
+# read from a location no deployment supplies.
 
 
 def _default_server_ui_roots() -> List[Path]:
@@ -57,8 +76,9 @@ def get_types_roots() -> List[Path]:
     Order matters: earlier roots take precedence.
 
     Env vars:
-    - AGIENCE_TYPES_PATHS: extra roots (os.pathsep-separated)
-    - AGIENCE_TYPES_DISABLE_BUILTIN: if truthy, do not include repo `types/`
+    - AGIENCE_TYPES_PATHS: roots (os.pathsep-separated). The ONLY filesystem source since the
+      builtin `package/types` root was removed (see the note above `_default_server_ui_roots`).
+      Empty is the normal state: server-owned types are self-registered, not scanned.
     """
     roots: List[Path] = []
     seen: set[Path] = set()
@@ -82,32 +102,20 @@ def get_types_roots() -> List[Path]:
             if p.exists() and p.is_dir():
                 add_root(p)
 
-    disable_builtin = os.getenv("AGIENCE_TYPES_DISABLE_BUILTIN", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "y",
-        "on",
-    }
-    if not disable_builtin:
-        builtin = _builtin_types_root()
-        if builtin.exists() and builtin.is_dir():
-            add_root(builtin)
-
     return roots
 
 
 def _merge_ordered_roots() -> List[Path]:
-    """FILESYSTEM type roots in MERGE precedence (LOWEST first): core
-    (``package/types``) is the base/fallback; a local override
-    (``AGIENCE_TYPES_PATHS``) overrides core. Deep-merge applies LATER over
-    EARLIER.
+    """FILESYSTEM type roots in MERGE precedence (LOWEST first). Deep-merge applies
+    LATER over EARLIER.
 
-    Server-owned types are NOT on the filesystem here — they are self-registered
-    at runtime and overlaid ON TOP of these roots in :func:`resolve_type_definition`
-    (an "Open-with"-style chain: core base < runtime/self-registered < local).
-    A type lives canonically in exactly ONE place; higher layers contribute
-    partial overrides (e.g. just a viewer), never a full duplicate.
+    Since the builtin ``package/types`` root was removed there is exactly one
+    filesystem source — ``AGIENCE_TYPES_PATHS`` — and it is usually unset. Server-owned
+    types are NOT on the filesystem: they are self-registered at runtime and overlaid ON
+    TOP of these roots in :func:`resolve_type_definition` (an "Open-with"-style chain:
+    filesystem base < runtime/self-registered). A type lives canonically in exactly ONE
+    place; higher layers contribute partial overrides (e.g. just a viewer), never a full
+    duplicate.
     """
     roots: List[Path] = []
     seen: set[Path] = set()
@@ -119,11 +127,6 @@ def _merge_ordered_roots() -> List[Path]:
         seen.add(resolved)
         roots.append(resolved)
 
-    disable_builtin = os.getenv("AGIENCE_TYPES_DISABLE_BUILTIN", "").strip().lower() in {
-        "1", "true", "yes", "y", "on",
-    }
-    if not disable_builtin:
-        add_root(_builtin_types_root())              # core (base)
     # Chorus types are NOT read from the filesystem here. Servers self-register
     # them; resolution overlays the pushed runtime defs (see resolve_type_definition).
     extra = os.getenv("AGIENCE_TYPES_PATHS", "")
@@ -135,7 +138,7 @@ def _merge_ordered_roots() -> List[Path]:
             p = Path(raw)
             if not p.is_absolute():
                 p = _repo_root() / p
-            add_root(p)                              # local (overrides chorus)
+            add_root(p)
     return roots
 
 
@@ -152,10 +155,10 @@ def _content_type_to_rel_folder(content_type: str) -> Optional[Path]:
 def _find_type_folder(roots: Iterable[Path], content_type: str) -> Optional[Tuple[Path, str]]:
     """Return (folder_path, source_label) for the highest-priority definition.
 
-    Root ordering from ``get_types_roots()`` defines the priority:
-    extra roots > builtin ``types/`` > server ``ui/`` overlays.  When a
-    builtin type skeleton also has a server viewer overlay, the builtin
-    definition wins — this is the expected configuration, not an error.
+    Root ordering from ``get_types_roots()`` defines the priority. Since the builtin
+    ``package/types`` root was removed there is one filesystem source
+    (``AGIENCE_TYPES_PATHS``), usually unset; server-owned definitions arrive as a
+    runtime overlay, not as a root here.
     """
     rel = _content_type_to_rel_folder(content_type)
     if rel is None:
@@ -366,9 +369,11 @@ def resolve_type_definition(content_type: str, *, roots: Optional[List[Path]] = 
     """Resolve a type definition.
 
     Resolution is an "Open-with"-style override chain (LOWEST first):
-    ``core (package/types) < self-registered (runtime) < local``, then layered
+    ``filesystem (AGIENCE_TYPES_PATHS) < self-registered (runtime)``, then layered
     over any ``inherits`` parents (child wins). Mirrors the Facet content-types
-    plugin so the platform and the frontend resolve types identically.
+    plugin so the platform and the frontend resolve types identically. (The
+    ``package/types`` builtin base was removed 2026-07-30 — no deployment ever
+    supplied it, and servers self-register what they own.)
 
     The runtime overlay (server self-registered types, ``_runtime_types``) is
     applied ONLY on the default-roots path (``roots is None``). When an explicit
@@ -651,10 +656,10 @@ def register_runtime_type(
 
     ``raw_definition`` is the full ``type.json`` the owning server published. It
     is parsed into the standard definition shape and stored as the runtime
-    OVERLAY for this content type. Resolution layers it on top of the core
-    (``package/types``) base (see :func:`resolve_type_definition`), so a server
-    may publish either a full type (chorus-owned, e.g. ``chat``) or a partial
-    override of a core type (e.g. a viewer for ``application/json``).
+    OVERLAY for this content type. Resolution layers it on top of whatever
+    filesystem base exists (see :func:`resolve_type_definition`) — normally none —
+    so a server may publish either a full type (chorus-owned, e.g. ``chat``) or a
+    partial override of a supplied base (e.g. a viewer for ``application/json``).
 
     Upsert semantics: a re-push (server restart / edit) replaces the prior
     overlay — last publish wins — and the per-type cache entry is invalidated.
@@ -686,7 +691,7 @@ _type_cache: Dict[str, Optional[TypeResolutionResult]] = {}
 def resolve_type_definition_cached(content_type: str) -> Optional[TypeResolutionResult]:
     """Cached variant of `resolve_type_definition` using default roots.
 
-    Resolution = core (``package/types``) base overlaid with the self-registered
+    Resolution = the (usually empty) filesystem base overlaid with the self-registered
     runtime types, then ``inherits`` parents — all handled inside
     :func:`resolve_type_definition`. This wrapper only adds a process-wide cache,
     keyed by content type, invalidated per-type on (re-)registration and wholesale

@@ -1,4 +1,4 @@
-﻿# routers/artifacts_router.py
+# routers/artifacts_router.py
 #
 # Unified Artifact API — single REST surface for all artifact operations.
 #
@@ -35,15 +35,15 @@ import logging
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Set
 
-from arango.database import StandardDatabase
+from mantle.db.store import Database
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 from pydantic.functional_serializers import SerializerFunctionWrapHandler
 
-from services.dependencies import get_arango_db
-import db.arango as arango
-from db.arango import has_children as db_has_children, count_children as db_count_children
-from services.dependencies import (
+from mantle.services.dependencies import get_store_db
+import mantle.db.backend as store
+from mantle.db.backend import has_children as db_has_children, count_children as db_count_children
+from mantle.services.dependencies import (
     get_auth,
     AuthContext,
     check_access,
@@ -73,6 +73,11 @@ class CreateArtifactRequest(BaseModel):
     content: Optional[str] = None
     content_type: Optional[str] = None
     description: Optional[str] = None
+    # WHERE-indexing hint (Information Gauge DB, Phase 1): "eager" indexes now,
+    # "lazy" leaves the artifact latent (indexed on first access). None uses the
+    # deployment default (MANTLE_LAZY_INDEX). Applies to content in a container;
+    # top-level containers are always indexed eagerly (the navigable frame).
+    index: Optional[str] = None
 
 
 class UpdateArtifactRequest(BaseModel):
@@ -102,21 +107,23 @@ class RemoveItemRequest(BaseModel):
 
 
 class ArtifactSearchRequest(BaseModel):
-    """Search across accessible artifacts.
+    """Search across accessible artifacts. ``query_text`` is required.
 
-    Provide exactly one of ``query_text`` (text → embedded + hybrid BM25/kNN) or
-    ``embedding`` (a raw query vector → kNN directly, skipping the text-embed
-    step — "embedding activation" for callers that already hold a vector).
+    Unknown fields are IGNORED (pydantic default), not rejected — a client still
+    sending the removed ``embedding`` or ``aperture`` gets a normal lexical search,
+    not a 422. Neither field has any effect.
     """
     model_config = ConfigDict(populate_by_name=True)
 
     query_text: Optional[str] = None
-    embedding: Optional[List[float]] = None      # raw query vector (XOR query_text)
+    # No `embedding`: a caller-supplied query vector is trained-model output — BYOK by
+    # another name — and accepting one lit the vector arm with no provider configured.
+    # Removed 2026-07-30, no-models rule (universal, incl. BYOK).
     scope: Optional[List[str]] = None           # container IDs to restrict
     state: str = "committed"                     # index segment: committed (default) | draft | archived
     content_types: Optional[List[str]] = None
     use_hybrid: Optional[bool] = None
-    aperture: Optional[float] = None
+    # `aperture` removed 2026-07-30 — it was never read; see mantle/search/types.py.
     from_: int = 0
     size: int = 20
     sort: Optional[Literal["relevance", "recency"]] = None
@@ -180,18 +187,17 @@ class ArtifactSearchResponse(BaseModel):
 # Unified artifact store: containers and artifacts both live in `artifacts`.
 _COLL_ARTIFACTS = "artifacts"
 
-def _artifact_exists(db: StandardDatabase, artifact_id: str) -> bool:
+def _artifact_exists(db: Database, artifact_id: str) -> bool:
     """Return True if artifact_id refers to an existing artifact document."""
     try:
-        coll = db.collection(_COLL_ARTIFACTS)
-        doc = coll.get(artifact_id)
-        return doc is not None
+        from mantle.db.backend import get_raw_artifact
+        return get_raw_artifact(db, artifact_id) is not None
     except Exception:
         return False
 
 
 
-def _find_artifact(db: StandardDatabase, artifact_id: str) -> Optional[dict]:
+def _find_artifact(db: Database, artifact_id: str) -> Optional[dict]:
     """Locate an artifact in the unified store.
 
     First resolves builtin server short-names ("astra", "verso", etc.) to their
@@ -201,34 +207,26 @@ def _find_artifact(db: StandardDatabase, artifact_id: str) -> Optional[dict]:
     Archived artifacts return None.
     """
     # Resolve builtin server names to their stable bootstrap UUID.
-    from services import server_registry as _server_registry
+    from mantle.services import server_registry as _server_registry
+    from mantle.db.backend import _decrypt_artifact_content as _decrypt_doc
     resolved_id = _server_registry.get_id(artifact_id)
     if resolved_id:
         artifact_id = resolved_id
 
+    from mantle.db.backend import get_raw_artifact, find_newest_by_root
     try:
-        coll = db.collection(_COLL_ARTIFACTS)
-        doc = coll.get(artifact_id)
+        doc = get_raw_artifact(db, artifact_id)
         if doc and doc.get("state") != "archived":
+            _decrypt_doc(doc)  # this raw-doc path bypasses the entity converters — decrypt here
             return doc
     except Exception:
         logger.warning("_find_artifact: key lookup failed for %r", artifact_id, exc_info=True)
 
     # Resolve stable root IDs to the newest non-archived version row.
     try:
-        cursor = db.aql.execute(
-            """
-            FOR a IN @@col
-              FILTER a.root_id == @root_id
-                AND a.state != "archived"
-              SORT a.modified_time DESC
-              LIMIT 1
-              RETURN a
-            """,
-            bind_vars={"@col": _COLL_ARTIFACTS, "root_id": artifact_id},
-        )
-        doc = next(iter(cursor), None)
+        doc = find_newest_by_root(db, artifact_id)
         if doc:
+            _decrypt_doc(doc)
             return doc
     except Exception:
         logger.warning("_find_artifact: root_id scan failed for %r", artifact_id, exc_info=True)
@@ -239,9 +237,15 @@ def _find_artifact(db: StandardDatabase, artifact_id: str) -> Optional[dict]:
 def _normalize_artifact_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize an artifact document for API responses.
 
-    Sets defaults for missing fields and strips ArangoDB internal keys.
+    Sets defaults for missing fields and strips the lattice internal keys.
     """
     normalized = dict(doc)
+
+    # Defense-in-depth: decrypt inline content for any raw-doc path that reaches an
+    # API response through here. Idempotent (flag-gated) — a no-op on docs already
+    # decrypted by from_store_doc / _find_artifact / list_collection_artifacts.
+    from mantle.db.backend import _decrypt_artifact_content as _decrypt_doc
+    _decrypt_doc(normalized)
 
     artifact_id = normalized.get("id") or normalized.get("_key")
     if artifact_id and not normalized.get("root_id"):
@@ -307,20 +311,20 @@ async def list_visible(
         ),
     ),
     auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
 ):
     if not auth.user_id and not auth.bearer_grant:
         raise HTTPException(status_code=401, detail="Missing authorization")
 
-    from services.dependencies import _ACTION_FLAG_MAP
+    from mantle.services.dependencies import _ACTION_FLAG_MAP
 
     flag_attr = _ACTION_FLAG_MAP.get(action)
     if flag_attr is None:
         raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
 
-    from search.mantle.lightcone import LightConeResolver
+    from mantle.search.mantle.lightcone import LightConeResolver
 
-    resolver = LightConeResolver(arango_db)
+    resolver = LightConeResolver(store_db)
 
     # First-login provisioning is keyed on READ access (the baseline seed grant
     # set). A user with nothing readable has not yet been granted the platform
@@ -331,11 +335,11 @@ async def list_visible(
     read_authorized: Set[str] = resolver.resolve(auth.user_id, "read") if auth.user_id else set()
     if auth.user_id and not read_authorized:
         try:
-            from services.seed_provisioning import provision_user
+            from mantle.services.seed_provisioning import provision_user
             # Capture profile + tenant from the token (external-IdP logins carry
             # email/name/issuer); platform users pass None and are unaffected.
             provision_user(
-                arango_db,
+                store_db,
                 user_id=auth.user_id,
                 email=getattr(auth, "email", None),
                 name=getattr(auth, "name", None),
@@ -357,7 +361,7 @@ async def list_visible(
 
     results: list = []
     for aid in authorized:
-        doc = _find_artifact(arango_db, aid)
+        doc = _find_artifact(store_db, aid)
         if not doc:
             continue
         if content_type and doc.get("content_type") != content_type:
@@ -373,7 +377,7 @@ async def create_artifact(
     request: Request,
     body: Dict[str, Any] = Body(...),
     auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
 ):
     """Create a new artifact.
 
@@ -390,13 +394,13 @@ async def create_artifact(
 
     # Mantle is the database layer — `create` is a plain insert; no operation
     # dispatch, no type resolution. content_type is an opaque label.
-    return await _default_create_artifact(body, auth, arango_db)
+    return await _default_create_artifact(body, auth, store_db)
 
 
 async def _default_create_artifact(
     body: Dict[str, Any],
     auth: AuthContext,
-    arango_db: Any,
+    store_db: Any,
 ) -> Dict[str, Any]:
     """Create an artifact. One path for everything — a collection is just an
     artifact with child edges, so there's no separate container-create:
@@ -412,12 +416,12 @@ async def _default_create_artifact(
     parsed = CreateArtifactRequest(**body)
     context_str = _merge_content_type_into_context(parsed.context, parsed.content_type)
 
-    from services import workspace_service
+    from mantle.services import workspace_service
 
     # Top-level: no parent to authorize against; the creator owns it.
     if not parsed.container_id:
         entity = workspace_service.create_container(
-            db=arango_db,
+            db=store_db,
             user_id=auth.user_id,
             content_type=parsed.content_type,
             name=parsed.name,
@@ -428,44 +432,79 @@ async def _default_create_artifact(
         return entity.to_dict()
 
     # Into a collection — the caller needs create/Add permission on it.
-    check_access(auth, parsed.container_id, "create", arango_db)
-    if not _artifact_exists(arango_db, parsed.container_id):
+    check_access(auth, parsed.container_id, "create", store_db)
+    if not _artifact_exists(store_db, parsed.container_id):
         raise HTTPException(status_code=404, detail="Container not found")
 
     # source_artifact_id -> LINK an existing artifact in (edge only), no new artifact.
     if parsed.source_artifact_id:
-        return _link_source_artifact(arango_db, parsed)
+        return _link_source_artifact(store_db, parsed, auth)
 
     entity = workspace_service.create_workspace_artifact(
-        db=arango_db,
+        db=store_db,
         user_id=auth.user_id,
         workspace_id=parsed.container_id,
         context=context_str or "",
         content=parsed.content or "",
         content_type=parsed.content_type,
         name=parsed.name,
+        index=parsed.index,
     )
     return entity.to_dict()
 
 
 def _link_source_artifact(
-    arango_db: Any,
+    store_db: Any,
     parsed: CreateArtifactRequest,
+    auth: Any,
 ) -> Dict[str, Any]:
-    """Link an existing artifact into a container instead of creating a duplicate."""
-    from db.arango import (
+    """Link an existing artifact into a container instead of creating a duplicate.
+
+    ⛔ THIS RAN WITH NO CHECK ON THE SOURCE AT ALL.
+    `check_access` had been applied to the *container* only — which the attacker
+    owns — so `POST /artifacts {container_id: <mine>, source_artifact_id: <yours>}`
+    did two things:
+
+      (a) returned `source.to_dict()`, i.e. the victim's CONTENT, decrypted. The
+          read choke point in `db.store.from_store_doc` selects the decryption
+          key from the stored document's `created_by`, so the attacker's identity
+          never enters the decryption path — it decrypts with the VICTIM's key.
+
+      (b) wrote a **creation-lineage** edge (`origin=True`, `propagate=None` — the
+          defaults) from the attacker's container to the victim's root. Grants
+          propagate parent -> child and `check_access` walks UP from a target via
+          `get_origin_parent`, so the attacker's container could be returned as
+          the victim's origin parent and confer grants over the whole subtree.
+          With `propagate=None` no action is masked out: all of CRUDEASIO.
+
+    Two fixes, both required:
+      1. Authorize the source for `read` before touching it.
+      2. Link with `origin=False, propagate=[]` so a link edge can never be a
+         grant-inheritance path, regardless of who is allowed to create it.
+    """
+    from mantle.db.backend import (
         get_artifact as _get_artifact,
         get_latest_committed_artifact,
         add_artifact_to_collection,
     )
 
-    source = _get_artifact(arango_db, parsed.source_artifact_id)
+    # Authorize BEFORE loading: the load decrypts, and the 404-vs-403 distinction
+    # would otherwise confirm the artifact's existence to a caller with no read.
+    check_access(auth, parsed.source_artifact_id, "read", store_db)
+
+    source = _get_artifact(store_db, parsed.source_artifact_id)
     if not source:
-        source = get_latest_committed_artifact(arango_db, parsed.source_artifact_id)
+        source = get_latest_committed_artifact(store_db, parsed.source_artifact_id)
     if not source:
         raise HTTPException(status_code=404, detail="Source artifact not found")
     root_id = source.root_id or source.id
-    add_artifact_to_collection(arango_db, parsed.container_id, root_id)
+    add_artifact_to_collection(
+        store_db,
+        parsed.container_id,
+        root_id,
+        origin=False,
+        propagate=[],
+    )
     return source.to_dict()
 
 
@@ -492,16 +531,16 @@ def _merge_content_type_into_context(
 async def read_artifact(
     artifact_id: str,
     auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
 ):
     """Read a single artifact by ID."""
-    check_access(auth, artifact_id, "read", arango_db)
+    check_access(auth, artifact_id, "read", store_db)
 
-    doc = _find_artifact(arango_db, artifact_id)
+    doc = _find_artifact(store_db, artifact_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Not found")
 
-    # Normalize ArangoDB internal keys.
+    # Normalize the lattice internal keys.
     doc.pop("_id", None)
     doc.pop("_rev", None)
     if "_key" in doc:
@@ -509,50 +548,52 @@ async def read_artifact(
 
     # Inject computed child-containment fields.
     root_id = doc.get("root_id") or doc.get("id") or artifact_id
-    doc["has_children"] = db_has_children(arango_db, root_id)
-    doc["child_count"] = db_count_children(arango_db, root_id) if doc["has_children"] else 0
+    doc["has_children"] = db_has_children(store_db, root_id)
+    doc["child_count"] = db_count_children(store_db, root_id) if doc["has_children"] else 0
+
+    # Lazy indexing: first genuine (authorized) access materializes a latent vertex.
+    # No-op unless MANTLE_LAZY_INDEX is on and the vertex isn't already materialized.
+    try:
+        from mantle.services import workspace_service as _ws
+        from mantle.entities.artifact import Artifact as _Artifact
+        _ws.materialize_on_access(
+            store_db,
+            artifact_id=doc.get("id") or artifact_id,
+            collection_id=doc.get("collection_id"),
+            tenant_id=auth.user_id,
+            artifact=_Artifact.from_dict(doc),
+        )
+    except Exception:
+        pass
 
     return doc
 
 
-# ---------- GET /artifacts/{artifact_id}/embedding — Raw stored vector(s) ----------
+# ---------- POST /artifacts/{container_id}/warm — Warm-sweep (lazy indexing) ----------
 
-@router.get("/{artifact_id}/embedding")
-async def get_artifact_embedding(
-    artifact_id: str,
+@router.post("/{container_id}/warm")
+async def warm_collection_endpoint(
+    container_id: str,
     auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
 ):
-    """Return the artifact's stored MANTLE embedding(s) — raw vectors out, no text.
+    """Warm-sweep guardrail: materialize every latent artifact in a collection so
+    it is searchable up front, rather than waiting for each to be accessed. For
+    corpora that must be searchable immediately. Requires read access."""
+    check_access(auth, container_id, "read", store_db)
+    from mantle.services import workspace_service as _ws
+    n = _ws.warm_collection(store_db, container_id, tenant_id=auth.user_id)
+    return {"collection_id": container_id, "materialized": n}
 
-    The inverse of the `embedding` inputs on /search and /activate. `embedding` is
-    the primary (first) chunk vector; `chunks` carries all of them (content that was
-    chunked yields several). Caller must have read on the artifact.
-    """
-    check_access(auth, artifact_id, "read", arango_db)
-    doc = _find_artifact(arango_db, artifact_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Not found")
 
-    from entities.artifact import Artifact as _Artifact
-    from search.ingest.pipeline_unified import get_artifact_embeddings
+# ── GET /artifacts/{id}/embedding: REMOVED 2026-07-30 ────────────────────────
+# "Raw vectors out, no text" — an embedding-serving endpoint, and the stored
+# vectors are bge-m3 output (trained weights on someone else's disk).
+#
+# Removed ENTIRELY rather than 404/501, per the standing ruling on `/coherence`
+# and `/embed`: an observer does not offer "embed this" or "score this" as a
+# service. No caller existed in any repo. No-models rule.
 
-    art = _Artifact.from_dict(doc)
-    chunks = get_artifact_embeddings(art, art.collection_id)
-    if not chunks:
-        raise HTTPException(
-            status_code=404,
-            detail="No stored embedding (vector arm off, or nothing indexed for this artifact)",
-        )
-    return {
-        "artifact_id": art.root_id or art.id,
-        "model_id": chunks[0].get("model_id"),
-        "embedding": chunks[0].get("embedding"),
-        "chunks": [
-            {"chunk_id": c.get("chunk_id"), "embedding": c.get("embedding")}
-            for c in chunks
-        ],
-    }
 
 
 # ---------- GET /artifacts/{artifact_id}/children — List children ----------
@@ -563,7 +604,7 @@ async def list_children(
     request: Request,
     content_type: Optional[str] = Query(None),
     workspace_id: Optional[str] = Query(None),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
     auth: AuthContext = Depends(get_auth),
 ):
     """List children of any artifact (universal container model).
@@ -575,7 +616,7 @@ async def list_children(
     Each child is enriched with `committed_collection_ids` — the set of committed
     containers it currently appears in.
     """
-    check_access(auth, artifact_id, "read", arango_db)
+    check_access(auth, artifact_id, "read", store_db)
 
     # A draft is workspace-private. Only surface drafts linked into this container
     # when the caller passes a workspace_id they can READ — then drafts homed in
@@ -583,13 +624,13 @@ async def list_children(
     draft_workspace_id: Optional[str] = None
     if workspace_id:
         try:
-            check_access(auth, workspace_id, "read", arango_db)
+            check_access(auth, workspace_id, "read", store_db)
             draft_workspace_id = workspace_id
         except HTTPException:
             draft_workspace_id = None  # no access → don't include its drafts
 
-    children = arango.list_collection_artifacts(
-        arango_db, artifact_id, draft_workspace_id=draft_workspace_id
+    children = store.list_collection_artifacts(
+        store_db, artifact_id, draft_workspace_id=draft_workspace_id
     )
 
     # Filter out operator edges (relationship != null means non-containment)
@@ -600,10 +641,10 @@ async def list_children(
         children = [c for c in children if c.get("content_type") == content_type]
 
     # Enrich with committed_collection_ids (structural — pure edge traversal)
-    from entities.artifact import Artifact as ArtifactEntity
-    from services.collection_service import attach_committed_collection_ids
+    from mantle.entities.artifact import Artifact as ArtifactEntity
+    from mantle.services.collection_service import attach_committed_collection_ids
     entities = [ArtifactEntity.from_dict(c) for c in children]
-    attach_committed_collection_ids(arango_db, entities)
+    attach_committed_collection_ids(store_db, entities)
     for raw, entity in zip(children, entities):
         raw["committed_collection_ids"] = getattr(entity, "committed_collection_ids", [])
 
@@ -621,28 +662,28 @@ async def update_artifact(
     artifact_id: str,
     body: UpdateArtifactRequest,
     auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
 ):
     """Partially update an artifact or container."""
     if not auth.user_id:
         raise HTTPException(status_code=401, detail="User identification required")
 
-    check_access(auth, artifact_id, "update", arango_db)
+    check_access(auth, artifact_id, "update", store_db)
 
-    doc = _find_artifact(arango_db, artifact_id)
+    doc = _find_artifact(store_db, artifact_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Not found")
 
     # Strip immutable fields from context updates (schema-driven mutability)
     context = _strip_immutable_context_fields(doc, body.context)
 
-    from services import workspace_service
+    from mantle.services import workspace_service
 
     container_id = doc.get("collection_id")
     if not container_id:
         # Top-level container artifact (workspace/collection) — no parent collection_id.
         updated = workspace_service.update_workspace(
-            arango_db,
+            store_db,
             auth.user_id,
             artifact_id,
             name=body.name,
@@ -652,7 +693,7 @@ async def update_artifact(
         return updated.to_dict()
 
     updated = workspace_service.update_artifact(
-        arango_db,
+        store_db,
         auth.user_id,
         container_id,
         artifact_id,
@@ -670,24 +711,24 @@ async def update_artifact(
 async def delete_artifact(
     artifact_id: str,
     auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
 ):
     """Delete or archive an artifact."""
     if not auth.user_id:
         raise HTTPException(status_code=401, detail="User identification required")
 
-    check_access(auth, artifact_id, "delete", arango_db)
+    check_access(auth, artifact_id, "delete", store_db)
 
-    doc = _find_artifact(arango_db, artifact_id)
+    doc = _find_artifact(store_db, artifact_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Not found")
 
-    from services import workspace_service
+    from mantle.services import workspace_service
     container_id = doc.get("collection_id")
     if not container_id:
         raise HTTPException(status_code=500, detail="Artifact missing collection_id")
 
-    workspace_service.delete_artifact(arango_db, auth.user_id, container_id, artifact_id)
+    workspace_service.delete_artifact(store_db, auth.user_id, container_id, artifact_id)
     return {"id": artifact_id, "deleted": True}
 
 
@@ -696,18 +737,18 @@ async def remove_artifact_from_container_endpoint(
     artifact_id: str,
     body: RemoveItemRequest,
     auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
 ):
     """Detach an artifact from a container without hard-deleting the root."""
     if not auth.user_id:
         raise HTTPException(status_code=401, detail="User identification required")
 
-    check_access(auth, body.container_id, "evict", arango_db)
+    check_access(auth, body.container_id, "evict", store_db)
 
-    from services import workspace_service
+    from mantle.services import workspace_service
 
     artifact = workspace_service.remove_artifact_from_container(
-        arango_db,
+        store_db,
         auth.user_id,
         body.container_id,
         artifact_id,
@@ -721,7 +762,7 @@ async def remove_artifact_from_container_endpoint(
 async def search_artifacts(
     body: ArtifactSearchRequest,
     auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
 ):
     """Search across accessible artifacts.
 
@@ -738,12 +779,10 @@ async def search_artifacts(
     if not user_id and not bearer_grant:
         raise HTTPException(status_code=401, detail="Missing authorization")
 
-    has_text = bool(body.query_text and body.query_text.strip())
-    has_embedding = bool(body.embedding)
-    if has_text == has_embedding:
+    if not (body.query_text and body.query_text.strip()):
         raise HTTPException(
             status_code=400,
-            detail="provide exactly one of 'query_text' or 'embedding'",
+            detail="query_text is required",
         )
 
     # Resolve explicit container scope when body.scope is provided.
@@ -758,7 +797,7 @@ async def search_artifacts(
     scope: Optional[List[str]] = None
 
     if body.scope:
-        col_ids = [cid for cid in body.scope if _artifact_exists(arango_db, cid)]
+        col_ids = [cid for cid in body.scope if _artifact_exists(store_db, cid)]
         scope = col_ids or None
     elif auth.principal_type == "api_key" and api_key_grants:
         api_scope = [
@@ -770,15 +809,14 @@ async def search_artifacts(
         scope = [bearer_grant.resource_id] if bearer_grant.resource_id else None
 
     # Build and execute search query.
-    from search.types import SearchQuery
+    from mantle.search.types import SearchQuery
 
     query = SearchQuery(
         query_text=body.query_text or "",
-        query_embedding=body.embedding,
+        query_embedding=None,
         user_id=user_id or "",
         scope=scope,
         use_hybrid=body.use_hybrid,
-        aperture=body.aperture if body.aperture is not None else 0.75,
         from_=body.from_,
         size=body.size,
         sort=body.sort or "relevance",
@@ -786,22 +824,22 @@ async def search_artifacts(
     )
 
     # MANTLE-SSE is the canonical search backend after Step 2.6.9.
-    # OpenSearch is retired; the legacy SearchAccessor / MantleSearchAccessor
-    # are gone. If SSE prerequisites (Oracle, S3, Arango) aren't satisfied,
+    # the legacy lexical index is retired; the legacy SearchAccessor / MantleSearchAccessor
+    # are gone. If SSE prerequisites (Oracle, S3, the lattice) aren't satisfied,
     # search returns 503 — there's no plaintext fallback by design.
-    from search.mantle.wiring import VALID_SEGMENTS, build_sse_search_accessor
+    from mantle.search.mantle.wiring import VALID_SEGMENTS, build_sse_search_accessor
     segment = (body.state or "committed").lower()
     if segment not in VALID_SEGMENTS:
         raise HTTPException(
             status_code=400,
             detail=f"state must be one of {', '.join(VALID_SEGMENTS)}",
         )
-    accessor = build_sse_search_accessor(arango_db, segment=segment)
+    accessor = build_sse_search_accessor(store_db, segment=segment)
     if accessor is None:
         raise HTTPException(
             status_code=503,
             detail=(
-                "Encrypted search is not available — Oracle, S3, or Arango "
+                "Encrypted search is not available — Oracle, S3, or the lattice "
                 "prerequisite missing. Check platform/key_manager + "
                 "content_service initialization."
             ),
@@ -839,101 +877,17 @@ async def search_artifacts(
     )
 
 
-class ActivateRequest(BaseModel):
-    """Native embedding interaction — present a signal, see its grounded meaning."""
-    text: Optional[str] = None
-    embedding: Optional[List[float]] = None
-    model_id: Optional[str] = None
-    scope: Optional[List[str]] = None
-    top_k: int = 10            # nearest neighbours to return when act=True
-    top_anchors: int = 8       # anchors reported in the native activation
-    act: bool = True           # also return nearest authorized neighbours
+# ── /activate: REMOVED 2026-07-30 ────────────────────────────────────────────
+# "Native embedding interaction" — it accepted a caller-supplied `embedding` +
+# `model_id`, and echoed the raw carrier vector back. That is an embed/score
+# service, and it is BYOK by another name: a caller POSTing a vector lit the
+# whole vector arm with no provider configured.
+#
+# Removed ENTIRELY rather than 501/503, per the standing ruling on `/coherence`
+# and `/embed`: an observer does not offer "embed this" or "score this" as a
+# service. No caller existed in any repo. No-models rule, universal incl. BYOK.
 
 
-@router.post("/activate")
-async def activate(
-    body: ActivateRequest,
-    auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
-):
-    """Activate a signal in the meaning manifold (canonical plan §7).
-
-    Feed-forward, one shot: present text *or* an embedding → reconcile to the
-    native language (the grounded anchors it activates) + its density-zoom layer
-    → optionally return the nearest authorized artifacts. The embedding is the
-    carrier; classic ``/search`` and this share the same manifold.
-    """
-    user_id = auth.user_id
-    if not user_id and not auth.bearer_grant:
-        raise HTTPException(status_code=401, detail="Missing authorization")
-
-    has_text = bool(body.text and body.text.strip())
-    has_embedding = bool(body.embedding)
-    if has_text == has_embedding:
-        raise HTTPException(
-            status_code=400, detail="provide exactly one of 'text' or 'embedding'",
-        )
-
-    # Resolve the carrier embedding.
-    if has_embedding:
-        vec = body.embedding
-        model_id = body.model_id
-    else:
-        from embeddings import Embeddings, model_id as emb_model_id
-        vectors = Embeddings()([body.text])
-        if not vectors or not vectors[0]:
-            raise HTTPException(
-                status_code=503,
-                detail="Embeddings provider unavailable — cannot activate text.",
-            )
-        vec = vectors[0]
-        model_id = body.model_id or emb_model_id()
-
-    # Native activation (geometry; non-authorizing — canonical plan §1).
-    from search.anchors.activate import activate_vector
-    try:
-        activation = activate_vector(vec, model_id=model_id, top_anchors=body.top_anchors)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    # Act: nearest authorized artifacts via the canonical encrypted search.
-    neighbors: List[dict] = []
-    if body.act:
-        from search.mantle.wiring import build_sse_search_accessor
-        from search.types import SearchQuery
-        accessor = build_sse_search_accessor(arango_db)
-        if accessor is not None:
-            query = SearchQuery(
-                query_text="",
-                query_embedding=vec,
-                user_id=user_id or "",
-                scope=body.scope or None,
-                use_hybrid=False,
-                size=body.top_k,
-            )
-            try:
-                result = accessor.search(query)
-                neighbors = [
-                    {
-                        "id": h.doc_id,
-                        "root_id": h.root_id,
-                        "collection_id": h.collection_id,
-                        "score": h.score,
-                        "title": h.title or None,
-                    }
-                    for h in result.hits
-                ]
-            except Exception as exc:
-                logger.warning("activate: neighbour search failed: %s", exc)
-
-    # Echo the raw carrier vector so text->embedding (or embedding->embedding) is a
-    # single call — "receive an embedding directly".
-    return {
-        "activation": activation,
-        "neighbors": neighbors,
-        "model_id": model_id,
-        "vector": [float(x) for x in vec],
-    }
 
 
 # =============================================================================
@@ -983,7 +937,7 @@ class BatchFetchRequest(BaseModel):
 async def batch_fetch_artifacts(
     body: BatchFetchRequest,
     auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
 ):
     """Batch fetch artifacts by IDs across all containers."""
     if not auth.user_id and not auth.bearer_grant:
@@ -991,13 +945,13 @@ async def batch_fetch_artifacts(
 
     results = []
     for aid in body.artifact_ids:
-        doc = _find_artifact(arango_db, aid)
+        doc = _find_artifact(store_db, aid)
         if not doc:
             continue
 
         # Verify read access silently — skip inaccessible artifacts.
         try:
-            check_access(auth, aid, "read", arango_db)
+            check_access(auth, aid, "read", store_db)
         except HTTPException:
             continue
 
@@ -1017,7 +971,7 @@ async def upload_initiate(
     artifact_id: str,
     body: UploadInitiateRequest,
     auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
 ):
     """Initiate an S3 upload for an artifact.
 
@@ -1027,13 +981,13 @@ async def upload_initiate(
     if not auth.user_id:
         raise HTTPException(status_code=401, detail="User identification required")
 
-    check_access(auth, artifact_id, "create", arango_db)
+    check_access(auth, artifact_id, "create", store_db)
 
-    from services.workspace_service import initiate_upload_and_create_artifact
+    from mantle.services.workspace_service import initiate_upload_and_create_artifact
 
     try:
         out, artifact = initiate_upload_and_create_artifact(
-            db=arango_db,
+            db=store_db,
             user_id=auth.user_id,
             workspace_id=artifact_id,
             filename=body.filename,
@@ -1061,15 +1015,15 @@ async def upload_status(
     artifact_id: str,
     body: UploadStatusRequest,
     auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
 ):
     """Update upload progress or mark complete/failed."""
     if not auth.user_id:
         raise HTTPException(status_code=401, detail="User identification required")
 
-    check_access(auth, artifact_id, "update", arango_db)
+    check_access(auth, artifact_id, "update", store_db)
 
-    doc = _find_artifact(arango_db, artifact_id)
+    doc = _find_artifact(store_db, artifact_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -1078,11 +1032,11 @@ async def upload_status(
         raise HTTPException(status_code=500, detail="Artifact missing collection_id")
 
 
-    from services.workspace_service import update_upload_status as svc_update_upload
+    from mantle.services.workspace_service import update_upload_status as svc_update_upload
 
     try:
         result = svc_update_upload(
-            db=arango_db,
+            db=store_db,
             user_id=auth.user_id,
             workspace_id=workspace_id,
             upload_id=artifact_id,
@@ -1107,43 +1061,18 @@ async def multipart_part_url(
     artifact_id: str,
     part_number: int = Query(..., ge=1),
     auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
 ):
-    """Get a presigned URL for uploading a specific multipart part."""
-    if not auth.user_id:
-        raise HTTPException(status_code=401, detail="User identification required")
-
-    check_access(auth, artifact_id, "update", arango_db)
-
-    doc = _find_artifact(arango_db, artifact_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Not found")
-
-    # Read upload context from artifact to get s3_key and multipart_id.
-    context_raw = doc.get("context")
-    ctx: Dict[str, Any] = {}
-    if context_raw:
-        try:
-            ctx = json.loads(context_raw) if isinstance(context_raw, str) else context_raw
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-    upload = ctx.get("upload", {})
-    s3_key = upload.get("s3_key") or ctx.get("content_key")
-    multipart_id = upload.get("multipart_id")
-
-    if not s3_key or not multipart_id:
-        raise HTTPException(status_code=400, detail="No active multipart upload for this artifact")
-
-    from services.content_service import generate_multipart_part_url as gen_part_url
-
-    try:
-        url = gen_part_url(s3_key, multipart_id, part_number)
-    except Exception as exc:
-        logger.error("Multipart part URL generation failed: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to generate part URL: {exc}")
-
-    return {"url": url, "part_number": part_number}
+    """Superseded. Presigned multipart parts upload directly to the object store,
+    bypassing Mantle — which cannot envelope-encrypt them. Content is now encrypted
+    on Mantle's byte path via the proxied `PUT /artifacts/{id}/content` upload
+    (see `upload-initiate`, which returns that URL). Chunked proxied upload is a
+    post-MVP enhancement."""
+    raise HTTPException(
+        status_code=409,
+        detail="Presigned multipart upload is disabled (content must be encrypted on "
+               "Mantle's byte path). Use the proxied PUT /artifacts/{id}/content upload.",
+    )
 
 
 # ---------- GET /artifacts/{artifact_id}/content-url ----------
@@ -1152,12 +1081,12 @@ async def multipart_part_url(
 async def content_url(
     artifact_id: str,
     auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
 ):
     """Get a signed content URL for an artifact's stored content."""
-    check_access(auth, artifact_id, "read", arango_db)
+    check_access(auth, artifact_id, "read", store_db)
 
-    doc = _find_artifact(arango_db, artifact_id)
+    doc = _find_artifact(store_db, artifact_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -1173,23 +1102,87 @@ async def content_url(
     if not content_key:
         raise HTTPException(status_code=404, detail="No downloadable content for this artifact")
 
-    filename = ctx.get("filename")
-    content_type = ctx.get("content_type")
+    # S3 is invisible to callers and holds only ciphertext, so we no longer hand out
+    # a presigned S3 URL (a direct S3 fetch would return undecryptable ciphertext).
+    # Point callers at Mantle's proxied content endpoint, which decrypts on its byte path.
+    return {"url": f"/artifacts/{artifact_id}/content"}
 
-    from services.content_service import generate_signed_url
 
-    # When the caller is a server acting via delegation (actor field set),
-    # use the server-facing endpoint so the URL is reachable from the
-    # server's network context.
-    use_server_facing = bool(getattr(auth, "actor", None))
+@router.get("/{artifact_id}/content")
+async def get_artifact_content(
+    artifact_id: str,
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    """Proxied content download — Mantle streams the artifact's stored bytes,
+    **decrypting on the byte path**. The object store never yields plaintext and is
+    invisible to callers (no presigned S3 URL). Requires read access."""
+    check_access(auth, artifact_id, "read", store_db)
+    doc = _find_artifact(store_db, artifact_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Not found")
 
+    ctx: Dict[str, Any] = {}
+    craw = doc.get("context")
+    if craw:
+        try:
+            ctx = json.loads(craw) if isinstance(craw, str) else craw
+        except (json.JSONDecodeError, TypeError):
+            ctx = {}
+    content_key = ctx.get("content_key")
+    if not content_key:
+        raise HTTPException(status_code=404, detail="No downloadable content for this artifact")
+
+    owner_id = doc.get("created_by")
+    from mantle.services.content_service import get_bytes_decrypted
+    from fastapi import Response
     try:
-        url = generate_signed_url(content_key, filename=filename, content_type=content_type, server_facing=use_server_facing)
+        data = get_bytes_decrypted(content_key, owner_id)
     except Exception as exc:
-        logger.error("Content URL generation failed: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to generate content URL: {exc}")
+        logger.error("content download failed for %s: %s", artifact_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to read content")
 
-    return {"url": url}
+    headers = {}
+    fn = ctx.get("filename")
+    if fn:
+        headers["Content-Disposition"] = f'attachment; filename="{fn}"'
+    return Response(content=data, media_type=ctx.get("content_type") or "application/octet-stream", headers=headers)
+
+
+@router.put("/{artifact_id}/content")
+async def put_artifact_content(
+    artifact_id: str,
+    request: Request,
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    """Proxied content upload — Mantle receives the bytes and **encrypts them on the
+    byte path** before writing to the object store (no presigned S3 PUT; storage never
+    receives plaintext). Requires update access. This is the target of `upload-initiate`."""
+    check_access(auth, artifact_id, "update", store_db)
+    doc = _find_artifact(store_db, artifact_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    ctx: Dict[str, Any] = {}
+    craw = doc.get("context")
+    if craw:
+        try:
+            ctx = json.loads(craw) if isinstance(craw, str) else craw
+        except (json.JSONDecodeError, TypeError):
+            ctx = {}
+    content_key = ctx.get("content_key") or f"artifacts/{artifact_id}.content"
+    owner_id = doc.get("created_by")
+    ctype = request.headers.get("content-type") or ctx.get("content_type") or "application/octet-stream"
+
+    body = await request.body()
+    from mantle.services.content_service import put_bytes_encrypted
+    try:
+        put_bytes_encrypted(content_key, body, ctype, owner_id)
+    except Exception as exc:
+        logger.error("content upload failed for %s: %s", artifact_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to store content")
+    return {"stored": True, "size": len(body), "content_key": content_key}
 
 
 # =============================================================================
@@ -1203,24 +1196,24 @@ async def reorder_children(
     artifact_id: str,
     body: ReorderRequest,
     auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
 ):
     """Reorder children of any artifact (any container)."""
     if not auth.user_id:
         raise HTTPException(status_code=401, detail="User identification required")
 
-    check_access(auth, artifact_id, "update", arango_db)
+    check_access(auth, artifact_id, "update", store_db)
 
-    if not _artifact_exists(arango_db, artifact_id):
+    if not _artifact_exists(store_db, artifact_id):
         raise HTTPException(status_code=404, detail="Artifact not found")
 
     # Resolve version-ids or root-ids → root-ids; reorder edges.
     ordered_roots: List[str] = []
     for aid in body.ordered_ids:
-        a = arango.get_artifact(arango_db, aid)
+        a = store.get_artifact(store_db, aid)
         if a:
             ordered_roots.append(a.root_id)
-    arango.reorder_collection_artifacts(arango_db, artifact_id, ordered_roots)
+    store.reorder_collection_artifacts(store_db, artifact_id, ordered_roots)
 
     return {"order_version": 0}
 
@@ -1231,7 +1224,7 @@ async def reorder_children(
 async def revert_artifact_endpoint(
     artifact_id: str,
     auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
 ):
     """Restore the artifact's last committed version, discarding the draft delta.
 
@@ -1243,20 +1236,20 @@ async def revert_artifact_endpoint(
     if not auth.user_id:
         raise HTTPException(status_code=401, detail="User identification required")
 
-    check_access(auth, artifact_id, "update", arango_db)
+    check_access(auth, artifact_id, "update", store_db)
 
-    doc = _find_artifact(arango_db, artifact_id)
+    doc = _find_artifact(store_db, artifact_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Not found")
 
     workspace_id = doc.get("collection_id") or doc.get("_key") or ""
 
-    from services.workspace_service import revert_artifact
+    from mantle.services.workspace_service import revert_artifact
 
     try:
         result = revert_artifact(
-            workspace_db=arango_db,
-            collection_db=arango_db,
+            workspace_db=store_db,
+            collection_db=store_db,
             user_id=auth.user_id,
             workspace_id=workspace_id,
             artifact_id=artifact_id,
@@ -1281,21 +1274,21 @@ async def revert_artifact_endpoint(
 async def list_commits(
     container_id: str,
     auth: AuthContext = Depends(get_auth),
-    arango_db: StandardDatabase = Depends(get_arango_db),
+    store_db: Database = Depends(get_store_db),
 ):
     """List commits for a collection container."""
-    check_access(auth, container_id, "read", arango_db)
+    check_access(auth, container_id, "read", store_db)
 
-    if not _artifact_exists(arango_db, container_id):
+    if not _artifact_exists(store_db, container_id):
         raise HTTPException(status_code=400, detail="Commits only available for collections")
 
     if not auth.user_id:
         raise HTTPException(status_code=401, detail="User identification required")
 
-    from services.collection_service import get_commits_for_collection
+    from mantle.services.collection_service import get_commits_for_collection
 
     try:
-        commits = get_commits_for_collection(arango_db, auth.user_id, container_id)
+        commits = get_commits_for_collection(store_db, auth.user_id, container_id)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1316,4 +1309,24 @@ async def list_commits(
             for c in commits
         ],
     }
+
+
+@router.get("/{artifact_id}/access-log")
+async def get_artifact_access_log(
+    artifact_id: str,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    result: Optional[str] = Query(None, description="filter: allowed | denied"),
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    """The artifact's own access history — who touched it, when, allowed or denied
+    (the access-audit "force"). Requires ``admin`` on the artifact; reading it is
+    itself witnessed (recursively) via the same check_access gate."""
+    check_access(auth, artifact_id, "admin", store_db)
+    from mantle.services import audit_service
+    events = audit_service.get_artifact_access_log(
+        store_db, artifact_id, limit=limit, offset=offset, result=result
+    )
+    return {"artifact_id": artifact_id, "count": len(events), "events": events}
 

@@ -5,9 +5,9 @@
 # `platform` was extracted to agience-origin (formerly agience-core) and is NOT vendored here;
 # the code under mantle/ imports it as `platform`.
 #   Local dev (until agience-origin is published) — editable install from the sibling checkout:
-#     pip install -e ../agience-core/src/agience_core
+#     pip install -e ../agience-core/src/core
 #   Production — pin to a pushed tag:
-#     agience_core @ git+ssh://git@github.com/Agience/agience-origin.git@platform-v0.1.0#subdirectory=src/agience_core
+#     core @ git+ssh://git@github.com/Agience/agience-origin.git@platform-v0.1.0#subdirectory=src/core
 
 # Authentication & Security
 authlib==1.6.9
@@ -36,14 +36,16 @@ pydantic-core==2.41.1
 annotated-types==0.7.0
 email-validator==2.2.0
 
-# AI & Embeddings
-anthropic>=0.42.0
-google-genai>=1.0.0
-tiktoken==0.12.0
+# AI & Embeddings — NONE. [John, 2026-07-22: the no-models rule is UNIVERSAL]
+# Removed: anthropic (remote LLM client — no importer in src, dead since the
+# platform_llm provisioner removal), google-genai (remote LLM client, no
+# importer), tiktoken (OpenAI cl100k BPE ranks downloaded at first use —
+# a trained vocabulary; chunking is whitespace-word based now, see
+# search/ingest/chunking.py). A remote model is still trained weights.
 
 # Vector Database & Search
 numpy==2.3.3
-# opensearch-py retired in Step 2.6.9 (2026-05-09); search runs on
+# the legacy lexical client retired in Step 2.6.9 (2026-05-09); search runs on
 # encrypted MANTLE + MANTLE-SSE.
 
 # Database
@@ -55,8 +57,9 @@ alembic>=1.13
 # Manifest loader (Origin)
 pyyaml>=6.0
 
-# Graph Database
-python-arango==8.1.3
+# Graph Database — none. The legacy graph driver was removed 2026-07-22: dead since
+# the store flip (db/store.py aliases the handle type as Any at runtime; the
+# TYPE_CHECKING import of that driver was replaced with a local alias).
 
 # Cloud Storage
 boto3==1.40.50

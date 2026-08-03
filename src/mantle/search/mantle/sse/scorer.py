@@ -1,11 +1,11 @@
-﻿"""In-process BM25 scorer for MANTLE-SSE (Step 2.6.5).
+"""In-process BM25 scorer for MANTLE-SSE (Step 2.6.5).
 
 Standard Okapi BM25 with field boosting. After the SSE query engine
 fetches and decrypts posting lists for the query's blind tokens, this
 module aggregates per-(artifact, collection) scores using the corpus
 stats from :mod:`stats`.
 
-Formula (per BM25 reference, matching OpenSearch's defaults)::
+Formula (per BM25 reference, matching the legacy lexical engine's defaults)::
 
     BM25(q, d) = Σ_{t in q} field_boost · IDF(t) · normalized_tf(t, d)
 
@@ -13,7 +13,7 @@ Formula (per BM25 reference, matching OpenSearch's defaults)::
     normalized_tf(t, d) = (tf · (k1 + 1)) /
                           (tf + k1 · (1 - b + b · dl / avgdl))
 
-Defaults: ``k1 = 1.2``, ``b = 0.75`` (Lucene / OpenSearch BM25Similarity).
+Defaults: ``k1 = 1.2``, ``b = 0.75`` (Lucene / the legacy BM25 indexSimilarity).
 
 A blind token encodes ``(field, term)`` (see :mod:`blind_tokens`), so a
 posting list inherently scopes to one field. The scorer takes a flat

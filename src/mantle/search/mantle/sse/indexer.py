@@ -1,9 +1,10 @@
-﻿"""SseIndexer — commit-path posting list + manifest + stats updater (Step 2.6.6).
+"""SseIndexer — commit-path posting list + manifest + stats updater (Step 2.6.6).
 
 Mirrors :class:`mantle.search.mantle.indexer.MantleIndexer` for the SSE
 lexical index. Composes:
 
-- :class:`OracleService` — derives the owner SSE key
+- :class:`SseKeyProvider` (``.keys``) — derives the owner SSE key. The PROTOCOL, not the
+  platform's ``OracleService``, which merely satisfies it.
 - :mod:`tokenizer` — analysis pipeline (lowercase → possessive → stop
   → Porter stem)
 - :mod:`blind_tokens` — HMAC-based exact + prefix token generation
@@ -41,7 +42,7 @@ See ``.dev/features/mantle-sse-lexical-index.md`` § Indexing Flow.
 from __future__ import annotations
 
 import logging
-from typing import Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from .blind_tokens import (
     FIELD_CONTENT,
@@ -68,7 +69,12 @@ from .posting import (
 from . import stats as stats_mod
 from .stats import StatsStore
 from .tokenizer import bigrams as _stem_bigrams, tokenize
-from ..oracle import OracleService
+# ⛔ THE KEY CONTRACT, NOT THE CUSTODY IMPLEMENTATION. Importing `..oracle` here pinned the whole
+# encrypted lexical arm service-side (EREA §5): 703 lines of grant verifier, lattice master-key store
+# and CRUDEASIO mint policy, for one method call. `SseKeyProvider` is that one method.
+# `request` stays untyped — it is the PROVIDER's policy object (`oracle.KeyRequest` in the platform),
+# and naming its type here would drag the custody model back across the seam.
+from .keys import SseKeyProvider
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +128,7 @@ class SseIndexer:
 
     def __init__(
         self,
-        oracle: OracleService,
+        oracle: SseKeyProvider,
         posting_store: PostingStore,
         stats_store: StatsStore,
     ) -> None:
@@ -140,6 +146,7 @@ class SseIndexer:
         collection_id: str,
         artifact_id: str,
         fields: Mapping[str, str],
+        request: Any,          # the PROVIDER's policy object (oracle.KeyRequest in the platform)
     ) -> int:
         """Index (or re-index) one artifact. Returns the number of distinct
         blind tokens written / updated.
@@ -162,7 +169,7 @@ class SseIndexer:
         if not artifact_id:
             raise ValueError("artifact_id is required")
 
-        owner_sse_key = self._oracle.derive_sse_key(principal_id)
+        owner_sse_key = self._oracle.derive_sse_key(principal_id, request)
 
         # ---- 1. Analyze each field -----------------------------------
         new_field_dls: dict[str, int] = {}
@@ -276,7 +283,10 @@ class SseIndexer:
 
         return len(new_tokens)
 
-    def remove_artifact(self, principal_id: str, artifact_id: str) -> int:
+    def remove_artifact(
+        self, principal_id: str, artifact_id: str,
+        request: Any,          # the PROVIDER's policy object (oracle.KeyRequest in the platform)
+    ) -> int:
         """Strip every reference to ``artifact_id`` from the SSE index.
 
         Reads the artifact's manifest to find every blind token referencing
@@ -291,7 +301,7 @@ class SseIndexer:
         if not principal_id or not artifact_id:
             raise ValueError("principal_id and artifact_id are required")
 
-        owner_sse_key = self._oracle.derive_sse_key(principal_id)
+        owner_sse_key = self._oracle.derive_sse_key(principal_id, request)
         manifest_key = derive_manifest_key(owner_sse_key, artifact_id)
         manifest_blob = self._postings.get_manifest(principal_id, artifact_id)
         if manifest_blob is None:

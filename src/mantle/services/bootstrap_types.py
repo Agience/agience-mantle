@@ -25,7 +25,6 @@ AUTHORITY_CONTENT_TYPE = "application/vnd.agience.authority+json"
 HOST_CONTENT_TYPE = "application/vnd.agience.host+json"
 AGENCY_CONTENT_TYPE = "application/vnd.agience.agency+json"
 AGENT_CONTENT_TYPE = "application/vnd.agience.agent+json"
-LLM_CONNECTION_CONTENT_TYPE = "application/vnd.agience.llm-connection+json"
 MCP_SERVER_CONTENT_TYPE = "application/vnd.agience.mcp-server+json"
 PACKAGE_CONTENT_TYPE = "application/vnd.agience.package+json"
 # A content-type definition, itself stored as an artifact. Servers self-register
@@ -72,7 +71,9 @@ ALL_SERVERS_COLLECTION_SLUG = "agience-seeds-all-servers"
 ALL_TOOLS_COLLECTION_SLUG = "agience-seeds-all-tools"
 AGENTS_COLLECTION_SLUG = "agience-seeds-agents"
 
-LLM_CONNECTIONS_COLLECTION_SLUG = "agience-llm-connections"
+# LLM_CONNECTIONS_COLLECTION_SLUG removed 2026-07-22 (no-models rule — universal):
+# the collection, its three anthropic connection artifacts and the user-read grant
+# are gone from the seed tree; nothing invokes a model anywhere in the platform.
 
 # The shared AnchorSet — a collection whose members are anchor artifacts (the
 # routing centroids of MANTLE encrypted search + grounding for Anchored
@@ -97,10 +98,9 @@ AUTHORITY_ARTIFACT_SLUG = "agience-authority-current-instance"
 HOST_ARTIFACT_SLUG = "agience-host-current-instance"
 AGENCY_ARTIFACT_SLUG = "agience-agency-platform"
 AGENT_ARTIFACT_SLUG_PREFIX = "agience-agent-"
-LLM_CONNECTION_SLUG_PREFIX = "agience-llm-"
 # The platform MCP server (backend/mcp_server/) is always available.
 # It gets a stable UUID via platform_topology like every other platform entity.
-AGIENCE_CORE_SLUG = "agience-core"
+AGIENCE_CORE_SLUG = "agience-beam"
 
 # Phase 7 — Server Artifact Proxy. First-party MCP servers are seeded as
 # vnd.agience.mcp-server+json artifacts at bootstrap. Slug format: agience-server-{name}
@@ -116,12 +116,6 @@ PLATFORM_AGENT_SLUGS = [
     "ophan", "seraph", "verso",
 ]
 
-PLATFORM_LLM_CONNECTION_SLUGS = [
-    "anthropic-sonnet",
-    "anthropic-haiku",
-    "anthropic-opus",
-]
-
 # ---------------------------------------------------------------------------
 # Seed collection fixture lists
 # ---------------------------------------------------------------------------
@@ -134,7 +128,6 @@ USER_READABLE_SEED_SLUGS = [
     ALL_SERVERS_COLLECTION_SLUG,
     ALL_TOOLS_COLLECTION_SLUG,
     AGENTS_COLLECTION_SLUG,
-    LLM_CONNECTIONS_COLLECTION_SLUG,
     PACKAGE_REGISTRY_COLLECTION_SLUG,
     ANCHORSET_COLLECTION_SLUG,
 ]
@@ -156,7 +149,6 @@ ALL_PLATFORM_COLLECTION_SLUGS = [
     ALL_SERVERS_COLLECTION_SLUG,
     ALL_TOOLS_COLLECTION_SLUG,
     AGENTS_COLLECTION_SLUG,
-    LLM_CONNECTIONS_COLLECTION_SLUG,
     PACKAGE_REGISTRY_COLLECTION_SLUG,
     ANCHORSET_COLLECTION_SLUG,
 ]

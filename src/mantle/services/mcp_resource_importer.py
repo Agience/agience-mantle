@@ -1,4 +1,4 @@
-﻿"""MCP resource / capability importer.
+"""MCP resource / capability importer.
 
 Operation-dispatcher native targets for the `vnd.agience.mcp-server+json`
 type's `resources_read`, `resources_import`, and `materialize_capabilities`
@@ -8,7 +8,7 @@ Replaces the corresponding `dispatch_resources_*` functions in the old
 `mcp_service.py`. The transport layer (calling out to the MCP server) is
 now `chorus_client` — mantle no longer holds an in-process MCP client.
 The artifact-creation logic stays here in mantle because it walks the
-local Arango (sub-collections, deterministic UUIDs, archive-stale).
+local the lattice (sub-collections, deterministic UUIDs, archive-stale).
 
 JSON-RPC item shapes consumed (from chorus's gateway forwarding to the
 target persona's FastMCP handlers):
@@ -28,20 +28,21 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
-from arango.database import StandardDatabase
+from mantle.db.store import Database
 
-from db import arango as arango_db_module
-from db.arango import (
+from mantle.db import backend as store_backend
+from mantle.db.backend import (
     add_artifact_to_collection as db_add_artifact_to_collection,
     create_artifact as db_create_artifact,
     get_artifact as db_get_artifact,
     list_collection_artifacts as _db_list_collection_artifacts,
     update_artifact as db_update_artifact,
 )
-from entities.artifact import Artifact as ArtifactEntity
-from entities.collection import COLLECTION_CONTENT_TYPE
+from mantle.entities.artifact import Artifact as ArtifactEntity
+from mantle.entities.collection import COLLECTION_CONTENT_TYPE
 
-from services import chorus_client
+from mantle.services import chorus_client
+from mantle.services.acting_principal import acting_as
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +133,7 @@ def _enqueue_capability_index(
     committed entry. Sub-collection containers are NOT indexed (matching the normal
     container-create path). Best-effort + async (off the import critical path)."""
     try:
-        from search.ingest.pipeline_unified import enqueue_index_artifact
+        from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
         enqueue_index_artifact(artifact, artifact.collection_id, vacate=vacate)
     except Exception:
         logger.debug(
@@ -141,7 +142,7 @@ def _enqueue_capability_index(
 
 
 def _upsert_capability_artifact(
-    db: StandardDatabase,
+    db: Database,
     *,
     artifact_id: str,
     collection_id: str,
@@ -190,7 +191,7 @@ def _upsert_capability_artifact(
 
 
 def _ensure_subcollection(
-    db: StandardDatabase,
+    db: Database,
     server_root_id: str,
     kind: str,
     label: str,
@@ -224,7 +225,7 @@ def _ensure_subcollection(
 
 
 def _archive_stale_capabilities(
-    db: StandardDatabase,
+    db: Database,
     parent_id: str,
     live_ids: Set[str],
     user_id: str,
@@ -254,7 +255,7 @@ def _archive_stale_capabilities(
 
 
 def import_resources_as_artifacts(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     server_artifact_id: str,
@@ -265,13 +266,13 @@ def import_resources_as_artifacts(
     `server_artifact_id` is the seeded MCP-server artifact UUID.
     Returns the list of created artifact IDs.
     """
-    ws_grants = arango_db_module.get_active_grants_for_principal_resource(
+    ws_grants = store_backend.get_active_grants_for_principal_resource(
         db, grantee_id=user_id, resource_id=workspace_id,
     )
     if not any(getattr(g, "can_create", False) for g in ws_grants):
         raise ValueError("Workspace not found")
 
-    from services.workspace_service import create_workspace_artifacts_bulk
+    from mantle.services.workspace_service import create_workspace_artifacts_bulk
 
     items: List[Dict[str, Any]] = []
     for r in resources or []:
@@ -297,7 +298,7 @@ def import_resources_as_artifacts(
 
 
 def materialize_server_capabilities(
-    db: StandardDatabase,
+    db: Database,
     server_root_id: str,
     user_id: str,
 ) -> Dict[str, int]:
@@ -332,7 +333,7 @@ def materialize_server_capabilities(
 
 
 def _materialize_kind(
-    db: StandardDatabase,
+    db: Database,
     server_root_id: str,
     kind: str,
     items: List[Dict[str, Any]],
@@ -439,13 +440,19 @@ def dispatch_resources_import(artifact: Dict, body: Dict, ctx) -> Dict:
     if not server_artifact_id:
         raise ValueError("Cannot resolve server artifact id from dispatch target")
 
-    created_ids = import_resources_as_artifacts(
-        db=ctx.arango_db,
-        user_id=ctx.user_id,
-        workspace_id=workspace_id.strip(),
-        server_artifact_id=str(server_artifact_id),
-        resources=resources,
-    )
+    # Act as the dispatching user. This arrives from the Chorus gateway through the
+    # operation dispatcher, NOT through `Depends(get_auth)`, so the acting principal
+    # is not already published — but `ctx.user_id` is a real authenticated user, so
+    # the correct identity here is that user, not the platform system principal.
+    # These calls write artifacts (content encryption) and enqueue indexing.
+    with acting_as(ctx.user_id, principal_type="user", source="request"):
+        created_ids = import_resources_as_artifacts(
+            db=ctx.store_db,
+            user_id=ctx.user_id,
+            workspace_id=workspace_id.strip(),
+            server_artifact_id=str(server_artifact_id),
+            resources=resources,
+        )
     return {"created_artifact_ids": created_ids, "count": len(created_ids)}
 
 
@@ -455,9 +462,13 @@ def dispatch_materialize_capabilities(artifact: Dict, body: Dict, ctx) -> Dict:
     if not server_artifact_id:
         raise ValueError("Cannot resolve server artifact id from dispatch target")
 
-    return materialize_server_capabilities(
-        db=ctx.arango_db,
-        server_root_id=str(server_artifact_id),
-        user_id=ctx.user_id,
-    )
+    # Same as `dispatch_resources_import`: dispatcher entry, so act as the
+    # authenticated dispatching user. Writes capability artifacts and enqueues
+    # indexing.
+    with acting_as(ctx.user_id, principal_type="user", source="request"):
+        return materialize_server_capabilities(
+            db=ctx.store_db,
+            server_root_id=str(server_artifact_id),
+            user_id=ctx.user_id,
+        )
 

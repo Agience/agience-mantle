@@ -63,7 +63,7 @@ def _reporting_period(start: str | None, end: str | None, label: str | None) -> 
 
 
 def main() -> int:
-    from scripts.review_installation import _read_json_file  # type: ignore[import-not-found]
+    from mantle.scripts.review_installation import _read_json_file  # type: ignore[import-not-found]
 
     parser = argparse.ArgumentParser(
         description="Generate a canonical licensing usage snapshot JSON payload for Ophan reporting."

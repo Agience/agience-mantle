@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 from jose import jwt
 
-from agience_core import config
+from origin import config
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +100,7 @@ class OidcVerifier:
     def refresh_from_db(self, db: Any) -> None:
         """Reload trusted-issuer artifacts from the store and rebuild trust maps."""
         try:
-            from services.issuers import load_issuer_configs
+            from mantle.services.issuers import load_issuer_configs
             arts = load_issuer_configs(db)
         except Exception:
             logger.debug("issuer refresh failed", exc_info=True)
@@ -127,7 +127,7 @@ class OidcVerifier:
     def _load_manifest_anchors(self) -> None:
         """Register the authority manifest's service anchors as issuers, so this one
         verifier uniformly covers: platform-service JWTs (iss = origin/mantle/chorus/
-        bridge), Origin-signed user tokens + delegations (iss = AUTHORITY_ISSUER),
+        crystal), Origin-signed user tokens + delegations (iss = AUTHORITY_ISSUER),
         and external OIDC IdPs. Inline JWKS — no fetch. Explicitly-configured
         external issuers win over manifest anchors (setdefault)."""
         manifest = _read_authority_manifest()
@@ -199,6 +199,18 @@ class OidcVerifier:
             return None
 
         aud = expected_audience or cfg.get("audience")
+        if not aud and iss in self._external:
+            # Confused-deputy guard (multi-tenant): a trusted EXTERNAL tenant IdP that
+            # binds no audience would let a token it minted for a DIFFERENT relying
+            # party be accepted here — a cross-tenant hole once several issuers are
+            # trusted. Fail closed; register the issuer with an `audience` to trust it.
+            # (Internal manifest anchors / the Origin issuer are NOT in `_external`;
+            # their aud is validated downstream by `_validate_aud_for_principal`, so
+            # they keep verifying without a per-issuer audience.)
+            logger.warning(
+                "oidc: rejecting token from external issuer=%s — no audience bound "
+                "(register the issuer with an `audience`)", iss)
+            return None
         options = {"verify_aud": bool(aud)}
         try:
             return jwt.decode(token, jwk, algorithms=_ALGS, issuer=iss, audience=aud, options=options)

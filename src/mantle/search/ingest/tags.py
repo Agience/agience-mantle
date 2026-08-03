@@ -56,11 +56,29 @@ def parse_tags_from_context(context_str: str) -> List[str]:
     """
     import json
     
-    if not context_str or not context_str.strip():
+    # Same defect as `chunking.extract_text_from_context` -- see the note there.
+    if context_str is None or (isinstance(context_str, str) and not context_str.strip()):
+        return []
+    if not context_str:
         return []
     
+    # ⛔ NON-JSON CONTEXT IS PROSE, NOT AN ERROR — see the note in `chunking.extract_text_from_context`.
+    # Measured: 48 of 500 live vertices carry a bare string here. Unlike the text extractor there is
+    # genuinely NOTHING to recover for TAGS from free prose (inventing tags by splitting a sentence
+    # would be adding words the artifact never carried, the other half of the same law), so this
+    # returns no tags — but it does so SILENTLY, because "this artifact has no tags" is an ordinary
+    # reading, not a fault worth a warning per artifact per ingest.
+    if isinstance(context_str, str):
+        try:
+            context = json.loads(context_str)
+        except json.JSONDecodeError:
+            return []
+    else:
+        context = context_str
+    if not isinstance(context, dict):
+        return []
+
     try:
-        context = json.loads(context_str) if isinstance(context_str, str) else context_str
         tags = context.get("tags", [])
         
         if isinstance(tags, list):
@@ -91,7 +109,10 @@ def extract_metadata_from_context(context_str: str) -> dict:
     
     metadata = {}
     
-    if not context_str or not context_str.strip():
+    # Third instance of the same type-assuming guard -- see chunking.extract_text_from_context.
+    if context_str is None or (isinstance(context_str, str) and not context_str.strip()):
+        return metadata
+    if not context_str:
         return metadata
     
     try:

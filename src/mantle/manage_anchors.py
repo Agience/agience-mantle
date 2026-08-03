@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
-"""manage_anchors.py — bootstrap / inspect the live MANTLE AnchorSet.
+"""manage_anchors.py — inspect the live MANTLE AnchorSet.
 
 The AnchorSet is the shared coordinate system / routing centroids / grounding
-(see `.dev/features/mantle-canonical-architecture.md` §3). "Light-training"
-bootstrap clusters the platform's *common grounded knowledge* — the platform
-seed corpus — and admits representative items as the initial L1 anchors. The
-set grows from there as the manifold grows.
+(see `.dev/features/mantle-canonical-architecture.md` §3). It is **provisioned**: the canonical set
+arrives as an artifact and every node admits the same one. It grows from there as the manifold grows.
 
 Run from the `mantle/` directory.
 
 Actions
 -------
-bootstrap   Embed the platform seed corpus, cluster into K anchors, save.
-inspect     Show the current live AnchorSet (count, model, sample anchors).
+seed-corpus  Report the platform seed corpus this deployment ships (what gets INDEXED once the
+             AnchorSet exists). It is NOT the source of the anchors.
+inspect      Show the current live AnchorSet (count, model, sample anchors).
+grow         Propose a candidate anchor from novel text.
 
-Requires the embeddings provider to be configured + reachable (EMBEDDINGS_URI).
+⛔ THE `bootstrap` ACTION IS REMOVED (2026-07-31). It clustered the seed corpus with k-means and
+admitted the medoids. Anchors derived locally mint region ids no peer computes, so it produced an
+index that looked healthy and shared with nobody. There is no replacement action: provision the
+canonical AnchorSet artifact into the anchor repo.
+
+⛔ NO EMBEDDINGS PROVIDER EXISTS (2026-07-22, universal no-models rule — see embeddings.py), so
+`grow` fails with an explicit error: it needs vectors and nothing produces them. `inspect` and
+`seed-corpus` work without any.
 """
 
 import argparse
 import logging
 
-from search.anchors import (
-    bootstrap_anchorset,
+from mantle.search.anchors import (
     gather_seed_corpus,
     get_anchor_repo,
     get_live_anchorset,
@@ -33,33 +39,24 @@ logging.basicConfig(
 logger = logging.getLogger("manage_anchors")
 
 
-def action_bootstrap(k: int, dry_run: bool) -> None:
+def action_seed_corpus(_dry_run: bool) -> None:
+    """Report the seed corpus. It is what gets INDEXED; it is not where anchors come from."""
     corpus = gather_seed_corpus()
     if not corpus:
         raise SystemExit("No seed corpus under package/seeds/platform/artifacts.")
-    logger.info("Gathered %d seed items for anchor bootstrap.", len(corpus))
-    if dry_run:
-        logger.info("[DRY-RUN] Would embed %d items, admit K=%d anchors.", len(corpus), k)
-        for label, _ in corpus[:12]:
-            logger.info("  - %s", label)
-        return
-
-    try:
-        aset = bootstrap_anchorset(get_anchor_repo(), k=k)
-    except RuntimeError as exc:
-        raise SystemExit(str(exc)) from exc
-    logger.info(
-        "Bootstrapped AnchorSet: %d anchors (model=%s) persisted as artifacts",
-        len(aset), aset.model_id,
-    )
-    for a in aset.anchors[: min(len(aset), 12)]:
-        logger.info("  anchor[%s] %s", a.tier, a.label)
+    logger.info("Platform seed corpus: %d items.", len(corpus))
+    for label, _ in corpus[:12]:
+        logger.info("  - %s", label)
+    if len(corpus) > 12:
+        logger.info("  ... and %d more", len(corpus) - 12)
+    logger.info("Anchors are NOT derived from these — the AnchorSet is provisioned.")
 
 
 def action_inspect(_dry_run: bool) -> None:
     aset = get_live_anchorset()
     if aset is None:
-        logger.info("No live AnchorSet yet. Run: python manage_anchors.py --action bootstrap")
+        logger.info("No live AnchorSet. It is provisioned, not generated here — load the canonical "
+                    "AnchorSet artifact into the anchor repo.")
         return
     logger.info("Live AnchorSet: %d anchors, model=%s, dim=%d", len(aset), aset.model_id, aset.dim)
     logger.info("  (manifold analysis is available via the Beacon add-on)")
@@ -71,37 +68,61 @@ def action_grow(text: str, dry_run: bool) -> None:
     """Admit a novel signal as a new CANDIDATE anchor (RG-flow growth)."""
     if not text:
         raise SystemExit("--text is required for grow")
-    from embeddings import Embeddings
+    from mantle.embeddings import Embeddings
     vectors = Embeddings()([text])
     if not vectors or not vectors[0]:
-        raise SystemExit("Embeddings provider unavailable — set EMBEDDINGS_URI.")
+        raise SystemExit(
+            "No embeddings provider exists (removed 2026-07-22 under the universal "
+            "no-models rule — see embeddings.py). grow requires vectors."
+        )
+    # Both branches report the CONTINUOUS density, not just the layer. An operator told
+    # "layer L1" cannot tell a signal sitting a thousandth from the threshold — where the
+    # answer will flip at the next refit — from one sitting well inside it, and the layer
+    # thresholds themselves are refitted from anchor spacing on every growth step. The
+    # admit/reject stays binary; the evidence for it no longer has to be guessed at.
     if dry_run:
-        from search.anchors import get_density_zoom
+        from mantle.search.anchors import get_density_zoom
         dz = get_density_zoom()
-        layer = dz.layer(vectors[0])[0] if dz is not None else "?"
-        logger.info("[DRY-RUN] %r → density layer %s (admitted only if L0/novel)", text, layer)
+        if dz is None:
+            logger.info("[DRY-RUN] %r → no density zoom available", text)
+            return
+        layer, density = dz.layer(vectors[0])
+        logger.info(
+            "[DRY-RUN] %r → density layer %s (density=%.4f, t_low=%s, t_high=%s); "
+            "admitted only if L0/novel",
+            text, layer, float(density),
+            getattr(dz, "_t_low", None), getattr(dz, "_t_high", None),
+        )
         return
-    from search.anchors.grow import propose_anchor
-    anchor = propose_anchor(text[:80], vectors[0])
-    if anchor is None:
-        logger.info("Not admitted — no AnchorSet, dim mismatch, or already covered (not novel).")
+    from mantle.search.anchors.grow import propose_anchor_decided
+    decision = propose_anchor_decided(text[:80], vectors[0])
+    if decision.anchor is None:
+        # `reason` separates the three cases the old single `None` merged: no AnchorSet,
+        # dimension mismatch, and a genuine geometric rejection.
+        logger.info("Not admitted (%s): %s", decision.reason, decision.as_read())
     else:
-        logger.info("Admitted candidate anchor: %s (%s)", anchor.label, anchor.anchor_id[:12])
+        logger.info("Admitted candidate anchor: %s (%s) %s",
+                    decision.anchor.label, decision.anchor.anchor_id[:12],
+                    decision.as_read())
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Manage the MANTLE AnchorSet.")
-    parser.add_argument("--action", choices=["bootstrap", "inspect", "grow"], required=True)
-    parser.add_argument("--k", type=int, default=24, help="Anchors to admit (bootstrap).")
+    parser.add_argument("--action", choices=["seed-corpus", "inspect", "grow"], required=True)
     parser.add_argument("--text", help="Text to grow a candidate anchor from (grow).")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    if args.action == "bootstrap":
-        action_bootstrap(args.k, args.dry_run)
-    elif args.action == "inspect":
-        action_inspect(args.dry_run)
-    elif args.action == "grow":
-        action_grow(args.text, args.dry_run)
+    # CLI: no request context. Anchor admission writes anchor artifacts through the
+    # ordinary artifact path.
+    from mantle.services.system_identity import system_acting_context
+
+    with system_acting_context(scope="platform.manage-anchors"):
+        if args.action == "seed-corpus":
+            action_seed_corpus(args.dry_run)
+        elif args.action == "inspect":
+            action_inspect(args.dry_run)
+        elif args.action == "grow":
+            action_grow(args.text, args.dry_run)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,16 @@
+"""Collect local deployment usage metrics from THE store (the standalone lattice).
+
+The metric KEY SET is stable — downstream usage snapshots/licensing read these names — but the
+values now come from the lattice: maintained counters where published (`count`, `count_edges`),
+typed-plane streams for the small per-type tallies. Ported from the lattice collection counts
+with the 2026-07-22 flip.
+"""
 from __future__ import annotations
 
 import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any
 
 
 def _backend_root() -> Path:
@@ -15,55 +21,44 @@ backend_root = _backend_root()
 if str(backend_root) not in sys.path:
     sys.path.insert(0, str(backend_root))
 
-get_arangodb_connection = None
-config_module = None
+# Injectable for tests: a callable returning the store handle.
+get_store_handle = None
 
 
 def _load_backend_dependencies() -> None:
-    global get_arangodb_connection
-    global config_module
-
-    if get_arangodb_connection is None:
-        from schemas.arango.initialize import get_arangodb_connection as arango_connection
-
-        get_arangodb_connection = arango_connection
-
-    if config_module is None:
-        from agience_core import config as _config
-        config_module = _config
+    global get_store_handle
+    if get_store_handle is None:
+        from mantle.db import backend
+        get_store_handle = backend.store_handle
 
 
-def _safe_collection_count(db, name: str) -> int:
-    if not db.has_collection(name):
-        return 0
-    return int(db.collection(name).count())
+def _count_ct(db, content_type: str) -> int:
+    """Stream-count one typed plane. Small planes only (grants/commits/containers)."""
+    return sum(1 for _ in db.artifacts.list_artifacts(content_type=content_type))
 
 
 def collect_usage_metrics() -> dict[str, int]:
     _load_backend_dependencies()
+    db = get_store_handle()
 
-    arango: Any = get_arangodb_connection(
-        host=config_module.ARANGO_HOST,
-        port=config_module.ARANGO_PORT,
-        username=config_module.ARANGO_USERNAME,
-        password=config_module.ARANGO_PASSWORD,
-        db_name=config_module.ARANGO_DATABASE,
-    )
+    from mantle.db.lattice_api import _GRANT_CT, _COMMIT_CT               # the typed planes
+    from mantle.db.lattice_identity import _PEOPLE
+    from mantle.entities.collection import WORKSPACE_CONTENT_TYPE, COLLECTION_CONTENT_TYPE
 
     return {
-        "users_total": _safe_collection_count(arango, "people"),
-        "workspaces_total": _safe_collection_count(arango, "workspaces"),
-        "workspace_artifacts_total": _safe_collection_count(arango, "workspace_artifacts"),
-        "collections_total": _safe_collection_count(arango, "collections"),
-        "committed_artifact_versions_total": _safe_collection_count(arango, "artifact_versions"),
-        "grants_total": _safe_collection_count(arango, "grants"),
-        "commits_total": _safe_collection_count(arango, "commits"),
+        "users_total": sum(1 for _ in _PEOPLE.all(db)),
+        "workspaces_total": _count_ct(db, WORKSPACE_CONTENT_TYPE),
+        "workspace_artifacts_total": int(db.graph.count_edges()),   # membership edges
+        "collections_total": _count_ct(db, COLLECTION_CONTENT_TYPE),
+        "committed_artifact_versions_total": int(db.artifacts.count(state="committed")),
+        "grants_total": _count_ct(db, _GRANT_CT),
+        "commits_total": _count_ct(db, _COMMIT_CT),
     }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Collect local deployment usage metrics from ArangoDB."
+        description="Collect local deployment usage metrics from the lattice store."
     )
     parser.add_argument(
         "--output-file",

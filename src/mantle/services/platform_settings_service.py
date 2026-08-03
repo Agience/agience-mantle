@@ -3,15 +3,15 @@ services/platform_settings_service.py
 
 DB-backed platform configuration with in-memory cache.
 
-All runtime settings are stored in the platform_settings ArangoDB collection.
+All runtime settings are stored in the platform_settings table (the lattice).
 Settings marked is_secret=True are encrypted at rest using the Fernet
 encryption key from key_manager.
 
 Usage:
-    from services.platform_settings_service import settings
+    from mantle.services.platform_settings_service import settings
 
     # After load_all() has been called at startup:
-    value = settings.get("ai.default_provider")
+    value = settings.get("mantle.search.chunk_size")
     secret = settings.get_secret("auth.google.client_secret")
 """
 
@@ -20,10 +20,10 @@ import os
 from typing import Optional
 
 from cryptography.fernet import Fernet
-from arango.database import StandardDatabase
+from mantle.db.store import Database
 
-from agience_core.key_manager import get_encryption_key
-from db import arango_identity as arango_ws
+from prism.trust.key_manager import get_encryption_key
+from mantle.db import identity_backend as identity_store
 
 logger = logging.getLogger(__name__)
 
@@ -33,38 +33,28 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULTS: dict[str, str] = {
-    # PostgreSQL (bootstrap — also resolved from key files)
-    "db.postgres.host": "sql",
-    "db.postgres.port": "5432",
-    "db.postgres.user": "agience",
-    "db.postgres.name": "agience",
+    # db.postgres.* defaults REMOVED (2026-07-22): zero consumers anywhere in the
+    # workspace — Origin runs its own SQLite and mantle its lattice; no compose file
+    # has carried a `sql` container since the flip. Defaults for absent infrastructure
+    # are how a settings page grows knobs that configure nothing.
 
-    # AI defaults — provider-agnostic. Anthropic is the platform default.
-    "ai.default_provider": "anthropic",
-    "ai.default_model": "claude-sonnet-4-6",
-    "ai.quick_model": "claude-haiku-4-5-20251001",
-    "ai.ollama_base_url": "http://localhost:11434",
+    # AI + embeddings defaults REMOVED (2026-07-22, no-models rule — universal):
+    # `ai.default_provider/default_model/quick_model/ollama_base_url` and
+    # `embeddings.provider/dim` configured model capability that no longer exists
+    # anywhere in the platform (see mantle/embeddings.py for the tombstone).
 
-    # Embeddings — provider-agnostic via HTTP. Default: Agience embeddings server.
-    "embeddings.provider": "agience",
-    "embeddings.dim": "1024",
+    # External-DB settings retired with the 2026-07-22 flip: the lattice is opened
+    # in-process from MANTLE_LATTICE_PATH; there is no DB server to configure.
 
-    # ArangoDB — use env vars so dev mode resolves to 127.0.0.1; Docker sets ARANGO_HOST=graph
-    "db.arango.host": os.getenv("ARANGO_HOST", "127.0.0.1"),
-    "db.arango.port": os.getenv("ARANGO_PORT", "8529"),
-    "db.arango.username": "root",
-    "db.arango.database": "agience",
-
-    # OpenSearch retired in Step 2.6.9 (2026-05-09); no opensearch defaults.
+    # the legacy lexical index retired in Step 2.6.9 (2026-05-09); no legacy-lexical defaults.
 
     # Search tuning
-    "search.refresh_interval": "750ms",
-    "search.chunk_size": "1000",
-    "search.chunk_overlap": "200",
-    "search.field_weights_preset": "description-first",
-    "search.bm25_size": "200",
-    "search.knn_k": "400",
-    "search.knn_num_candidates": "1000",
+    "mantle.search.refresh_interval": "750ms",
+    "mantle.search.chunk_size": "1000",
+    "mantle.search.chunk_overlap": "200",
+    "mantle.search.bm25_size": "200",
+    "mantle.search.knn_k": "400",
+    "mantle.search.knn_num_candidates": "1000",
 
     # Content storage (S3/MinIO)
     "storage.content_uri": os.getenv("CONTENT_URI", "http://localhost:9000"),
@@ -107,9 +97,9 @@ class PlatformSettingsService:
         self._secret_flags: dict[str, bool] = {}
         self._loaded = False
 
-    def load_all(self, db: StandardDatabase) -> None:
-        """Load all settings from ArangoDB platform_settings collection into memory cache."""
-        rows = arango_ws.get_all_platform_settings(db)
+    def load_all(self, db: Database) -> None:
+        """Load all settings from the lattice platform_settings collection into memory cache."""
+        rows = identity_store.get_all_platform_settings(db)
         cache = {}
         secret_flags = {}
         for row in rows:
@@ -182,17 +172,17 @@ class PlatformSettingsService:
 
     def set_setting(
         self,
-        db: StandardDatabase,
+        db: Database,
         key: str,
         value: str,
         category: str,
         is_secret: bool = False,
         updated_by: Optional[str] = None,
     ) -> None:
-        """Write a single setting to ArangoDB and update the cache."""
+        """Write a single setting to the lattice and update the cache."""
         stored_value = self._encrypt(value) if is_secret else value
 
-        arango_ws.set_platform_setting(
+        identity_store.set_platform_setting(
             db,
             key=key,
             value=stored_value,
@@ -207,7 +197,7 @@ class PlatformSettingsService:
 
     def set_many(
         self,
-        db: StandardDatabase,
+        db: Database,
         settings: list[dict],
         updated_by: Optional[str] = None,
     ) -> int:
@@ -224,7 +214,7 @@ class PlatformSettingsService:
             is_secret = s.get("is_secret", False)
             stored_value = self._encrypt(value) if is_secret else value
 
-            arango_ws.set_platform_setting(
+            identity_store.set_platform_setting(
                 db,
                 key=key,
                 value=stored_value,
@@ -238,13 +228,12 @@ class PlatformSettingsService:
         self.load_all(db)
         return count
 
-    def delete_keys(self, db: StandardDatabase, keys: list[str]) -> int:
+    def delete_keys(self, db: Database, keys: list[str]) -> int:
         """Delete platform settings by key. Reloads the cache afterwards."""
         count = 0
-        coll = db.collection("platform_settings")
+        from mantle.db import lattice_identity
         for key in keys:
-            if coll.has(key):
-                coll.delete(key)
+            if lattice_identity.delete_platform_setting(db, key):
                 count += 1
         self.load_all(db)
         return count

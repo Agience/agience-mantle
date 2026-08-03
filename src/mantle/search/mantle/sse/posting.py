@@ -1,4 +1,4 @@
-﻿"""Encrypted posting-list manager for MANTLE-SSE (Step 2.6.3).
+"""Encrypted posting-list manager for MANTLE-SSE (Step 2.6.3).
 
 A *posting list* is the encrypted unit of lexical storage: one blob per
 ``(principal_id, blind_token)``. Each posting list holds the entries for every
@@ -219,7 +219,10 @@ def serialize_entries(entries: List[dict]) -> bytes:
     added without rewriting every existing blob).
     """
     payload = {"entries": entries}
-    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    # ensure_ascii=False per RFC 8785 — see the note in `search/mantle/cell.py`. Read back by
+    # `deserialize_entries` via `json.loads`, which accepts both spellings, so existing blobs decode.
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
 
 
 def deserialize_entries(plaintext: bytes) -> List[dict]:
@@ -287,7 +290,10 @@ def serialize_manifest(
     deduped = sorted({str(t) for t in blind_tokens if t})
     dls = {str(k): int(v) for k, v in (field_dls or {}).items() if v}
     payload = {"tokens": deduped, "field_dls": dls}
-    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    # ensure_ascii=False per RFC 8785 — see the note in `search/mantle/cell.py`. Read back by
+    # `deserialize_manifest` via `json.loads`, so blobs written before this change still decode.
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
 
 
 def deserialize_manifest(plaintext: bytes) -> tuple[List[str], dict[str, int]]:

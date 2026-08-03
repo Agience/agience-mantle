@@ -35,7 +35,27 @@ class Crosswalk:
     matrix: np.ndarray     # (dim_in, dim_out)
     dim_in: int
     dim_out: int
-    error_bound: float     # mean cosine distance on the fit set
+    # ⚠ IN-SAMPLE ERROR. This is the mean cosine distance on the SAME pairs the map was fitted
+    # to — it is training error, not a generalisation bound, and the name has been read as a
+    # fidelity guarantee downstream ("reports exactly what this embedder loses"). It is smallest
+    # precisely when the fit is worthless: with fewer pairs than input dimensions the system is
+    # underdetermined and `lstsq` interpolates the fit set EXACTLY. Measured — 8 pairs, 64->32
+    # dims: reported error_bound **1e-08**, held-out mean cosine distance **1.003** (1.0 = chance).
+    # Read it together with `n_pairs`/`underdetermined` below, never alone.
+    error_bound: float
+    # How many pairs the fit saw. Defaulted so existing constructors (notably
+    # `crosswalk_artifact.from_artifact`, which deserialises a stored walk) keep working; 0 there
+    # means "not recorded", which `underdetermined` reports as unknown rather than as fine.
+    n_pairs: int = 0
+
+    @property
+    def underdetermined(self) -> Optional[bool]:
+        """Is `error_bound` meaningless because the fit had fewer constraints than parameters?
+
+        None when `n_pairs` was not recorded — unknown is not a pass."""
+        if not self.n_pairs:
+            return None
+        return self.n_pairs < self.dim_in
 
     def apply(self, vec: Sequence[float] | np.ndarray) -> np.ndarray:
         """Project + unit-normalize a single vector into the target space."""
@@ -64,6 +84,14 @@ def fit_crosswalk(
     B = l2norm(np.asarray(target, dtype=np.float32))   # (n, d_out)
     if A.ndim != 2 or B.ndim != 2 or A.shape[0] != B.shape[0]:
         raise ValueError("source and target must be paired 2-D arrays")
+    # ⛔ A ZERO-PAIR FIT USED TO SUCCEED AND RETURN error_bound = NaN. It passed the shape check
+    # above, SVD'd a zero matrix into a fabricated identity, and `np.mean` over an empty array
+    # gave NaN — so the returned Crosswalk looked well-formed while EVERY threshold comparison
+    # against it is False. Measured: `nan < 0.1` is False AND `nan > 0.1` is False, so a consumer
+    # gating one way silently rejects and one gating the other way silently accepts. There is no
+    # projection to be learned from zero examples; say so.
+    if A.shape[0] == 0:
+        raise ValueError("cannot fit a cross-walk from zero pairs")
     d_in, d_out = A.shape[1], B.shape[1]
 
     if method == "auto":
@@ -81,8 +109,9 @@ def fit_crosswalk(
         raise ValueError(f"unknown cross-walk method: {method!r}")
 
     projected = l2norm(A @ matrix)
-    error_bound = float(np.mean(1.0 - np.sum(projected * B, axis=1)))
+    error_bound = float(np.mean(1.0 - np.sum(projected * B, axis=1)))   # IN-SAMPLE; see the field
     return Crosswalk(
+        n_pairs=int(A.shape[0]),
         source_model_id=source_model_id,
         target_model_id=target_model_id,
         method=method,

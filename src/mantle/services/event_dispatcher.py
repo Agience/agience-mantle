@@ -1,14 +1,14 @@
-﻿"""Workspace event dispatcher — mantle service.
+"""Workspace event dispatcher — mantle service.
 
 Scans workspace artifacts for handler definitions (context.type ==
 "workspace-event-handler"), matches them against the incoming event, and
 invokes the configured actions via MCP tool dispatch.
 
-Lives in mantle's service layer because dispatch reads from Arango
+Lives in mantle's service layer because dispatch reads from the lattice
 (workspace artifacts), looks up persona names against `server_registry`
 (which parses `chorus/manifest.json`), and routes calls through
 `chorus_client.call_tool` (signed delegation JWT → chorus universal
-gateway). Was previously misfiled under `src/agience_core/event_dispatcher.py`;
+gateway). Was previously misfiled under `src/beam/event_dispatcher.py`;
 the docstring's old "core platform infrastructure" framing predated
 the four-container split.
 
@@ -26,15 +26,26 @@ Handler artifact schema (context JSON):
   },
   "actions": [
     {
-      "type": "invoke_operator",
-      "operator": "ingest_runner",
-      "operator_params": {...}
+      "type": "invoke_transform",
+      "transform_artifact_id": "...",     # or a "selector" to match one
     }
   ]
 }
 
-The "invoke_operator" action type routes via MCP to the appropriate server
-tool based on the operator name mapping below.
+Every dispatch path here resolves its target (server + tool) from the ARTIFACT or the type contract —
+`_dispatch_contract_event` via `types_service.resolve_event_binding`, `_invoke_transform` off the
+transform artifact's own context. Nothing is addressed by a routing table in Core.
+
+[2026-07-29, Environment Builder] The `invoke_operator` action type and its `_OPERATOR_TO_SERVER`
+table were DELETED as stale. Verified dead before removal: `resolve_operator_server` had zero callers
+in the monorepo; the string "invoke_operator" appeared nowhere outside this module (no persona, seed,
+type.json or test produced such an action); and its keys (`transcribe`, `verso:invoke_llm`) were in a
+namespace disjoint from the `op.*` operator artifacts the system actually publishes. It was the last
+path in this file that did not read its binding off the artifact.
+
+If operator dispatch is wanted again, it must ADVERTISE rather than enumerate — the gap to close first
+is that pushed operator definitions carry no server/persona stamp (`sage/retrieval.py` writes no
+`entry`; `crystal/host.py` flattens personas and discards which produced each).
 """
 
 from __future__ import annotations
@@ -44,45 +55,18 @@ import logging
 import re
 from typing import Any, Dict, Iterable, Optional
 
-from arango.database import StandardDatabase
+from mantle.db.store import Database
 
-from services import chorus_client
-from services import server_registry
-from services import types_service
-from services.dependencies import get_arango_db as _get_arango_db
+from mantle.services import chorus_client
+from mantle.services import server_registry
+from mantle.services import types_service
+from mantle.services.dependencies import get_store_db as _get_store_db
 
 logger = logging.getLogger(__name__)
 
 
 _TEMPLATE_RE = re.compile(r"\{\{(\w+)\}\}")
 _TRANSFORM_MIME = "application/vnd.agience.transform+json"
-
-# Maps operator names to (server, tool) pairs for MCP dispatch.
-# All domain logic lives on the server; this table is the only Core knowledge
-# of which server owns which operator name.
-_OPERATOR_TO_SERVER: Dict[str, tuple[str, str]] = {
-    "transcribe":                  ("verso", "transcribe_artifact"),
-    "ingest_runner":               ("astra", "ingest_text"),
-    "extract_units":               ("aria",  "extract_units"),
-    "provenance":                  ("aria",  "attach_provenance"),
-    # Colon-namespaced names used by inter-server calls
-    "verso:invoke_llm":            ("verso", "invoke_llm"),
-    "ophan:check_llm_allowance":   ("ophan", "check_llm_allowance"),
-    "ophan:record_llm_usage":      ("ophan", "record_llm_usage"),
-    "iris:notify_inbound":          ("iris",  "notify_inbound"),
-    "iris:send_templated_email":    ("iris",  "send_templated_email"),
-}
-
-
-def resolve_operator_server(operator_name: str) -> Optional[tuple[str, str]]:
-    """Look up the (server, tool) pair for a named operator.
-
-    Returns ``None`` if the operator name has no server mapping.  This is the
-    public API; callers outside this module should use this function rather
-    than accessing ``_OPERATOR_TO_SERVER`` directly.
-    """
-    return _OPERATOR_TO_SERVER.get(operator_name)
-
 
 def _parse_context(artifact) -> Optional[Dict[str, Any]]:
     """Safely parse artifact.context JSON string to dict."""
@@ -111,7 +95,7 @@ _CONTRACT_LIFECYCLE_EVENTS = frozenset({"upload_complete"})
 
 def _dispatch_contract_event(
     *,
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     event_type: str,
@@ -140,7 +124,7 @@ def _dispatch_contract_event(
     if not isinstance(target_server, str) or not target_server.strip():
         # Default to the chorus 'core' persona — agent-facing artifact-management
         # surface that fronts Mantle's HTTP REST. Replaces the legacy
-        # 'agience-core' platform-server alias.
+        # 'agience-beam' platform-server alias.
         target_server = "core"
 
     # Resolve short persona name to the seeded server artifact UUID. The
@@ -331,11 +315,11 @@ def _invoke_transform(
     transform_ctx: Dict[str, Any],
     *,
     transform_artifact_id: str,
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     source_artifact_id: str,
-    collection_db: Optional[StandardDatabase] = None,
+    collection_db: Optional[Database] = None,
 ) -> None:
     run = transform_ctx.get("run") or (transform_ctx.get("order") or {}).get("run") or {}
     if not isinstance(run, dict):
@@ -357,12 +341,12 @@ def _invoke_transform(
 
     run_type = run.get("type")
     if run_type != "mcp-tool":
-        logger.warning("Transform %s has unsupported run.type '%s'", transform_artifact_id, run_type)
+        logger.warning("Transform %s run.type is '%s'; transforms run 'mcp-tool'", transform_artifact_id, run_type)
         return
 
     # Resolve server from the transform's context. Per Step 1.6, typed
     # relationships live on the artifact's context (handler-owned), not as
-    # separate Arango edges. The transform context's `run` block carries
+    # separate the lattice edges. The transform context's `run` block carries
     # `server_artifact_id` (preferred) or the legacy `server` field.
     server = run.get("server_artifact_id") or run.get("server")
     if not server:
@@ -403,14 +387,14 @@ def _invoke_transform(
 def _execute_action(
     action: Dict[str, Any],
     *,
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     source_artifact_id: str,
     event_type: str,
     all_artifacts: Iterable[Any],
     source_ctx: Optional[Dict[str, Any]] = None,
-    collection_db: Optional[StandardDatabase] = None,
+    collection_db: Optional[Database] = None,
 ) -> None:
     action_type = (action.get("type") or "").strip()
 
@@ -437,76 +421,31 @@ def _execute_action(
         )
         return
 
-    if action_type != "invoke_operator":
-        logger.info("Skipping unsupported action type '%s'", action_type)
-        return
-
-    operator_name = (action.get("operator") or "").strip()
-    if not operator_name:
-        return
-
-    server_tool = _OPERATOR_TO_SERVER.get(operator_name)
-    if not server_tool:
-        logger.warning("Handler references unknown operator '%s' (no server mapping)", operator_name)
-        return
-
-    server, tool = server_tool
-
-    # `_OPERATOR_TO_SERVER` lookup yields a persona short-name; resolve it to
-    # the seeded server artifact UUID for chorus's universal-gateway dispatch.
-    if not chorus_client.is_uuid_like(server):
-        resolved = server_registry.resolve_name_to_id(server)
-        if not resolved:
-            logger.warning(
-                "Operator '%s' references unknown server '%s' — skipping",
-                operator_name, server,
-            )
-            return
-        server = resolved
-
-    # Build params with injected variables
-    raw_params = action.get("operator_params") or {}
-    if not isinstance(raw_params, dict):
-        raw_params = {}
-
-    variables = {
-        "workspace_id": workspace_id,
-        "artifact_id": source_artifact_id,
-        "event_type": event_type,
-    }
-    params = _replace_templates(raw_params, variables)
-    params["workspace_id"] = workspace_id
-    params["source_artifact_id"] = source_artifact_id
-    params["artifact_id"] = source_artifact_id
-
-    try:
-        chorus_client.call_tool(server, tool, arguments=params, user_id=user_id)
-    except Exception:
-        logger.exception(
-            "invoke_operator '%s' → %s:%s failed for artifact %s",
-            operator_name, server, tool, source_artifact_id,
-        )
-        raise
+    # Anything else is unsupported. `invoke_operator` used to be handled here off a hardcoded
+    # operator→(server,tool) table; deleted 2026-07-29 as stale (see module docstring) — nothing in
+    # the system produced that action type, and every surviving path resolves its target from the
+    # artifact or the type contract rather than from Core-side knowledge.
+    logger.info("Skipping action type '%s'; the dispatched type is invoke_transform", action_type)
 
 
 def dispatch_workspace_event(
-    db: StandardDatabase,
+    db: Database,
     user_id: str,
     workspace_id: str,
     event_type: str,
     source_artifact_id: str,
     source_artifact=None,
-    collection_db: Optional[StandardDatabase] = None,
+    collection_db: Optional[Database] = None,
 ) -> None:
     """Evaluate artifact-based workspace event handlers for *event_type*.
 
     Scans all workspace artifacts for handlers, matches against the event and
     source artifact, and executes each matched handler's actions via MCP dispatch.
     """
-    from db import arango as arango_db_module
+    from mantle.db import backend as store_backend
 
-    arango_db: StandardDatabase = collection_db or next(_get_arango_db())
-    all_artifact_dicts = arango_db_module.list_collection_artifacts(arango_db, workspace_id)
+    store_db: Database = collection_db or next(_get_store_db())
+    all_artifact_dicts = store_backend.list_collection_artifacts(store_db, workspace_id)
 
     # Wrap dicts as SimpleNamespace for attribute access compatibility
     from types import SimpleNamespace
@@ -518,7 +457,7 @@ def dispatch_workspace_event(
 
     try:
         _dispatch_contract_event(
-            db=arango_db,
+            db=store_db,
             user_id=user_id,
             workspace_id=workspace_id,
             event_type=event_type,
@@ -560,7 +499,7 @@ def dispatch_workspace_event(
             try:
                 _execute_action(
                     action,
-                    db=arango_db,
+                    db=store_db,
                     user_id=user_id,
                     workspace_id=workspace_id,
                     source_artifact_id=source_artifact_id,

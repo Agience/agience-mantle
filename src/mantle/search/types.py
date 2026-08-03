@@ -1,14 +1,14 @@
-﻿"""Search request / response shapes (post-OpenSearch retirement, Step 2.6.9 part 2).
+"""Search request / response shapes (post lexical-backend retirement, Step 2.6.9 part 2).
 
 The `SearchQuery` / `SearchHit` / `SearchResult` dataclasses are the
 public contract between the artifacts router and whatever search engine
-is wired in. After OpenSearch retirement, the engine is MANTLE-SSE
+is wired in. After the lexical-backend retirement, the engine is MANTLE-SSE
 (encrypted lexical) + MANTLE vector via RRF — see
 `mantle.search.mantle.sse.router_accessor`. These dataclasses are
 engine-independent so the router code is unchanged.
 
 Originally lived in `search.accessor.search_accessor` alongside the
-OpenSearch-specific :class:`SearchAccessor` class. Extracted here when
+legacy-lexical-specific :class:`SearchAccessor` class. Extracted here when
 that module went away.
 """
 
@@ -56,7 +56,12 @@ class SearchQuery:
 
     # UI features
     highlight: bool = False
-    aperture: float = 0.75  # 0.0 strict → 1.0 permissive
+    # ⛔ `aperture: float = 0.75` REMOVED 2026-07-30. Declared "0.0 strict → 1.0 permissive" and
+    # NEVER READ — no code path in mantle consumed it. It was written into SearchQuery at four
+    # call sites with three different values (UI 0.5, sage/retrieval 0.7, mantle 0.75), exposed
+    # to HTTP callers as a tunable, and surfaced in the UI as "Precise / Focused / Balanced /
+    # Wide". A parameter that is triple-valued AND inert was never even tested. Relevance width
+    # is derived from the score series (beam.resolution.signal_end), not dialled.
 
     # Control parameters from @ namespace
     controls: Optional[Dict[str, str]] = None
@@ -99,6 +104,12 @@ class SearchResult:
     parsed_query: ParsedQuery
     corrections: List[str]
     used_hybrid: bool
+
+    # ⚠ Was `total` a match count? No — it is the number of CANDIDATES the fused arms returned,
+    # which the accessor has already capped at `top_k`. This flag says when that cap was hit, so
+    # a caller rendering "N results" or a page count can tell a real total from a truncated one.
+    # Defaulted, so existing constructors are unaffected.
+    total_is_capped: bool = False
 
     # Facets (optional)
     facets: Optional[Dict[str, List[Dict[str, Any]]]] = None

@@ -43,7 +43,7 @@ def _license_id(license_payload: dict[str, Any], state_payload: dict[str, Any], 
 
 
 def main() -> int:
-    from scripts.review_installation import _decode_tool_result, _read_json_file  # type: ignore[import-not-found]
+    from mantle.scripts.review_installation import _decode_tool_result, _read_json_file  # type: ignore[import-not-found]
 
     parser = argparse.ArgumentParser(
         description="Submit a licensing usage snapshot to Ophan and persist the reporting result locally."

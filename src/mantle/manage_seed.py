@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 manage_seed.py -- Platform inbox-seed collection management tool.
 
@@ -48,23 +48,22 @@ Examples
 import argparse
 import logging
 
-from arango.database import StandardDatabase
-from agience_core import config
-from agience_core.config import AGIENCE_PLATFORM_USER_ID
+from mantle.db.store import Database
+from origin import config
+from origin.config import AGIENCE_PLATFORM_USER_ID
 import os
 from pathlib import Path
 
-from schemas.arango.initialize import init_arangodb
-from services.seed_provisioning import provision_user, seed_from_artifacts
-from services.bootstrap_types import (
+from mantle.services.seed_provisioning import provision_user, seed_from_artifacts
+from mantle.services.bootstrap_types import (
     INBOX_SEEDS_COLLECTION_SLUG,
     START_HERE_COLLECTION_SLUG,
     PLATFORM_ARTIFACTS_COLLECTION_SLUG,
     ALL_SERVERS_COLLECTION_SLUG,
     ALL_TOOLS_COLLECTION_SLUG,
 )
-from services.platform_topology import get_id, pre_resolve_platform_ids
-from services.platform_settings_service import settings as platform_settings
+from mantle.services.platform_topology import get_id, pre_resolve_platform_ids
+from mantle.services.platform_settings_service import settings as platform_settings
 
 
 def _platform_seeds_root() -> Path:
@@ -95,22 +94,18 @@ logger = logging.getLogger("manage_seed")
 
 # â"â" DB connections â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"
 
-def connect() -> StandardDatabase:
-    logger.info("Connecting to ArangoDB at %s:%s db=%s...", config.ARANGO_HOST, config.ARANGO_PORT, config.ARANGO_DATABASE)
-    db = init_arangodb(
-        host=config.ARANGO_HOST,
-        port=config.ARANGO_PORT,
-        username=config.ARANGO_USERNAME,
-        password=config.ARANGO_PASSWORD,
-        db_name=config.ARANGO_DATABASE,
-    )
-    logger.info("Connected.")
+def connect() -> Database:
+    """Open THE store — the standalone lattice (MANTLE_LATTICE_PATH / MANTLE_ORIGIN env)."""
+    from mantle.db import backend
+    logger.info("Opening the lattice store...")
+    db = backend.store_handle()
+    logger.info("Open.")
     return db
 
 
 # â"â" Actions â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"â"
 
-def action_seed(db: StandardDatabase, dry_run: bool) -> None:
+def action_seed(db: Database, dry_run: bool) -> None:
     """Apply the declarative platform seed tree (package/seeds/platform). Idempotent."""
     if dry_run:
         logger.info("[DRY-RUN] Would apply %s via the loader.", _platform_seeds_root())
@@ -121,14 +116,14 @@ def action_seed(db: StandardDatabase, dry_run: bool) -> None:
         logger.warning("  %s", err)
 
 
-def action_populate(db: StandardDatabase, dry_run: bool) -> None:
+def action_populate(db: Database, dry_run: bool) -> None:
     """Alias for `seed` — the declarative loader applies the full platform tree."""
     action_seed(db, dry_run)
 
 
-def action_grant_write(db: StandardDatabase, user_id: str, dry_run: bool) -> None:
+def action_grant_write(db: Database, user_id: str, dry_run: bool) -> None:
     """Grant admin write access to all inbox-seed collections (parent + all sub-collections)."""
-    from db.arango import upsert_user_collection_grant
+    from mantle.db.backend import upsert_user_collection_grant
 
     if dry_run:
         for slug in _ADMIN_WRITE_SLUGS:
@@ -153,9 +148,9 @@ def action_grant_write(db: StandardDatabase, user_id: str, dry_run: bool) -> Non
             logger.info("Granted write access: user=%s  collection=%s (%s)  grant_id=%s", user_id, col_id, _SLUG_NAMES.get(slug, slug), grant.id)
 
 
-def action_revoke(db: StandardDatabase, user_id: str, dry_run: bool) -> None:
+def action_revoke(db: Database, user_id: str, dry_run: bool) -> None:
     """Revoke all active grants for a user on the inbox-seed collection."""
-    from db.arango import get_active_grants_for_principal_resource, update_grant
+    from mantle.db.backend import get_active_grants_for_principal_resource, update_grant
     from datetime import datetime, timezone
 
     col_id = get_id(INBOX_SEEDS_COLLECTION_SLUG)
@@ -177,15 +172,15 @@ def action_revoke(db: StandardDatabase, user_id: str, dry_run: bool) -> None:
             logger.info("Revoked grant %s (user=%s  collection=%s)", g.id, user_id, col_id)
 
 
-def action_migrate(arango_db: StandardDatabase, dry_run: bool) -> None:
+def action_migrate(store_db: Database, dry_run: bool) -> None:
     """
     Back-fill all existing users:
     1. Issue a read grant to the inbox-seed collection (idempotent).
     2. Grant access to other platform-owned collections (for example the current host collection).
     """
-    from db.arango_identity import list_all_people
+    from mantle.db.identity_backend import list_all_people
 
-    people = list_all_people(arango_db)
+    people = list_all_people(store_db)
     logger.info("Found %d users to migrate.", len(people))
     success = errors = 0
 
@@ -196,7 +191,7 @@ def action_migrate(arango_db: StandardDatabase, dry_run: bool) -> None:
             logger.info("  [DRY-RUN] %s -- would provision user.", label)
             continue
         try:
-            provision_user(arango_db, person_id)
+            provision_user(store_db, person_id)
             success += 1
         except Exception as exc:
             logger.warning("  Migration failed for %s: %s", label, exc)
@@ -236,19 +231,25 @@ def main():
     db = connect()
     platform_settings.load_all(db)
     pre_resolve_platform_ids(db)
-    from services import server_registry
+    from mantle.services import server_registry
     server_registry.populate_ids()
 
-    if args.action == "seed":
-        action_seed(db, args.dry_run)
-    elif args.action == "populate":
-        action_populate(db, args.dry_run)
-    elif args.action == "grant-write":
-        action_grant_write(db, args.user, args.dry_run)
-    elif args.action == "revoke":
-        action_revoke(db, args.user, args.dry_run)
-    elif args.action == "migrate":
-        action_migrate(db, args.dry_run)
+    # CLI: no request context, so declare the identity explicitly. Every action
+    # below writes or reads artifacts, and artifact content encryption now requires
+    # an acting principal the grant ledger can check.
+    from mantle.services.system_identity import system_acting_context
+
+    with system_acting_context(scope="platform.manage-seed"):
+        if args.action == "seed":
+            action_seed(db, args.dry_run)
+        elif args.action == "populate":
+            action_populate(db, args.dry_run)
+        elif args.action == "grant-write":
+            action_grant_write(db, args.user, args.dry_run)
+        elif args.action == "revoke":
+            action_revoke(db, args.user, args.dry_run)
+        elif args.action == "migrate":
+            action_migrate(db, args.dry_run)
 
 
 if __name__ == "__main__":

@@ -46,7 +46,10 @@ CANDIDATE, WORKING, CANONICAL = "candidate", "working", "canonical"
 
 
 def l2norm(v: np.ndarray) -> np.ndarray:
-    """Unit-normalize along the last axis (zero-safe)."""
+    """Unit-normalize along the last axis (zero-safe), in anchor precision (float32).
+
+    Zero-safe, in anchor precision (float32). mantle is dependency-free (storage owns its anchor
+    geometry), so this is inline rather than through prism.vector."""
     v = np.asarray(v, dtype=np.float32)
     n = np.linalg.norm(v, axis=-1, keepdims=True)
     return v / np.clip(n, 1e-12, None)
@@ -228,33 +231,19 @@ class AnchorSet:
         raise KeyError(anchor_id)
 
     # ------------------------------------------------------------- bootstrap
-    def bootstrap(
-        self,
-        items: Sequence[Tuple[str, Sequence[float] | np.ndarray]],
-        k: int,
-        *,
-        tier: str = WORKING,
-        iters: int = 25,
-        seed: int = 0,
-        placed_frame: int = 0,
-    ) -> "AnchorSet":
-        """Light-training bootstrap: cluster ``items`` (label, vec) into ``k``
-        groups and admit the **medoid** (nearest real item to each cluster
-        center) of each as an anchor. Real items, not synthetic centers — anchors
-        are fully-disclosed artifacts (§3). Deterministic given ``seed``.
-        """
-        if not items:
-            return self
-        labels = [lab for lab, _ in items]
-        X = l2norm(np.vstack([np.asarray(v, dtype=np.float32).ravel() for _, v in items]))
-        if X.shape[1] != self.dim:
-            raise ValueError(f"item dim {X.shape[1]} != AnchorSet dim {self.dim}")
-        k = min(k, len(items))
-        centers = _kmeans_cosine(X, k, iters=iters, seed=seed)
-        for c in centers:
-            j = int(np.argmax(X @ c))  # medoid: nearest real item to the center
-            self.add_text(labels[j], X[j], tier=tier, placed_frame=placed_frame)
-        return self
+    # ⛔ `bootstrap(items, k, ...)` IS DELETED — it was spherical k-means (`_kmeans_cosine`,
+    # `iters=25, seed=0`), and its own docstring called it a "Light-training bootstrap". We do not
+    # use k-means. [John, 2026-07-31: "We dont use kmeans"]
+    #
+    # It could not be right even on its own terms: an anchor id is content-addressed over
+    # `(label, model_id, embedding)`, so cluster centers computed from whatever corpus a node
+    # happened to hold minted region ids no other node computes. Two deployments would each route
+    # confidently, into disjoint cells, and only discover it when a sync produced no overlap. The
+    # `seed=0` did not make that shareable — it made it reproducible on one machine.
+    #
+    # The AnchorSet is PROVISIONED, not derived: it is the canonical artifact that arrives from
+    # outside, which is the same rule the leaf already obeys (agience-ember/README.md §First light:
+    # "A leaf must *never* author its own"). Load it with `AnchorSet.load` / the anchor repo.
 
     # ------------------------------------------------------------- persistence
     def save(self, path: str | Path) -> None:
@@ -296,32 +285,3 @@ class AnchorSet:
                 )
             )
         return s
-
-
-def _kmeans_cosine(X: np.ndarray, k: int, *, iters: int = 25, seed: int = 0) -> np.ndarray:
-    """Tiny deterministic spherical k-means (cosine). Returns ``(k, dim)``
-    unit-norm centers. k-means++ init on cosine distance."""
-    rng = np.random.default_rng(seed)
-    n = len(X)
-    first = int(rng.integers(n))
-    centers = [X[first]]
-    d2 = 1.0 - (X @ centers[0])
-    for _ in range(1, k):
-        probs = np.clip(d2, 0.0, None)
-        total = float(probs.sum())
-        if total <= 0.0:
-            centers.append(X[int(rng.integers(n))])
-        else:
-            r = float(rng.random()) * total
-            j = int(np.searchsorted(np.cumsum(probs), r))
-            centers.append(X[min(j, n - 1)])
-        d2 = np.minimum(d2, 1.0 - (X @ centers[-1]))
-    C = l2norm(np.vstack(centers))
-    for _ in range(iters):
-        assign = np.argmax(X @ C.T, axis=1)
-        new = []
-        for c in range(len(C)):
-            pts = X[assign == c]
-            new.append(l2norm(pts.mean(0)) if len(pts) else C[c])
-        C = np.vstack(new).astype(np.float32)
-    return C

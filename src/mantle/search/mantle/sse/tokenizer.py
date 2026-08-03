@@ -1,6 +1,6 @@
-﻿"""English analysis pipeline for MANTLE-SSE.
+"""English analysis pipeline for MANTLE-SSE.
 
-Mirrors the structure of OpenSearch's `english_analyzer`:
+Mirrors the structure of the legacy lexical engine's `english_analyzer`:
 
     standard tokenizer → lowercase → possessive stemmer → stop words → Porter stemmer
 
@@ -17,15 +17,14 @@ has no dialect or version flag: stemmer choice is part of the index format.
 Public API:
 
 - :func:`tokenize` — full pipeline; returns the list of stems in input order.
-- :data:`STOP_WORDS` — the set used by :func:`is_stop_word`. Matches Lucene's
+- (no stop-word stage: removed 2026-07-30 — see `tokenize`.) Formerly Lucene's
   default English stop list (`_english_`) so behavior parallels the
-  OpenSearch path during the migration window.
+  the legacy lexical index path during the migration window.
 
 The stages are also exposed individually for testing:
 
 - :func:`split_words`
 - :func:`strip_possessive`
-- :func:`is_stop_word`
 - :func:`porter_stem`
 """
 
@@ -39,13 +38,9 @@ from typing import List
 # Stop word list — Lucene's `_english_` default
 # ---------------------------------------------------------------------------
 
-STOP_WORDS: frozenset[str] = frozenset({
-    "a", "an", "and", "are", "as", "at", "be", "but", "by",
-    "for", "if", "in", "into", "is", "it",
-    "no", "not", "of", "on", "or", "such",
-    "that", "the", "their", "then", "there", "these",
-    "they", "this", "to", "was", "will", "with",
-})
+# ⛔ `STOP_WORDS` (Lucene's English set) DELETED 2026-07-30 along with `is_stop_word`. Left
+# exported-but-unused it would simply be picked up again; a stop-list is the defect, not its
+# call site. Which words carry information is measured (IDF), never declared.
 
 
 # ---------------------------------------------------------------------------
@@ -97,15 +92,6 @@ def strip_possessive(token: str) -> str:
     if len(token) >= 2 and token.endswith("s'"):
         return token[:-1]
     return token
-
-
-# ---------------------------------------------------------------------------
-# Stage 4 — stop word filter
-# ---------------------------------------------------------------------------
-
-def is_stop_word(token: str) -> bool:
-    """True if ``token`` is in the English stop word list."""
-    return token in STOP_WORDS
 
 
 # ---------------------------------------------------------------------------
@@ -392,9 +378,20 @@ def tokenize(text: str) -> List[str]:
     2. Lowercase.
     3. Strip English possessive (``'s`` / ``s'``).
     4. Drop empty tokens.
-    5. Drop stop words.
-    6. Porter stem.
-    7. Drop tokens that became empty after stemming.
+    5. Porter stem.
+    6. Drop tokens that became empty after stemming.
+
+    ⛔ "Drop stop words" was stage 5 and is REMOVED 2026-07-30. A stop-list asserts by hand that a
+    fixed set of words carries no information; the corpus measures that (IDF), and BM25 already
+    discounts common terms by construction — a term in every document contributes almost nothing
+    to its own score. The list was doing, badly, what the ranking function does correctly.
+    [John: "we shouldnt have a stopword list. that's a bogus algorithm in itself."]
+
+    ⚠ THIS CHANGES THE INDEX FORMAT. Stop words are now indexed, so an index built before this
+    change and one built after are not comparable, and a query for a former stop word returns
+    nothing against an old index. The SSE stack already carries a REBUILD-not-migration decision
+    (see `db/lattice/fts.py`, DECISION 1), so this rides on that rebuild — it must not be applied
+    to a live index in place.
 
     Returns the stems in input order. Duplicate stems are *not* deduplicated
     here — callers that need term frequencies (the SSE indexer) compute
@@ -407,8 +404,6 @@ def tokenize(text: str) -> List[str]:
     for raw in split_words(text):
         token = strip_possessive(raw.lower())
         if not token:
-            continue
-        if is_stop_word(token):
             continue
         stem = porter_stem(token)
         if not stem:
@@ -437,9 +432,7 @@ def bigrams(stems: List[str]) -> List[str]:
 
 
 __all__ = [
-    "STOP_WORDS",
     "bigrams",
-    "is_stop_word",
     "porter_stem",
     "split_words",
     "strip_possessive",

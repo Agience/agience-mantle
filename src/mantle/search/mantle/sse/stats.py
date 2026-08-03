@@ -1,4 +1,4 @@
-﻿"""Per-owner corpus statistics for MANTLE-SSE BM25 (Step 2.6.4).
+"""Per-owner corpus statistics for MANTLE-SSE BM25 (Step 2.6.4).
 
 BM25 needs three numbers per query:
 
@@ -143,7 +143,11 @@ def serialize_stats(stats: Stats) -> bytes:
         "field_total_dl": {k: int(v) for k, v in stats.field_total_dl.items()},
         "df": {k: int(v) for k, v in stats.df.items()},
     }
-    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    # ensure_ascii=False per RFC 8785 — see the note in `search/mantle/cell.py`. Read back by
+    # `deserialize_stats` via `json.loads`, so blobs written before this change still decode. (Field
+    # names appear as KEYS here, so a non-ASCII field name is the case that would have diverged.)
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
 
 
 def deserialize_stats(plaintext: bytes) -> Stats:

@@ -1,4 +1,4 @@
-﻿"""Blind-token generator for MANTLE-SSE.
+"""Blind-token generator for MANTLE-SSE.
 
 Per `.dev/features/mantle-sse-lexical-index.md` § Blind Tokens::
 

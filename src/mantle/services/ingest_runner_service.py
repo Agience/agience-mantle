@@ -10,8 +10,8 @@ from typing import Optional
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 
-from services.content_service import generate_signed_url
-from services.types_service import resolve_capability_target
+from mantle.services.content_service import generate_signed_url
+from mantle.services.types_service import resolve_capability_target
 
 logger = logging.getLogger(__name__)
 
