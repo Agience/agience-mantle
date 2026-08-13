@@ -3,7 +3,7 @@
 The deployment-simple (stdlib-only) stand-in for the libp2p DHT of MANTLE-MESH.md §5.
 A node folds peers' advertised manifests into ``region_id -> {peer -> ProviderInfo}``, so
 a query routed by anchor (:func:`anchor_routing.route_query_regions`) resolves to *which*
-peer to pull each cell from — preferring the **freshest, most-coherent, densest** source
+peer to pull each cell from — preferring the **freshest, best-attributed, densest** source
 (the "maps to where the source / denser information lives" property the mesh is for).
 
 Directories **gossip** by :meth:`RegionDirectory.merge`: a node unions its neighbors'
@@ -24,13 +24,18 @@ from .manifest import ShardManifest
 from .node import MeshNode, ShardVerifyError
 
 
-def coherence_of(manifest: ShardManifest) -> float:
-    """Region-level provenance weight: mean of the items' entroptics consensus scores.
-    Routing prefers the more-coherent replica of a region when versions tie."""
+def attribution_of(manifest: ShardManifest) -> float:
+    """What fraction of this replica's items name an ORIGIN — how well-provenanced the copy is.
+
+    Attribution genuinely differs per replica, and it is the right preference: a copy that names
+    origins is the copy a puller can compute agreement from, whereas an unattributed copy carries
+    the bytes and nothing about who stands behind them. Fraction of the items, so it does not
+    double-count density — which is already its own term in `rank`.
+    """
     items = manifest.items or []
     if not items:
         return 0.0
-    return sum(float(i.get("consensus", 0.0)) for i in items) / len(items)
+    return sum(1 for i in items if i.get("origin")) / len(items)
 
 
 @dataclass(frozen=True)
@@ -38,11 +43,11 @@ class ProviderInfo:
     """What a directory knows about one peer's copy of one region."""
     version: int
     density: int
-    coherence: float
+    attribution: float
 
-    # Best-first sort key: freshest wins; then most-coherent; then densest.
+    # Best-first sort key: freshest wins; then best-attributed; then densest.
     def rank(self) -> Tuple[int, float, int]:
-        return (self.version, self.coherence, self.density)
+        return (self.version, self.attribution, self.density)
 
 
 class RegionDirectory:
@@ -56,7 +61,7 @@ class RegionDirectory:
         """Fold a peer's advertised manifests into the map (newer version wins per peer)."""
         for m in manifests:
             info = ProviderInfo(version=int(m.version), density=int(m.density),
-                                coherence=coherence_of(m))
+                                attribution=attribution_of(m))
             peers = self._map.setdefault(m.region_id, {})
             cur = peers.get(peer_id)
             if cur is None or info.version >= cur.version:
@@ -92,7 +97,7 @@ class RegionDirectory:
 
     # ---------------------------------------------------------------- wire form
     def to_dict(self) -> dict:
-        return {r: {p: [i.version, i.density, i.coherence] for p, i in peers.items()}
+        return {r: {p: [i.version, i.density, i.attribution] for p, i in peers.items()}
                 for r, peers in self._map.items()}
 
     @classmethod
@@ -137,4 +142,4 @@ def pull_regions(directory: RegionDirectory, regions: Sequence[str], into: MeshN
     return satisfied
 
 
-__all__ = ["ProviderInfo", "RegionDirectory", "coherence_of", "pull_regions"]
+__all__ = ["ProviderInfo", "RegionDirectory", "attribution_of", "pull_regions"]

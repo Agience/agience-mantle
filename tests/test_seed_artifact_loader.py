@@ -22,7 +22,7 @@ from mantle.services.seed_provisioning import loader
 @pytest.fixture(autouse=True)
 def _clear_topology_registry():
     """Isolate the module-global platform_topology registry between tests — the
-    loader now reads it first (get_id_optional), so a leaked id would bleed
+    loader reads it first (get_id_optional), so a leaked id would bleed
     across tests that each use a distinct instance namespace. Also stub id
     persistence (the MagicMock DB can't run platform_settings.set_many)."""
     from mantle.services import platform_topology
@@ -73,7 +73,7 @@ def test_derive_uuid_is_deterministic():
 
 
 def test_walk_resolve_substitutes_config_directive(monkeypatch):
-    from origin import config
+    from mantle import config
     monkeypatch.setattr(config, "AUTHORITY_ISSUER", "http://test.example/")
     out = loader._walk_resolve(
         {"issuer": "{{config.AUTHORITY_ISSUER}}"},
@@ -107,14 +107,14 @@ def test_walk_resolve_substitutes_refs():
 
 def test_walk_resolve_file_directive_with_key(tmp_path, monkeypatch):
     monkeypatch.setenv("KEYS_DIR", str(tmp_path))
-    manifest = {"trust_anchors": {"chorus": {"jwks": {"keys": []}}}, "issuer": "x"}
+    manifest = {"trust_anchors": {"crystal": {"jwks": {"keys": []}}}, "issuer": "x"}
     (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     out = loader._walk_resolve(
         {"anchors": "{{file:manifest.json:trust_anchors}}"},
         uuid.UUID("11111111-1111-1111-1111-111111111111"),
         refs={},
     )
-    assert out == {"anchors": {"chorus": {"jwks": {"keys": []}}}}
+    assert out == {"anchors": {"crystal": {"jwks": {"keys": []}}}}
 
 
 def test_walk_resolve_file_directive_missing_returns_none(tmp_path, monkeypatch):
@@ -233,7 +233,7 @@ def test_seed_from_artifacts_inserts_collection_then_artifact_then_edge(seeds_ro
     kwargs = mock_add_to_coll.call_args.kwargs
     assert args[1] == coll_uuid       # container
     assert args[2] == art_uuid        # child
-    assert args[3] == "a0"            # order_key (was buggily the uuid before)
+    assert args[3] == "a0"            # order_key
     assert kwargs["origin"] is True
     assert kwargs["relationship"] is None
     assert kwargs["propagate"] is None
@@ -513,4 +513,4 @@ def test_seed_from_artifacts_uses_preregistered_id_over_uuid5(seeds_root, tmp_pa
     ):
         loader.seed_from_artifacts(db, seeds_root)
     created_art = mock_create_art.call_args.args[1]
-    assert created_art.id == pinned  # registered id, NOT uuid5-derived
+    assert created_art.id == pinned  # registered id, not uuid5-derived

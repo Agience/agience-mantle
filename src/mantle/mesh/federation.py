@@ -1,7 +1,7 @@
-"""The mesh: two (or more) Ember shards, each a full local Ember/Mantle install with its OWN
-ArcadeDB+Garage, holding a DISJOINT half of the corpus (partitioned by EMBER_SHARDS). Writes stay
-local on each box — that is the write-scaling win. This module federates the READ side: it fans out
-to peers over their HTTP /health endpoint and merges the numbers so /status shows ONE universe.
+"""The mesh: two (or more) Ember shards, each a full local Ember/Mantle install with its own
+ArcadeDB+Garage, holding a disjoint half of the corpus (partitioned by EMBER_SHARDS). Writes stay
+local on each box — that is the write-scaling win. This module federates the read side: it fans out
+to peers over their HTTP /health endpoint and merges the numbers so /status shows one universe.
 
 Federation is metric-level and content-blind here (counts, ρ, curriculum) — no artifact bytes cross
 the wire, so it is cheap and leaks nothing. Deeper federation (op.mesh.search across shards) builds
@@ -19,7 +19,7 @@ import urllib.request
 from typing import Any, Dict, List
 
 # A peer's /health runs a metrics scan (several seconds on a large shard), so give it room and
-# CACHE the aggregate briefly — /status polling must not re-hit the peer on every request.
+# cache the aggregate briefly — /status polling must not re-hit the peer on every request.
 _PEER_TIMEOUT = 20.0
 _CACHE: Dict[str, Any] = {"ts": 0.0, "val": None}
 _CACHE_TTL = 30.0
@@ -37,7 +37,7 @@ def _get(url: str, *, timeout: float = _PEER_TIMEOUT) -> Dict[str, Any]:
 
 
 def peer_stats(base: str, *, timeout: float = 6.0) -> Dict[str, Any]:
-    """A peer's SNAPSHOT (its stats.json via /stats) — instant, no scan on the peer side. This is
+    """A peer's snapshot (its stats.json via /stats) — instant, no scan on the peer side. This is
     what the dashboard aggregates: N tiny snapshot reads, never N full-corpus scans."""
     try:
         d = _get(base + "/stats", timeout=timeout)
@@ -63,8 +63,8 @@ def peer_health(base: str, *, timeout: float = _PEER_TIMEOUT) -> Dict[str, Any]:
 
 
 def mesh_status(local_artifacts: int, *, local_rho: float | None = None) -> Dict[str, Any]:
-    """Aggregate THIS shard + every configured peer into one universe view. `local_artifacts` is
-    passed in (the caller already has the cheap COUNT) so this stays a pure network fan-out."""
+    """Aggregate this shard + every configured peer into one universe view. `local_artifacts` is
+    passed in (the caller already has the cheap count) so this stays a pure network fan-out."""
     now = time.time()
     if _CACHE["val"] is not None and (now - _CACHE["ts"]) < _CACHE_TTL:
         ps = _CACHE["val"]
@@ -85,70 +85,53 @@ def mesh_status(local_artifacts: int, *, local_rho: float | None = None) -> Dict
     }
 
 
-# ── authoritative replication: D: (.71) pulls every peer's artifacts INTO itself ─────────────────
+# ── authoritative replication: D: (.71) pulls every peer's artifacts into itself ─────────────────
 # The mesh's remote shards ingest in parallel (fast local writes, CPU-heavy describe offloaded), but
-# the OWNER wants ONE authoritative store (D:) that contains everything. op.mesh.pull replicates each
-# peer's artifacts into the local store. content_ref = cas/sha256(PLAINTEXT) is key-independent, so
-# re-encrypting a pulled artifact's plaintext under D:'s own key yields the SAME ref — the doc stays
-# valid. Edges are NOT shipped: collection/lemma edges re-derive from the doc on upsert, and semantic
+# the owner wants one authoritative store (D:) that contains everything. op.mesh.pull replicates each
+# peer's artifacts into the local store. content_ref = cas/sha256(plaintext) is key-independent, so
+# re-encrypting a pulled artifact's plaintext under D:'s own key yields the same ref — the doc stays
+# valid. Edges are not shipped: collection/lemma edges re-derive from the doc on upsert, and semantic
 # edges (crosswalk/consolidation) are re-run locally as operators. Cursor-checkpointed + idempotent.
 import base64  # noqa: E402
 
 
 def export_page(store, offset: int = 0, limit: int = 25, *, after: str = "",
                 with_content: bool = False) -> Dict[str, Any]:
-    """Peer side: return a page of artifacts at SKIP `offset` LIMIT `limit`, in storage order. By
-    default DOCS ONLY (metadata + lemmas + context + 300-char preview + content-addressed ref) —
-    fast, and enough for the authoritative store to hold the complete knowledge GRAPH + keyed
-    lookup. with_content=True also ships full decrypted plaintext (slow; for the blob back-fill).
+    """Peer side: return a page of artifacts, in storage order. By default docs only (metadata +
+    lemmas + context + 300-char preview + content-addressed ref) — fast, and enough for the
+    authoritative store to hold the complete knowledge graph + keyed lookup. with_content=True
+    also ships full decrypted plaintext (slow; for the blob back-fill).
 
-    OFFSET paging (not `WHERE id > cursor`) is deliberate: a peer under heavy concurrent ingest can
-    have a transiently-inconsistent UNIQUE id index (a duplicate-key race at cold start), and an
-    index RANGE scan then NPEs — a sequential SKIP/LIMIT scan sidesteps the index entirely. Any dup
-    rows a peer holds collapse on arrival (the authoritative store's own id index is healthy).
+    Pages by keyset when the store exposes `page_by_id` — a lattice store's own sanctioned
+    pagination primitive, immune to the index inconsistency below and O(limit) rather than
+    O(offset) per page (measured: 743ms against 142,136ms for an equivalent `SKIP` page at
+    depth 5M). Falls back to `offset`/`limit` SKIP/LIMIT SQL against the legacy ArcadeDB store,
+    where a peer under heavy concurrent ingest can have a transiently-inconsistent unique id
+    index (a duplicate-key race at cold start), and an index range scan then NPEs — a sequential
+    SKIP/LIMIT scan sidesteps the index entirely. Any dup rows a peer holds collapse on arrival
+    (the authoritative store's own id index is healthy).
 
-    ⚠ COLD PATH — SUPERSEDED, and O(offset). `SKIP n` is measured at 142,136ms at depth 5M (the
-    keyset form `WHERE id > :cur ORDER BY id LIMIT n` is FLAT, ~743ms at the same depth), so a full
-    replication sweep of a multi-million-row peer costs time QUADRATIC in its size — at page=25 that
-    is unusable at any real scale. It is left in the O(offset) form ON PURPOSE:
+    Both cursors are always returned: `next_offset` stays monotonic for a peer still on the
+    legacy SKIP contract, and `next_after` carries the keyset cursor for one backed by a lattice
+    store. `pull_from_peers` prefers `next_after` when present, so neither side is stranded
+    mid-sweep by the other's backend.
 
-      * It is only reachable when EMBER_PEERS is set (pull_from_peers iterates peers(); pool.py:316
-        gates the whole mesh-pull job on the same var). Nothing in the tree sets EMBER_PEERS — the
-        S3 mesh plane (mesh/sync.py, per-node encrypted segment logs) replaced HTTP peer-pull — so
-        this is believed dead. "Believed", not proven: peers are configured out-of-band by design,
-        so a live deployment could still set it. Not deleted on that evidence.
-      * `offset` / `next_offset` are the WIRE CONTRACT with pull_from_peers' persisted cursor
-        artifact (`page_offset`, an int). Converting to a keyset changes that contract and would
-        strand any peer running the other version mid-sweep.
-      * The NPE-avoidance reason above is real and would be given up by moving onto the id index.
-
-    If this path is ever revived at scale, migrate BOTH sides together to an id keyset and accept
-    the index risk — do not tune the page size, the cost is in the SKIP."""
-    # ── RETIREMENT RECOMMENDED, NOT TAKEN. See the unit report; deletion is Phase 8. ──────────────
-    #
-    # ON LATTICE THIS USES A KEYSET AND BOTH SIDES MIGRATE TOGETHER, which is exactly what the
-    # docstring above says is required. `SKIP` is banned by contract §0.6 and measured at 142,136ms
-    # at depth 5M against 743ms for the equivalent keyset page, so an O(offset) sweep of a
-    # multi-million-row peer costs time QUADRATIC in its size. A lattice store also cannot NPE on an
-    # id range — the reason the SKIP form was defensible on ArcadeDB — so the one argument for
-    # keeping it does not survive the backend change.
-    #
-    # THE WIRE CONTRACT IS EXTENDED, NOT BROKEN. `pull_from_peers` persists `page_offset` as an int,
-    # and a peer running the older code still returns only `next_offset`. So this returns BOTH:
-    # `next_offset` stays monotonic for a legacy caller, and `next_after` carries the real keyset
-    # cursor. `pull_from_peers` below prefers `next_after` WHEN PRESENT and falls back to
-    # `next_offset` otherwise, so neither side is stranded mid-sweep in either direction.
+      * The SKIP fallback is only reachable when EMBER_PEERS is set (pull_from_peers iterates
+        peers(); pool.py:316 gates the whole mesh-pull job on the same var). Peers are configured
+        out-of-band, never hardcoded, so whether this path is live depends on deployment config —
+        the S3 mesh plane (mesh/sync.py, per-node encrypted segment logs) is the other route
+        between shards and does not depend on EMBER_PEERS.
+      * `offset` / `next_offset` are the wire contract with `pull_from_peers`' persisted cursor
+        artifact (`page_offset`, an int). A peer still on the legacy path depends on it staying
+        monotonic regardless of which backend serves the page.
+    """
+    # `SKIP` paging is banned by contract §0.6; the keyset path above is what satisfies it for a
+    # lattice store. The dual `next_offset`/`next_after` return is what keeps a legacy peer on the
+    # SKIP contract working unchanged while a lattice-backed peer never pays for it.
     offset = max(0, int(offset))          # already cast before interpolation — never raw
     after = str(after or "")
     v = getattr(store, "artifacts", None)
     if hasattr(v, "page_by_id"):
-        # ⛔ CROSS-UNIT DEPENDENCY, GUARDED LOUDLY RATHER THAN LEFT TO ROT.
-        # `op.mesh.export`'s dispatcher (`genesis.py:1747`, Unit B — blocked, not mine to edit) does
-        # NOT forward `after` yet. Without this guard a caller advancing `offset` would get page ONE
-        # every time on a lattice store, since the keyset ignores `offset` entirely: a sweep that
-        # re-pulls the first 25 rows forever while reporting healthy `pulled_this_call` counts. That
-        # is the shim's exact failure signature — a plausible wrong answer — and it must not be
-        # reintroduced through an argument nobody plumbed.
         if offset > 0 and not after:
             raise RuntimeError(
                 "op.mesh.export: this store pages by KEYSET but the request carried offset=%d with "
@@ -158,20 +141,12 @@ def export_page(store, offset: int = 0, limit: int = 25, *, after: str = "",
         rows = [r["doc"] for r in v.page_by_id(after=after, limit=int(limit))]
     else:
         rows = store.artifacts.c.query(f"SELECT FROM Artifact SKIP {offset} LIMIT {int(limit)}")
-    # OPERATIONAL state (the work-queue, mesh cursors) is per-box, NOT shared knowledge — never
+    # Operational state (the work-queue, mesh cursors) is per-box, not shared knowledge — never
     # replicate it (it would pollute the authoritative store's queue).
     #
-    # ⛔ THIS WAS A DRIFTED DUPLICATE OF `sync._OP_EXCLUDE` AND IT LET REAL ROWS THROUGH. The local
-    # copy listed four types and had fallen two behind — it was missing
-    # `application/vnd.agience.s3sync-cursor+json` (the S3 publish/consume cursors) and
-    # `application/vnd.agience.mesh-declined+json` — and it carried NONE of the three prefix bans
-    # (`application/x-probe*`, `application/vnd.agience.probe*`, `"throwaway" in ct`). So this path
-    # would ship a peer's per-box publish cursors AND its probe fixtures into the authoritative
-    # store. Probe fixtures are the specific thing that once pinned publish cursors beyond every
-    # real row and MUTED FIVE NODES PERMANENTLY.
     #
-    # There is now ONE definition of "does this replicate", in the module that owns the policy. A
-    # second copy of a security-relevant predicate is a copy that will drift again.
+    # There is one definition of "does this replicate", in the module that owns the policy: a
+    # second copy of a security-relevant predicate is a copy that will drift.
     from .sync import _is_replicated
     out = []
     scanned = 0
@@ -194,9 +169,9 @@ def export_page(store, offset: int = 0, limit: int = 25, *, after: str = "",
             except Exception:
                 pass
         out.append(item)
-    # next_offset advances by rows SCANNED (incl. excluded); exhausted when a short page comes back.
-    # `next_after` is the keyset cursor — the value a caller SHOULD resume on. Both are returned so
-    # an old caller keeps working unchanged and a new one never pays the SKIP.
+    # next_offset advances by rows scanned (incl. excluded); exhausted when a short page comes back.
+    # `next_after` is the keyset cursor — the value a caller should resume on. Both are returned so
+    # an old caller keeps working unchanged and a new one never pays the SKIP cost.
     return {"artifacts": out, "next_offset": offset + scanned, "next_after": last_id,
             "scanned": scanned, "exhausted": scanned < int(limit), "count": len(out)}
 
@@ -216,13 +191,13 @@ def _cursor_id(base: str) -> str:
 
 def pull_from_peers(store, *, max_pages: int = 40, page: int = 25, with_content: bool = False) -> Dict[str, Any]:
     """Local (authoritative) side: for each peer, page through its artifacts and upsert them here.
-    DOCS ONLY by default (fast — the complete graph + keyed index + previews + content-addressed
-    refs); with_content=True also re-stores full plaintext under THIS store's key (the slow bulk
+    Docs only by default (fast — the complete graph + keyed index + previews + content-addressed
+    refs); with_content=True also re-stores full plaintext under this store's key (the slow bulk
     back-fill). Resumable via a per-peer cursor artifact; bounded pages per call so it never runs
     long when scheduled."""
     from mantle.shard import content as C
-    from prism import grounding as genesis   # ⚠ CONTRACT, NOT THE RUNNER: only the provenance
-    # rung + citation id + timestamp are used here, and those moved to prism on 2026-07-31.
+    from prism import grounding as genesis   # contract, not the runner: only the provenance
+    # rung + citation id + timestamp are used here.
     # mantle may reach prism; it may not reach ember.
     summary = []
     for base in peers():
@@ -238,7 +213,7 @@ def pull_from_peers(store, *, max_pages: int = 40, page: int = 25, with_content:
             data = None
             for _try in range(3):                 # a transient peer 500 shouldn't abandon the peer
                 try:
-                    # Send BOTH cursors. A peer on the old code ignores `after` and pages on
+                    # Send both cursors. A peer on the old code ignores `after` and pages on
                     # `offset`; a peer on the new code pages on `after` and returns `next_after`.
                     res = _post(base, "op.mesh.export",
                                 {"offset": offset, "after": after, "limit": page,
@@ -272,7 +247,7 @@ def pull_from_peers(store, *, max_pages: int = 40, page: int = 25, with_content:
                 store.artifacts.put_many(docs, batch=100)
                 pulled += len(docs)
             offset = int(data.get("next_offset", offset))
-            # PREFER THE KEYSET WHEN THE PEER OFFERS ONE. Absent `next_after` the peer is running
+            # Prefer the keyset when the peer offers one. Absent `next_after` the peer is running
             # the old code and `offset` is all there is; present, it is authoritative and the O(offset)
             # SKIP never runs. A peer that returns `next_after == after` has made no forward progress
             # — stop rather than re-request the identical page forever.

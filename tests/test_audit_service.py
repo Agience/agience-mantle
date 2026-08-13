@@ -1,9 +1,9 @@
 """Tests for the access-audit 'force' (services/audit_service.py).
 
-Lattice mode: flush writes through `db/lattice/audit.py` into the `access_event`
+Lattice mode: flush writes through `db/audit.py` into the `access_event`
 TABLE via `db.conn` — exercised against a REAL temp lattice store.
 """
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import mantle.services.audit_service as audit
 
@@ -41,9 +41,24 @@ def test_record_buffers_and_flush_inserts(tmp_path):
 
 
 def test_flush_empty_is_noop():
-    db = MagicMock()
-    assert audit.flush_once(db) == 0
-    db.collection.return_value.insert_many.assert_not_called()
+    """An idle tick writes nothing — asserted at the real seam.
+
+    The seam is `mantle.db.audit.append_access_events`, the one function `flush_once`
+    reaches the store through. It is asserted to EXIST first: a bare `MagicMock` answers to any
+    attribute name, so `mock.whatever.assert_not_called()` passes for a method that was renamed,
+    or never existed — which is what this test used to do (`db.collection(...).insert_many`, a
+    Mongo-era name absent from the whole of `src/mantle`).
+    """
+    import mantle.db.audit as _la
+
+    assert callable(getattr(_la, "append_access_events", None)), (
+        "the audit write seam was renamed or removed — this test is now asserting against a name "
+        "nothing calls, which is a pass that means nothing")
+
+    with patch.object(_la, "append_access_events", autospec=True) as append:
+        written = audit.flush_once(MagicMock())
+    append.assert_not_called()
+    assert written == 0
 
 
 def test_record_never_raises_on_bad_input():
@@ -95,12 +110,12 @@ def test_get_artifact_access_log_filters_by_artifact_and_result(tmp_path):
 
 
 def test_a_failed_flush_is_counted_not_just_logged(tmp_path, monkeypatch):
-    """FAILURE MODE FIRST: `flush_once` drains the buffer, then inserts. On failure it logged and
-    returned 0 — the SAME value it returns when there was nothing to flush.
+    """`flush_once` drains the buffer, then inserts. On failure it still returns 0, the same
+    value it returns when there was nothing to flush, so a caller cannot tell an idle tick from
+    one that lost events by return value alone.
 
-    So a caller could not tell an idle tick from one that lost events, and at shutdown
-    `drain_and_stop` stops on 0, silently abandoning the rest. Audit is the data structure; losing
-    access events without a number attached is the one outcome this service must not have.
+    At shutdown `drain_and_stop` stops on 0, so an unflagged loss would also cut the drain short.
+    `stats()["lost_total"]` is what makes a loss visible when the return value cannot.
     """
     for i in range(3):
         audit.record_access(principal_id=f"u{i}", artifact_id="art-1",
@@ -110,7 +125,7 @@ def test_a_failed_flush_is_counted_not_just_logged(tmp_path, monkeypatch):
 
     db = _open_store(tmp_path)
 
-    import mantle.db.lattice.audit as _la
+    import mantle.db.audit as _la
 
     def _boom(*a, **kw):
         raise RuntimeError("disk gone")
@@ -118,9 +133,9 @@ def test_a_failed_flush_is_counted_not_just_logged(tmp_path, monkeypatch):
     monkeypatch.setattr(_la, "append_access_events", _boom)
 
     assert audit.flush_once(db) == 0            # indistinguishable from idle, by design of the loop
-    assert audit.pending() == 0                 # ...and the events are GONE from the buffer
+    assert audit.pending() == 0                 # ...and the events are gone from the buffer
     assert audit.stats()["lost_total"] == 3     # which is exactly why the loss must be counted
 
-    # an idle flush must NOT inflate the counter — otherwise the number means nothing
+    # an idle flush must not inflate the counter — otherwise the number means nothing
     assert audit.flush_once(db) == 0
     assert audit.stats()["lost_total"] == 3

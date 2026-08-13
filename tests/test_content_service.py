@@ -76,12 +76,12 @@ class TestGetContentStorageMode:
 
 class TestBuildPublicContentUrl:
     def test_strips_trailing_slash_from_base(self):
-        with patch("origin.config.CONTENT_URI", "https://content.example/"):
+        with patch("mantle.config.CONTENT_URI", "https://content.example/"):
             url = content_service.build_public_content_url("art-1", "doc.pdf")
         assert url == "https://content.example/files/art-1/doc.pdf"
 
     def test_replaces_path_separators_in_filename(self):
-        with patch("origin.config.CONTENT_URI", "https://content.example"):
+        with patch("mantle.config.CONTENT_URI", "https://content.example"):
             url = content_service.build_public_content_url("art-1", "a/b/c.pdf")
         # Forward slashes in the filename are replaced so the path stays
         # predictable; the resulting URL should contain the flattened name
@@ -257,25 +257,33 @@ class TestDeleteObject:
 
 
 # ---------------------------------------------------------------------------
-# Content encryption must not fail open (FIX 1)
+# Content encryption must not fail open
 # ---------------------------------------------------------------------------
 
 
 class TestEncryptionNeverFailsOpen:
     """A security control that is skipped when unavailable is not a control.
 
-    ``put_bytes_encrypted`` used to log a warning and write the object in
-    PLAINTEXT when encryption failed. That fail-open was both irreversible and
-    undetectable: a blob with no ``MEC1`` magic reads back as "legacy plaintext",
-    so an affected object is byte-for-byte indistinguishable from an intentionally
-    legacy one. There was no flag and no way to enumerate what leaked.
+    ``db.store._encrypt_artifact_content`` enforces the same contract on the
+    artifact path; these tests hold the S3 path to it too.
 
-    ``db.store._encrypt_artifact_content`` already fixed this exact shape on the
-    artifact path; these tests hold the S3 path to the same contract.
+    These are about the OBJECT-STORE leg specifically, so they declare the two facts that leg now
+    depends on: that this node has an object store at all (``edge_store_configured``, which is
+    False without resolvable credentials — a node with no bucket is a configuration, not a
+    failure), and that it has no local content tier to write through instead. The local leg has
+    its own file, ``test_content_route_needs_no_object_store.py``.
     """
 
     def _boom(self, *a, **kw):
         raise RuntimeError("oracle unavailable")
+
+    @pytest.fixture(autouse=True)
+    def _an_object_store_exists(self):
+        with (
+            patch.object(content_service, "edge_store_configured", return_value=True),
+            patch.object(content_service, "local_content_tier", return_value=None),
+        ):
+            yield
 
     def test_write_raises_and_stores_nothing_when_encryption_fails(self):
         with (
@@ -287,7 +295,10 @@ class TestEncryptionNeverFailsOpen:
                 content_service.put_bytes_encrypted(
                     "k1", b"secret", "text/plain", "owner-1",
                 )
-        put.assert_not_called(), "plaintext was written to the object store"
+        # `assert not put.called, "..."` — NOT `put.assert_not_called(), "..."`, which is a tuple
+        # expression: the check still runs, but the message is unreachable and reads as coverage
+        # of an explanation that can never be printed.
+        assert not put.called, "plaintext was written to the object store"
 
     def test_write_succeeds_and_stores_ciphertext_when_encryption_works(self):
         """The control must not be a blanket failure -- the good path still writes."""
@@ -310,13 +321,10 @@ class TestEncryptionNeverFailsOpen:
         put.assert_called_once()
 
     def test_read_raises_rather_than_returning_ciphertext_as_data(self):
-        """The read path used to hand back raw ciphertext typed as content.
-
-        Callers cannot tell the difference -- ``get_text_direct`` decodes it as
+        """        Callers cannot tell the difference -- ``get_text_direct`` decodes it as
         UTF-8, so an operator/authorizer config becomes garbage that is then
         parsed, stored, or re-encrypted (the double-encryption destruction chain
-        documented in ``db.store._decrypt_artifact_content``).
-        """
+        documented in ``db.store._decrypt_artifact_content``)."""
         body = MagicMock()
         body.read.return_value = b"MEC1" + b"\x00" * 40
         with (

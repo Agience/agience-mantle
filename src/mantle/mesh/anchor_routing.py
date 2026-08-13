@@ -35,16 +35,9 @@ def cell_region(principal: str, collection: str, cluster: str, *, secret=None) -
 
     ``cluster`` is the routing anchor id (``route_vector``). Same triple → same
     region id everywhere, so an authored cell and a routed query name the same shard.
-
-    ⛔ BLINDED WHEN A SECRET IS PRESENT (AGENT-HOST-DESIGN.md Phase 0.2). The cleartext form
-    ``f"{principal}/{collection}/{cluster}"`` put the person's id (an email) IN THE KEY, made the
-    collection publicly derivable, and named the concept — an oracle for *does this person hold data
-    about this concept*, groupable by the shared ``principal/collection/`` prefix. `ember.region`
-    replaces it with ``HMAC(secret, principal|collection|cluster)``: deterministic for the holder,
-    opaque and unlinkable to everyone else. Write and query BOTH route through here, so blinding
-    both under one secret preserves the invariant that an authored cell and its query name the same
-    shard. ``secret=None`` yields the legacy cleartext form, so a node with no secret (or a demo)
-    still works — and `region.blind` reports `blinded=False` so degradation is never silent."""
+    Without a secret this returns the plain, unblinded id; `region.blind` is what
+    reports `blinded=False` when blinding was requested but no secret exists, so
+    degradation is never silent — this wrapper only returns the id."""
     if secret:
         from mantle.shard import region
         rid, _blinded = region.cell_region(principal, collection, cluster, secret=secret)
@@ -85,15 +78,10 @@ def route_query_regions(anchorset: AnchorSet, query_vec: Sequence[float] | np.nd
     node fetches only those cells — the working set for this query — verified + blind.
 
     ``secret`` blinds the region ids (see :func:`cell_region`); it MUST be the same secret the
-    write path used, or a query names a shard the write never created.
-
-    ⭐ DUAL-READ MIGRATION. When a secret is present, the query returns BOTH the blinded ids AND the
-    legacy cleartext ids for the same anchors (``legacy_read=True``, the default). This is what
-    makes enabling blinding a smooth rollout rather than a big-bang re-key: a freshly-provisioned
-    node WRITES only blinded cells (the leak stops immediately) but can still FIND cells that were
-    authored under the old scheme, so nothing already on disk is orphaned. Legacy cells age out or
-    are re-authored blinded over time; set ``legacy_read=False`` once the corpus is fully migrated
-    to close the reader too. With no secret this is a no-op — there is only the legacy id."""
+    write path used, or a query names a shard the write never created. ``legacy_read`` also
+    includes each anchor's unblinded id, so a query still finds cells written before blinding
+    was turned on; set it False once every write is blinded, to close the reader too. With no
+    secret this is a no-op — there is only the legacy id."""
     anchor_ids = route_query(anchorset, query_vec, nprobe=nprobe)
     out: List[str] = []
     seen = set()

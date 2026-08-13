@@ -1,46 +1,40 @@
 """BEACON conformance — the reduced screen read must keep answering the same question.
 
-There are two implementations of ONE question ("how many independent directions does this
+There are two implementations of one question ("how many independent directions does this
 frame have"), and they cannot import each other: `beam/optics.py` is the full aperture and
 depends on a local entroptics checkout; `mantle/search/beacon` is the reduced,
 dependency-free engine that ships to corporate installs, and mantle must stay beam-free
 (the target DAG is `mantle => origin` only).
 
-Two independent implementations of one measurement drift. This pins them the same way
-`agience-beam/vectors/contract_vectors.json` pins prism-py/js/c parity: a shared vector
+Two independent implementations of one measurement can drift apart silently. This pins them
+the same way `prism.vectors/contract_vectors.json` pins prism-py/js/c parity: a shared vector
 file, regenerated from seeds so no matrix is stored and both sides build byte-identical
-input. A change to either engine that moves a number in that file is a DELIBERATE act and
+input. A change to either engine that moves a number in that file is a deliberate act and
 must move the file in the same commit.
 
-FAILURE MODE this exists to catch: the two engines silently disagreeing. Before 2026-07-30
-`beacon` reproduced beam's MAD whitening but NOT its degradation flag, so a frame whose
-scale is carried by one channel — a collapsed feature axis, where the spectrum read is not
-the spectrum of the data — came back from beacon as a confident `k=1`, indistinguishable
-from a genuine one-mode screen.
+The case that matters most: a frame whose scale is carried by one channel — a collapsed
+feature axis, where the spectrum read is not the spectrum of the data — must come back from
+beacon as degraded, not as a confident `k=1` indistinguishable from a genuine one-mode
+screen.
 """
 from __future__ import annotations
-
-import json
-from pathlib import Path
 
 import numpy as np
 import pytest
 
 from mantle.search import beacon
 
-
-def _vectors_path() -> Path | None:
-    """The shared vector file lives in agience-beam (one canonical copy, read as DATA).
-
-    Reading a JSON file is not a code dependency, so the DAG is untouched. A standalone
-    mantle checkout will not have the sibling repo — that skips, it does not fail.
-    """
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        candidate = parent / "agience-beam" / "vectors" / "screen_read_vectors.json"
-        if candidate.is_file():
-            return candidate
-    return None
+# The shared vectors come from the installed prism package. Absence of the data must not be
+# mistaken for the two engines agreeing: `prism.vectors.load_vectors` raises `MissingVectors` on a
+# missing file, and this module lets that propagate rather than skipping — a skipped module and a
+# passing one look identical from outside, so a broken pin should error out of collection instead.
+#
+# This adds no new dependency edge: `mantle => prism` already exists (~28 modules import prism; it
+# is declared under the `service` extra) and prism is the Apache-2.0 floor that imports nothing
+# from this workspace. `agience-prism-py` is named in the `dev` extra so this test can reach the
+# vectors directly. `mantle => beam` remains the edge the target DAG forbids, which is why the
+# shared vector data lives in prism rather than beam.
+from prism.vectors import load_vectors
 
 
 def _build(v: dict) -> np.ndarray:
@@ -58,14 +52,13 @@ def _build(v: dict) -> np.ndarray:
     return m
 
 
-_PATH = _vectors_path()
-_DOC = json.loads(_PATH.read_text(encoding="utf-8")) if _PATH else {"vectors": []}
-_VECTORS = _DOC.get("vectors", [])
-
-pytestmark = pytest.mark.skipif(
-    _PATH is None,
-    reason="screen_read_vectors.json not found (standalone mantle checkout — no sibling agience-beam)",
-)
+# No `or {}`, no default, no `skipif`. Absent vectors raise out of collection and this module
+# ERRORS — the only outcome that cannot be mistaken for agreement between the two engines.
+_DOC = load_vectors("screen_read_vectors")
+_VECTORS = _DOC["vectors"]
+assert _VECTORS, (
+    "screen_read_vectors.json carries no cases — every parametrised test below would collect zero "
+    "cases and this gate would report success while comparing the two engines on nothing")
 
 
 @pytest.mark.parametrize("v", _VECTORS, ids=[v["name"] for v in _VECTORS])
@@ -90,9 +83,9 @@ def test_planted_structure_is_recovered(v):
 
 
 def test_collapsed_axis_is_marked_degraded():
-    """The case beam measured and beacon used to miss: a frame whose scale is carried by
+    """The case beam measures and beacon must not miss: a frame whose scale is carried by
     one channel. `whiten` zeroes channels with no spread, so the feature axis collapses and
-    the spectrum read is not the spectrum of the data. It must NOT come back as a clean
+    the spectrum read is not the spectrum of the data. It must not come back as a clean
     one-mode read."""
     case = next((v for v in _VECTORS if v.get("collapse")), None)
     assert case is not None, "the collapsed-axis vector must exist"
@@ -109,12 +102,18 @@ def test_every_read_names_its_instrument():
 
 
 def test_exported_surface_is_only_the_beacon_cut():
-    """This package is CONFIDENTIAL, so an export is DISCLOSED SURFACE, not just API.
+    """An export from beacon is a promise: the published surface is exactly the beacon cut and
+    nothing else. Beacon is Apache-2.0 and public — the reduced instrument that makes a free store
+    genuinely useful — so a published export is something a third party may build on and cannot
+    change without breaking them, which makes a narrow surface more important here, not less.
 
-    FAILURE MODE: it exported twelve symbols and exactly one pair was used outside the
-    package. Anything added back here is trade-secret surface being published to every
-    corporate install that imports it.
+    `structure_rank` was retired from this surface: zero production callers anywhere in mantle,
+    and the correlated-row path it existed to serve reaches `_permutation_core` directly through
+    `instrument.py` now, not through this public wrapper. `ENGINE_ID_PERM` stays exported — it is
+    still how a caller distinguishes a permutation-null read from a Tracy-Widom one, and
+    `instrument.py`'s reads still carry it.
     """
     assert set(beacon.__all__) == {
-        "DEFAULT_FAR", "ENGINE_ID", "BeaconEngineError", "RankResult", "signal_rank",
+        "DEFAULT_FAR", "ENGINE_ID", "ENGINE_ID_PERM", "BeaconEngineError", "RankResult",
+        "signal_rank",
     }

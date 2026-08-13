@@ -1,37 +1,31 @@
-"""The SSE arm's KEY CONTRACT — the one seam between encrypted lexical search and key custody.
+"""The SSE arm's key contract — the seam between encrypted lexical search and key custody.
 
-⛔ WHY THIS MODULE EXISTS: TO MAKE THE LEXICAL ARM SHIPPABLE.
+`sse/` implements blind tokens, encrypted posting lists, and the narrowing that reads them —
+deterministic, fast, and
+encrypted, with no model and no embedding. That makes it the retrieval story for an embedding
+consumer of the store. It is blind: the index holds HMAC'd tokens and encrypted postings, never
+plaintext terms, so the server cannot read the vocabulary of a collection or confirm whether any
+given term appears in it.
 
-`sse/` is blind tokens, encrypted posting lists and BM25 — deterministic, fast, and encrypted, with
-no model and no embedding. That makes it the retrieval story for an EMBEDDING consumer of the store
-(EREA §5, 2026-07-28: they are retiring their vector index rather than porting it, because the
-alternative — `db/lattice/fts.py` — is FTS5 *contentless* but still holds PLAINTEXT term postings,
-which discloses the vocabulary of every collection and confirms whether any given term appears).
+Every `sse/` module besides `router_accessor.py` — the vector-arm and custody integration —
+depends on nothing but stdlib + `cryptography`. That includes `indexer.py` and
+`narrowing.py`, which need a key and take :class:`SseKeyProvider` from here rather than `..oracle`,
+the module carrying the grant verifier, the lattice-backed master key store, and the CRUDEASIO
+mint/read policy. None of that is retrieval; all of it is custody.
 
-Ten of the eleven `sse/` modules were already free of everything but stdlib + `cryptography`. The
-lexical arm was pinned service-side by ONE import — `indexer.py` and `query.py` reaching for
-`..oracle`, a 703-line module carrying the grant verifier, the lattice-backed master key store and
-the CRUDEASIO mint/read policy. None of that is retrieval. All of it is custody.
+Dependency direction: this module is the interface and knows nothing of grants, the lattice, or
+Fernet. `oracle.OracleService` is one implementation of it; an embedding consumer supplies
+another. The implementation depends on the interface, never the reverse — so nothing here
+imports `..oracle`.
 
-⚠ MEASURED, NOT ASSUMED. The entire coupling was: `OracleService` as a type annotation, ONE method
-call (`derive_sse_key`), `KeyRequest` passed straight through, and `MasterKeyMissing` caught in one
-place. That is an INTERFACE, and it was being satisfied by dragging in an implementation.
+The refusals a provider raises — `MasterKeyUnavailable` and `MasterKeyMissing` — are exactly one
+class object each and live in :mod:`..custody`, which defines them and nothing else. Duplicating
+them here would give the same name two types, and every `except` clause naming one would silently
+stop matching the other; defining them in `..oracle` instead, next to the raises, made
+`narrowing.py` import the whole custodian to catch one name. A module that holds only the two names is what lets
+both sides name the same class without either reaching the other.
 
-DIRECTION OF THE DEPENDENCY. `oracle.py` imports FROM here and re-exports, rather than this module
-importing from `oracle`. The implementation depends on the interface, never the reverse — and it is
-why the exceptions had to MOVE rather than be duplicated: `pipeline_unified.py` and
-`test_key_custody_bypasses.py` both `except MasterKeyMissing` off the oracle import, so a second
-class of the same name would silently stop matching. There is exactly ONE class; `oracle` re-exports
-the same object.
-
-⚠ THE EXCEPTIONS ARE PART OF THE CONTRACT, NOT INCIDENTAL. `query.py` distinguishes
-`MasterKeyMissing` ("no key exists yet — an honest empty result") from `MasterKeyUnavailable` ("the
-key exists and we cannot read it — a hard stop"). Collapsing them would turn a broken key volume
-into "no results", which is the silent-`[]` failure class this codebase keeps killing. Any provider
-substituted here MUST preserve that distinction.
-
-STDLIB ONLY. No `cryptography`, no sibling package. Deliberately: this is the file that decides
-whether the lexical arm can travel.
+Stdlib only. No `cryptography`, no sibling package.
 """
 from __future__ import annotations
 
@@ -39,55 +33,20 @@ from typing import Any, Protocol, runtime_checkable
 
 __all__ = [
     "SseKeyProvider",
-    "MasterKeyUnavailable",
-    "MasterKeyMissing",
 ]
-
-
-class MasterKeyUnavailable(RuntimeError):
-    """A principal's master key cannot be used right now.
-
-    ⛔ A HARD STOP, NEVER AN EMPTY RESULT. The key material exists as far as anyone knows; what
-    failed is reading or unwrapping it (an unmounted keys volume, a rotated wrapping key, a store
-    that will not answer). Degrading this to "no results" would report a broken deployment as a
-    successful search that found nothing — indistinguishable, to the caller, from a corpus that
-    genuinely lacks the term.
-    """
-
-
-class MasterKeyMissing(MasterKeyUnavailable):
-    """No master key EXISTS for this principal, and this request may not create one.
-
-    Subclasses :class:`MasterKeyUnavailable` so existing handling — which already treats "the key is
-    not usable" as a hard stop — applies unchanged. The distinction is *why*: absent rather than
-    unreadable, and absence is the one case a READ may legitimately answer as empty (there is
-    nothing indexed under a key that was never minted). See `query.py`'s narrow catch.
-    """
 
 
 @runtime_checkable
 class SseKeyProvider(Protocol):
     """Derives the per-principal SSE key that blinds tokens and encrypts posting lists.
 
-    The WHOLE interface `sse/` needs from key custody. `OracleService` satisfies it in the deployed
+    The whole interface `sse/` needs from key custody. `OracleService` satisfies it in the deployed
     platform — gating on the CRUDEASIO grant light cone, minting only under write actions, reading
     the master key from the lattice — and an embedding consumer supplies its own.
 
-    ⚠ WHAT A SUBSTITUTE MUST STILL DO, because `sse/` cannot check it:
-      * AUTHORIZE. This method is where the grant is enforced. Returning a key for a principal the
-        caller may not act as hands them a readable index. `sse/` treats any returned key as
-        already-authorized — it has no grant, no light cone, and no way to second-guess one.
-      * DERIVE, NOT INVENT. The same (principal, request) must yield the same key forever, or
-        previously-written postings become unreadable — the index is not re-derivable from
-        ciphertext.
-      * DISTINGUISH ABSENT FROM UNREADABLE. Raise :class:`MasterKeyMissing` when no key exists and
-        this request may not mint one; raise :class:`MasterKeyUnavailable` (or a subclass that is
-        NOT `MasterKeyMissing`) when a key exists but cannot be read. `query.py` answers empty for
-        the first and propagates the second.
-
-    `request` is opaque here on purpose — it carries the purpose/action/context the PROVIDER's
+    `request` is opaque here on purpose — it carries the purpose/action/context the provider's
     policy reads (`oracle.KeyRequest` in the platform). Typing it concretely would drag the custody
-    model back across this seam, which is the coupling the module exists to cut.
+    model back across this seam, which is the coupling this interface exists to cut.
     """
 
     def derive_sse_key(self, principal_id: str, request: Any) -> bytes:

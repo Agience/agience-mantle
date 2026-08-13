@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import List, Optional, Set, TYPE_CHECKING, Any, Dict, Mapping, Sequence, cast
 
-import mantle.event_bus as event_bus
+import mantle.events.event_bus as event_bus
 
 try:
     from fastapi import HTTPException, status  # type: ignore
@@ -28,11 +28,6 @@ if TYPE_CHECKING:
 else:
     Database = Any
 
-# ⚠ AN `store.exceptions` IMPORT LIVED HERE, guarded by a try/except that defined a local
-# fallback class. Neither the imported name nor the fallback was ever raised or caught anywhere in
-# this tree (grep: two hits, both of them this block). It was dead in the most durable way — a
-# dependency that no test could notice was unused, because the fallback made it always succeed.
-# Removed 2026-07-23 [John: "We shouldn't be using the legacy store at all."]
 
 from mantle.entities.artifact import Artifact as ArtifactEntity
 from mantle.entities.collection import Collection as CollectionEntity
@@ -56,6 +51,9 @@ from mantle.db.backend import (
     get_artifacts_by_creator_id as db_get_artifacts_by_creator_id,
     get_draft_artifact as db_get_draft_artifact,
     get_latest_committed_artifact as db_get_latest_committed_artifact,
+    get_current_in_collection as db_get_current_in_collection,
+    get_current_in_collection_many as db_get_current_in_collection_many,
+    get_current_in_any_collection_many as db_get_current_in_any_collection_many,
     list_collection_artifacts as db_list_collection_artifacts,
     archive_artifact as db_archive_artifact,
     after_key as _db_after_key,
@@ -78,9 +76,14 @@ from mantle.db.backend import (
 
 
 # Local thin adapters that re-shape unified-store calls to the names this
-# module's body still uses. Keeps the rest of the file untouched.
+# module's body uses.
 
 def db_get_artifact_by_version_id(db, version_id):
+    """One artifact version by its version id, or ``None``.
+
+    An archived version reads as absent here, so callers that treat ``None`` as "not found"
+    do not have to re-check ``state`` themselves.
+    """
     a = db_get_artifact(db, version_id)
     if a and a.state == "archived":
         return None
@@ -88,23 +91,31 @@ def db_get_artifact_by_version_id(db, version_id):
 
 
 def db_get_latest_artifact_version_by_root_id(db, root_id):
+    """The newest committed version of a lineage in any collection, or ``None`` if the root
+    has never been committed. Drafts are not considered."""
     return db_get_latest_committed_artifact(db, root_id)
 
 
 def db_get_artifact_by_collection_id_and_root_id(db, collection_id, root_id):
-    draft = db_get_draft_artifact(db, root_id, collection_id)
-    if draft:
-        return draft
-    return db_get_latest_committed_artifact(db, root_id, collection_id)
+    """The current version of ``root_id`` as seen from ``collection_id`` — the draft in that
+    collection if one exists, else the newest version committed there. ``None`` when the root
+    has no version in this collection."""
+    # `get_current_in_collection` is the same draft-then-committed rule over ONE lineage read;
+    # the draft/committed pair reads the lineage twice to answer the same question.
+    return db_get_current_in_collection(db, collection_id, root_id)
 
 
 def db_get_artifacts_by_collection_id(db, collection_id):
+    """The collection's current members as ``Artifact`` entities, one per membership edge,
+    ordered by ``order_key``. Archived members are omitted."""
     from mantle.entities.artifact import Artifact
     rows = db_list_collection_artifacts(db, collection_id)
     return [Artifact.from_dict(r) for r in rows]
 
 
 def db_delete_collection_artifact_by_collection_and_root(db, collection_id, root_id):
+    """Drop the membership edge for (collection, root). Idempotent: ``True`` means the edge is
+    gone, whether or not it was there to begin with."""
     return _db_remove_edge(db, collection_id, root_id)
 
 from mantle.search.ingest.pipeline_unified import (  # noqa: E402
@@ -132,7 +143,6 @@ def ensure_collection_descriptor(db: Database, collection: CollectionEntity) -> 
 
     Container-as-artifact means we index the container artifact itself
     (workspace/collection), not a separate descriptor artifact.
-
     """
     try:
         index_artifact(collection, collection.id, is_head=True)
@@ -199,7 +209,7 @@ def create_new_collection(
 ) -> CollectionEntity:
     """Create a collection. When ``container_id`` is given, the collection is
     homed in that container and linked with an origin edge — exactly how any
-    artifact created in a workspace becomes a member of it. A collection IS an
+    artifact created in a workspace becomes a member of it. A collection is an
     artifact, so a collection created in a workspace shows up in that workspace
     like anything else. Without ``container_id`` it is created top-level."""
     from mantle.entities.collection import COLLECTION_CONTENT_TYPE
@@ -294,6 +304,11 @@ def get_collection_for_user(
     user_id: Optional[str],
     collection_id: str,
 ) -> CollectionEntity:
+    """Load a collection by id. Raises ``HTTPException(404)`` if it does not exist.
+
+    ``user_id`` is accepted for call-site symmetry with the rest of this module but is not
+    consulted: this performs no access check, so the caller must authorize the read itself.
+    """
     collection = db_get_collection_by_id(db, collection_id)
     if not collection:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
@@ -307,6 +322,14 @@ def update_user_collection(
     name: Optional[str],
     description: Optional[str],
 ) -> CollectionEntity:
+    """Rename and/or re-describe a collection, returning the updated entity.
+
+    ``None`` and empty values leave the corresponding field unchanged, so this cannot be used to
+    blank a name or description. Requires an active grant carrying ``can_update`` on the
+    collection; a caller without one — including an anonymous ``user_id=None`` — gets
+    ``HTTPException(404)``, the same answer as a collection that does not exist, so refusal does
+    not disclose existence. Raises ``HTTPException(500)`` if the store rejects the write.
+    """
     collection = db_get_collection_by_id(db, collection_id)
     if not collection:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
@@ -376,12 +399,10 @@ def delete_user_collection(db: Database, user_id: Optional[str], collection_id: 
         except Exception:
             memberships = []
         if not memberships:
-            # Delete all versions for this root and remove their index docs.
-            # 2026-07-22 hardening: this was a silent `deleted_versions = []` placeholder — the
-            # ONE spot in the delete path that reported success while doing nothing, so a root
-            # leaving its last collection leaked every version and its index docs forever.
-            # `delete_artifacts_by_root` (db/lattice_api.py) is the hard-delete this docstring
-            # promises; failure is LOGGED, never swallowed into a fake empty result.
+            # Delete all versions for this root and remove their index docs. A root leaving its
+            # last collection must not leak every version and its index docs, so
+            # `delete_artifacts_by_root` (db/lattice_api.py) does the hard delete this docstring
+            # promises; failure is logged, never swallowed into a fake empty result.
             try:
                 from mantle.db.backend import delete_artifacts_by_root as db_delete_artifacts_by_root
                 deleted_versions = db_delete_artifacts_by_root(db, root_id)
@@ -404,8 +425,8 @@ def delete_user_collection(db: Database, user_id: Optional[str], collection_id: 
 
 def create_new_artifact(db: Database, user_id: str, context: str, content: str) -> ArtifactEntity:
     """
-    Create a new artifact VERSION document only. Root and linking are handled separately.
-    EXACT 1:1 mapping - no modified_by/modified_time (don't exist in the lattice schema).
+    Create a new artifact version document only. Root and linking are handled separately.
+    Exact 1:1 mapping - no modified_by/modified_time (don't exist in the lattice schema).
     """
     now = datetime.now(timezone.utc).isoformat()
     artifact = ArtifactEntity(
@@ -434,13 +455,13 @@ def edit_artifact_in_collection(
     actor_id: Optional[str] = None,
 ) -> ArtifactEntity:
     """
-    Create a NEW VERSION under an existing ROOT and relink to it.
-    Archive the previously linked VERSION if requested.
-    Provenance: remove by previous VERSION id, add by new VERSION id.
+    Create a new version under an existing root and relink to it.
+    Archive the previously linked version if requested.
+    Provenance: remove by previous version id, add by new version id.
 
     prev_version_id: Pre-fetched currently linked version (skip lookup)
     """
-    # Read the currently linked version BEFORE unlinking (if not provided)
+    # Read the currently linked version before unlinking (if not provided)
     if prev_version_id is None:
         linked = db_get_artifact_by_collection_id_and_root_id(db, collection_id, root_id)
         prev_version_id = getattr(linked, "id", None) if linked else None
@@ -515,10 +536,10 @@ def remove_artifact_from_collection_by_version(
     linked_version_id: Optional[str] = None,
 ) -> None:
     """
-    Unlink by VERSION id. If the currently linked version equals version_id, unlink.
+    Unlink by version id. If the currently linked version equals version_id, unlink.
     If it differs, unlink by root to honor user intent and consider that a drift case.
     If archive=True and you are unlinking the currently linked version, set is_archived=true.
-    Provenance: record remove using VERSION id.
+    Provenance: record remove using version id.
 
     root_id: Pre-fetched root_id (skip version lookup)
     linked_version_id: Pre-fetched currently linked version (skip link lookup)
@@ -600,6 +621,12 @@ def get_unattached_artifacts(db: Database, user_id: str) -> List[ArtifactEntity]
 
 
 def get_artifacts_for_user(db: Database, user_id: str) -> List[ArtifactEntity]:
+    """Every non-archived artifact version ``user_id`` created, with
+    ``committed_collection_ids`` hydrated.
+
+    Authorship, not access: the listing is keyed on ``created_by``, so it includes versions in
+    collections the user can no longer read and excludes ones they can read but did not write.
+    """
     artifacts = db_get_artifacts_by_creator_id(db, user_id)
     _attach_committed_collection_ids(db, artifacts)
     return artifacts
@@ -611,6 +638,12 @@ def get_collection_artifact(
     collection_id: str,
     artifact_root_id: str,
 ) -> ArtifactEntity:
+    """The current version of ``artifact_root_id`` in ``collection_id``, with
+    ``committed_collection_ids`` hydrated.
+
+    Addressed by ROOT id, not version id. Raises ``HTTPException(404)`` when the root has no
+    version in this collection. ``user_id`` is not consulted — the caller authorizes the read.
+    """
     artifact = db_get_artifact_by_collection_id_and_root_id(db, collection_id, artifact_root_id)
     if not artifact:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
@@ -626,6 +659,20 @@ def get_collection_artifact_content_url(
     *,
     expires_in: int,
 ) -> Dict[str, Any]:
+    """Mint a download URL for a collection artifact's stored content.
+
+    Returns ``{"url", "expires_in", "filename"}``. An artifact whose context declares
+    ``access: "public"`` and carries a ``uri`` returns that uri verbatim with
+    ``expires_in=None``; everything else returns a signed URL over the artifact's own object
+    key, valid for ``expires_in`` seconds.
+
+    The key is derived from the artifact id rather than taken from context — a context-supplied
+    key naming a different artifact is refused, since authoring an artifact would otherwise mint
+    a download URL for another tenant's object.
+
+    Raises ``HTTPException(404)`` if the collection or the artifact is absent, and
+    ``HTTPException(400)`` if the content is not agience-hosted (nothing to sign).
+    """
     collection = db_get_collection_by_id(db, collection_id)
     if not collection:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
@@ -656,7 +703,7 @@ def get_collection_artifact_content_url(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Not an agience-hosted file")
 
     # Validated, not trusted — see `workspace_service._safe_content_key`. Unchecked, a caller who
-    # can author an artifact's `context` mints a signed download URL for ANOTHER tenant's object.
+    # can author an artifact's `context` mints a signed download URL for another tenant's object.
     from mantle.services.workspace_service import _safe_content_key
     key = _safe_content_key(ctx, artifact_root_id, default_prefix=str(collection.created_by))
     filename = ctx.get("filename", "download")
@@ -674,18 +721,29 @@ def get_collection_artifact_content_url(
     }
 
 
-def get_collection_artifacts_batch(
+def get_collection_artifacts_by_root_ids(
     db: Database,
     user_id: Optional[str],
     collection_id: str,
     artifact_root_ids: List[str],
 ) -> List[ArtifactEntity]:
-    """Batch fetch multiple artifacts from a collection."""
-    artifacts = []
-    for root_id in artifact_root_ids:
-        artifact = db_get_artifact_by_collection_id_and_root_id(db, collection_id, root_id)
-        if artifact and not getattr(artifact, "is_archived", False):
-            artifacts.append(artifact)
+    """The current version of each named root in ``collection_id``, archived ones omitted, with
+    ``committed_collection_ids`` hydrated. Roots absent from the collection are skipped, so the
+    result may be shorter than the input, and results follow the order the roots were named in.
+
+    One chunked lineage read for the whole set, not one per root: the store publishes a
+    multi-root lineage read (``ArtifactStore.versions_of_many``, reached through
+    :func:`lattice_api.get_current_in_collection_many`), so the per-root round trip is no longer
+    the floor. Repeats in ``artifact_root_ids`` are read once and yielded once. The membership
+    hydration afterwards is collapsed across the set the same way — see
+    :func:`_attach_committed_collection_ids`.
+
+    ``user_id`` is not consulted; the caller authorizes the read.
+    """
+    roots = list(dict.fromkeys(artifact_root_ids or []))
+    current = db_get_current_in_collection_many(db, collection_id, roots)
+    artifacts = [a for a in (current.get(root_id) for root_id in roots)
+                 if a is not None and not getattr(a, "is_archived", False)]
     _attach_committed_collection_ids(db, artifacts)
     return artifacts
 
@@ -695,30 +753,37 @@ def get_collection_artifacts_batch_global(
     user_id: Optional[str],
     artifact_root_ids: List[str],
 ) -> List[ArtifactEntity]:
-    """Batch fetch multiple artifacts across all accessible collections by root IDs."""
+    """Batch fetch multiple artifacts across all accessible collections by root IDs.
+
+    A genuine batch on both axes: one chunked store read covers every distinct root
+    (``ArtifactStore.versions_of_many``), and which collection a root is visible through is
+    decided in memory against the caller's accessible set. The lineage is the same lineage
+    whichever collection is being asked about, so re-reading it per candidate collection buys
+    nothing, and re-reading it per root made the cost O(roots x collections) round trips for an
+    answer that depends on one read.
+
+    Candidate collections are ordered owned-first, then grant-reachable, so a root visible
+    through more than one resolves the same way on every call. A `set` alone leaves that tie to
+    hash order, which is per-process. Results follow the order the roots were named in."""
     owned_collections = db_get_collections_by_owner_id(db, user_id) if user_id else []
-    collection_ids = {c.id for c in owned_collections}
+    collection_ids: List[str] = list(dict.fromkeys(c.id for c in owned_collections))
     if user_id:
         try:
-            collection_ids.update(db_get_active_collection_ids_for_user(db, user_id))
+            granted = db_get_active_collection_ids_for_user(db, user_id)
         except Exception:
             logger.exception("get_collection_artifacts_batch_global: failed resolving user grants")
-    
-    # For each root_id, find the artifact in any accessible collection
-    artifacts = []
-    seen_root_ids = set()
-    for root_id in artifact_root_ids:
-        if root_id in seen_root_ids:
-            continue  # Skip duplicates
-        
-        # Try to find this root_id in any accessible collection
-        for collection_id in collection_ids:
-            artifact = db_get_artifact_by_collection_id_and_root_id(db, collection_id, root_id)
-            if artifact and not getattr(artifact, "is_archived", False):
-                artifacts.append(artifact)
-                seen_root_ids.add(root_id)
-                break  # Found it, move to next root_id
-    
+            granted = []
+        seen_collections = set(collection_ids)
+        for cid in granted:
+            if cid not in seen_collections:
+                seen_collections.add(cid)
+                collection_ids.append(cid)
+
+    roots = list(dict.fromkeys(artifact_root_ids or []))
+    current = db_get_current_in_any_collection_many(db, roots, collection_ids)
+    artifacts = [a for a in (current.get(root_id) for root_id in roots)
+                 if a is not None and not getattr(a, "is_archived", False)]
+
     _attach_committed_collection_ids(db, artifacts)
     return artifacts
 
@@ -728,6 +793,12 @@ def get_collection_artifacts(
     user_id: Optional[str],
     collection_id: str,
 ) -> List[ArtifactEntity]:
+    """Every current, non-archived member of a collection, ordered by ``order_key``, with
+    ``committed_collection_ids`` hydrated.
+
+    Returns ``[]`` for a collection that is empty and for one that does not exist — the two are
+    indistinguishable here. ``user_id`` is not consulted; the caller authorizes the read.
+    """
     all_artifacts = db_get_artifacts_by_collection_id(db, collection_id)
     active_artifacts = [artifact for artifact in all_artifacts if not getattr(artifact, "is_archived", False)]
     _attach_committed_collection_ids(db, active_artifacts)
@@ -742,8 +813,8 @@ def add_artifact_to_collection_with_access_check(
     root_id: Optional[str] = None,
 ) -> ArtifactEntity:
     """
-    Service-level wrapper: Link an existing VERSION into a collection.
-    Resolve ROOT from the VERSION.
+    Service-level wrapper: Link an existing version into a collection.
+    Resolve root from the version.
 
     root_id: Pre-fetched root_id (skip version lookup)
     """
@@ -797,12 +868,9 @@ def create_commit(db: Database, user_id: str, commit: CommitEntity) -> CommitEnt
     """
     Handles explicit commit creation from the API.
     """
-    # Validate the user can write to every referenced collection_id in items
-    # If CommitOpEntity has collection_id optional in your model, enforce presence for now.
-    # touched_collections = set()
+    # This loop performs no per-item validation: `record_collection_commit` is the path
+    # that validates write access per referenced collection_id, and normal flows use it.
     for item_id in getattr(commit, "item_ids", []) or []:
-        # If you store items first, this path might be a no-op. Keep API minimal for now.
-        # Caller should use record_collection_commit for normal flows.
         pass
 
     # Minimal envelope write: fill id, timestamp, author then create
@@ -865,7 +933,7 @@ def record_collection_commit(
     host_id: Optional[str] = None,
     server_id: Optional[str] = None,
     agent_id: Optional[str] = None,
-    api_key_id: Optional[str] = None,
+    grant_key_id: Optional[str] = None,
     confirmation: Optional[str] = None,
     changeset_type: Optional[str] = None,
 ) -> str:
@@ -911,7 +979,7 @@ def record_collection_commit(
         host_id=host_id,
         server_id=server_id,
         agent_id=agent_id,
-        api_key_id=api_key_id,
+        grant_key_id=grant_key_id,
         confirmation=confirmation or "human_affirmed",
         changeset_type=changeset_type or "manual",
         item_ids=item_ids,

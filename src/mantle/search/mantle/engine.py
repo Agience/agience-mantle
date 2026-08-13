@@ -1,6 +1,6 @@
 """MantleQueryEngine — encrypted IVF search over authorized cells.
 
-Step 2.3 implementation. The query-time inverse of :class:`MantleIndexer`:
+The query-time inverse of :class:`MantleIndexer`:
 
     query_vec ─► nearest_clusters ─► oracle.derive_cell_key ─► cell_store.get
                                                                      │
@@ -13,13 +13,13 @@ Step 2.3 implementation. The query-time inverse of :class:`MantleIndexer`:
                                        ▼
                                     scored hits
 
-Composes the substrate built in 2.2:
+Composes:
 
-- :class:`OracleService` (2.2a) — derives cell keys; refuses keys for
+- :class:`OracleService` — derives cell keys; refuses keys for
   revoked grants
-- :func:`cell.unpack_cell` (2.2b.i) — decrypts + deserializes
-- :mod:`clustering` (2.2b.ii) — routes the query to its nearest clusters
-- :class:`CellStore` + :class:`CentroidStore` (2.2b.iii) — opaque storage
+- :func:`cell.unpack_cell` — decrypts + deserializes
+- :mod:`clustering` — routes the query to its nearest clusters
+- :class:`CellStore` + :class:`CentroidStore` — opaque storage
 
 Cell cache: an in-memory dict with TTL (configurable, default 60s) keeps
 recently-decrypted cells around so repeat queries don't pay the crypto
@@ -35,7 +35,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import AbstractSet, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -44,6 +44,35 @@ from .oracle import KeyRequest, OracleService
 from .stores import CellStore
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Where the result set stops
+# ---------------------------------------------------------------------------
+#
+# `search/beacon/cut.py` is the reduced instrument: a Tracy-Widom signal-rank read of a
+# query-relative multi-head screen, cut at the largest relative gap. It is parameter-free —
+# no fixed k, no MAD multiple, no significance level, no keep-fraction — and it is the
+# project's stated position on result cuts, which is why the arm takes it rather than a
+# noise-floor z-score somebody chose.
+#
+# It applies HERE and to nothing else, and the reason is the shape of its input rather than a
+# preference. `beacon.cut.select` reads `(item_embs, query_emb)`: it needs a vector per
+# candidate. Only this arm has those. The blind-token narrowing holds a SET and a pair of
+# integer counts per artifact — no vectors at all — so there is nothing there for a silhouette
+# to read, and `router_accessor._by_coverage` consequently takes no cut: a coverage-ordered
+# recall returns the whole narrowed set.
+#
+# The rank fusion this cut was once at risk of being pointed at is gone with BM25, and the
+# hazard is worth keeping written down because it is what a future fusion would walk back into:
+# an RRF score is `Σ 1/(k + rank)`, so the consecutive ratios of a single arm's list are
+# `(k+r+1)/(k+r)` — monotonically decreasing, largest at the very first pair, always cutting
+# after one item. Those gaps are manufactured by `k`, not measured from the data, so reading a
+# silhouette off them measures the fusion constant. Beacon cuts a ranked list that has a
+# spectrum.
+CUT_BEACON = "beacon"
+CUT_NONE = "none"
+VALID_CUTS = (CUT_BEACON, CUT_NONE)
 
 
 # ---------------------------------------------------------------------------
@@ -64,15 +93,16 @@ class _CellOutcome(enum.Enum):
     """What happened when a cell was fetched — the evidence the caller reasons over."""
 
     OK = "ok"                # decrypted and authenticated
-    TAMPERED = "tampered"    # GCM auth failed: evidence ABOUT THE KEY
+    TAMPERED = "tampered"    # GCM auth failed: evidence about the key
     MALFORMED = "malformed"  # unparseable blob: a storage defect, says nothing about the key
 
 @dataclass(frozen=True)
 class MantleHit:
     """One decrypted, scored hit from the MANTLE query path.
 
-    ``score`` is cosine similarity in [-1, 1]; higher is closer. When fused
-    with BM25 in the accessor (Step 2.4), it'll be fed into RRF.
+    ``score`` is cosine similarity in [-1, 1]; higher is closer. Nothing fuses it with
+    anything: this arm is the only ranker, so the number the accessor puts on a
+    ``SearchHit`` for a cosine-ordered recall IS this one.
     """
     artifact_id: str
     chunk_id: int
@@ -166,23 +196,24 @@ class MantleQueryEngine:
         *,
         cell_cache_ttl_s: int = 60,
         nprobe: int = 8,
-        enable_selfsize: Optional[bool] = None,
-        selfsize_z: float = 3.5,
-        selfsize_min_k: int = 5,
+        cut: Optional[str] = None,
     ) -> None:
         self._oracle = oracle
         self._cells = cell_store
         self._cache = _CellCache(ttl_seconds=cell_cache_ttl_s)
         self._nprobe = nprobe
-        # Entroptics self-sizing result cut (MANTLE-SEARCH-SPEC Change B1). **Default
-        # OFF** — it changes result COUNTS and must be A/B'd on retrieval quality
-        # before enabling. Toggle via env MANTLE_SEARCH_SELFSIZE=1 (no redeploy).
+        # How the result set STOPS. See `_beacon_cut`. `MANTLE_SEARCH_CUT=none` returns the
+        # whole scored horizon and lets the caller's top_k be the only bound.
         import os as _os
-        if enable_selfsize is None:
-            enable_selfsize = _os.getenv("MANTLE_SEARCH_SELFSIZE", "") in ("1", "true", "True")
-        self._selfsize = bool(enable_selfsize)
-        self._selfsize_z = float(_os.getenv("MANTLE_SEARCH_SELFSIZE_Z", str(selfsize_z)))
-        self._min_k = int(_os.getenv("MANTLE_SEARCH_SELFSIZE_MIN_K", str(selfsize_min_k)))
+        if cut is None:
+            cut = (_os.getenv("MANTLE_SEARCH_CUT", CUT_BEACON) or CUT_BEACON).strip().lower()
+        if cut not in VALID_CUTS:
+            logger.error(
+                "MANTLE_SEARCH_CUT=%r is not one of %s — using %r rather than guessing.",
+                cut, ", ".join(VALID_CUTS), CUT_BEACON,
+            )
+            cut = CUT_BEACON
+        self._cut = cut
 
     # ------------------------------------------------------------------
     # Search
@@ -195,6 +226,7 @@ class MantleQueryEngine:
         request: "KeyRequest",
         *,
         top_k: int = 50,
+        authorized_artifacts: Optional[AbstractSet[str]] = None,
     ) -> List[MantleHit]:
         """Run a vector search over the union of authorized cells.
 
@@ -202,7 +234,19 @@ class MantleQueryEngine:
         tuples — the result of :class:`LightConeResolver`.resolve() filtered
         through the artifact ownership graph.
 
-        ``request`` is the REQUIRED :class:`~search.mantle.oracle.KeyRequest`
+        ``authorized_artifacts`` is the artifact-granular set from that same
+        resolve(). A cell is the unit of ENCRYPTION, not of authorization: holding
+        the key to a cell means every chunk inside it decrypts, including chunks
+        belonging to artifacts the requester was never granted. Scoring every
+        decrypted chunk therefore turns a grant on one artifact into recall over
+        its whole collection. When supplied, chunks outside this set are dropped
+        before scoring — a meet over the cell-level cut, never a widening of it.
+        ``None`` leaves the engine at cell granularity, which is the engine-level default for
+        callers and tests; the production recall path
+        (:meth:`~.sse.router_accessor.MantleSseSearchAccessor.search`) always passes a concrete
+        set, so the fail-closed decision lives in one place rather than being re-derived here.
+
+        ``request`` is the required :class:`~search.mantle.oracle.KeyRequest`
         identifying the principal on whose behalf the search runs. It is passed
         down to every cell-key derivation, so the oracle re-verifies the grant for
         each context rather than trusting that ``authorized_contexts`` was built
@@ -214,7 +258,10 @@ class MantleQueryEngine:
         merge results. Deduplicates by ``(artifact_id, chunk_id)`` — when a
         chunk appears in multiple authorized contexts, the highest score wins.
 
-        Returns up to ``top_k`` hits sorted by descending score.
+        Returns AT MOST ``top_k`` hits sorted by descending score. ``top_k`` is the
+        horizon; how many of it belong together is read off the spectrum by
+        :meth:`_beacon_cut`, so a query with three good answers returns three rather than
+        fifty with a tail of noise.
 
         Raises :class:`ValueError` when ``query_embedding`` is empty or
         when the cell store isn't wired up.
@@ -240,10 +287,19 @@ class MantleQueryEngine:
         if top_k <= 0:
             return []
 
+        # Empty-but-present is "the light cone authorized nothing" and must not be
+        # read as "unspecified" — only `None` means that. Short-circuiting here also
+        # avoids decrypting cells whose every chunk would be discarded.
+        if authorized_artifacts is not None and not authorized_artifacts:
+            return []
+
         # Route the query to its nearest-anchor clusters (canonical plan §5.1):
         # decrypt only those cells per authorized context, not the whole union.
-        # The AnchorSet is mandatory (bootstrapped from the seed corpus on first
-        # use); there is one path and no flat fallback.
+        #
+        # The AnchorSet is mandatory and PROVISIONED — nothing derives one, here or on first
+        # use — so on an unprovisioned node this line raises `AnchorSetNotProvisioned` on every
+        # query. There is one path and no flat fallback: without anchors this arm reads nothing,
+        # and `unified` catches the raise so recall still answers from the lexical arm alone.
         from mantle.search.anchors.routing import route_query
         from mantle.search.anchors.store import require_live_anchorset
 
@@ -251,8 +307,14 @@ class MantleQueryEngine:
 
         # Best-score-wins dedup.
         best: dict[Tuple[str, int], MantleHit] = {}
+        # The unit vector behind each surviving hit, kept only when the cut will read it.
+        # A cell's decrypted chunks are already resident in `_CellCache` for the TTL window,
+        # so this holds one float32 row per DEDUPED hit on top of plaintext already in memory.
+        vectors: Optional[dict[Tuple[str, int], np.ndarray]] = (
+            {} if self._cut == CUT_BEACON else None
+        )
 
-        # FIX 2 bookkeeping — see `_load_cell` and the systemic-fault check below.
+        # Systemic-fault bookkeeping — see `_load_cell` and the check below.
         attempted = 0
         failed_auth = 0
 
@@ -272,33 +334,25 @@ class MantleQueryEngine:
                     attempted += 1
                     failed_auth += 1
                 if chunks:
-                    self._score_chunks(q, chunks, principal_id, collection_id, best)
+                    self._score_chunks(
+                        q, chunks, principal_id, collection_id, best,
+                        authorized_artifacts=authorized_artifacts,
+                        vectors=vectors,
+                    )
 
-        # ⛔ TOTAL KEY LOSS USED TO BE INDISTINGUISHABLE FROM AN EMPTY CORPUS.
-        # Every cell failing GCM auth was logged and treated as a cache miss, so a
-        # wrong/rotated/destroyed master key returned `[]` — "no results" — with
-        # only a warning in a log nobody reads. That is the worst possible
-        # presentation of unrecoverable data loss: it looks like a working system.
         #
-        # The original DoS reasoning is CORRECT and is preserved: one tampered cell
-        # must not fail a whole query, because then anyone who can corrupt a single
-        # cell can deny the entire corpus. So the two conditions are separated by
-        # the only signal that actually distinguishes them — the RATIO, not the
-        # event:
+        # One tampered cell must not fail a whole query, because then anyone who can
+        # corrupt a single cell can deny the entire corpus. So the two conditions are
+        # separated by the only signal that actually distinguishes them — the ratio,
+        # not the event:
         #
-        #   some cells decrypt, some don't  → per-cell corruption. Degrade, as before.
-        #   EVERY cell we could read fails  → the key itself is wrong. Systemic; raise.
+        #   some cells decrypt, some don't  → per-cell corruption. Degrade.
+        #   every cell we could read fails  → the key itself is wrong. Systemic; raise.
         #
         # A per-cell attacker cannot reach the second branch without already having
         # corrupted every cell in every authorized context, at which point the
         # corpus is gone anyway and saying so is the correct behaviour.
         #
-        # ⚠ Known edge: a principal whose ONLY cell is genuinely tampered raises
-        # instead of degrading. That is accepted deliberately — with a sample size
-        # of one there IS no evidence distinguishing "this cell is corrupt" from
-        # "the key is wrong", and of the two possible errors, wrongly reporting a
-        # systemic fault is recoverable while wrongly reporting an empty corpus is
-        # the failure mode that already cost us production data.
         if attempted and failed_auth == attempted:
             raise SystemicKeyFailure(
                 f"all {attempted} readable cell(s) across {len(contexts)} authorized "
@@ -310,17 +364,12 @@ class MantleQueryEngine:
         # Sort by score descending.
         hits = sorted(best.values(), key=lambda h: h.score, reverse=True)
 
-        # Optional entroptics noise-calibrated self-sizing (MANTLE-SEARCH-SPEC B1,
-        # default OFF). Random cosine in d dims ~ N(0, 1/d) → noise scale ~1/sqrt(d);
-        # keep only hits a z-sigma above the null, never below min_k, never above the
-        # caller's top_k. This is the entroptics principle (read the noise floor from
-        # the data) applied to the score distribution — NOT the search itself.
-        if self._selfsize and hits:
-            floor = self._selfsize_z / (q.size ** 0.5)
-            k = sum(1 for h in hits if h.score > floor)
-            hits = hits[: max(self._min_k, k)]
-
-        return hits[:top_k]
+        # `top_k` is the horizon, not the answer: it bounds what the caller is willing to
+        # look at, and the cut decides how much of that actually belongs together.
+        hits = hits[:top_k]
+        if self._cut == CUT_BEACON and vectors is not None:
+            hits = self._beacon_cut(q, hits, vectors)
+        return hits
 
     # ------------------------------------------------------------------
     # Internals
@@ -340,31 +389,23 @@ class MantleQueryEngine:
         failure and must not count toward the systemic-fault ratio), otherwise the
         :class:`_CellOutcome` of the attempt.
 
-        A cell that fails GCM authentication still degrades to a miss HERE, exactly
-        as before — the DoS argument for that is sound. What changed is that the
-        outcome is now REPORTED to the caller, which can see the difference between
-        one bad cell and a wholesale key fault. Losing that distinction was the
-        defect, not the local degradation.
-
-        ⚠ ``request`` IS REQUIRED AND HAS NO DEFAULT. It previously defaulted to
-        ``None``, which meant a caller that simply forgot it reached the oracle with
-        ``None`` and got a ``TypeError`` — an unauthenticated request surfacing as a
-        crash rather than a denial, and only if it got as far as the oracle at all.
+        A cell that fails GCM authentication degrades to a miss here — the DoS argument
+        for that is sound — and the outcome is reported to the caller, which can see the
+        difference between one bad cell and a wholesale key fault.
         """
-        # ⚠ ORDERING IS LOAD-BEARING — AUTHORIZE BEFORE THE CACHE READ.
         #
-        # This cache holds DECRYPTED CHUNKS keyed by (principal, collection,
-        # cluster) with NO requester component, so serving a hit grants exactly what
-        # handing over the cell key would. Reading it first meant an unauthorized
-        # caller was served another principal's plaintext for the 60s TTL, with the
-        # oracle never invoked — the grant coupling was real on a cache miss and
-        # absent on a hit.
+        # This cache holds decrypted chunks keyed by (principal, collection,
+        # cluster) with no requester component, so serving a hit grants exactly what
+        # handing over the cell key would. Authorization therefore runs before the
+        # cache is read: checking the cache first would serve an unauthorized caller
+        # another principal's plaintext for the TTL window, since the oracle would
+        # never be invoked on a hit.
         #
-        # This mirrors what the SSE arm already does (`sse/query.py`: derive the key
-        # first, then let the loaders read their caches) and what this oracle's own
+        # This mirrors what the SSE arm does (`sse/query.py`: derive the key first,
+        # then let the loaders read their caches) and what this oracle's own
         # master-key cache does (`oracle.__init__`: authorize on every call, cached
-        # or not). Both had it right; only this arm inverted it. `authorize()` runs
-        # the identical check without paying for a derivation on every hit.
+        # or not) — the same pattern applied consistently. `authorize()` runs the
+        # identical check without paying for a derivation on every hit.
         self._oracle.authorize(principal_id, collection_id, request)
 
         cached = self._cache.get(principal_id, collection_id, cluster_id)
@@ -393,12 +434,46 @@ class MantleQueryEngine:
                 principal_id, collection_id, cluster_id,
             )
             # Malformed ≠ wrong key: a truncated/garbage blob is a storage defect and
-            # says nothing about key custody, so it does NOT count toward the
+            # says nothing about key custody, so it does not count toward the
             # systemic-key ratio. Only GCM auth failure is evidence about the key.
             return [], _CellOutcome.MALFORMED
 
         self._cache.put(principal_id, collection_id, chunks, cluster_id)
         return chunks, _CellOutcome.OK
+
+    def _beacon_cut(
+        self,
+        query: np.ndarray,
+        hits: List[MantleHit],
+        vectors: dict[Tuple[str, int], np.ndarray],
+    ) -> List[MantleHit]:
+        """Where this result set stops, read off its own spectrum. See the module header.
+
+        ``hits`` is already the bounded, score-ordered horizon, which is the pool
+        :func:`beacon.cut.select` documents itself as wanting: it reads the structure of the
+        set it is handed, so handing it the whole corpus asks a different question. Order is
+        preserved — beacon decides membership, cosine decides rank.
+
+        Degrades to the uncut horizon on anything unexpected. A cut is a refinement of an
+        answer that already exists; failing to take one must not cost the answer.
+        """
+        if len(hits) <= 2:
+            # Two candidates have no spectrum to read — `select` would keep both anyway, and
+            # a cut that never had a reading must not look like one that did.
+            return hits
+        try:
+            from mantle.search.beacon.cut import select
+
+            pool = np.stack([vectors[(h.artifact_id, h.chunk_id)] for h in hits])
+            keep = select(pool, query)
+            cut = [hits[i] for i in sorted(int(i) for i in keep)]
+        except Exception:
+            logger.warning(
+                "MANTLE: the beacon cut could not be taken over %d candidates; returning the "
+                "uncut horizon", len(hits), exc_info=True,
+            )
+            return hits
+        return cut or hits
 
     def _score_chunks(
         self,
@@ -407,14 +482,27 @@ class MantleQueryEngine:
         principal_id: str,
         collection_id: str,
         best: dict[Tuple[str, int], MantleHit],
+        *,
+        authorized_artifacts: Optional[AbstractSet[str]] = None,
+        vectors: Optional[dict[Tuple[str, int], np.ndarray]] = None,
     ) -> None:
-        """Cosine-score every chunk in a cell against ``query``; update ``best``.
+        """Cosine-score every AUTHORIZED chunk in a cell against ``query``; update ``best``.
 
         ``query`` is already L2-normalized. Embeddings are stacked and scored in a
         single matrix-vector product (BLAS) rather than a Python per-chunk loop —
         **behavior-identical** (same cosine, same best-score-wins dedup, same
         missing-field / dim-mismatch / zero-norm skips), ~10-100x faster on dense
         cells (MANTLE-SEARCH-SPEC Change A).
+
+        ``authorized_artifacts`` narrows "every chunk in the cell" to "every chunk
+        of an artifact this principal may read". The cell's contents are wider than
+        the grant whenever the grant is artifact-scoped, so this is the point where
+        decryptability stops standing in for authorization.
+
+        ``vectors``, when supplied, collects the unit vector behind each surviving hit for
+        :meth:`_beacon_cut`. It is filled here rather than re-derived later because these are
+        the rows already normalized for the cosine — recomputing them would mean holding the
+        decrypted chunks past the point the scorer needs them.
         """
         ids: List[Tuple[str, int]] = []
         vecs: List[np.ndarray] = []
@@ -423,6 +511,8 @@ class MantleQueryEngine:
             artifact_id = chunk.get("artifact_id")
             chunk_id = chunk.get("chunk_id")
             if embedding is None or artifact_id is None or chunk_id is None:
+                continue
+            if authorized_artifacts is not None and artifact_id not in authorized_artifacts:
                 continue
             try:
                 vec = np.asarray(embedding, dtype=np.float32)
@@ -441,9 +531,10 @@ class MantleQueryEngine:
         if not keep.any():
             return
         # query is pre-normalized, so cosine == (unit rows) @ query, one matmul.
-        scores = (M[keep] / norms[keep, None]) @ query
+        unit = M[keep] / norms[keep, None]
+        scores = unit @ query
         kept_ids = [ids[i] for i in np.nonzero(keep)[0]]
-        for (artifact_id, chunk_id), s in zip(kept_ids, scores):
+        for row, ((artifact_id, chunk_id), s) in enumerate(zip(kept_ids, scores)):
             score = float(s)
             key = (artifact_id, chunk_id)
             existing = best.get(key)
@@ -455,6 +546,8 @@ class MantleQueryEngine:
                     principal_id=principal_id,
                     collection_id=collection_id,
                 )
+                if vectors is not None:
+                    vectors[key] = unit[row]
 
     # ------------------------------------------------------------------
     # Cache management

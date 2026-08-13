@@ -1,4 +1,14 @@
-﻿import uuid
+﻿# OpenBLAS sizes its thread pool once, at library load. `mantle/__init__.py` sets this
+# environment variable, and every test module here that uses numpy imports mantle first,
+# so the pin is already in effect by the time numpy loads. Setting it again at the top of
+# this file keeps that guarantee independent of import order elsewhere in the suite.
+import os as _os
+
+_os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+del _os
+
+import itertools
+import uuid
 
 import pytest
 from typing import AsyncGenerator
@@ -6,7 +16,7 @@ from httpx import AsyncClient
 from httpx._transports.asgi import ASGITransport
 
 import bcrypt as _bcrypt
-import origin.config as _cfg
+import mantle.config as _cfg
 from mantle.entities.person import Person
 from mantle.services.bootstrap_types import (
     ALL_PLATFORM_COLLECTION_SLUGS,
@@ -26,7 +36,6 @@ from mantle.services.dependencies import (
 from mantle.services.dependencies import get_store_db
 from mantle.main import app
 from unittest.mock import MagicMock
-import mantle.main as _main_module
 
 # ---------------------------------------------------------------------------
 # Fast crypto: reduce bcrypt cost and PBKDF2 iterations so tests don't spend
@@ -36,9 +45,9 @@ _orig_gensalt = _bcrypt.gensalt
 _bcrypt.gensalt = lambda rounds=4, prefix=b"2b": _orig_gensalt(rounds=4, prefix=prefix)
 _cfg.PASSWORD_PBKDF2_ITERS = 1000
 
-# Disable setup mode for all tests — the middleware blocks all non-setup routes
-# when _setup_mode is True (the default at import time).
-_main_module._setup_mode = False
+#: Names the per-test keyset directories under `_test_keys_base`. A counter rather than a random
+#: name so the entries stay short and strictly increasing.
+_keyset_seq = itertools.count()
 
 _TEST_PLATFORM_IDS: dict[str, str] = {}
 
@@ -72,7 +81,7 @@ def _reset_acting_principal():
     That would be quietly corrosive: a test asserting a refusal could pass or fail
     depending on which test ran before it, and the fail-closed default — no
     principal means no key — would stop being what a fresh test actually starts
-    from. Reset on the way in AND out so neither ordering nor a raising test can
+    from. Reset on the way in and out so neither ordering nor a raising test can
     leave an identity behind.
     """
     from mantle.services.acting_principal import _acting
@@ -84,27 +93,10 @@ def _reset_acting_principal():
         _acting.reset(token)
 
 
-@pytest.fixture(autouse=True)
-def _seed_server_registry():
-    """Populate the dynamic server registry with the platform personas for tests.
-
-    Production fills it at runtime via ``load_from_store()`` / ``register()``; unit
-    tests have no such path (the registry starts EMPTY since it no longer reads a
-    manifest file), so seed it here. Tests that resolve platform-server client_ids /
-    ids — e.g. gate_router's platform-service auth — depend on it being populated.
-    """
-    from mantle.services import server_registry as _sr
-    from mantle.services.bootstrap_types import PLATFORM_AGENT_SLUGS
-    _sr._reset_for_tests()
-    for _name in PLATFORM_AGENT_SLUGS:
-        _sr._add_entry(_sr.ManifestEntry(
-            name=_name, title=_name.title(), path=f"/{_name}/mcp",
-            client_id=f"agience-server-{_name}", role="", summary="",
-        ))
-
 @pytest.fixture(autouse=True, scope="session")
 def _init_test_encryption_key():
-    """Initialize the encryption key with a test value so secrets_service works in tests."""
+    """Initialize the platform KEK with a test value, so the key oracle and the
+    encrypted platform settings both have one in tests."""
     from cryptography.fernet import Fernet
     import prism.trust.key_manager as _km
     _km._encryption_key = Fernet.generate_key().decode()
@@ -138,16 +130,40 @@ def _init_test_jwt_keys():
 
 @pytest.fixture(scope="session")
 def _test_trust_keys():
-    """Generate origin/mantle/chorus keypairs once per test session (expensive)."""
+    """Generate origin/mantle/peer keypairs once per test session (expensive)."""
     from cryptography.hazmat.primitives.asymmetric import rsa
     return {
         name: rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        for name in ("origin", "mantle", "chorus")
+        for name in ("origin", "mantle", "peer")
     }
 
 
+@pytest.fixture(scope="session")
+def _test_keys_base(tmp_path_factory):
+    """A CLEAN parent directory for the per-test ``KEYS_DIR`` below.
+
+    The keyset directory itself stays per-test — same isolation as before, nothing is shared —
+    but it is created HERE rather than in the system temp directory, and this is a performance
+    fix worth ~500x on Windows.
+
+    ``tempfile.mkdtemp()`` puts its directory in ``%TEMP%``, and the fixture below never removed
+    it, so every suite run leaked one directory per test (~3000) into a directory shared with
+    every other program on the machine. On NTFS the cost of creating an entry grows with the
+    number of entries already present — 8.3 short-name generation has to scan for a free alias
+    among same-prefixed siblings — so the leak made the NEXT run slower, and the run after that
+    slower again. Measured on this machine once the leak had accumulated: ``mkdtemp`` in
+    ``%TEMP%`` cost 0.345s and the first ``write_text`` into the result another 0.158s, against
+    0.0007s for the same call in an empty parent.
+
+    ``tmp_path_factory`` is pytest's own base, which pytest reaps (it keeps the last three
+    sessions), and the fixture below removes each keyset on teardown, so this parent holds about
+    one entry at a time and entry creation stays flat for the life of the suite.
+    """
+    return tmp_path_factory.mktemp("keysets")
+
+
 @pytest.fixture(autouse=True)
-def _install_test_service_identity_and_authority(_test_trust_keys):
+def _install_test_service_identity_and_authority(_test_trust_keys, _test_keys_base):
     """Phase C: install in-memory service identity (`mantle`) + authority manifest
     before every test. Function-scoped because individual test files
     (test_service_identity, test_authority_trust) reset module state to
@@ -183,7 +199,7 @@ def _install_test_service_identity_and_authority(_test_trust_keys):
         "trust_anchors": {
             name: {"uri": f"http://{name}:8080",
                    "jwks": {"keys": [_public_jwk(keys[name].public_key(), f"{name}-1")]}}
-            for name in ("origin", "mantle", "chorus")
+            for name in ("origin", "mantle", "peer")
         },
         "bootstrap_token_hash": None,
     }
@@ -201,9 +217,15 @@ def _install_test_service_identity_and_authority(_test_trust_keys):
     # reset the verifier singleton so it reloads them.
     import json as _json
     import os as _os
-    import tempfile as _tempfile
+    import shutil as _shutil
     from pathlib import Path as _P
-    keys_dir = _tempfile.mkdtemp(prefix="agience-test-keys-")
+    # A fresh, empty directory per test — unchanged in kind from the `mkdtemp` this replaces —
+    # but parented on `_test_keys_base` and removed again below, so it costs milliseconds and
+    # leaves nothing behind. The name is a short counter rather than a random hex string because
+    # both stay unique here and the short one gives NTFS nothing to disambiguate.
+    keys_dir = _test_keys_base / str(next(_keyset_seq))
+    keys_dir.mkdir()
+    keys_dir = str(keys_dir)
     _os.environ["KEYS_DIR"] = keys_dir
     (_P(keys_dir) / "authority.manifest.json").write_text(_json.dumps(raw))
     # Mantle's outbound signer (services.peer_signing) reads its OWN key + instance
@@ -221,6 +243,11 @@ def _install_test_service_identity_and_authority(_test_trust_keys):
     except Exception:
         pass
     yield
+    # Removed so the parent stays empty and entry creation stays O(1) — see `_test_keys_base`.
+    # `ignore_errors` because a test may still hold an open handle to a file in here, and on
+    # Windows that refuses the unlink; a directory left behind costs the next run nothing more
+    # than the one entry it occupies.
+    _shutil.rmtree(keys_dir, ignore_errors=True)
 
 @pytest.fixture
 async def client() -> AsyncGenerator[AsyncClient, None]:
@@ -274,105 +301,80 @@ def _reset_runtime_types():
     types_service.set_lazy_type_loader(None)
 
 
-@pytest.fixture
-def mock_user():
-    return Person(
-        id="user-123",
-        email="test@example.com",
-        name="Test User",
-        picture="https://example.com/avatar.png"
-    )
+@pytest.fixture(autouse=True)
+def _reset_indexed_geometry():
+    """A test starts from a store that has never been indexed under any AnchorSet.
+
+    `anchors.store` records the fingerprint of the set a cell write happens under, and refuses a
+    later set that names a different space. One deployment has one coordinate system, so that
+    record is durable by design — but the suite swaps toy AnchorSets of different widths through
+    one session lattice, which is a sequence no deployment performs. Clearing the record around
+    each test keeps the gate answering about the test in front of it.
+    """
+    def _clear():
+        try:
+            from mantle.db import identity_backend as identity_store
+            from mantle.search.anchors.store import _GEOMETRY_KEY
+            from mantle.services.dependencies import get_store_db
+            db_gen = get_store_db()
+            db = next(db_gen)
+            try:
+                identity_store.delete_platform_setting(db, _GEOMETRY_KEY)
+            finally:
+                try:
+                    next(db_gen)
+                except StopIteration:
+                    pass
+        except Exception:
+            pass
+    _clear()
+    yield
+    _clear()
 
 
 # ---------------------------------------------------------------------------
 # Standalone-Mantle collection guards
 #
-# Mantle was extracted from the monorepo as a pure database layer. Two classes of
-# inherited tests don't apply to the standalone build; rather than edit/delete
-# each file we quarantine them here so the suite stays collectable + green, with
-# the reason documented in one place.
+# Mantle is a pure database layer. Two classes of inherited tests don't apply to
+# the standalone build; rather than edit or delete each file, they are quarantined
+# here so the suite stays collectable and green, with the reason documented in one
+# place.
 #
-# (1) DEAD MACHINERY — tests importing modules that were removed when operation
-#     dispatch moved OUT of Mantle into the agience-prism-py gateway (Phase 2b).
-#     They error on import and can never pass in Mantle by design; the gateway
-#     owns + tests that behavior now (agience-prism-py/tests).
+# (1) dead machinery — tests importing modules that no longer exist in this package.
+#     They error on import and cannot pass in Mantle; the gateway (agience-prism-py)
+#     owns and tests that behavior now (agience-prism-py/tests).
 #
-# (2) SEED/TYPE TREE — tests that load `package/seeds` or `package/types`, which
+# (2) seed/type tree — tests that load `package/seeds` or `package/types`, which
 #     belong to the application/Origin and are absent from standalone Mantle.
-#     Skipped when the tree is absent; they run unchanged if it is mounted. This
-#     converges with the queued "Mantle pure-DB / seeds→Origin" sprint.
+#     Skipped when the tree is absent; they run unchanged if it is mounted.
 # ---------------------------------------------------------------------------
 from pathlib import Path as _Path  # noqa: E402
 
-# ⚠ `collect_ignore` IS THE WORST QUARANTINE THERE IS: an ignored file is reported as neither run NOR
-# skipped, so it vanishes from every count with nothing to notice. Each entry below was MEASURED on
-# 2026-07-29 (Contract Builder) by collecting and running it directly, and **the stated reasons were
-# wrong for three of the four**:
-#
-#   | file                                | collected | ran            | the recorded reason was |
-#   |-------------------------------------|-----------|----------------|-------------------------|
-#   | test_operator_and_secret_material   | 4 tests   | **4 PASSED**   | FALSE — no such import  |
-#   | test_search_as_artifact_smoke       | ImportError | —            | TRUE                    |
-#   | test_router_types                   | 6 tests   | 5 failed/1 pass| true in effect          |
-#   | test_router_beacon                  | 4 tests   | 4 failed       | true in effect          |
-#
-# 🔴 So **4 PASSING tests covering OPERATOR AND SECRET MATERIAL were being hidden** behind the claim
-# that the file imported `services.handler_registry` — which it does not, and may never have. That is a
-# straight coverage loss wearing quarantine's clothes, and it is exactly why
-# `test_collect_ignore_entries_are_honest` below now ENFORCES this list instead of trusting its comments.
-# ✅ DECIDED AND CLOSED, 2026-07-30 — the two router entries are GONE, with their routers and their
-# tests. They were carried as "⏭ DECISION NEEDED: retire the router and its tests together, or mount it
-# and let these run." John's ruling was to remove. What was deleted, and what each test PROVED, recorded
-# here because the tests were the only description of the surface:
-#
-#   · `routers/beacon_router.py` + `tests/test_router_beacon.py` (4 tests, all failing).
-#     MEASURED before deleting: the router existed on disk but every `beacon` hit in `main.py` is a
-#     COMMENT — it was in no `include_router` call, so `/internal/beacon/*` 404'd on every deployment.
-#     WHAT THE TESTS PROVED: that `GET /internal/beacon/anchorset` and `GET|POST /internal/beacon/profile`
-#     were gated on the `beacon` capability flag (`gate_service.has_feature`) and refused a caller
-#     without it. ⚠ THE ENTITLEMENT MECHANISM ITSELF SURVIVES and is still tested —
-#     `gate_service.has_feature` / `features: ["beacon"]` are exercised by `test_gate_features.py` and
-#     `test_gate_service.py`. Only the unmounted HTTP surface and its gate went. If `/internal/beacon`
-#     ever returns, re-establish the capability check first.
-#     NOT touched: `mantle/search/beacon/` — a different thing entirely (the ranking engine
-#     `search/anchors/density.py` imports), alive and unrelated to the router.
-#   · `tests/test_router_types.py` (6 tests, 5 failing). `routers/types_router.py` was ALREADY deleted,
-#     so the file was simply dead. Its sibling deletion note is in `test_types_service.py:84-103`.
-collect_ignore = [
-    # Genuinely uncollectable: imports `mantle.services.operation_dispatcher` (:18-19) and
-    # `handler_registry` (:27), both of which are DELETED from the tree (verified absent on disk).
-    "test_search_as_artifact_smoke.py",
-]
+# `collect_ignore` hides a file from collection entirely: an ignored file is
+# reported as neither run nor skipped, so an entry whose stated reason stops
+# holding goes unnoticed until something checks it directly.
+# `test_collect_ignore_entries_are_honest` enforces that every entry here is
+# genuinely uncollectable rather than merely inconvenient.
+collect_ignore: list = []
 
-#: Entries expected to be UNCOLLECTABLE (import-time dead). Anything else in `collect_ignore` must be
-#: justified as collect-but-fail, and nothing may be ignored while PASSING — see the enforcing test.
-_IGNORE_UNCOLLECTABLE = {"test_search_as_artifact_smoke.py"}
+#: Entries expected to be uncollectable (import-time dead). Anything else in
+#: `collect_ignore` must be justified as collect-but-fail, and nothing may be
+#: ignored while passing — see the enforcing test.
+_IGNORE_UNCOLLECTABLE: set = set()
 
-# 🔴 THE RECORDED REASON FOR THESE 46 SKIPS WAS WRONG (measured 2026-07-29, Contract Builder).
-# The skip message says the seeds/types tree "moved to Origin in the repo split". **It did not.** There is
-# no `package/` tree anywhere in `agience-origin`; the tree is alive and git-tracked at
-# **`agience-bundle/package/{seeds,types}`**, with exactly the expected shape
-# (`seeds/{admin,platform,user}`, `types/{application,audio,image,text,video}`). So for as long as that
-# message has stood, anyone deciding whether these tests could be revived was reading a pointer to the
-# wrong repo — which is the practical cost of a wrong reason: it does not merely fail to inform, it
-# actively stops the next person measuring.
+# The seeds/types package tree is split across repos: seeds live at
+# `agience-bundle/package/seeds`; types live at `agience-crystal/src/types`, with
+# a vendored copy at `agience-chorus/src/astra/web/vendor/package/types`.
+# `_package_root` is the one place that resolves both locations, so the gate here
+# and the tests below it agree on where the tree lives.
 #
-# ⚠ MEASURED by pointing this at the bundle tree and running the five dependent files:
-# **23 passed · 23 failed · 1 skipped.** So the skip is masking real COVERAGE *and* real BREAKAGE in
-# roughly equal measure, and it is NOT a clean switch-on: wiring it up as-is would put 23 failures into
-# the shared gate. Deliberately left OFF by default for that reason — but now overridable, so the
-# measurement is reproducible by anyone in one command instead of requiring a temporary source edit:
+#     MANTLE_PACKAGE_ROOT=<genesis>/agience-bundle/package python -m pytest -q tests
 #
-#     MANTLE_PACKAGE_ROOT=<genesis>/agience-bundle/package python -m pytest -q src/mantle/tests
-#
-# ⏭ The open work is triaging those 23 failures (test_types_service 5, test_user_provisioning 2,
-# test_seed_drift 4, and the rest across test_seed_exporter / test_seed_platform_tree), then pointing
-# this default at the bundle tree so 23 real tests rejoin the suite. That is a bounded, measurable task
-# with a known cost — which is the whole point of publishing the number instead of the excuse.
-# Resolved through `_package_root`, which is now the ONE place that knows this location. It was TWO
-# places until 2026-07-29 — this gate and a hardcoded `parents[3] / "package"` inside four of the test
-# files — so overriding only the gate un-skipped the tests and left them measuring an empty directory
-# (`test_platform_tree_loads_without_errors` asserted 0 == 11 against a tree holding 56 real files).
+# points the gate at the bundle tree. Because that root holds seeds but not
+# types, the seed-dependent tests run and the type-dependent ones still skip —
+# reviving the type-dependent tests needs `_package_root` to resolve a second,
+# separate root for `types/`.
+from ._package_root import have_tree as _have_tree  # noqa: E402
 from ._package_root import package_root as _package_root  # noqa: E402
 
 _PKG_ROOT = _package_root()
@@ -384,42 +386,36 @@ _TREE_DEPENDENT = {
     "test_seed_drift.py",                      # asserts seed files match manifest/persona lists
 }
 
+#: A roster of BARE FILENAMES matched against `item.fspath.name`, so a renamed file drops out of the
+#: gate without anything failing — the marker simply stops being applied, and on a machine with the
+#: tree mounted nothing looks different at all. Checked here, at collection, where a stale name is
+#: an immediate loud error rather than a skip that quietly stops happening.
+_TREE_DEPENDENT_MISSING = sorted(
+    name for name in _TREE_DEPENDENT if not (_Path(__file__).parent / name).is_file()
+)
+assert not _TREE_DEPENDENT_MISSING, (
+    "_TREE_DEPENDENT names test files that are not in tests/: %r — the skip gate silently stops "
+    "covering a file it names by hand, so retarget the entry rather than deleting it."
+    % _TREE_DEPENDENT_MISSING
+)
 
-# (3) ⛔ MOVED OP-DISPATCH — THE 10 UNCONDITIONAL SKIPS ARE GONE, AND SO ARE THE TESTS
-#     (2026-07-29, Contract Builder).
-#
-#     A roster of 10 `Class::method` ids was skipped here UNCONDITIONALLY, with the reason
-#     "artifact op-dispatch (/op/{op}) moved to the gateway (crystal) in Phase 2b; covered in the
-#     gateway's tests". A permanently-skipped test is a silent pass — it is dead code presenting as
-#     coverage, and it prints an `s` that reads like caution rather than absence. Same shape as
-#     `test_edge_upsert.py`, which was deleted for testing `db.arcade` after that module ceased to
-#     exist.
-#
-#     MEASURED before deleting, so this is not a tidy-up on a hunch:
-#       · `POST /artifacts/{id}/op/{op}` is **absent from mantle's live source entirely** — zero hits
-#         across `routers/`, `services/` and `main.py`. All 10 tests posted to `/artifacts/.../op/...`,
-#         verified individually by extracting the URL from each test body.
-#       · the "covered in the gateway's tests" half was **partly true and never enforced**: crystal's
-#         `test_dispatcher.py` does cover grant-gated dispatch, while crystal has ZERO hits for `op/`,
-#         `revert`, `nonce`, `challenge` or `requires_user`.
-#       · the nonce/challenge guard is NOT uncovered (a hypothesis that measurement killed):
-#         `verify_nonce` is exercised by this repo's own live `test_inbound_nonce.py` and
-#         `test_router_inbound_nonce_enforcement.py`.
-#     `TestCommitArtifacts` was removed whole — both its methods were in the roster, so what remained
-#     would have been an empty class.
-#
-#     The prose claim is replaced by an ENFORCED one:
-#     `db/lattice/test_op_dispatch_route_is_gone.py` asserts the route stays absent. If it ever comes
-#     back to mantle, that test fails and this deletion gets revisited — which a comment could not do.
+
+# (3) The `/artifacts/{id}/op/{op}` dispatch route lives in the gateway
+#     (agience-prism-py), not in Mantle. `db/test_op_dispatch_route_is_gone.py`
+#     asserts the route stays absent from Mantle's own routes.
 
 
 def pytest_collection_modifyitems(config, items):
     """Quarantine inherited tests that don't apply to standalone Mantle."""
     # (2) Seed/type-tree tests — only when that tree isn't present.
-    if (_PKG_ROOT / "seeds").is_dir() and (_PKG_ROOT / "types").is_dir():
+    # `_package_root.have_tree()` is the one place that answers this, so the gate
+    # and the tree-dependent tests always agree on whether the tree is mounted.
+    if _have_tree():
         return
     skip = pytest.mark.skip(
-        reason="requires package/seeds|types tree (moved to Origin in the repo split)"
+        reason="requires a package root holding BOTH seeds/ and types/ — the tree is SPLIT: "
+               "seeds at agience-bundle/package/seeds, types at agience-crystal/src/types. "
+               "NOT in agience-origin. See the note above."
     )
     for item in items:
         if _Path(str(item.fspath)).name in _TREE_DEPENDENT:

@@ -1,23 +1,23 @@
-"""Search initialization (post lexical-backend retirement).
+"""Search initialization.
 
-After Step 2.6.9 part 2 there is no per-startup index creation step —
-both MANTLE vector cells and MANTLE-SSE posting lists are S3 objects that
-are created lazily on first commit (the indexer auto-bootstraps owner
-domains).
+There is no per-startup index creation step — both MANTLE vector cells and
+MANTLE-SSE posting lists are objects created lazily on first commit (the indexer
+auto-bootstraps owner domains), on S3 or on local disk.
 
-What stays here:
+Lazy bootstrap covers index STORAGE, and only that. It does not cover the semantic arm's other
+prerequisite: an AnchorSet is provisioned by an operator and is never created on first commit,
+on first boot, or by anything in this module. Startup on a node without one is silent — the
+first evidence is a per-write WARNING from the ingest path, or the ``vector_arm`` field
+:func:`reindex_all_artifacts` returns.
+
+What lives here:
 
 - :func:`reindex_all_artifacts` — bulk re-encryption walker. Used as a
   one-shot admin command to populate the encrypted indexes from
-  existing artifacts after a key rotation, after a fresh deploy, or as
-  the migration command for the legacy-lexical → SSE cutover.
+  existing artifacts, e.g. after a key rotation or a fresh deploy.
 - :func:`init_search` — startup hook (no-op shape preserved for
   callers; logs that there's nothing to initialize).
 - :func:`shutdown_search` — startup hook (no-op).
-
-The legacy-lexical-specific bits (``ensure_search_indices_exist``,
-``check_search_health``, ``clear_readonly_blocks``, the ``mappings/``
-JSON, the ``the legacy lexical client's exceptions`` import) all went with the legacy lexical index.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 def init_search() -> None:
-    """Startup hook — nothing to initialize after the lexical-backend retirement.
+    """Startup hook — nothing to initialize.
 
     Cells / posting lists / stats blobs are created on first commit by
     the indexer's auto-bootstrap path. This function is kept so the
@@ -55,7 +55,7 @@ def reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
 
     One-shot admin operation. Use cases:
 
-    - Migrating from a previous index (e.g. the lexical-backend retirement).
+    - Migrating to a new index.
     - Re-encrypting after an owner key rotation.
     - Recovering from a corrupted S3 prefix.
 
@@ -72,29 +72,22 @@ def reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
        round-trip per artifact into a handful of batches. This is the dominant
        win: a remote GPU embedder is latency-bound, so call COUNT is the cost.
     2. The AnchorSet is loaded once, single-threaded, before fan-out, so workers
-       don't contend on the load. It is provisioned, not derived (the k-means
-       bootstrap was removed 2026-07-31); when absent, the vector arm is off for
-       the whole run and each artifact is lexical-only.
+       don't contend on the load. It is provisioned, not derived; when absent,
+       the vector arm is off for the whole run and each artifact is lexical-only.
     3. Fan-out runs at ``INDEX_QUEUE_MAX_WORKERS`` (default 16), and each worker
        passes its precomputed ``fields`` to ``index_artifact`` so there is no
        re-extraction and no per-artifact embed round-trip (cache hits only).
 
     Returns ``{"indexed", "skipped", "failed", "total", "vector_arm"}``, where
-    ``indexed`` counts artifacts for which AT LEAST ONE ARM WROTE. ``skipped`` is the
+    ``indexed`` counts artifacts for which at least one arm wrote. ``skipped`` is the
     third outcome — nothing to write, or an arm whose prerequisites (an AnchorSet, a
     wired indexer) are absent — and it keeps ``failed`` meaning failed.
 
     Runs as the platform system principal: it has no request context, and it both
-    READS every artifact (decrypting content) and WRITES every index cell, so it
+    reads every artifact (decrypting content) and writes every index cell, so it
     needs an identity the grant ledger can check. The wrapper is here rather than at
     the call sites because this function is reached from startup, an admin endpoint
     and the CLI — one wrapper covers all three and none can forget it.
-
-    ⚠ The system principal must hold grants on what it reindexes. It is a principal,
-    not a bypass: an unreadable collection is reported as a failure, not skipped
-    silently. Enforced from 2026-07-31. Before that, both index arms swallowed their
-    own exceptions, ``index_artifact`` returned a flat ``True``, and a run whose every
-    SSE write was refused with ``GrantDenied`` reported ``{"indexed": 5, "failed": 0}``.
     """
     with system_acting_context(scope="platform.reindex"):
         return _reindex_all_artifacts(max_workers=max_workers)
@@ -102,7 +95,7 @@ def reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
 
 def _reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
     """Body of :func:`reindex_all_artifacts`; assumes an acting principal is set."""
-    from origin import config
+    from mantle import config
     from mantle.db.backend import COLLECTION_ARTIFACTS, query_documents
     from mantle.entities.artifact import Artifact as ArtifactEntity
     from mantle.search.ingest.pipeline_unified import (
@@ -112,41 +105,37 @@ def _reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
     )
     from mantle.services.dependencies import get_store_db
 
-    # ⛔ DO NOT START A 2.15-MILLION-ARTIFACT REINDEX THAT CANNOT STORE ANYTHING.
-    # Both index arms (MANTLE cells, MANTLE-SSE postings) write to the edge S3 bucket. On a node
-    # with no credentials neither can write — so this pass reads every artifact, extracts fields,
-    # embeds, and then fails at the last step, per artifact, with a traceback.
     #
-    # MEASURED 2026-08-01 on 71: 1,450,252 artifacts attempted, mantle.log at 11.7 GB on a disk with
-    # 46 GB free, and the work is triggered on EVERY boot (`is_post_setup = not _platform_seeded`,
-    # and `platform.bootstrap.seeded` is False on this store because Mantle explicitly does not seed
-    # itself — the flag has no writer). A full pass cannot finish before the next restart, so it
-    # begins again from zero: a loop that never converges, wearing the disk and burning ~1.4 cores.
+    # Without usable index storage, the reindex is triggered on every boot (`is_post_setup =
+    # not _platform_seeded`, and `platform.bootstrap.seeded` is False on this store because
+    # Mantle explicitly does not seed itself — the flag has no writer). A full pass cannot
+    # finish before the next restart, so it begins again from zero: a loop that never
+    # converges, wearing the disk and burning CPU for no persisted result.
     #
     # Refusing here is not a fallback, it is the honest answer to "is there anywhere to put this?".
-    # The check is a MEASUREMENT (`wiring.edge_s3_if_reachable` does one `head_bucket`, memoised),
-    # not an inference from an object existing — which is the same defect that let the per-artifact
-    # failures happen in the first place. [[verification-that-cannot-fail]]
+    # The check is a measurement (`head_bucket` for S3, a created root directory for the local
+    # store — see `wiring._build_sse_stores`), not an inference from an object existing.
+    # [[verification-that-cannot-fail]]
+    #
+    # It asks about the selected backend, not about S3 specifically: a standalone install can
+    # hold a local index, and asking about S3 alone would skip the reindex on a store that has
+    # somewhere perfectly good to put one, leaving `POST /artifacts/recall` answering nothing on
+    # the install that needs it most.
     try:
-        from mantle.search.mantle.wiring import edge_s3_if_reachable
-        if edge_s3_if_reachable("reindex")[0] is None:
+        from mantle.search.mantle.wiring import sse_index_storage_available
+        if not sse_index_storage_available():
             logger.warning(
-                "Reindex SKIPPED: no reachable index storage, so a full pass could not persist "
+                "Reindex SKIPPED: no usable index storage, so a full pass could not persist "
                 "anything. Nothing was scanned. Point the edge S3 bucket at a reachable endpoint "
-                "(or provide credentials) and reindex explicitly.")
+                "(or provide credentials), or set MANTLE_SSE_DIR to a writable directory, and "
+                "reindex explicitly.")
             return {"indexed": 0, "skipped": 0, "failed": 0, "total": 0}
     except ImportError:
         pass                       # wiring unavailable → fall through and let the arms decide
 
-    # ⛔ AND DO NOT DO IT AGAIN ON EVERY BOOT. The caller gates this on
-    # `is_post_setup = not _platform_seeded` (main.py:453), reading `platform.bootstrap.seeded` —
-    # a flag with NO WRITER, because Mantle explicitly does not seed itself ("the application on top
-    # provisions"). MEASURED False on 71's store, so the gate was always open: every start began a
-    # fresh 2.15M-artifact pass, which cannot finish before the next restart, so it began again from
-    # zero. A loop that never converges — the destabiliser, not a slow job.
     #
     # A flag nobody sets cannot answer "has this been done". The honest condition is a record of the
-    # WORK ACTUALLY COMPLETING, written by the thing that completes it — so the marker is set at the
+    # work actually completing, written by the thing that completes it — so the marker is set at the
     # end of a successful pass below, and read here. First boot indexes; later boots skip; a rebuild
     # is an explicit call, which is what a rebuild should be. [[never-impose-knowledge-derive-it]]
     _marker = "search.reindex.completed_at"
@@ -181,7 +170,7 @@ def _reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
             if artifact.state == ArtifactEntity.STATE_ARCHIVED:
                 continue
             # Platform trust config is not user content and has no search context —
-            # filtered HERE as well as at the gate so it is never counted as work
+            # filtered here as well as at the gate so it is never counted as work
             # this run was supposed to do. See pipeline_unified.NON_INDEXABLE_CONTENT_TYPES.
             if not is_indexable(artifact):
                 not_indexable += 1
@@ -207,7 +196,7 @@ def _reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
             logger.info("Reindex complete: no indexable artifacts")
             return {"indexed": 0, "skipped": 0, "failed": 0, "total": 0}
 
-        # Load the AnchorSet ONCE up front (single-threaded): workers then see an
+        # Load the AnchorSet once up front (single-threaded): workers then see an
         # existing set rather than racing on the load, and its embeds hit the warm cache.
         vector_arm_available = True
         try:
@@ -252,11 +241,6 @@ def _reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
             collection_id: str, artifact: ArtifactEntity, fields: dict
         ):
             """Return the artifact's :class:`IndexOutcome`, or ``None`` if it raised.
-
-            ⚠ IT RETURNS THE OUTCOME, NOT A BOOL. Each arm swallows its own
-            exceptions one level down, so a bool here carries only "the call
-            returned" — which is what reported ``indexed: 5, failed: 0`` over an
-            index that had refused all five writes.
             """
             try:
                 return index_artifact(
@@ -268,7 +252,7 @@ def _reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
                 )
                 return None
 
-        # `propagate` captures THIS thread's context (which carries the system
+        # `propagate` captures this thread's context (which carries the system
         # acting principal, set below) so each pool worker runs under it. Without
         # it a worker starts from an empty context and every index write fails
         # closed with NoActingPrincipal — see services.acting_principal.propagate.
@@ -308,8 +292,8 @@ def _reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
             "Reindex complete: %s", result,
         )
 
-        # ── THE WRITER THE BOOT GATE NEVER HAD ───────────────────────────────────────────────
-        # Recorded ONLY on a clean pass: work was done and nothing failed. A run with failures
+        # ── The writer the boot gate never had ───────────────────────────────────────────────
+        # Recorded only on a clean pass: work was done and nothing failed. A run with failures
         # leaves the marker unset, so the next boot tries again — which is the point. Claiming
         # completion after a partial pass would turn a one-off loop into a permanently half-built
         # index that reports itself finished, which is worse than repeating the work.

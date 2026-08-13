@@ -1,16 +1,20 @@
 """Self-contained peer-auth signing for Mantle.
 
-Mantle authenticates to peer services (Origin, Chorus, the embeddings host) with
-short-lived JWTs signed by its OWN key (``mantle.private.pem``). Kept local so the
-database depends on no shared trust library — it reads its own key and signs with
-jose, nothing more. Tokens are claim-for-claim identical to what the old platform
-signer produced, so peers verify them unchanged.
+Mantle authenticates to peer services with a short-lived JWT signed by its own key
+(``mantle.private.pem``). Kept local so the database depends on no shared trust
+library — it reads its own key and signs with jose, nothing more.
 
-Mantle is a verifier-first database; this is the minimal signing it needs for its
-outbound platform calls (api-key/grants lookups to Origin, the welcome-email
-delegation to Iris via Chorus, embeddings requests to Prism). A purist
-"verify-only Mantle" would relocate those calls out of the DB entirely — see
-[[project_kit_trust_floor]].
+Mantle is a verifier-first database, so this is a small surface: **one signature**.
+The service JWT (``iss=sub=mantle``, ``principal_type=service``) is what
+``clients/origin_client`` presents on its one outbound call to Origin. Mantle signs
+nothing else — no user token, and no delegation.
+
+Delegation is inbound-only here, and deliberately so. ``services/dependencies``
+accepts ``principal_type == "delegation"`` on any route, requiring ``sub`` /
+``act.sub`` / ``host_id``, so Mantle *verifies* RFC 8693
+delegations; the peer that mints them is the authority issuer, not this module. A
+signer for the direction Mantle never initiates would be an untested surface whose
+only job is to drift out of agreement with the verifier that faces it.
 """
 from __future__ import annotations
 
@@ -24,7 +28,10 @@ from jose import jwt as _jwt
 
 _NAME = "mantle"
 _KID = "mantle-1"
-_DELEGATION_TTL = 300
+
+#: Default lifetime of a signed service JWT. Short enough that a leaked token is a
+#: window rather than a credential; long enough to survive one slow peer call.
+_TTL = 300
 
 _priv_pem: Optional[str] = None
 
@@ -40,7 +47,6 @@ def init() -> None:
 
 
 def _pem() -> str:
-    global _priv_pem
     if _priv_pem is None:
         init()
     return _priv_pem  # type: ignore[return-value]
@@ -56,7 +62,7 @@ def get_instance_namespace() -> Optional[uuid.UUID]:
 
 
 def get_host_id() -> str:
-    """The current-instance host artifact id (the `host_id` claim on delegations)."""
+    """The current-instance host artifact id, as `services/system_identity.py` resolves it."""
     ns = get_instance_namespace()
     return str(uuid.uuid5(ns, "agience/agience-host-current-instance")) if ns else ""
 
@@ -69,30 +75,17 @@ def get_system_principal_id() -> str:
 
 # -- signing -----------------------------------------------------------------
 
-def sign_service_jwt(audience: str = "mantle", ttl_seconds: int = _DELEGATION_TTL,
+def sign_service_jwt(audience: str = "mantle", ttl_seconds: int = _TTL,
                      additional_claims: Optional[Dict[str, Any]] = None) -> str:
-    """Service JWT (iss=sub=mantle, principal_type=service) for a peer service."""
+    """Service JWT (iss=sub=mantle, principal_type=service) for a peer service.
+
+    The whole of Mantle's outbound signing. `sub` is Mantle itself, never a user:
+    this token says "Mantle is calling", and it can say nothing else.
+    """
     now = int(time.time())
     claims: Dict[str, Any] = {
         "iss": _NAME, "sub": _NAME, "aud": audience,
         "principal_type": "service", "iat": now, "exp": now + ttl_seconds,
-    }
-    if additional_claims:
-        for k, v in additional_claims.items():
-            claims.setdefault(k, v)
-    return _jwt.encode(claims, _pem(), algorithm="RS256", headers={"kid": _KID})
-
-
-def sign_delegation_jwt(*, audience: str, user_sub: str, host_id: Optional[str] = None,
-                        ttl_seconds: int = _DELEGATION_TTL,
-                        additional_claims: Optional[Dict[str, Any]] = None) -> str:
-    """RFC 8693 delegation JWT — Mantle acting on behalf of a user (act.sub=mantle)."""
-    now = int(time.time())
-    claims: Dict[str, Any] = {
-        "iss": _NAME, "sub": user_sub, "aud": audience,
-        "act": {"sub": _NAME},
-        "host_id": host_id if host_id is not None else get_host_id(),
-        "principal_type": "delegation", "iat": now, "exp": now + ttl_seconds,
     }
     if additional_claims:
         for k, v in additional_claims.items():

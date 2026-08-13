@@ -6,7 +6,7 @@ from mantle.scripts import collect_usage_metrics, generate_usage_snapshot
 
 
 def test_collect_usage_metrics_returns_stable_metric_set(tmp_path, monkeypatch):
-    """The metric KEY SET is the contract — seeded against a REAL temp lattice."""
+    """The metric key set is the contract — seeded against a real temp lattice."""
     from mantle.db import lattice_api as api
     from mantle.entities.artifact import Artifact
     from mantle.entities.grant import Grant
@@ -17,7 +17,9 @@ def test_collect_usage_metrics_returns_stable_metric_set(tmp_path, monkeypatch):
     monkeypatch.setattr(collect_usage_metrics, "get_store_handle", lambda: db)
     monkeypatch.setattr(
         "mantle.services.content_crypto._default_master_key",
-        lambda principal_id, collection_id=None: b"" * 32)
+        # Mirrors the real signature, `may_create` included — see the note on the same stub in
+        # `db/test_lattice_api.py`.
+        lambda principal_id, collection_id=None, *, may_create=False, creator_id=None: b"" * 32)
 
     api.create_collection(db, Artifact(id="ws-1", collection_id="", content="",
                                        content_type=WORKSPACE_CONTENT_TYPE,

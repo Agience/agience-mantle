@@ -2,7 +2,7 @@
 
 An anchor **is an artifact** (`vnd.agience.anchor+json`); the **AnchorSet is a
 collection** of them (slug ``agience-anchorset``). The geometry layer loads
-anchors by a **direct, non-authorizing the lattice read** (canonical plan §1: no cell
+anchors by a **direct, non-authorizing read of the lattice** (canonical plan §1: no cell
 keys, no light-cone, no oracle — anchors are public geometry), builds the
 in-memory :class:`AnchorSet`, and caches it. There is no JSON-file store.
 
@@ -18,12 +18,12 @@ import logging
 import uuid
 from typing import List, Optional, Protocol
 
-from .anchorset import Anchor, AnchorSet
+from .anchorset import Anchor, AnchorSet, AnchorSetCorrupt, verify_anchor_id
 
 logger = logging.getLogger(__name__)
 
 # Provenance for platform-created anchor artifacts. `created_by` is provenance
-# only (no access, no ownership — Phase 1 decoupled cell keys from it).
+# only — it carries no access or ownership.
 _ANCHOR_CREATED_BY = "agience-mantle"
 
 # Fallback namespace for deriving the AnchorSet collection id when the instance
@@ -42,24 +42,48 @@ class AnchorRepo(Protocol):
         """Persist one anchor artifact (idempotent on the anchor's id)."""
 
     def bulk_add(self, anchors: List[Anchor]) -> None:
-        """Persist many anchors (best-effort per anchor)."""
+        """Persist many anchors. Raises if any anchor could not be written."""
 
     def count(self) -> int:
         """Number of stored anchors."""
 
 
+#: How many offending anchors an assembly failure names before summarising the rest.
+_REPORTED_OFFENDERS = 5
+
+#: Anchors written between progress callbacks during a bulk load.
+_PROGRESS_EVERY = 500
+
+
 def _build_anchorset(anchors: List[Anchor]) -> Optional[AnchorSet]:
-    """Assemble an :class:`AnchorSet` from anchors (first one fixes model/dim)."""
+    """Assemble an :class:`AnchorSet` from anchors (the first one fixes model/dim).
+
+    A mixed-width or mixed-model set is REFUSED, not thinned. The width and the model come from
+    whichever anchor happened to be read first, so "skip the ones that disagree" resolves a file
+    holding two vocabularies into whichever of them the store listed first — a different
+    AnchorSet on a node whose listing order differs, with a different fingerprint, addressing a
+    different set of cells, and no error anywhere. There is no reading under which some of a
+    canonical set is the canonical set.
+    """
     if not anchors:
         return None
     aset = AnchorSet(model_id=anchors[0].model_id, dim=anchors[0].embedding.shape[-1])
+    bad: List[str] = []
     for a in anchors:
         try:
             aset.add(a)
-        except ValueError:
-            # dim/model mismatch — a foreign-model anchor slipped in; skip it
-            # rather than corrupt the set (cross-walks bridge models elsewhere).
-            logger.debug("AnchorRepo: skipped anchor %s (model/dim mismatch)", a.label)
+        except ValueError as e:
+            bad.append(f"{a.label!r}: {e}")
+    if bad:
+        raise AnchorSetCorrupt(
+            f"{len(bad)} of {len(anchors)} stored anchors do not belong to one set "
+            f"(model {aset.model_id!r}, dim {aset.dim}). "
+            + " | ".join(bad[:_REPORTED_OFFENDERS])
+            + (f" | ... and {len(bad) - _REPORTED_OFFENDERS} more"
+               if len(bad) > _REPORTED_OFFENDERS else "")
+            + " -- one collection is one space. TO FIX: reset the anchorset collection and load "
+              "a single set with `python -m mantle.system.manage_anchors --action load`."
+        )
     return aset if len(aset) else None
 
 
@@ -79,9 +103,11 @@ class InMemoryAnchorRepo:
     def add(self, anchor: Anchor) -> None:
         self._anchors[anchor.anchor_id] = anchor  # idempotent on id
 
-    def bulk_add(self, anchors: List[Anchor]) -> None:
-        for a in anchors:
+    def bulk_add(self, anchors: List[Anchor], *, progress=None) -> None:
+        for i, a in enumerate(anchors, start=1):
             self.add(a)
+            if progress is not None:
+                progress(i, len(anchors))
 
     def count(self) -> int:
         return len(self._anchors)
@@ -179,6 +205,7 @@ class StoreAnchorRepo:
             logger.warning("AnchorRepo: failed listing AnchorSet %s", cid, exc_info=True)
             return None
         anchors: List[Anchor] = []
+        unreadable: List[str] = []
         for d in docs:
             if d.get("content_type") != ANCHOR_CONTENT_TYPE:
                 continue
@@ -197,13 +224,49 @@ class StoreAnchorRepo:
                 anchors.append(Anchor.from_context(str(aid), ctx))
             except Exception:
                 logger.debug("AnchorRepo: skipped malformed anchor doc %s", aid)
+        # The id an anchor artifact carries is the CLUSTER id — it names the cell path, the HKDF
+        # `info`, the AEAD associated data and the mesh region. Provisioning through
+        # POST /artifacts mints a fresh uuid4 for the artifact, so an anchor loaded here can
+        # perfectly well state an id its own content does not produce, and every downstream use
+        # accepts an arbitrary string. That is the whole silent failure: the node routes
+        # confidently into regions no peer computes, queries miss, sync transfers nothing, and
+        # every call returns 200. Nothing else in the read path can tell, so it is told here.
+        for a in anchors:
+            reason = verify_anchor_id(a.anchor_id, a.label, a.model_id, a.embedding)
+            if reason is not None:
+                unreadable.append(reason)
+        if unreadable:
+            raise AnchorSetCorrupt(
+                f"{len(unreadable)} of {len(anchors)} anchors in collection {cid} carry an id "
+                "their content does not produce, so this node's cells would be addressed by ids "
+                "no holder of the same canonical set computes. "
+                + " | ".join(unreadable[:_REPORTED_OFFENDERS])
+                + (f" | ... and {len(unreadable) - _REPORTED_OFFENDERS} more"
+                   if len(unreadable) > _REPORTED_OFFENDERS else "")
+                + " -- TO FIX: load the canonical set with "
+                "`python -m mantle.system.manage_anchors --action load --path PATH`, which "
+                "preserves ids; POST /artifacts assigns a fresh uuid4 and cannot."
+            )
         return _build_anchorset(anchors)
+
+    def _artifact_for(self, anchor: Anchor, cid: str):
+        from mantle.entities.artifact import Artifact
+        from mantle.services.bootstrap_types import ANCHOR_CONTENT_TYPE
+        return Artifact(
+            id=anchor.anchor_id,
+            root_id=anchor.anchor_id,
+            collection_id=cid,
+            content="",
+            context=json.dumps(anchor.to_context(), separators=(",", ":")),
+            state=Artifact.STATE_COMMITTED,
+            created_by=_ANCHOR_CREATED_BY,
+            name=anchor.label,
+            content_type=ANCHOR_CONTENT_TYPE,
+        )
 
     def add(self, anchor: Anchor) -> None:
         cid = self._ensure_collection_id()
         from mantle.db import backend as db_store
-        from mantle.entities.artifact import Artifact
-        from mantle.services.bootstrap_types import ANCHOR_CONTENT_TYPE
 
         # Idempotent: deterministic id means re-adding the same anchor is a no-op
         # on the doc; we still ensure the membership edge.
@@ -213,26 +276,55 @@ class StoreAnchorRepo:
         except Exception:
             exists = False
         if not exists:
-            artifact = Artifact(
-                id=anchor.anchor_id,
-                root_id=anchor.anchor_id,
-                collection_id=cid,
-                content="",
-                context=json.dumps(anchor.to_context(), separators=(",", ":")),
-                state=Artifact.STATE_COMMITTED,
-                created_by=_ANCHOR_CREATED_BY,
-                name=anchor.label,
-                content_type=ANCHOR_CONTENT_TYPE,
-            )
-            db_store.create_artifact(self._db, artifact)
+            db_store.create_artifact(self._db, self._artifact_for(anchor, cid))
         db_store.add_artifact_to_collection(self._db, cid, anchor.anchor_id, origin=True)
 
-    def bulk_add(self, anchors: List[Anchor]) -> None:
-        for a in anchors:
+    def bulk_add(self, anchors: List[Anchor], *, progress=None) -> None:
+        """Persist many anchors — one batched existence probe, then only the missing writes.
+
+        A canonical set is six figures of anchors, so the existence check is `get_raw_artifacts`
+        over the whole id list rather than a read per anchor; re-running a load then costs one
+        probe and no writes. Failures are collected and raised together: a half-written AnchorSet
+        is the silent state this module exists to prevent, and a per-anchor warning in a log is
+        indistinguishable from success to whoever ran the load.
+
+        ``progress`` is an optional ``(done, total) -> None`` callback for large sets.
+        """
+        if not anchors:
+            return
+        cid = self._ensure_collection_id()
+        from mantle.db import backend as db_store
+
+        try:
+            present = set(db_store.get_raw_artifacts(self._db, [a.anchor_id for a in anchors]) or {})
+        except Exception:
+            logger.debug("AnchorRepo: batched existence probe unavailable; falling back per anchor",
+                         exc_info=True)
+            present = None
+
+        failed: List[str] = []
+        total = len(anchors)
+        for i, a in enumerate(anchors, start=1):
             try:
-                self.add(a)
-            except Exception:
-                logger.warning("AnchorRepo: failed adding anchor %s", a.label, exc_info=True)
+                if present is None:
+                    self.add(a)
+                else:
+                    if a.anchor_id not in present:
+                        db_store.create_artifact(self._db, self._artifact_for(a, cid))
+                    db_store.add_artifact_to_collection(self._db, cid, a.anchor_id, origin=True)
+            except Exception as e:
+                failed.append(f"{a.label!r} ({a.anchor_id[:12]}): {e}")
+            if progress is not None and (i % _PROGRESS_EVERY == 0 or i == total):
+                progress(i, total)
+        if failed:
+            raise AnchorSetCorrupt(
+                f"{len(failed)} of {total} anchors could not be written, so this node holds a "
+                "PARTIAL AnchorSet — a different set from the canonical one, with a different "
+                "fingerprint and a different set of cells. "
+                + " | ".join(failed[:_REPORTED_OFFENDERS])
+                + (f" | ... and {len(failed) - _REPORTED_OFFENDERS} more"
+                   if len(failed) > _REPORTED_OFFENDERS else "")
+            )
 
     def count(self) -> int:
         aset = self.load()

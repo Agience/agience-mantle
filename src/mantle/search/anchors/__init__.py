@@ -1,35 +1,39 @@
-"""Anchors & reconciliation — the geometry layer.
+"""Anchors — the coordinate system, loaded and routed against.
 
 The AnchorSet is the shared coordinate system / routing centroids / grounding
-(see `.dev/features/mantle-canonical-architecture.md` §3–§4). The Reconciler
-turns any source embedding into the native language: a sparse, model-unbiased
-anchor-relative code.
+(see `.dev/features/mantle-canonical-architecture.md` §3–§4). A client seeds it;
+this layer loads it, compares vectors against it, and names the cell each one
+lands in.
+
+**Mantle does not derive, grow, reconcile or crosswalk a coordinate system, and
+that is deliberate.** An anchor id is content-addressed over
+`(label, model_id, embedding)`, so a set fitted here would mint region ids no peer
+computes — an index that looks healthy and shares with nobody. The whole surface is
+therefore: seed a set (`python -m mantle.system.manage_anchors --action load`),
+supply a query vector in that set's space, get ranked results.
 
 INVARIANT (§1): this layer operates on plaintext vectors only. It never touches
 cell keys, the light-cone, the oracle, or the ledger, and runs strictly before
 partition/encryption (index) and routing (query). It cannot affect authorization.
 """
 
-from .activate import activate_vector
 from .anchorset import (
-    Anchor, AnchorSet, L0, L1, L2, CANDIDATE, WORKING, CANONICAL,
+    Anchor, AnchorSet, AnchorSetCorrupt, CANDIDATE, WORKING, CANONICAL,
+    anchor_content_hash, anchor_id_for, anchorset_fingerprint, verify_anchor_id,
 )
-from .seed_corpus import gather_seed_corpus
-from .crosswalk import Crosswalk, CrosswalkRegistry, fit_crosswalk
-from .density import DensityZoom
-from .grow import GrowthDecision, propose_anchor, propose_anchor_decided
-from .reconciler import Reconciler, SparseCode
 from .routing import (
-    QueryRoute, RouteDecision, route_query, route_query_scored, route_vector,
-    route_vector_scored,
+    DEFAULT_NPROBE, QueryRoute, RouteDecision, route_query, route_query_scored,
+    route_vector, route_vector_scored,
 )
 from .repo import AnchorRepo, StoreAnchorRepo, InMemoryAnchorRepo
 from .store import (
+    AnchorSetDiverged,
     AnchorSetNotProvisioned,
     get_anchor_repo,
-    get_crosswalks,
-    get_density_zoom,
     get_live_anchorset,
+    indexed_geometry,
+    live_fingerprint,
+    record_indexed_geometry,
     require_live_anchorset,
     reset_anchorset,
     save_live_anchorset,
@@ -37,16 +41,16 @@ from .store import (
 )
 
 __all__ = [
-    "activate_vector", "propose_anchor", "propose_anchor_decided", "GrowthDecision",
-    "Anchor", "AnchorSet", "Reconciler", "SparseCode", "DensityZoom",
-    "Crosswalk", "CrosswalkRegistry", "fit_crosswalk",
-    "L0", "L1", "L2", "CANDIDATE", "WORKING", "CANONICAL",
+    "Anchor", "AnchorSet",
+    "CANDIDATE", "WORKING", "CANONICAL",
+    "DEFAULT_NPROBE",
     "route_query", "route_vector", "route_query_scored", "route_vector_scored",
     "RouteDecision", "QueryRoute",
-    "gather_seed_corpus", "AnchorSetNotProvisioned",
+    "AnchorSetNotProvisioned", "AnchorSetCorrupt", "AnchorSetDiverged",
+    "anchor_content_hash", "anchor_id_for", "anchorset_fingerprint", "verify_anchor_id",
     "AnchorRepo", "StoreAnchorRepo", "InMemoryAnchorRepo",
     "get_anchor_repo", "set_anchor_repo",
     "get_live_anchorset", "require_live_anchorset",
-    "get_density_zoom", "get_crosswalks",
     "save_live_anchorset", "reset_anchorset",
+    "live_fingerprint", "indexed_geometry", "record_indexed_geometry",
 ]

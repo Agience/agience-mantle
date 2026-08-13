@@ -309,41 +309,37 @@ class TestPackUnpackPosting:
 class TestSerializeManifest:
     def test_dedups_and_sorts(self):
         blob = posting.serialize_manifest(["b" * 64, "a" * 64, "b" * 64])
-        tokens, dls = posting.deserialize_manifest(blob)
-        assert tokens == ["a" * 64, "b" * 64]
-        assert dls == {}
+        assert posting.deserialize_manifest(blob) == ["a" * 64, "b" * 64]
 
     def test_drops_empty_tokens(self):
         blob = posting.serialize_manifest(["a" * 64, "", "b" * 64])
-        tokens, _ = posting.deserialize_manifest(blob)
-        assert tokens == ["a" * 64, "b" * 64]
+        assert posting.deserialize_manifest(blob) == ["a" * 64, "b" * 64]
 
     def test_round_trip_tokens_only(self):
         tokens = sorted({f"{i:064x}" for i in range(10)})
         blob = posting.serialize_manifest(tokens)
-        recovered, dls = posting.deserialize_manifest(blob)
-        assert recovered == tokens
-        assert dls == {}
-
-    def test_carries_field_dls(self):
-        blob = posting.serialize_manifest(
-            ["a" * 64], field_dls={"title": 5, "content": 100},
-        )
-        tokens, dls = posting.deserialize_manifest(blob)
-        assert tokens == ["a" * 64]
-        assert dls == {"title": 5, "content": 100}
-
-    def test_drops_zero_dls(self):
-        # Empty / zero-length fields shouldn't bloat the manifest.
-        blob = posting.serialize_manifest(
-            ["a" * 64], field_dls={"title": 5, "description": 0},
-        )
-        _, dls = posting.deserialize_manifest(blob)
-        assert dls == {"title": 5}
+        assert posting.deserialize_manifest(blob) == tokens
 
     def test_canonical_empty(self):
-        # Empty token list, no field_dls — canonical bytes are stable.
-        assert posting.serialize_manifest([]) == b'{"field_dls":{},"tokens":[]}'
+        # Empty token list — canonical bytes are stable, and are now the whole wire shape.
+        assert posting.serialize_manifest([]) == b'{"tokens":[]}'
+
+    def test_a_legacy_manifest_carrying_field_dls_still_reads(self):
+        """THE no-reindex claim for the manifest, at the primitive.
+
+        ``field_dls`` carried the per-field document length BM25 needed on re-index. It is no
+        longer written, and a reader that had insisted on it would have turned every
+        un-rewritten manifest into a ``PostingMalformed`` — an intact index reporting itself
+        corrupt. The reader takes ``tokens`` and ignores the rest, so the old shape is simply
+        a larger blob saying the same thing.
+        """
+        legacy = b'{"field_dls":{"title":5,"content":100},"tokens":["' + b"a" * 64 + b'"]}'
+        assert posting.deserialize_manifest(legacy) == ["a" * 64]
+
+    def test_an_unknown_future_key_is_ignored_the_same_way(self):
+        """Not a special case for ``field_dls`` — the reader reads one key, by name."""
+        blob = b'{"tokens":["' + b"a" * 64 + b'"],"whatever":{"nested":[1,2]}}'
+        assert posting.deserialize_manifest(blob) == ["a" * 64]
 
     def test_rejects_missing_tokens_key(self):
         with pytest.raises(posting.PostingMalformed, match="tokens"):
@@ -357,33 +353,12 @@ class TestSerializeManifest:
         with pytest.raises(posting.PostingMalformed):
             posting.deserialize_manifest(b"not json")
 
-    def test_rejects_non_object_field_dls(self):
-        with pytest.raises(posting.PostingMalformed, match="field_dls"):
-            posting.deserialize_manifest(b'{"tokens":[],"field_dls":[]}')
-
-    def test_rejects_non_int_field_dls_value(self):
-        with pytest.raises(posting.PostingMalformed, match="field_dls"):
-            posting.deserialize_manifest(
-                b'{"tokens":[],"field_dls":{"title":"five"}}'
-            )
-
 
 class TestPackUnpackManifest:
     def test_round_trip(self, owner_key, token_a, token_b):
         key = posting.derive_manifest_key(owner_key, "art-1")
         blob = posting.pack_manifest([token_a, token_b], key)
-        tokens, dls = posting.unpack_manifest(blob, key)
-        assert tokens == sorted([token_a, token_b])
-        assert dls == {}
-
-    def test_round_trip_with_field_dls(self, owner_key, token_a):
-        key = posting.derive_manifest_key(owner_key, "art-1")
-        blob = posting.pack_manifest(
-            [token_a], key, field_dls={"title": 5, "content": 200},
-        )
-        tokens, dls = posting.unpack_manifest(blob, key)
-        assert tokens == [token_a]
-        assert dls == {"title": 5, "content": 200}
+        assert posting.unpack_manifest(blob, key) == sorted([token_a, token_b])
 
     def test_wrong_key_raises_tampered(self, owner_key, token_a):
         key = posting.derive_manifest_key(owner_key, "art-1")
@@ -671,11 +646,9 @@ class TestIndexerShape:
         )
 
         # Retrieval round-trip preserves the set.
-        recovered_tokens, recovered_dls = posting.unpack_manifest(
+        assert posting.unpack_manifest(
             store.get_manifest("owner-A", "art-1"), manifest_key,
-        )
-        assert sorted(tokens) == recovered_tokens
-        assert recovered_dls == {}
+        ) == sorted(tokens)
 
     def test_at_rest_blob_does_not_leak_plaintext(self, owner_key, entries):
         """A stored posting blob must not contain plaintext artifact ids,
@@ -691,3 +664,116 @@ class TestIndexerShape:
         wrong_key = os.urandom(32)
         with pytest.raises(posting.PostingTampered):
             posting.unpack_posting(blob, wrong_key)
+
+
+# ---------------------------------------------------------------------------
+# Slot binding (AEAD associated data)
+#
+# Status: wired. sse/indexer.py, sse/query.py and sse/stats.py all pass matching
+# `aad=`, so every blob written from here on is bound to its slot.
+#
+# The tests below pin what that binding is worth: the negative (right key, wrong
+# slot -> raises, before deserialization) and the dual-read that carries the
+# pre-binding corpus (a blob written unbound still opens under `allow_unbound=True`,
+# the reader default).
+# ---------------------------------------------------------------------------
+
+class TestSlotBinding:
+    def test_bound_round_trip(self, owner_key, token_a, entries):
+        key = posting.derive_posting_key(owner_key, token_a)
+        aad = posting.posting_aad("owner-A", token_a)
+        blob = posting.pack_posting(entries, key, aad=aad)
+        assert posting.unpack_posting(blob, key, aad=aad) == entries
+
+    def test_correct_key_wrong_slot_raises(self, owner_key, token_a, token_b, entries):
+        """The test that did not exist: the KEY is correct and only the AAD moves."""
+        key = posting.derive_posting_key(owner_key, token_a)
+        aad = posting.posting_aad("owner-A", token_a)
+        blob = posting.pack_posting(entries, key, aad=aad)
+
+        # Sanity: the key really is the right one.
+        assert posting.unpack_posting(blob, key, aad=aad) == entries
+
+        for wrong in (posting.posting_aad("owner-B", token_a),   # another principal
+                      posting.posting_aad("owner-A", token_b)):  # another token
+            assert wrong != aad
+            with pytest.raises(posting.PostingTampered):
+                posting.unpack_posting(blob, key, aad=wrong, allow_unbound=False)
+
+    def test_bound_blob_does_not_open_unbound(self, owner_key, token_a, entries):
+        """The fallback is a fallback, not a hole: a BOUND blob still needs its AAD."""
+        key = posting.derive_posting_key(owner_key, token_a)
+        blob = posting.pack_posting(
+            entries, key, aad=posting.posting_aad("owner-A", token_a))
+        with pytest.raises(posting.PostingTampered):
+            posting.unpack_posting(blob, key)          # no aad at all
+
+    def test_wrong_slot_fails_before_deserialization(self, monkeypatch, owner_key,
+                                                     token_a, token_b, entries):
+        key = posting.derive_posting_key(owner_key, token_a)
+        blob = posting.pack_posting(
+            entries, key, aad=posting.posting_aad("owner-A", token_a))
+
+        def _landmine(_plaintext):
+            raise AssertionError("deserialize_entries reached on an unauthenticated blob")
+
+        monkeypatch.setattr(posting, "deserialize_entries", _landmine)
+        with pytest.raises(posting.PostingTampered):
+            posting.unpack_posting(blob, key,
+                                   aad=posting.posting_aad("owner-A", token_b),
+                                   allow_unbound=False)
+
+    def test_dual_read_opens_a_legacy_unbound_blob(self, owner_key, token_a, entries):
+        """PROOF: every posting blob already on disk keeps opening once binding is on."""
+        key = posting.derive_posting_key(owner_key, token_a)
+        legacy = posting.pack_posting(entries, key)          # written with no AAD
+        assert posting.unpack_posting(
+            legacy, key, aad=posting.posting_aad("owner-A", token_a)) == entries
+
+    def test_allow_unbound_false_refuses_the_legacy_form(self, owner_key, token_a, entries):
+        """The switch that makes the binding ENFORCING, once a corpus is migrated."""
+        key = posting.derive_posting_key(owner_key, token_a)
+        legacy = posting.pack_posting(entries, key)
+        with pytest.raises(posting.PostingTampered):
+            posting.unpack_posting(legacy, key,
+                                   aad=posting.posting_aad("owner-A", token_a),
+                                   allow_unbound=False)
+
+    def test_manifest_binding(self, owner_key, token_a):
+        key = posting.derive_manifest_key(owner_key, "art-1")
+        aad = posting.manifest_aad("owner-A", "art-1")
+        blob = posting.pack_manifest([token_a], key, aad=aad)
+        assert posting.unpack_manifest(blob, key, aad=aad) == [token_a]
+        with pytest.raises(posting.PostingTampered):
+            posting.unpack_manifest(blob, key,
+                                    aad=posting.manifest_aad("owner-A", "art-2"),
+                                    allow_unbound=False)
+        # Dual-read: a manifest written unbound still opens.
+        assert posting.unpack_manifest(
+            posting.pack_manifest([token_a], key), key, aad=aad) == [token_a]
+
+    def test_aad_fields_cannot_be_repartitioned(self, token_a):
+        """Length-prefixed, so ("a:b", tok) and ("a", "b:" + tok) cannot collide."""
+        assert posting.posting_aad("owner-A", token_a) != \
+            posting.manifest_aad("owner-A", token_a)
+        assert posting.posting_aad("ab", token_a) != posting.posting_aad("a", token_a)
+
+    def test_aad_requires_a_real_slot(self, token_a):
+        with pytest.raises(ValueError):
+            posting.posting_aad("", token_a)
+        with pytest.raises(ValueError):
+            posting.posting_aad("owner-A", "not-a-blind-token")
+        with pytest.raises(ValueError):
+            posting.manifest_aad("owner-A", "")
+
+    def test_default_wire_form_is_unchanged(self, owner_key, token_a, entries):
+        """A pack with no `aad` is byte-for-byte the pre-binding wire form.
+
+        That is what makes the dual-read a migration rather than a rewrite: the blobs
+        already on disk are exactly what this produces, and they open with no fallback
+        involved."""
+        key = posting.derive_posting_key(owner_key, token_a)
+        blob = posting.pack_posting(entries, key)
+        # Openable with no AAD and no fallback involved.
+        assert posting.unpack_posting(blob, key, allow_unbound=False) == entries
+        assert len(blob) == 12 + len(posting.serialize_entries(entries)) + 16

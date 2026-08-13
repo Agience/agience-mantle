@@ -47,10 +47,20 @@ def content_root(item_hashes: List[str]) -> str:
 
 @dataclass
 class ShardItem:
+    """One item's row in a manifest — and, because the manifest names its signing `authority`,
+    ONE OBSERVER'S ATTESTATION of that item.
+
+    `origin` lets agreement count distinct ORIGINS, not distinct holders, because N replicas of
+    one origin are one observation and not N. Empty means unattributed — this authority holds the
+    bytes but cannot say who originated them, which is the honest state whenever origin cannot be
+    determined.
+    """
+
     id: str            # artifact id
     hash: str          # sha256 of the (encrypted) content bytes
     size: int
-    consensus: float = 0.0   # entroptics consensus/coherence score (provenance weight)
+    origin: str = ""   # authority that ORIGINATED it ("self" => the signing authority); "" unknown
+    channel: str = ""  # how THIS authority obtained it — a fact about acquisition, not a rank
 
 
 @dataclass
@@ -85,13 +95,23 @@ class ShardManifest:
 
 
 def build_manifest(region_id: str, version: int, authority: str,
-                   items: Dict[str, bytes], consensus: Dict[str, float] | None = None) -> ShardManifest:
-    """Assemble an (unsigned) manifest from a shard's ``{artifact_id: content_bytes}``."""
-    consensus = consensus or {}
-    shard_items = [
-        ShardItem(id=aid, hash=item_hash(c), size=len(c), consensus=float(consensus.get(aid, 0.0)))
-        for aid, c in items.items()
-    ]
+                   items: Dict[str, bytes],
+                   attest: Dict[str, dict] | None = None) -> ShardManifest:
+    """Assemble an (unsigned) manifest from a shard's ``{artifact_id: content_bytes}``.
+
+    ``attest`` is ``{artifact_id: {"origin": ..., "channel": ...}}`` — what THIS authority observed
+    about each item. An item with no entry is published unattributed, which is a true statement
+    about a node that does not know where the bytes came from, and is read as such by
+    `prism.attestation`. It is not published as a weight, because this node measuring a weight
+    every other node would measure identically is not an observation.
+    """
+    attest = attest or {}
+    shard_items = []
+    for aid, c in items.items():
+        a = attest.get(aid) or {}
+        shard_items.append(ShardItem(id=aid, hash=item_hash(c), size=len(c),
+                                     origin=str(a.get("origin") or ""),
+                                     channel=str(a.get("channel") or "")))
     return ShardManifest(
         region_id=region_id,
         version=version,

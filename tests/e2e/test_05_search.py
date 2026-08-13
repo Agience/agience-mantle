@@ -1,7 +1,7 @@
 """Search — lexical ranking + the light-cone authorization chokepoint.
 
-`POST /artifacts/search` ranks & paginates; `POST /search/query` returns the raw
-authorized candidate set (it can never widen access). Both require the search
+`POST /artifacts/recall` ranks & paginates; the same endpoint with `candidates: true`
+returns the raw authorized candidate set (it can never widen access). Both require the search
 backend (the lattice + MinIO) — 503 otherwise, which the suite treats as "skip".
 Semantic ranking needs remote prism; without it search degrades to lexical, so
 these assertions stay lexical.
@@ -47,7 +47,7 @@ def test_committed_artifact_is_findable(user):
 @pytest.mark.search
 def test_search_validates_exactly_one_query_arm(user):
     # Neither query_text nor embedding → 400.
-    r = user["api"].post("/artifacts/search", json={"state": "committed"})
+    r = user["api"].post("/artifacts/recall", json={"state": "committed"})
     if r.status_code == 503:
         pytest.skip("search backend unavailable")
     assert r.status_code == 400, r.text
@@ -55,7 +55,7 @@ def test_search_validates_exactly_one_query_arm(user):
 
 @pytest.mark.search
 def test_search_rejects_bad_state(user):
-    r = user["api"].post("/artifacts/search", json={"query_text": "x", "state": "bogus"})
+    r = user["api"].post("/artifacts/recall", json={"query_text": "x", "state": "bogus"})
     if r.status_code == 503:
         pytest.skip("search backend unavailable")
     assert r.status_code == 400, r.text
@@ -81,8 +81,9 @@ def test_search_is_light_cone_confined(user_factory):
 def test_raw_query_primitive_returns_candidates(user):
     token = f"zqx{uuid.uuid4().hex[:8]}"
     coll_id, _ = _committed_child(user["api"], f"raw candidate {token}")
-    r = user["api"].post("/search/query", json={
-        "query_text": token, "state": "committed", "scope": [coll_id], "candidate_budget": 50,
+    r = user["api"].post("/artifacts/recall", json={
+        "query_text": token, "state": "committed", "scope": [coll_id],
+        "candidates": True, "candidate_budget": 50,
     })
     if r.status_code == 503:
         pytest.skip("search backend unavailable")

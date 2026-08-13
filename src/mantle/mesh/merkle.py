@@ -1,58 +1,42 @@
 """Merkle anti-entropy — reconcile two stores by exchanging hashes, not data.
 
-WHY THIS EXISTS. The cursor-based log feed converges only if every node reads every other node's
-entire log: per-node work is O(N x fleet write rate), so total work is O(N^2). At 5 nodes that is
-survivable; at 500 it is 10,000x the work to move the same corpus. Worse, a cursor is a single
-fragile scalar per (peer, feed) — it silently skipped failed segments (permanent data loss), it
-could not express "how far behind am I", and a node whose store was rebuilt had no way back except
-replaying history from zero.
+The idea (Dynamo §4.7; Cassandra repair; Riak): both sides hash their data the same way, compare
+hashes, and move only what differs.
 
-Merkle anti-entropy (Dynamo section 4.7; Cassandra repair; Riak) replaces all of that with one
-idea: BOTH SIDES HASH THEIR DATA THE SAME WAY, COMPARE HASHES, AND MOVE ONLY WHAT DIFFERS.
-
-  - Recovery from ANY divergence is the SAME operation as steady state. 8 GB behind or 8 bytes
-    behind runs identical code. There is no "catch-up mode" to get wrong, and no reseed script.
-  - Cost is proportional to the DIFFERENCE, not the corpus. Two converged nodes exchange ONE hash
+  - Recovery from any divergence is the same operation as steady state. 8 GB behind or 8 bytes
+    behind runs identical code: no catch-up mode, no reseed script.
+  - Cost is proportional to the difference, not the corpus. Two converged nodes exchange one hash
     and stop. That is what makes 500 nodes affordable.
-  - There is no cursor, so the entire cursor-skip data-loss class cannot occur. A failed transfer
-    just leaves a hash mismatch that the next round retries. Self-healing is the default state.
-  - It is order-independent and idempotent, so it composes with a CRDT-shaped store: applying the
-    same artifact twice, or out of order, changes nothing.
+  - No cursor, so the cursor-skip data-loss class cannot occur. A failed transfer leaves a hash
+    mismatch the next round retries. Self-healing is the default state.
+  - Order-independent and idempotent, so it composes with a CRDT-shaped store.
 
-DESIGN NOTES (why it is built this way)
+Design notes
 
-Leaf assignment is by a HASH of the artifact id, not by the id itself. Ids are wildly non-uniform
-(`wn-*` synsets, wiki titles, `op.*` operators), so range-splitting raw ids would pile most of the
-corpus into a few leaves and defeat the point. blake2b of the id spreads them evenly regardless of
-naming, so every leaf holds roughly corpus/leaves rows and a mismatch localizes tightly.
-
-Leaf digests are XOR-of-row-hashes, which makes a leaf's value INDEPENDENT OF THE ORDER rows are
-read in. That matters because different nodes scan their store in different orders and we must not
-require a sort over millions of rows to compare — XOR is associative and commutative, so it can be
-computed streaming, in any order, and incrementally maintained later.
+Leaf digests are XOR-of-row-hashes, so a leaf's value is independent of row order — nodes scan in
+different orders, and XOR is associative and commutative, so it computes streaming and can be
+maintained incrementally.
 
 A row hashes as (id, _rev): `_rev` changes on every insert and in-place update, so a mutation
-(compaction, is->was decay) changes the leaf just as a new artifact does. Content is NOT hashed —
-it is content-addressed in `cas/` already, so id+rev is a complete identity for the graph row.
+(compaction, is->was decay) changes the leaf just as a new artifact does. Content is not hashed —
+it is already content-addressed in `cas/`, so id+rev is a complete identity for the graph row.
 
-MEASURED LIMIT — INCREMENTAL MAINTENANCE IS REQUIRED, NOT OPTIONAL (71, 2026-07-19)
-A full-rescan publish is too slow to be the steady-state mechanism. On the live corpus while the
-node was concurrently consuming, the scan ran at 6,286 rows/sec — ~7 minutes for 2.7M rows — and
-the corpus itself grew 2.23M -> 2.73M during the same session. A tree built by full rescan is
-therefore STALE BEFORE IT FINISHES on a node that is actively catching up, and publishing it would
-advertise a root that never matched any real state.
+Incremental maintenance is required, not optional: a full-rescan publish is too slow to be the
+steady-state mechanism. A full scan takes long enough, on a large and actively-written corpus,
+that the corpus keeps growing faster than the scan completes. A tree built by full rescan is
+therefore stale before it finishes on a node that is actively catching up, and publishing it
+would advertise a root that never matched any real state.
 
 The consequence is a division of labour, not a contest:
-  - WHILE CATCHING UP (large, known divergence) the log feed does the bulk transfer. It streams and
+  - While catching up (large, known divergence) the log feed does the bulk transfer. It streams and
     needs no consistent snapshot.
-  - AT STEADY STATE (small, unknown divergence) Merkle is the right tool: two converged nodes
+  - At steady state (small, unknown divergence) Merkle is the right tool: two converged nodes
     exchange one 32 KB tree and stop, which the log feed can never do.
 
-To make Merkle cheap enough to run continuously, leaf digests must be maintained INCREMENTALLY on
-write — XOR out the row's old hash, XOR in the new one — which the XOR construction already
-supports for free (that is a large part of why it was chosen over a sorted hash). Full rescan then
-becomes a bootstrap/verification path, not the hot path. This is what Cassandra and Riak do, and
-it is the next piece of work before wiring Merkle into the aggregator.
+What makes Merkle cheap enough to run continuously is that leaf digests are maintained
+incrementally on write — XOR out the row's old hash, XOR in the new one — which the XOR
+construction supports for free (a large part of why it was chosen over a sorted hash). Full rescan
+is then a bootstrap/verification path, not the hot path, the same division Cassandra and Riak use.
 """
 from __future__ import annotations
 
@@ -63,7 +47,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 def natural_leaves(n: int) -> int:
     """Leaf count DERIVED from the corpus (not a chosen constant). Byte-compatible with
-    `mantle.db.lattice.constants.natural_leaves`. A round costs `L + N/L` (publish the L-leaf tree +
+    `mantle.db.constants.natural_leaves`. A round costs `L + N/L` (publish the L-leaf tree +
     pull one differing leaf), minimised at L = sqrt(N); rounded to a power of two so different-sized
     nodes compare by XOR-folding the finer tree onto the coarser. k = round(log2(N)/2)."""
     n = max(1, int(n))
@@ -84,9 +68,8 @@ def leaf_of(artifact_id: str, leaves: int = DEFAULT_LEAVES) -> int:
 
 
 def row_hash(artifact_id: str, rev: Any) -> int:
-    """Identity of one row: id + _rev. A NULL/absent rev is hashed as 0 so pre-_rev rows still get a
-    stable, comparable value instead of being silently skipped (that omission is exactly what made
-    the legacy corpus unpublishable through the `_rev` feed)."""
+    """Identity of one row: id + _rev. A NULL/absent rev is hashed as 0 so rows with no rev still get
+    a stable, comparable value instead of being silently skipped."""
     r = rev if isinstance(rev, int) else 0
     return _h64(artifact_id.encode("utf-8") + b"\x00" + str(r).encode("ascii"))
 
@@ -113,7 +96,7 @@ def root(leaf_digests: List[int]) -> int:
 
 
 def fold(digests: List[int], target_len: int) -> Optional[List[int]]:
-    """Collapse a 2^k-leaf digest array onto a 2^k' one (k' <= k), by XOR. EXACT, because `leaf_of`
+    """Collapse a 2^k-leaf digest array onto a 2^k' one (k' <= k), by XOR. Exact, because `leaf_of`
     is `hash(id) mod 2^k`: a row in leaf j at resolution k lands in leaf `j mod 2^k'` at k', and the
     digest is an order-free XOR accumulator. Returns None if `target_len` is not a clean divisor
     (the two are not both powers of two nesting into each other)."""
@@ -137,7 +120,7 @@ def common(a: List[int], b: List[int]) -> Tuple[Optional[List[int]], Optional[Li
 
 
 def diff(mine: List[int], theirs: List[int]) -> List[int]:
-    """Leaf indices that differ, at the two trees' COMMON resolution. This is the whole
+    """Leaf indices that differ, at the two trees' common resolution. This is the whole
     reconciliation decision: everything not listed here is provably identical on both sides and is
     never read, transferred, or considered again. When the two trees have different (power-of-two)
     leaf counts, both are XOR-folded onto the smaller before comparing — so a node never has to

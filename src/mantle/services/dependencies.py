@@ -8,12 +8,13 @@
 #   get_person()       — load Person entity for the authenticated user
 #   resolve_auth()     — plain-function core (usable outside FastAPI DI)
 #   require_platform_admin() — post-auth guard
-#   get_end_user_claims() — user-only JWT guard (rejects API-key JWTs)
+#   get_end_user_claims() — user-only JWT guard (rejects retired API-key JWTs)
 #   check_access()        — verify principal has permission on an artifact
 #   _check_grant_permission() — grant permission helper
 
 import logging
 from dataclasses import dataclass, field
+from functools import partial
 from typing import List, Optional
 
 from fastapi import HTTPException, Depends, Security, Request
@@ -24,17 +25,17 @@ from mantle.db.store import Database
 
 from typing import Generator
 
-from mantle.clients.origin_client import get_origin_client
-from origin import config
+from mantle import config
 from mantle.services.acting_principal import acting_from_auth, set_acting_principal
-from mantle.services.person_service import get_user_by_id  # now expects Database
+from mantle.services.person_service import get_user_by_id  # expects Database
 from mantle.services.auth_service import verify_token
 from mantle.db import backend as db_store
 from mantle.services.bootstrap_types import AUTHORITY_COLLECTION_SLUG
 from mantle.services.platform_topology import get_id
 from mantle.entities.person import Person
-from mantle.entities.api_key import APIKey as APIKeyEntity
+from mantle.attenuation import propagates
 from mantle.entities.grant import Grant as GrantEntity, grant_is_allow, grant_is_deny
+from mantle.services import grant_key_service
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +50,69 @@ def get_store_db() -> Generator[Database, None, None]:
 
     Yields Mantle's OWN store (`db.lattice_api.LatticeDatabase`, one SQLite file opened once
     per process — THE STANDALONE DB; the same handle startup uses).
+
+    Deliberately a SYNCHRONOUS generator, and it must stay one. FastAPI runs a sync generator
+    dependency in its worker thread pool; rewriting it as `async def` would move
+    `store_handle()` — which opens the SQLite file and runs `ensure_schema` on the first
+    request of a process — onto the event loop, where it would block every other request.
+    "Make the dependency async" is the wrong direction here: the offload is `offload_sync`
+    below, applied to the work, not to the handle.
     """
     from mantle.db import backend
     yield backend.store_handle()
+
+
+async def offload_sync(fn, *args, **kwargs):
+    """Run a synchronous store call in a worker thread — the request-path offload primitive.
+
+    Nothing in the store is awaitable: SQLite and the content stores are synchronous, so a
+    `async def` handler that calls them directly holds the event loop for the whole call and
+    every other in-flight request waits behind it, including ones that would have finished in
+    microseconds. One slow read makes the process look single-threaded because, for the
+    duration, it is.
+
+    Applied, not merely available: `get_auth` / `get_person` here, and in the routers the
+    list / read / search / create handlers plus the byte path (see `routers/artifacts_router.py`,
+    `grants_router.py`, `system_router.py`). It is NOT applied to every store touch — the rule
+    is that a call earns a hop by issuing more than one query or doing file/network/crypto I/O.
+    A single indexed seek (`_artifact_exists`, `has_children`, `get_grant_by_id`) costs less than
+    the thread hop that would wrap it, so those stay on the loop. Nor does a router whose handlers
+    are plain `def` need it: FastAPI already runs a sync handler in its own worker pool, so
+    wrapping there would be a hop taken inside a thread.
+
+    Safe for this store, for reasons that are properties of `db/seq.py` rather than
+    assumptions about it:
+
+      * `LatticeConn` keeps its `sqlite3.Connection` in a `threading.local`, so a worker thread
+        gets its own connection and none is ever used from two threads at once — the thing
+        sqlite3 refuses to allow.
+      * Writers serialise on a process-wide `RLock` plus `BEGIN IMMEDIATE`, so concurrent
+        workers queue on a cheap mutex instead of racing to `SQLITE_BUSY`.
+      * A transaction never spans threads. `write()`'s re-entrancy depth and every
+        `SeqAllocator`'s in-transaction cache are thread-local, so one whole store call must
+        run in one thread — which is exactly what this does. Splitting a transaction across
+        threads would break gap-free `_seq` allocation; passing a *whole* call across one does
+        not.
+
+    Correctness notes for callers:
+
+      * Contextvars are COPIED into the worker, not shared. A value the callee sets — the
+        acting principal, notably — does not come back. Set those in the caller, after the
+        awaited call returns, which is what `get_auth` does.
+      * Exceptions propagate unchanged, so an `HTTPException` raised inside still becomes its
+        response.
+      * The pool is bounded (anyio's default limiter), which bounds the number of live
+        thread-local SQLite connections too.
+
+    This is single-process and needs no coordination. It is NOT the multi-worker change: the
+    event bus is in-process, so running multiple uvicorn workers without a back-plane silently
+    breaks the change feed. That is a separate change with its own precondition.
+    """
+    import anyio.to_thread
+
+    if kwargs:
+        return await anyio.to_thread.run_sync(partial(fn, *args, **kwargs))
+    return await anyio.to_thread.run_sync(fn, *args)
 
 
 # ---------------------------------------------------------------------------
@@ -62,42 +123,91 @@ def get_store_db() -> Generator[Database, None, None]:
 class AuthContext:
     """Unified auth context returned by ``get_auth()``.
 
-    Replaces all legacy auth dependency return types (tuples, Person,
-    old AuthContext) with a single consistent shape.  Field names follow
+    A single consistent shape for every auth path. Field names follow
     the Unified Artifact API spec.
     """
 
-    principal_id: str = ""                              # user_id | api_key_id | server_client_id
-    principal_type: str = "user"                        # "user" | "api_key" | "server" | "mcp_client" | "grant_key"
-    user_id: Optional[str] = None                       # present for user, mcp_client, api_key, delegation
+    #: Who the work is done on behalf of: user_id | grant_id | service name. For every
+    #: principal that acts FOR someone — ``delegation``, ``mcp_client`` — this is the
+    #: SUBJECT, not the machine; the machine is :attr:`actor`. A grant key is the
+    #: exception that proves the rule: it acts for nobody, so it is its own subject.
+    principal_id: str = ""
+    principal_type: str = "user"                        # "user" | "grant_key" | "service" | "mcp_client"
+    user_id: Optional[str] = None                       # present for user, mcp_client, delegation
+    #: For a grant key this is the RESOLVED bundle — the root plus every member,
+    #: each already narrowed by the root's bits. Consumers read it as a flat list.
     grants: List[GrantEntity] = field(default_factory=list)  # loaded server-side
-    api_key_id: Optional[str] = None                    # if auth was via API key
-    api_key_entity: Optional[APIKeyEntity] = None       # full entity — needed by collection service
-    server_id: Optional[str] = None                     # if auth was via server token
-    actor: Optional[str] = None                         # delegation: acting server
+    grant_key_id: Optional[str] = None                  # id of the root grant, if auth was via grant key
+    #: The machine acting FOR the subject, when one is: the acting server for a
+    #: delegation (``act.sub``), the OAuth client id for an ``mcp_client`` (``aud``).
+    #: Provenance only — never an authorization input, which is why both principal types
+    #: can name their actor here without either of them gaining reach by doing so.
+    actor: Optional[str] = None
     authority: Optional[str] = None                     # issuer / authority identity (external IdP = tenant)
     host_id: Optional[str] = None                       # host identity (platform instance)
     email: Optional[str] = None                         # profile email from token claims (external IdP login)
+    #: Did the issuer vouch for that address? Not the same as merely having one.
+    #:
+    #: `_claim_email` accepts `email` / `upn` / `preferred_username` — none of which is a claim that
+    #: the address was verified. Matching an invite on an unverified address is the classic
+    #: "Sign in with X" takeover: any IdP that lets a user type an arbitrary address becomes a way
+    #: to claim an invite addressed to someone else. Anything that decides access from the email
+    #: must read this too; anything merely displaying it need not.
+    email_verified: bool = False
     name: Optional[str] = None                          # profile display name from token claims
     bearer_grant: Optional[GrantEntity] = None           # convenience: grant resolved from Bearer grant key
-    target_artifact_id: Optional[str] = None             # artifact scoping from prefixed Bearer token ({id}:agc_xxx)
+    target_artifact_id: Optional[str] = None             # artifact scoping from prefixed Bearer token ({id}:agk_xxx)
 
 
 # ---------------------------------------------------------------------------
 # Schemes & helpers
 # ---------------------------------------------------------------------------
 
+#: The authorization server, absolute. Mantle serves NEITHER of the paths below — it is a
+#: protected RESOURCE, and `/auth/authorize` + `/auth/token` are Origin's endpoints (see
+#: `main.py`: "the /auth/authorize authorization endpoint lives in Origin"). Declared against
+#: Origin's public URI for exactly that reason: a RELATIVE url here is resolved by Swagger
+#: against Mantle's own host, so the Authorize button posts to a 404 on this service.
+#:
+#: A node with no authority configured names no endpoint at all rather than inventing one, and a
+#: deployment fronted by an external IdP authenticates against that IdP's own endpoints — neither
+#: is knowable here, and `/.well-known/oauth-protected-resource` (RFC 9728, built from
+#: `config.authorization_servers()`) is the machine-readable answer in both cases. This scheme is
+#: Swagger affordance only; it is not a second claim about who the issuer is.
+_AUTHORITY = (config.AUTHORITY_ISSUER or "").rstrip("/")
+
 oauth2_scheme = OAuth2AuthorizationCodeBearer(
-    authorizationUrl="/auth/authorize",
-    tokenUrl="/auth/token"
+    authorizationUrl=f"{_AUTHORITY}/auth/authorize" if _AUTHORITY else "",
+    tokenUrl=f"{_AUTHORITY}/auth/token" if _AUTHORITY else "",
 )
 
 
-def is_api_key_jwt_payload(payload: Optional[dict]) -> bool:
-    """Return True when JWT claims represent an API-key JWT token."""
+def is_retired_api_key_jwt(payload: Optional[dict]) -> bool:
+    """True for a JWT minted against the decommissioned API-key system.
+
+    Such a token cannot be honoured — the keys behind it are gone — but it must be
+    rejected on its own terms rather than treated as an ordinary user JWT, whose `sub`
+    it would otherwise be read as.
+    """
     if not payload:
         return False
     return bool(payload.get("api_key_id"))
+
+
+def _claim_email_verified(payload: dict) -> bool:
+    """Did the issuer assert `email_verified`? Absence means false.
+
+    It is an optional OIDC claim. A provider that never sends it is not saying "verified", it is
+    saying nothing, and collapsing the two is how an unverified address becomes an identity. The
+    string form is accepted because claims survive JSON round-trips as strings — and `bool("false")`
+    is `True`, so a naive cast would read an explicit denial as approval.
+    """
+    v = payload.get("email_verified")
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes")
+    return False
 
 
 def _claim_email(payload: dict) -> Optional[str]:
@@ -119,18 +229,29 @@ def _claim_name(payload: dict) -> Optional[str]:
     return None
 
 
+def _claim_aud_str(payload: dict) -> Optional[str]:
+    """``aud`` as a single readable string, for the audit field it is recorded in.
+
+    RFC 7519 allows ``aud`` to be an array, and a naive ``str()`` would render one as
+    ``"['a', 'b']"`` — a Python repr in an audit log, and a name that matches no client id
+    anyone could search for. Only ever read for provenance, never to decide access, so the
+    ambiguous multi-audience case is spelled out rather than resolved.
+    """
+    aud = payload.get("aud")
+    if isinstance(aud, (list, tuple)):
+        return ",".join(str(a) for a in aud) or None
+    return str(aud) if aud else None
+
+
 def _validate_aud_for_principal(payload: dict) -> None:
     """Post-decode audience validation for multi-type token paths."""
     principal_type = payload.get("principal_type", "user")
     aud = payload.get("aud")
     if principal_type == "service":
-        # Phase C platform mutual JWT: peer services (origin, chorus) calling
-        # Mantle with `aud="mantle"`.
+        # Platform mutual JWT: a peer service (origin) calling Mantle with
+        # `aud="mantle"`.
         if aud != "mantle":
             raise HTTPException(status_code=401, detail="Invalid token audience for platform service")
-    elif principal_type == "server":
-        if aud != "agience":
-            raise HTTPException(status_code=401, detail="Invalid token audience for server credential")
     elif principal_type == "mcp_client":
         if not aud:
             raise HTTPException(status_code=401, detail="Missing aud in mcp_client token")
@@ -175,8 +296,8 @@ def _get_end_user_token_payload(token: str) -> dict:
     payload = verify_token(token, expected_audience=config.AUTHORITY_ISSUER)
     if not payload or "sub" not in payload:
         raise HTTPException(status_code=401, detail="Invalid or malformed token")
-    if is_api_key_jwt_payload(payload):
-        raise HTTPException(status_code=403, detail="API key token not valid for this endpoint")
+    if is_retired_api_key_jwt(payload):
+        raise HTTPException(status_code=401, detail="API keys have been retired; use a grant key")
     return payload
 
 
@@ -198,10 +319,10 @@ def resolve_auth(
     """Core auth resolution — usable from both FastAPI deps and ASGI middleware.
 
     Token dispatch:
-    1. Parse optional artifact-id prefix (``{artifact_id}:agc_xxx``).
-    2. ``agc_`` prefix → API key path.
+    1. Parse optional artifact-id prefix (``{artifact_id}:agk_xxx``).
+    2. ``agk_`` prefix → grant key: the bearer acts AS a grant (see
+       :mod:`services.grant_key_service`).
     3. JWT (``ey`` prefix) → decode + dispatch by ``principal_type``.
-    4. Otherwise → grant key in Bearer slot.
     """
     if not token:
         raise HTTPException(status_code=401, detail="Missing Bearer token")
@@ -209,32 +330,46 @@ def resolve_auth(
     raw_token = token.strip()
     target_artifact_id: Optional[str] = None
 
-    # --- prefix parsing: {artifact_id}:agc_xxx ---
+    # --- prefix parsing: {artifact_id}:agk_xxx ---
     if ":" in raw_token and not raw_token.startswith("ey"):
         parts = raw_token.split(":", 1)
-        if len(parts) == 2 and parts[1].startswith("agc_"):
+        if len(parts) == 2 and parts[1].startswith(grant_key_service.KEY_PREFIX):
             target_artifact_id = parts[0]
             raw_token = parts[1]
 
-    # --- API key path ---
-    if raw_token.startswith("agc_"):
-        # Pluggable authz backend (Sovereign-Stack): `local` (default) verifies
-        # against Mantle's own api_keys + grants in the lattice — no Origin call;
-        # `origin` delegates to Origin. Verify + grants come back together.
-        from mantle.services.grant_store import get_apikey_backend
-        verify_result = get_apikey_backend().verify_api_key(store_db, raw_token)
-        if verify_result is None:
-            raise HTTPException(status_code=401, detail="Invalid API key")
-        api_key_entity, grants = verify_result
+    # --- Grant key path ---
+    #
+    # The credential resolves to a grant, and the grant is the whole authorization —
+    # there is no scope grammar layered on top of it. A bundle expands here, once, so
+    # every downstream consumer sees a flat list of effective grants and none of them
+    # needs to know whether the key was a single-resource key or a bundle.
+    if raw_token.startswith(grant_key_service.KEY_PREFIX):
+        root = grant_key_service.authenticate(store_db, raw_token)
+        if root is None:
+            raise HTTPException(status_code=401, detail="Invalid grant key")
+        grants = grant_key_service.resolve(store_db, root)
+        grant_key_service.touch(store_db, root)
 
         return AuthContext(
-            principal_id=str(getattr(api_key_entity, "id", "")),
-            principal_type="api_key",
-            user_id=str(api_key_entity.user_id) if api_key_entity.user_id else None,
+            principal_id=root.id or "",
+            principal_type="grant_key",
+            # A key is not a person. It carries no user_id, so nothing downstream can
+            # mistake it for the issuing user and hand it that user's full light cone —
+            # `check_access` resolves it through `ledger_identity` instead.
+            user_id=None,
             grants=grants,
-            api_key_id=str(getattr(api_key_entity, "id", None)) if getattr(api_key_entity, "id", None) else None,
-            api_key_entity=api_key_entity,
+            grant_key_id=root.id or None,
+            bearer_grant=root,
             target_artifact_id=target_artifact_id,
+        )
+
+    # A retired credential must say so. Falling through to the JWT branch would report
+    # a decommissioned API key as a malformed token, which sends the holder looking in
+    # the wrong place.
+    if raw_token.startswith("agc_"):
+        raise HTTPException(
+            status_code=401,
+            detail="API keys have been retired; use a grant key (see POST /grants/keys)",
         )
 
     # --- JWT path ---
@@ -250,39 +385,82 @@ def resolve_auth(
         except Exception:
             logger.debug("issuer refresh-on-miss failed", exc_info=True)
     if payload and "sub" in payload:
-        _validate_aud_for_principal(payload)
-
-        if is_api_key_jwt_payload(payload):
-            raise HTTPException(status_code=403, detail="API-key JWT not accepted; use direct API key")
-
         jwt_principal_type = payload.get("principal_type", "user")
 
+        # A `server` names nothing here. Mantle registers no servers, issues no server
+        # credentials and keeps no server JWK plane — a server is an ordinary
+        # `vnd.agience.server+json` artifact, and an artifact is not a principal. Such a
+        # token resolved to a principal that held no grants and no user id, so
+        # `check_access` refused it on every route.
+        #
+        # Rejected BY NAME, and before the audience rule, rather than deleted and left to
+        # fall through: the default branch below is the user branch, which would read
+        # `sub` — the string `server/<client_id>` — as a person and hand it a user's
+        # identity. A principal type this node cannot resolve is a 401, not a user.
+        if jwt_principal_type == "server":
+            raise HTTPException(
+                status_code=401,
+                detail="Server principals are not accepted; use a grant key (see POST /grants/keys)",
+            )
+
+        _validate_aud_for_principal(payload)
+
+        if is_retired_api_key_jwt(payload):
+            raise HTTPException(status_code=401, detail="API keys have been retired; use a grant key")
+
         if jwt_principal_type == "service":
-            # Phase C platform mutual JWT — origin/chorus identifying themselves
-            # to Mantle. `iss` carries the service name (verified by the dispatch
-            # in `verify_token`).
+            # Platform mutual JWT — a peer service (origin) identifying itself to
+            # Mantle. `iss` carries the service name (verified by the dispatch in
+            # `verify_token`).
             return AuthContext(
                 principal_id=str(payload.get("iss", "")),
                 principal_type="service",
                 authority=str(payload.get("iss", "")) or None,
             )
 
-        if jwt_principal_type == "server":
-            client_id = str(payload.get("client_id")) if payload.get("client_id") else None
-            return AuthContext(
-                principal_id=client_id or str(payload.get("sub", "")),
-                principal_type="server",
-                user_id=None,
-                server_id=str(payload.get("server_id")) if payload.get("server_id") else None,
-                authority=str(payload.get("authority", "")) or None,
-                host_id=str(payload.get("host_id", "")) or None,
-            )
-
         if jwt_principal_type == "mcp_client":
+            # THE SUBJECT IS THE USER, THE CLIENT IS THE ACTOR — the same shape as
+            # `delegation` below, because it is the same situation: a machine calling on a
+            # person's behalf, where `sub` names the person and a second claim names the
+            # machine. Origin mints exactly that (`auth_router`: `sub` = user id, `aud` =
+            # the client), so `aud` is an audience, not an identity to hold grants under.
+            #
+            # Reading `aud` as `principal_id` split this principal in two. Everything that
+            # keys on `user_id` — `check_access`, and `list_visible`'s light cone, which
+            # resolves `auth.user_id` as a plain `"user"` — already saw the person and
+            # already worked. Only `acting_principal.acting_from_auth` reads `principal_id`,
+            # so the key oracle alone resolved a light cone for the CLIENT ID, found no
+            # grants under it, and refused every content key. A client could therefore list
+            # artifacts and never read one.
+            #
+            # So this WIDENS NOTHING. It does not hand the client a reach it lacked; it
+            # makes key custody agree with the authorization decision two other call sites
+            # in the same request had already made against `sub`. The reachable set is
+            # unchanged — a request that was allowed is still allowed, a request that was
+            # denied is still denied — and what changes is that content under an allowed
+            # artifact now decrypts instead of failing closed.
+            #
+            # `scopes` is deliberately not consulted: Origin records it as "a record of the
+            # request and not a per-client entitlement", so narrowing by it would read an
+            # unvouched-for client's own ask as authority.
+            #
+            # `principal_type` stays `"mcp_client"` rather than collapsing to `"user"` as
+            # delegation does. `ledger_grantee_type` already maps it onto the ledger's
+            # `"user"` grantee vocabulary, so the grant lookup is identical either way —
+            # and keeping the name means the audit trail says which KIND of caller acted,
+            # and that a `principal_type == "user"` gate (Origin has two) can still tell a
+            # machine from a person.
+            mcp_sub = payload.get("sub")
             return AuthContext(
-                principal_id=str(payload.get("aud", "")),
+                principal_id=str(mcp_sub) if mcp_sub else "",
                 principal_type="mcp_client",
-                user_id=str(payload.get("sub")) if payload.get("sub") else None,
+                user_id=str(mcp_sub) if mcp_sub else None,
+                # `aud` is retained here and nowhere else: WHICH client acted for this user
+                # is worth keeping even though it is not the authorization key. `actor` is
+                # the field that already means exactly that (`ActingPrincipal.actor`: "NOT
+                # consulted for the authorization decision"), `acting_from_auth` carries it
+                # into the acting principal, and nothing in Mantle reads it to decide access.
+                actor=_claim_aud_str(payload),
             )
 
         if jwt_principal_type == "delegation":
@@ -323,6 +501,7 @@ def resolve_auth(
                 user_id=ext_uid,
                 authority=_oidc.tenant_for(payload.get("iss")),  # tenant key
                 email=_claim_email(payload),
+                email_verified=_claim_email_verified(payload),
                 name=_claim_name(payload),
             )
 
@@ -334,19 +513,8 @@ def resolve_auth(
             # Capture profile from claims for platform users too (Origin tokens carry
             # email/name). tenant stays None — platform users are the native tenant.
             email=_claim_email(payload),
+            email_verified=_claim_email_verified(payload),
             name=_claim_name(payload),
-        )
-
-    # --- Grant key in Bearer slot ---
-    key_grants = db_store.get_active_grants_by_key(store_db, raw_token)
-    if key_grants:
-        grant = key_grants[0]
-        return AuthContext(
-            principal_id=getattr(grant, "id", "") or "",
-            principal_type="grant_key",
-            user_id=None,
-            grants=[grant],
-            bearer_grant=grant,
         )
 
     raise HTTPException(status_code=401, detail="Invalid token")
@@ -364,18 +532,23 @@ async def get_auth(
     """Single auth dependency for all endpoints.
 
     Also publishes the authenticated caller to the acting-principal contextvar, which
-    is what lets the key oracle check WHO is asking (see
-    :mod:`services.acting_principal`). Before this, every layer below the router
-    re-derived a "principal" from the data it was handling, so the oracle's grant
-    check compared two caller-supplied values.
+    is what lets the key oracle check who is asking (see
+    :mod:`services.acting_principal`).
 
-    Set HERE rather than in an ASGI middleware because this dependency is where the
-    caller is actually resolved, and ``test_auth_policy_matrix`` already asserts every
-    critical route depends on it. A route that does NOT use it publishes nothing, and
+    Set here rather than in an ASGI middleware because this dependency is where the
+    caller is actually resolved, and ``test_auth_policy_matrix`` asserts every
+    critical route depends on it. A route that does not use it publishes nothing, and
     key issuance then fails closed rather than running under a stale or absent
     identity.
+
+    Resolution runs in a worker thread (see :func:`offload_sync`): it verifies a JWT, and on
+    the grant-key path reads and writes the store, none of it awaitable. On the event loop
+    that work blocks every concurrent request, and it is on the front of every authenticated
+    one. The acting principal is published below, back on the loop, because a contextvar set
+    inside a worker thread does not survive the return.
     """
-    auth = resolve_auth(
+    auth = await offload_sync(
+        resolve_auth,
         token=token or "",
         store_db=store_db,
         request=request,
@@ -394,15 +567,29 @@ async def get_auth(
 async def get_person(
     auth: AuthContext = Depends(get_auth),
     store_db: Database = Depends(get_store_db),
+    token: str = Security(oauth2_scheme),
 ) -> Person:
     """Load the Person entity for the authenticated user.
 
     Use as a second dependency alongside ``get_auth`` when a router needs
     Person fields (email, name, preferences, etc.) — not just ``user_id``.
+
+    ``token`` is declared again here, rather than reached for through ``auth``, because
+    :class:`AuthContext` is the RESULT of verification and deliberately carries no credential.
+    It is forwarded to Origin as the subject token (see
+    :data:`services.person_service.SUBJECT_TOKEN_HEADER`), and this is the one call site where
+    doing so is sound without a further check: the person being read is ``auth.user_id``, which
+    is the subject ``resolve_auth`` derived from this very token, so "the caller's bearer" and
+    "the subject's own token" are the same string by construction rather than by coincidence.
+
+    A grant key is never forwarded. ``resolve_auth`` gives a ``grant_key`` context
+    ``user_id=None`` ("a key is not a person"), so the 401 below is reached first — an opaque
+    ``agk_`` credential of this node's cannot leave it through this path.
     """
     if not auth.user_id:
         raise HTTPException(status_code=401, detail="User identification required")
-    person = get_user_by_id(db=store_db, id=auth.user_id)
+    person = await offload_sync(get_user_by_id, db=store_db, id=auth.user_id,
+                                subject_token=token or None)
     if not person:
         raise HTTPException(status_code=404, detail="User not found")
     return person
@@ -413,12 +600,17 @@ async def get_person(
 # ---------------------------------------------------------------------------
 
 def _authority_bootstrap_complete(store_db: Database) -> bool:
-    """True once an admin grant exists on the authority collection.
+    """True once a real platform admin exists on the authority collection.
 
     The bootstrap window (during which the ``platform.operator_id`` config fast-path
     is honored) is OPEN until this is true. Fail OPEN on error (return False) so a
     genuinely-bootstrapping operator isn't locked out by a transient query failure —
     the canonical grant check still gates everyone else.
+
+    Matches :func:`is_platform_admin` on ``can_admin`` deliberately. A weaker condition
+    here would let the window close on a grant that confers no admin — leaving the
+    operator retired and nobody able to appoint anyone, which is unrecoverable through
+    the API.
     """
     try:
         grants = db_store.get_grants_for_collection(
@@ -427,7 +619,7 @@ def _authority_bootstrap_complete(store_db: Database) -> bool:
         return any(
             getattr(g, "state", "active") == "active"
             and grant_is_allow(g)
-            and (getattr(g, "can_admin", False) or getattr(g, "can_update", False))
+            and getattr(g, "can_admin", False)
             for g in grants
         )
     except Exception:
@@ -435,54 +627,82 @@ def _authority_bootstrap_complete(store_db: Database) -> bool:
         return False
 
 
+def is_platform_admin(
+    store_db: Database,
+    user_id: Optional[str],
+    *,
+    operator_id: Optional[str] = None,
+    authority_id: Optional[str] = None,
+    bootstrap_open: Optional[bool] = None,
+) -> bool:
+    """THE platform-admin predicate — one answer, for gating and for reporting alike.
+
+    Platform admin is an active, allow-effect ``can_admin`` grant on the authority
+    collection, plus a bootstrap fast-path for the configured operator while no such
+    grant exists yet (someone has to be able to appoint the first admin).
+
+    ``can_admin`` and NOT ``can_update``: write access to the authority collection is
+    permission to edit a container, and must not escalate to permission to appoint
+    administrators. See ``tests/test_platform_admin_predicate.py``, which pins this.
+
+    The optional arguments let a caller that already resolved these values reuse them —
+    ``list_users`` evaluates this once per user and would otherwise re-scan the whole
+    grant set every iteration. They are an optimization only; omitted, each is resolved
+    here and the answer is identical.
+    """
+    if not user_id:
+        return False
+
+    if operator_id is None:
+        from mantle.services.operator import resolve_operator_id
+        operator_id = resolve_operator_id(store_db)
+
+    # `operator_id and` is the whole safety of this line, not defensive noise: on a
+    # part-provisioned store an unresolved operator and an unidentified caller are both
+    # commonly "" or None, and `"" == ""` would make an anonymous caller platform admin
+    # exactly when the system is least set up.
+    if operator_id and user_id == operator_id:
+        if bootstrap_open is None:
+            bootstrap_open = not _authority_bootstrap_complete(store_db)
+        if bootstrap_open:
+            return True
+
+    # `get_id` raises when the platform topology has not been resolved, so it belongs
+    # inside the guard: an unresolved slug must deny (and be visible as a 403) rather
+    # than escape as a 500 from the most privileged predicate in the service.
+    try:
+        if authority_id is None:
+            authority_id = get_id(AUTHORITY_COLLECTION_SLUG)
+        grants = db_store.get_active_grants_for_principal_resource(
+            store_db, grantee_id=user_id, resource_id=authority_id,
+        )
+    except Exception:
+        logger.debug("the lattice grant check failed in is_platform_admin", exc_info=True)
+        return False
+    return any(grant_is_allow(g) and getattr(g, "can_admin", False) for g in grants)
+
+
 def require_platform_admin(
     auth: AuthContext, store_db: Database
 ) -> str:
-    """Post-auth guard: require platform admin.
+    """Post-auth guard: require platform admin. The raising form of
+    :func:`is_platform_admin`, which holds the policy — this adds only the HTTP shape.
 
-    Merged successor to ``require_admin`` + ``require_operator`` (2026-04-06).
-    A platform admin is any user with a write grant on the authority
-    collection. During the post-setup / pre-Phase-4 bootstrap window,
-    the initial operator recorded in ``platform.operator_id`` settings
-    is treated as a platform admin even before the authority collection
-    has issued them a grant — this avoids a chicken-and-egg between the
-    setup wizard and the grant system.
+    The bootstrap fast-path lives there too: the initial operator recorded in
+    ``platform.operator_id`` is admin only while no real admin grant exists, so the
+    config-flag bypass retires once the grant system can serve them and even the
+    operator then acts through a revocable, authority-rooted grant. Genesis (writing
+    the manifest) is irreducible; standing runtime trust is not. See
+    .dev/features/issuer-merge-bootstrap.md §3b. Operator resolution is
+    sovereign-capable: Mantle setting → env (AGIENCE_OPERATOR_ID, standalone) →
+    Origin fallback.
 
     Returns the user_id on success, raises HTTP 403 otherwise.
     """
     if not auth.user_id:
         raise HTTPException(status_code=403, detail="Platform admin access required")
-
-    # Bootstrap fast-path: initial operator from setup wizard — CONFINED to the
-    # window before any admin grant exists on the authority collection. Once the
-    # operator (or the platform) holds a real authority grant, the window closes and
-    # even the operator must act through that revocable, authority-rooted grant. This
-    # keeps the operator out of the STANDING runtime trust boundary: genesis (writing
-    # the manifest) is irreducible, but the config-flag bypass must self-retire once
-    # the grant system can serve them. See .dev/features/issuer-merge-bootstrap.md §3b.
-    # Operator resolution is sovereign-capable: Mantle setting → env
-    # (AGIENCE_OPERATOR_ID, for standalone) → Origin fallback (full platform).
-    from mantle.services.operator import resolve_operator_id
-    stored_operator_id = resolve_operator_id(store_db)
-    if (
-        stored_operator_id
-        and auth.user_id == stored_operator_id
-        and not _authority_bootstrap_complete(store_db)
-    ):
+    if is_platform_admin(store_db, auth.user_id):
         return auth.user_id
-
-    # Canonical check: write grant on the authority collection — via lattice.
-    try:
-        grants = db_store.get_active_grants_for_principal_resource(
-            store_db,
-            grantee_id=auth.user_id,
-            resource_id=get_id(AUTHORITY_COLLECTION_SLUG),
-        )
-        if any(grant_is_allow(g) and g.can_update for g in grants):
-            return auth.user_id
-    except Exception:
-        logger.debug("the lattice grant check failed in require_platform_admin", exc_info=True)
-
     raise HTTPException(status_code=403, detail="Platform admin access required")
 
 
@@ -491,28 +711,15 @@ def require_platform_admin(
 # ---------------------------------------------------------------------------
 
 # Map action names to CRUDEASIO grant flag attributes.
-_ACTION_FLAG_MAP = {
-    "create": "can_create",
-    "read": "can_read",
-    "update": "can_update",
-    "delete": "can_delete",
-    "evict": "can_evict",
-    "invoke": "can_invoke",
-    "add": "can_add",
-    "share": "can_share",
-    "admin": "can_admin",
-}
+#: Re-exported from the entity, which owns it. Kept as a module name because the
+#: resolver and several routers import it from here.
+_ACTION_FLAG_MAP = GrantEntity.ACTION_FLAGS
 
-# ⛔ `_MAX_ORIGIN_DEPTH = 10` REMOVED 2026-07-30. It was a bare claim that grants never inherit
-# from more than 10 ancestors, and exceeding it fell through to `raise HTTPException(404)` — a
-# SILENT FALSE DENY on an artifact the principal is genuinely granted, indistinguishable from
-# "no such artifact". Unlike the other depth caps this walk had NO cycle guard, so the cap was
-# doing double duty. Termination is now `visited` (each ancestor once, over a finite graph).
 #
-# What remains is an OPERATIONAL bound, not a claim about lattice shape: a malformed store that
+# This is an operational bound, not a claim about lattice shape: a malformed store that
 # returns an endless chain of fresh ids would hang an auth request. It is deliberately far above
-# any real chain and it RAISES 500 — the point of the fix is that "you are not granted" (404) and
-# "this lattice did not terminate" (500) are different answers, and the old cap collapsed them.
+# any real chain, and exceeding it raises 500 rather than 404 — "you are not granted" and
+# "this lattice did not terminate" are different answers.
 _ORIGIN_WALK_CEILING = 10_000
 
 
@@ -544,61 +751,6 @@ def _grant_from_check_response(response: dict) -> GrantEntity:
     )
 
 
-# CRUDEASIO action -> the API-key scope action that must also permit it.
-# `read` covers the read-ish verbs; everything that mutates maps to `write`
-# unless it has a dedicated scope action. An action absent from this map is
-# treated as requiring `admin`, i.e. it fails closed for ordinary keys.
-_ACTION_TO_SCOPE_ACTION = {
-    "read": "read",
-    "list": "read",
-    "search": "search",
-    "invoke": "invoke",
-    "create": "create",
-    "add": "create",
-    "update": "write",
-    "delete": "delete",
-    "evict": "write",
-    "share": "admin",
-    "admin": "admin",
-}
-
-
-def _enforce_api_key_ceiling(auth: AuthContext, action: str) -> None:
-    """Require the API key's OWN scopes to permit *action*.
-
-    No-op for non-api_key principals. For an api_key principal this is a hard
-    ceiling on top of whatever the owning user is granted — the key can only
-    ever narrow, never widen.
-
-    Fails closed on an unmapped action and on a missing key entity: if we cannot
-    establish what the key is allowed to do, it is allowed to do nothing.
-    """
-    if auth.principal_type != "api_key":
-        return
-
-    key_entity = auth.api_key_entity
-    if key_entity is None:
-        raise HTTPException(status_code=403, detail="API key scope unavailable")
-
-    scope_action = _ACTION_TO_SCOPE_ACTION.get(action)
-    if scope_action is None:
-        raise HTTPException(
-            status_code=403, detail=f"API keys may not perform '{action}'"
-        )
-
-    try:
-        permitted = key_entity.has_scope("resource", "*", scope_action)
-    except Exception:
-        logger.warning("api key scope evaluation failed; denying", exc_info=True)
-        raise HTTPException(status_code=403, detail="API key scope check failed")
-
-    if not permitted:
-        raise HTTPException(
-            status_code=403,
-            detail=f"API key is not scoped for '{action}'",
-        )
-
-
 def check_access(
     auth: AuthContext,
     artifact_id: str,
@@ -611,6 +763,12 @@ def check_access(
     traversal: direct grant first, then walk origin edges upward checking
     propagated grants at each parent. Workspace IS A Collection IS An
     Artifact — all addressed by artifact _key.
+
+    Two kinds of principal reach this, and they differ only in where their grants
+    come from: a user's are looked up by ``user_id``, a grant key's were already
+    resolved (and narrowed by the bundle ceiling) at authentication. Everything after
+    that — deny-first, root, light-cone walk — is identical, which is the point: a
+    bearer key gets no separate, weaker enforcement path.
     """
     flag_attr = _ACTION_FLAG_MAP.get(action)
     if not flag_attr:
@@ -624,28 +782,28 @@ def check_access(
     if not doc:
         raise HTTPException(status_code=404, detail="Not found")
 
-    if not auth.user_id:
+    is_key = auth.principal_type == "grant_key"
+    # A principal with neither identity holds nothing. Nonexistence and denial return
+    # the same 404 throughout this function — no existence oracle.
+    if not auth.user_id and not is_key:
+        raise HTTPException(status_code=404, detail="Not found")
+    if is_key and not auth.grants:
         raise HTTPException(status_code=404, detail="Not found")
 
-    # ⛔ AN API KEY USED TO INHERIT ITS OWNER'S FULL AUTHORITY.
-    # Grants below resolve against `auth.user_id`, which for an api_key principal
-    # is the OWNING USER — and the key's own scopes were never consulted. So a
-    # read-only integration key handed to a third party carried the owner's
-    # entire CRUDEASIO. The key's scoping was decorative.
-    #
-    # The key is a CEILING, applied before the owner's grant is even looked up:
-    # effective permission = (owner's grant) ∩ (key's scopes). Checked first so a
-    # scope-exceeding call cannot be witnessed as "allowed" by the audit path.
-    _enforce_api_key_ceiling(auth, action)
-
-    # --- Access-audit "force": witness this authorization decision (allow OR deny) ---
+    # --- Access-audit "force": witness this authorization decision (allow or deny) ---
     # Emitted here in the authz layer so auditability is a property of access itself.
     # Wrapped so a failure in the audit path can NEVER deny or break legitimate access.
     _audit_ctx = {
         "via": auth.principal_type,
         "principal_id": auth.principal_id or None,
-        "api_key_id": auth.api_key_id,
+        "grant_key_id": auth.grant_key_id,
         "tenant": auth.authority,
+        # WHICH machine acted for this subject, when one did — the OAuth client id for an
+        # `mcp_client`, the acting server for a delegation. `principal_id` above records
+        # only whose authority was used, and for both of those principal types that is a
+        # person who was not the one making the call. Recorded, never consulted: the
+        # decision below is made against the subject's grants alone.
+        "actor": auth.actor,
     }
 
     def _witness(result: str, reason: Optional[str] = None) -> None:
@@ -655,7 +813,10 @@ def check_access(
             if reason:
                 ctx["reason"] = reason
             audit_service.record_access(
-                principal_id=auth.user_id,
+                # A key acts on its own behalf, not the issuer's. Attributing its
+                # actions to the issuing user would make the audit log say a person
+                # did something a detached credential did.
+                principal_id=auth.user_id or auth.principal_id,
                 artifact_id=artifact_id,
                 action=action,
                 result=result,
@@ -665,9 +826,14 @@ def check_access(
             logger.debug("access witness failed", exc_info=True)
 
     def _check_grants(resource_id: str) -> Optional[GrantEntity]:
-        grants = db_store.get_active_grants_for_principal_resource(
-            store_db, grantee_id=auth.user_id, resource_id=resource_id
-        )
+        if is_key:
+            # Already resolved and masked at authentication — re-querying by grantee
+            # would find the members UNMASKED and hand back more than the bundle allows.
+            grants = [g for g in auth.grants if g.resource_id == resource_id]
+        else:
+            grants = db_store.get_active_grants_for_principal_resource(
+                store_db, grantee_id=auth.user_id, resource_id=resource_id
+            )
         for g in grants:
             if grant_is_deny(g) and getattr(g, flag_attr, False):
                 _witness("denied", "deny_grant")
@@ -683,16 +849,10 @@ def check_access(
         _witness("allowed")
         return direct
 
-    # --- Grant on the artifact's ROOT ---
-    # ⛔ THIS RUNG WAS MISSING. The direct check above uses `artifact_id` (a
-    # VERSION id) and the traversal below starts at `root_id` but only ever
-    # checks that node's PARENTS — so a grant written on `root_id` itself was
-    # never consulted when reading any non-root version. Ownership grants are
-    # written against the root, so the owner of a versioned artifact could be
-    # refused their own artifact.
+    # --- Grant on the artifact's root ---
     #
-    # This is a fail-CLOSED gap (a false denial, not an escalation), which is why
-    # it survived: it degrades availability, not confidentiality.
+    # A false denial here degrades availability, not confidentiality — the gap
+    # fails closed rather than open.
     root_id = doc.get("root_id")
     if root_id and root_id != artifact_id:
         at_root = _check_grants(root_id)
@@ -717,7 +877,17 @@ def check_access(
         if not parent_id or parent_id in visited:
             break
 
-        if propagate_mask is not None and action not in propagate_mask:
+        # The light-cone prune, through the one attenuation operator rather than a second
+        # copy of it. This read `propagate_mask is not None and action not in propagate_mask`
+        # — the same rule `lattice_api.list_origin_descendants` spells out for the DOWNWARD
+        # BFS, written out a second time for the upward walk. `propagates` decodes the column
+        # with `Mask` and asks `allows`; the decoder is proved bit-for-bit equal to the old
+        # expression over every known column shape × every action in
+        # `tests/test_attenuation_algebra.py`, so no stored edge changes meaning. `action` is
+        # already known to be a CRUDEASIO verb (the `_ACTION_FLAG_MAP` guard at the top of
+        # this function), which is the only input on which the two could differ, and there
+        # the new one is the closed direction.
+        if not propagates(propagate_mask, action):
             break
 
         inherited = _check_grants(parent_id)
@@ -741,21 +911,21 @@ def check_inbound_nonce(request: Request, auth: AuthContext) -> None:
 
     Raises 403 if the nonce is absent or invalid.
     """
-    if auth.principal_type != "api_key":
+    if auth.principal_type != "grant_key":
         return
-    key_entity = auth.api_key_entity
-    if not key_entity or not getattr(key_entity, "requires_nonce", False):
+    root = auth.bearer_grant
+    if not root or not getattr(root, "requires_nonce", False):
         return
 
     from mantle.services.auth_service import verify_nonce as _verify_nonce
-    from origin import config
+    from mantle import config
 
     nonce = request.headers.get("X-Agience-Challenge", "")
     if not nonce:
         raise HTTPException(status_code=403, detail="Nonce required for inbound access")
 
     artifact_id = auth.target_artifact_id or ""
-    key_id = auth.api_key_id or ""
+    key_id = auth.grant_key_id or ""
 
     if not _verify_nonce(
         token=nonce,

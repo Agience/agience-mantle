@@ -36,9 +36,14 @@ class MeshNode:
     # -- authoring (a node that is the source-of-record for a region) ----------
     def put_shard(self, region_id: str, items: Dict[str, bytes], *, version: int,
                   authority: str, priv: Ed25519PrivateKey,
-                  consensus: Optional[Dict[str, float]] = None) -> ShardManifest:
+                  attest: Optional[Dict[str, dict]] = None) -> ShardManifest:
+        """Author/refresh a shard this node is authoritative for.
+
+        ``attest`` is ``{artifact_id: {"origin", "channel"}}`` — this authority's own observation of
+        each item, which is what travels (see `manifest.ShardItem`): a constant every node would
+        compute identically is not an observation, so no such weight is published."""
         manifest = sign_manifest(
-            build_manifest(region_id, version, authority, items, consensus), priv)
+            build_manifest(region_id, version, authority, items, attest), priv)
         self._shards[region_id] = {"manifest": manifest, "items": dict(items)}
         return manifest
 

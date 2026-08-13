@@ -20,9 +20,17 @@ AUTHORITY_ISSUER = os.getenv("E2E_AUTHORITY_ISSUER", "http://origin:8080")
 # The init container writes a single-use bootstrap token to
 # <data>/keys/bootstrap.token. When the suite runs on the same host as the
 # compose stack it can read it directly; otherwise pass E2E_BOOTSTRAP_TOKEN.
-_DEFAULT_DATA = (
-    Path(__file__).resolve().parents[2] / "agience-beam" / ".data-local"
+#
+# The stack is `agience-bundle`'s, and its default data root is `.data-local`
+# (`docker-compose.local.yml`: `${LOCAL_DATA:-./.data-local}`). That repo is a
+# SIBLING of this one, so the walk goes up past the mantle repo root:
+# parents[0] = tests/e2e, [1] = tests, [2] = the repo, [3] = the workspace.
+_MANTLE_REPO = Path(__file__).resolve().parents[2]
+assert (_MANTLE_REPO / "src" / "mantle").is_dir(), (
+    "path depth is wrong: parents[2] should be the agience-mantle repo root, got %s"
+    % _MANTLE_REPO
 )
+_DEFAULT_DATA = _MANTLE_REPO.parent / "agience-bundle" / ".data-local"
 DATA_DIR = Path(os.getenv("E2E_DATA_DIR", str(_DEFAULT_DATA)))
 BOOTSTRAP_TOKEN_ENV = os.getenv("E2E_BOOTSTRAP_TOKEN", "")
 
@@ -31,7 +39,7 @@ BOOTSTRAP_TOKEN_ENV = os.getenv("E2E_BOOTSTRAP_TOKEN", "")
 # first-observation (lazy materialization) assertions are meaningful.
 LAZY_INDEX = os.getenv("E2E_LAZY_INDEX", "") not in ("", "0", "false", "False")
 
-# The remote embeddings provider (prism) is usually absent locally; semantic
+# The remote embeddings provider (prism) is absent in a local run; semantic
 # search degrades to lexical. Skip semantic-only assertions unless told.
 HAS_EMBEDDINGS = os.getenv("E2E_HAS_EMBEDDINGS", "") not in ("", "0", "false", "False")
 

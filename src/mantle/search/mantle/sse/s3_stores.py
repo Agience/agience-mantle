@@ -1,21 +1,25 @@
-"""S3-backed :class:`PostingStore` + :class:`StatsStore` adapters (Step 2.6.9).
+"""S3-backed :class:`PostingStore` adapter.
 
-Production wiring of the in-memory stores from :mod:`posting` and
-:mod:`stats`. Encrypted blobs persist in S3 (or any S3-compatible store
-like MinIO) under::
+Production wiring of the in-memory store from :mod:`posting`. Encrypted blobs persist in S3
+(or any S3-compatible store like MinIO) under::
 
     {prefix}/{principal_id}/sse/posting/{blind_token}.enc
     {prefix}/{principal_id}/sse/manifests/{artifact_id}.enc
-    {prefix}/{principal_id}/sse/stats.enc
 
-The adapters are deliberately independent of :mod:`services.content_service`
+A third object used to sit beside them — ``{prefix}/{principal_id}/sse/stats.enc``, the
+per-owner BM25 corpus aggregates — written and read by a stats store this module also carried.
+Recall computes no corpus statistic, so nothing writes or reads it and the adapter is gone.
+The objects an existing bucket already holds are inert: nothing opens them, and nothing here
+deletes them either, because deleting an operator's data is an operator's decision.
+
+The adapter is deliberately independent of :mod:`services.content_service`
 so the MANTLE-SSE package can be wired against any boto3-compatible
-client. Mirror-images of :class:`S3CellStore` for the same reasons.
+client. Mirror-image of :class:`S3CellStore` for the same reasons.
 
 Wire format on disk: the raw bytes returned by :func:`pack_posting` /
-:func:`pack_manifest` / :func:`pack_stats` (`nonce ‖ ciphertext ‖ tag`).
-GCM authentication happens inside the SSE engine on read; these
-adapters are thin dictionaries over S3.
+:func:`pack_manifest` (`nonce ‖ ciphertext ‖ tag`).
+GCM authentication happens inside the SSE reader; this
+adapter is a thin dictionary over S3.
 """
 
 from __future__ import annotations
@@ -194,76 +198,4 @@ class S3PostingStore:
         return keys
 
 
-# ---------------------------------------------------------------------------
-# S3StatsStore
-# ---------------------------------------------------------------------------
-
-
-class S3StatsStore:
-    """:class:`StatsStore` Protocol implementation backed by an S3 bucket.
-
-    Layout::
-
-        {prefix}/{principal_id}/sse/stats.enc
-
-    One blob per owner. Args mirror :class:`S3PostingStore`.
-    """
-
-    def __init__(
-        self,
-        s3_client: object,
-        bucket: str,
-        prefix: str = "mantle-sse",
-    ) -> None:
-        if not bucket:
-            raise ValueError("S3StatsStore: bucket name is required")
-        self._s3 = s3_client
-        self._bucket = bucket
-        self._prefix = prefix.strip("/")
-
-    def _stats_key(self, principal_id: str) -> str:
-        return _join_key(self._prefix, principal_id, "sse", "stats.enc")
-
-    def get(self, principal_id: str) -> Optional[bytes]:
-        key = self._stats_key(principal_id)
-        try:
-            resp = self._s3.get_object(Bucket=self._bucket, Key=key)
-        except Exception as exc:
-            if _is_not_found(exc):
-                return None
-            logger.warning("S3StatsStore get failed for %s: %s", key, exc)
-            raise
-        body = resp.get("Body")
-        if body is None:
-            return None
-        try:
-            return body.read()
-        finally:
-            try:
-                body.close()
-            except Exception:
-                pass
-
-    def put(self, principal_id: str, blob: bytes) -> None:
-        if not isinstance(blob, (bytes, bytearray)):
-            raise TypeError("S3StatsStore.put expects bytes")
-        self._s3.put_object(
-            Bucket=self._bucket,
-            Key=self._stats_key(principal_id),
-            Body=bytes(blob),
-            ContentType="application/octet-stream",
-        )
-
-    def delete(self, principal_id: str) -> None:
-        try:
-            self._s3.delete_object(
-                Bucket=self._bucket, Key=self._stats_key(principal_id),
-            )
-        except Exception as exc:
-            if _is_not_found(exc):
-                return
-            logger.warning("S3StatsStore delete failed for %s: %s", principal_id, exc)
-            raise
-
-
-__all__ = ["S3PostingStore", "S3StatsStore"]
+__all__ = ["S3PostingStore"]

@@ -35,6 +35,12 @@ TYPE_DEFINITION_CONTENT_TYPE = "application/vnd.agience.type+json"
 # MANTLE anchor — a fully-disclosed reference point. The AnchorSet is a
 # collection of these; they are the routing centroids of encrypted search.
 ANCHOR_CONTENT_TYPE = "application/vnd.agience.anchor+json"
+# A credential — an API key, an OAuth client secret, a refresh token. An ordinary
+# artifact: the value is the artifact's CONTENT, so the envelope encrypts it at rest
+# under the origin-root principal and the light cone decides who may read it. There is
+# no second store and no second authorization path. `context` is plaintext, so it
+# carries only the non-secret metadata (provider, kind, label).
+CREDENTIAL_CONTENT_TYPE = "application/vnd.agience.credential+json"
 
 # ---------------------------------------------------------------------------
 # Collection slugs — stable human-readable IDs for idempotent bootstrap lookup
@@ -59,8 +65,8 @@ PEOPLE_COLLECTION_SLUG = "agience-people"
 # seed) and is intentionally NOT user-readable as a collection: users receive
 # resolved types through Mantle's `/types/all` endpoint, not by reading this
 # collection. So it stays out of ALL_PLATFORM_COLLECTION_SLUGS /
-# USER_READABLE_SEED_SLUGS. Servers self-register their types here (push); Mantle
-# loads them at startup so it survives restarts without reaching back to Chorus.
+# USER_READABLE_SEED_SLUGS. Servers push their types here; Mantle loads them at
+# startup, so a restart needs no round trip back to whoever pushed them.
 # Deterministic id — uuid5(instance_namespace, "agience/agience-types").
 TYPES_COLLECTION_SLUG = "agience-types"
 
@@ -71,9 +77,8 @@ ALL_SERVERS_COLLECTION_SLUG = "agience-seeds-all-servers"
 ALL_TOOLS_COLLECTION_SLUG = "agience-seeds-all-tools"
 AGENTS_COLLECTION_SLUG = "agience-seeds-agents"
 
-# LLM_CONNECTIONS_COLLECTION_SLUG removed 2026-07-22 (no-models rule — universal):
-# the collection, its three anthropic connection artifacts and the user-read grant
-# are gone from the seed tree; nothing invokes a model anywhere in the platform.
+# No LLM_CONNECTIONS collection: the no-models rule is universal — nothing invokes
+# a model anywhere in the platform, so no connection artifacts or grant are seeded.
 
 # The shared AnchorSet — a collection whose members are anchor artifacts (the
 # routing centroids of MANTLE encrypted search + grounding for Anchored
@@ -101,11 +106,6 @@ AGENT_ARTIFACT_SLUG_PREFIX = "agience-agent-"
 # The platform MCP server (backend/mcp_server/) is always available.
 # It gets a stable UUID via platform_topology like every other platform entity.
 AGIENCE_CORE_SLUG = "agience-beam"
-
-# Phase 7 — Server Artifact Proxy. First-party MCP servers are seeded as
-# vnd.agience.mcp-server+json artifacts at bootstrap. Slug format: agience-server-{name}
-# (matching the client_id used by platform server credentials).
-SERVER_ARTIFACT_SLUG_PREFIX = "agience-server-"
 
 # ---------------------------------------------------------------------------
 # Agent persona slugs (used to derive artifact slugs)

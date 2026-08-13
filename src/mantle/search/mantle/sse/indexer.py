@@ -1,40 +1,66 @@
-"""SseIndexer — commit-path posting list + manifest + stats updater (Step 2.6.6).
+"""SseIndexer — commit-path posting list + manifest updater.
 
 Mirrors :class:`mantle.search.mantle.indexer.MantleIndexer` for the SSE
 lexical index. Composes:
 
-- :class:`SseKeyProvider` (``.keys``) — derives the owner SSE key. The PROTOCOL, not the
+- :class:`SseKeyProvider` (``.keys``) — derives the owner SSE key. The protocol, not the
   platform's ``OracleService``, which merely satisfies it.
 - :mod:`tokenizer` — analysis pipeline (lowercase → possessive → stop
   → Porter stem)
 - :mod:`blind_tokens` — HMAC-based exact + prefix token generation
 - :mod:`posting` — encrypted posting list + manifest CRUD
-- :mod:`stats` — per-owner BM25 corpus aggregates
-- :class:`PostingStore` + :class:`StatsStore` — abstract storage
+- :class:`PostingStore` — abstract storage
 
-The indexer never touches S3 directly. Production wires up an S3-backed
-``PostingStore`` and ``StatsStore``; tests use the in-memory variants.
+The indexer never touches S3 directly. Production wires up an S3-backed or file-backed
+``PostingStore``; tests use the in-memory variant.
+
+WHAT A POSTING ENTRY CARRIES, AND WHAT IT NO LONGER DOES
+--------------------------------------------------------
+``{"artifact_id", "collection_id", "field"}`` and nothing else. ``tf``, ``dl`` and
+``positions`` were BM25's inputs — term frequency, document length, and token offsets — and
+BM25 is gone: the recall path answers membership and counts how much of a query each artifact
+matched, neither of which reads any of the three. ``positions`` was never read by anything in
+``src/`` even while the scorer existed. The manifest's ``field_dls`` went the same way; it
+existed to roll a document's length contribution back out of the corpus statistics on
+re-index, and there are no corpus statistics.
+
+This is a WIRE-FORMAT SUBTRACTION AND NEEDS NO REINDEX. :func:`posting.deserialize_entries`
+never inspected an entry's keys, and :func:`posting.deserialize_manifest` reads ``tokens`` and
+ignores anything else the object carries — so an existing blob written with the old fields
+still opens, still matches, and simply gets smaller the next time it is written.
 
 API:
 
-- :meth:`index_artifact` — analyze + write posting lists + manifest +
-  stats. Idempotent under re-index: an existing manifest's tokens are
-  diffed against the new set, dropped tokens get the artifact's entry
-  removed, kept/new tokens get an upsert; old corpus stats contribution
-  is subtracted before adding the new one.
-- :meth:`remove_artifact` — read the manifest, evict the artifact's
-  entry from every posting list it appears in, decrement corpus stats,
-  delete the manifest.
+- :meth:`index_artifact` — analyze + write posting lists + manifest. Idempotent under
+  re-index: an existing manifest's tokens are diffed against the new set, dropped tokens get
+  the artifact's entry removed, kept/new tokens get an upsert.
+- :meth:`remove_artifact` — read the manifest, evict the artifact's entry from every posting
+  list it appears in, delete the manifest.
 
 Field naming convention:
 
 - The blind-token API uses single-char field codes (``t`` / ``d`` /
   ``g`` / ``c``).
-- Posting entries, stats, and field_dls use the long-form field names
-  (``"title"`` / ``"description"`` / ``"tags"`` / ``"content"``) — what
-  field-boost presets and downstream callers expect.
+- Posting entries use the long-form field names (``"title"`` / ``"description"`` / ``"tags"``
+  / ``"content"``).
 
 The indexer maps between the two via :data:`_LONG_TO_SHORT`.
+
+Slot binding (AEAD associated data)
+-----------------------------------
+Every blob this module writes is bound to its slot: posting lists with
+:func:`posting.posting_aad` ``(principal, blind_token)``, manifests with
+:func:`posting.manifest_aad` ``(principal, artifact_id)``. The matching reads — here, and in
+:mod:`narrowing` — pass the identical AAD, which is the whole requirement: a blob written
+with an AAD does not open without it.
+
+This needed no reindex. :func:`posting.decrypt_blob` dual-reads — bound AAD first, then
+the legacy unbound form — so every blob written before binding still opens, and each
+binds on its next write. The reads therefore keep ``allow_unbound`` at its default
+``True``. **Do not flip it to False here.** Doing so makes the binding *enforcing*
+rather than merely recorded, which orphans every blob not yet rewritten; it is only
+safe after a completed full reindex, and that is an operational decision made once the
+corpus is known migrated — not a code change to make alongside the wiring.
 
 See ``.dev/features/mantle-sse-lexical-index.md`` § Indexing Flow.
 """
@@ -42,7 +68,7 @@ See ``.dev/features/mantle-sse-lexical-index.md`` § Indexing Flow.
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Mapping
 
 from .blind_tokens import (
     FIELD_CONTENT,
@@ -56,30 +82,24 @@ from .blind_tokens import (
 )
 from .posting import (
     PostingStore,
-    PostingTampered,
     derive_manifest_key,
     derive_posting_key,
+    manifest_aad,
     pack_manifest,
     pack_posting,
+    posting_aad,
     remove_artifact_collection_entries,
     unpack_manifest,
     unpack_posting,
     upsert_entry,
 )
-from . import stats as stats_mod
-from .stats import StatsStore
 from .tokenizer import bigrams as _stem_bigrams, tokenize
-# ⛔ THE KEY CONTRACT, NOT THE CUSTODY IMPLEMENTATION. Importing `..oracle` here pinned the whole
-# encrypted lexical arm service-side (EREA §5): 703 lines of grant verifier, lattice master-key store
-# and CRUDEASIO mint policy, for one method call. `SseKeyProvider` is that one method.
-# `request` stays untyped — it is the PROVIDER's policy object (`oracle.KeyRequest` in the platform),
-# and naming its type here would drag the custody model back across the seam.
 from .keys import SseKeyProvider
 
 logger = logging.getLogger(__name__)
 
 
-# Long-form (BM25 / field-boost-preset) → short-form (blind-token API).
+# Long-form (posting-entry) → short-form (blind-token API).
 _LONG_TO_SHORT = {
     "title": FIELD_TITLE,
     "description": FIELD_DESCRIPTION,
@@ -99,23 +119,24 @@ _PREFIX_LONG_FIELDS = frozenset({
 # ---------------------------------------------------------------------------
 
 
-def _analyze_field(text: str) -> tuple[list[str], dict[str, list[int]]]:
-    """Tokenize one field's text. Returns ``(tokens, term_positions)``.
+def _analyze_field(text: str) -> tuple[list[str], list[str]]:
+    """Tokenize one field's text. Returns ``(tokens, distinct_terms)``.
 
-    ``tokens`` is the analyzed token sequence (post-stem).
-    ``term_positions`` maps each unique stemmed term to the *list* of
-    positions (token indices) where it appears. ``tf`` is implied by
-    ``len(positions[term])``.
+    ``tokens`` is the analyzed token sequence (post-stem), in order, because the bigram pass
+    needs adjacency. ``distinct_terms`` is the same sequence deduplicated, first-occurrence
+    order kept so the written token set does not depend on set iteration.
+
+    A term's POSITIONS are no longer collected. They were computed to derive ``tf`` and to fill
+    a ``positions`` list on the posting entry; nothing reads either — see the module docstring.
+    A membership index needs to know that a term is present, and presence is what a distinct
+    term is.
 
     Empty / whitespace-only text returns empty containers.
     """
     if not text:
-        return [], {}
+        return [], []
     tokens = tokenize(text)
-    positions: dict[str, list[int]] = {}
-    for i, term in enumerate(tokens):
-        positions.setdefault(term, []).append(i)
-    return tokens, positions
+    return tokens, list(dict.fromkeys(tokens))
 
 
 # ---------------------------------------------------------------------------
@@ -130,11 +151,9 @@ class SseIndexer:
         self,
         oracle: SseKeyProvider,
         posting_store: PostingStore,
-        stats_store: StatsStore,
     ) -> None:
         self._oracle = oracle
         self._postings = posting_store
-        self._stats = stats_store
 
     # ------------------------------------------------------------------
     # Public API
@@ -146,7 +165,7 @@ class SseIndexer:
         collection_id: str,
         artifact_id: str,
         fields: Mapping[str, str],
-        request: Any,          # the PROVIDER's policy object (oracle.KeyRequest in the platform)
+        request: Any,          # the provider's policy object (oracle.KeyRequest in the platform)
     ) -> int:
         """Index (or re-index) one artifact. Returns the number of distinct
         blind tokens written / updated.
@@ -155,12 +174,9 @@ class SseIndexer:
         in :data:`_LONG_TO_SHORT` are indexed; others are silently ignored
         (so callers can pass artifact context dicts without filtering).
 
-        Re-index path: if a manifest already exists for the artifact, its
-        prior token list and ``field_dls`` are read, the corpus stats are
-        rolled back to that prior contribution, then the new index state
-        is applied. Tokens that were in the prior set but not the new
-        one have the artifact's entry stripped (and the posting list
-        deleted if it goes empty).
+        Re-index path: if a manifest already exists for the artifact, its prior token list is
+        read and diffed against the new set. Tokens that were in the prior set but not the new
+        one have the artifact's entry stripped (and the posting list deleted if it goes empty).
         """
         if not principal_id:
             raise ValueError("principal_id is required")
@@ -172,55 +188,39 @@ class SseIndexer:
         owner_sse_key = self._oracle.derive_sse_key(principal_id, request)
 
         # ---- 1. Analyze each field -----------------------------------
-        new_field_dls: dict[str, int] = {}
-        # token → posting-entry-shape data (per the spec's wire format)
+        # token → posting-entry-shape data. Three keys; see the module docstring for what the
+        # other three used to be and why their absence needs no reindex.
         new_entries: dict[str, dict] = {}
+
+        def _entry(field_long: str) -> dict:
+            return {
+                "artifact_id": artifact_id,
+                "collection_id": collection_id,
+                "field": field_long,
+            }
 
         for field_long, text in fields.items():
             if field_long not in _LONG_TO_SHORT:
                 continue
-            tokens, term_positions = _analyze_field(text)
-            dl = len(tokens)
-            if dl == 0:
+            tokens, terms = _analyze_field(text)
+            if not tokens:
                 continue
-            new_field_dls[field_long] = dl
             field_short = _LONG_TO_SHORT[field_long]
 
             # Exact tokens: one per unique term.
-            for term, positions in term_positions.items():
-                tok = blind_token(owner_sse_key, field_short, term)
-                new_entries[tok] = {
-                    "artifact_id": artifact_id,
-                    "collection_id": collection_id,
-                    "field": field_long,
-                    "tf": len(positions),
-                    "dl": dl,
-                    "positions": list(positions),
-                }
+            for term in terms:
+                new_entries[blind_token(owner_sse_key, field_short, term)] = _entry(
+                    field_long)
 
-            # Prefix tokens (title + tags only): aggregate tf + positions
-            # across every term sharing each prefix length / prefix string.
+            # Prefix tokens (title + tags only): one per distinct prefix of each length. The
+            # aggregation across terms sharing a prefix used to be a sum of their frequencies;
+            # with nothing to sum, a prefix is present or it is not.
             if field_long in _PREFIX_LONG_FIELDS:
                 for n in PREFIX_LENGTHS:
-                    aggregate: dict[str, list[int]] = {}
-                    for term, positions in term_positions.items():
-                        if len(term) < n:
-                            continue
-                        prefix = term[:n]
-                        aggregate.setdefault(prefix, []).extend(positions)
-                    for prefix, positions in aggregate.items():
-                        positions_sorted = sorted(positions)
-                        tok = prefix_blind_token(
-                            owner_sse_key, field_short, prefix, n,
-                        )
-                        new_entries[tok] = {
-                            "artifact_id": artifact_id,
-                            "collection_id": collection_id,
-                            "field": field_long,
-                            "tf": len(positions_sorted),
-                            "dl": dl,
-                            "positions": positions_sorted,
-                        }
+                    for prefix in {t[:n] for t in terms if len(t) >= n}:
+                        new_entries[
+                            prefix_blind_token(owner_sse_key, field_short, prefix, n)
+                        ] = _entry(field_long)
 
             # Bigram tokens: adjacent stem pairs for phrase-query support.
             # Uses blind_token with a space-joined pair as the "term" key —
@@ -229,27 +229,19 @@ class SseIndexer:
             for bigram in _stem_bigrams(tokens):
                 tok = blind_token(owner_sse_key, field_short, bigram)
                 if tok not in new_entries:
-                    new_entries[tok] = {
-                        "artifact_id": artifact_id,
-                        "collection_id": collection_id,
-                        "field": field_long,
-                        "tf": 1,
-                        "dl": dl,
-                        "positions": [],
-                    }
+                    new_entries[tok] = _entry(field_long)
 
         new_tokens = set(new_entries.keys())
 
         # ---- 2. Read existing manifest (re-index detection) ----------
         manifest_key = derive_manifest_key(owner_sse_key, artifact_id)
-        old_tokens: set[str] = set()
-        old_field_dls: dict[str, int] = {}
         manifest_blob = self._postings.get_manifest(principal_id, artifact_id)
+        old_tokens: set[str] = set()
         if manifest_blob is not None:
-            old_tokens_list, old_field_dls = unpack_manifest(
-                manifest_blob, manifest_key
-            )
-            old_tokens = set(old_tokens_list)
+            old_tokens = set(unpack_manifest(
+                manifest_blob, manifest_key,
+                aad=manifest_aad(principal_id, artifact_id),
+            ))
 
         # ---- 3. Diff: drop tokens that left, upsert tokens that stay/arrive
         dropped = old_tokens - new_tokens
@@ -264,35 +256,27 @@ class SseIndexer:
             )
 
         # ---- 4. Update manifest --------------------------------------
-        if new_tokens or new_field_dls:
+        if new_tokens:
             self._postings.put_manifest(
                 principal_id, artifact_id,
-                pack_manifest(new_tokens, manifest_key, field_dls=new_field_dls),
+                pack_manifest(new_tokens, manifest_key,
+                              aad=manifest_aad(principal_id, artifact_id)),
             )
         else:
             # Empty artifact (no analyzable fields) — drop any stale manifest.
             self._postings.delete_manifest(principal_id, artifact_id)
 
-        # ---- 5. Update corpus stats (subtract old, add new) ----------
-        self._update_stats(
-            principal_id, owner_sse_key,
-            is_reindex=manifest_blob is not None,
-            old_field_dls=old_field_dls, old_tokens=old_tokens,
-            new_field_dls=new_field_dls, new_tokens=new_tokens,
-        )
-
         return len(new_tokens)
 
     def remove_artifact(
         self, principal_id: str, artifact_id: str,
-        request: Any,          # the PROVIDER's policy object (oracle.KeyRequest in the platform)
+        request: Any,          # the provider's policy object (oracle.KeyRequest in the platform)
     ) -> int:
         """Strip every reference to ``artifact_id`` from the SSE index.
 
         Reads the artifact's manifest to find every blind token referencing
         it, evicts the entry from each posting list (deleting the list
-        entirely if it goes empty), decrements corpus stats, and removes
-        the manifest itself.
+        entirely if it goes empty), and removes the manifest itself.
 
         Returns the number of posting lists touched. Returns 0 if no
         manifest exists for this artifact (no-op — already removed or
@@ -307,7 +291,10 @@ class SseIndexer:
         if manifest_blob is None:
             return 0
 
-        old_tokens, old_field_dls = unpack_manifest(manifest_blob, manifest_key)
+        old_tokens = unpack_manifest(
+            manifest_blob, manifest_key,
+            aad=manifest_aad(principal_id, artifact_id),
+        )
 
         touched = 0
         for tok in old_tokens:
@@ -318,13 +305,6 @@ class SseIndexer:
 
         # Drop the manifest itself.
         self._postings.delete_manifest(principal_id, artifact_id)
-
-        # Roll back stats.
-        self._apply_stats_delta(
-            principal_id, owner_sse_key,
-            add_dls=None, add_tokens=None,
-            remove_dls=old_field_dls, remove_tokens=set(old_tokens),
-        )
 
         return touched
 
@@ -339,13 +319,19 @@ class SseIndexer:
         blind_token: str,
         entry: dict,
     ) -> None:
-        """Read-modify-write one posting list with a single entry upsert."""
+        """Read-modify-write one posting list with a single entry upsert.
+
+        Read and write use the SAME slot AAD, which is what makes the read-modify-write
+        safe to bind in place: whatever this read accepted (bound, or legacy unbound via
+        :func:`posting.decrypt_blob`'s dual-read) the write puts back bound.
+        """
         key = derive_posting_key(owner_sse_key, blind_token)
+        aad = posting_aad(principal_id, blind_token)
         blob = self._postings.get_posting(principal_id, blind_token)
-        entries = unpack_posting(blob, key) if blob else []
+        entries = unpack_posting(blob, key, aad=aad) if blob else []
         upsert_entry(entries, entry)
         self._postings.put_posting(
-            principal_id, blind_token, pack_posting(entries, key),
+            principal_id, blind_token, pack_posting(entries, key, aad=aad),
         )
 
     def _strip_entry(
@@ -365,7 +351,8 @@ class SseIndexer:
         if blob is None:
             return False
         key = derive_posting_key(owner_sse_key, blind_token)
-        entries = unpack_posting(blob, key)
+        aad = posting_aad(principal_id, blind_token)
+        entries = unpack_posting(blob, key, aad=aad)
         before = len(entries)
         entries = remove_artifact_collection_entries(
             entries, artifact_id, collection_id,
@@ -374,7 +361,7 @@ class SseIndexer:
             return False
         if entries:
             self._postings.put_posting(
-                principal_id, blind_token, pack_posting(entries, key),
+                principal_id, blind_token, pack_posting(entries, key, aad=aad),
             )
         else:
             self._postings.delete_posting(principal_id, blind_token)
@@ -393,84 +380,18 @@ class SseIndexer:
         if blob is None:
             return False
         key = derive_posting_key(owner_sse_key, blind_token)
-        entries = unpack_posting(blob, key)
+        aad = posting_aad(principal_id, blind_token)
+        entries = unpack_posting(blob, key, aad=aad)
         before = len(entries)
         entries = [e for e in entries if e.get("artifact_id") != artifact_id]
         if len(entries) == before:
             return False
         if entries:
             self._postings.put_posting(
-                principal_id, blind_token, pack_posting(entries, key),
+                principal_id, blind_token, pack_posting(entries, key, aad=aad),
             )
         else:
             self._postings.delete_posting(principal_id, blind_token)
         return True
-
-    def _update_stats(
-        self,
-        principal_id: str,
-        owner_sse_key: bytes,
-        *,
-        is_reindex: bool,
-        old_field_dls: dict[str, int],
-        old_tokens: Iterable[str],
-        new_field_dls: dict[str, int],
-        new_tokens: Iterable[str],
-    ) -> None:
-        """Re-index aware stats update.
-
-        On a fresh index: only ``add_document`` is applied with the new
-        contribution. On a re-index: the prior contribution is subtracted
-        first (using ``old_field_dls`` + ``old_tokens`` from the previous
-        manifest), then the new contribution is added.
-        """
-        self._apply_stats_delta(
-            principal_id, owner_sse_key,
-            add_dls=new_field_dls if (new_field_dls or new_tokens) else None,
-            add_tokens=set(new_tokens) if new_tokens else None,
-            remove_dls=old_field_dls if is_reindex else None,
-            remove_tokens=set(old_tokens) if is_reindex else None,
-        )
-
-    def _apply_stats_delta(
-        self,
-        principal_id: str,
-        owner_sse_key: bytes,
-        *,
-        add_dls: Optional[dict[str, int]],
-        add_tokens: Optional[set[str]],
-        remove_dls: Optional[dict[str, int]],
-        remove_tokens: Optional[set[str]],
-    ) -> None:
-        """Apply an arbitrary remove-then-add delta to the owner's stats blob."""
-        stats_key = stats_mod.derive_stats_key(owner_sse_key)
-        existing = self._stats.get(principal_id)
-        if existing is not None:
-            try:
-                current = stats_mod.unpack_stats(existing, stats_key)
-            except PostingTampered:
-                logger.warning(
-                    "Stats blob for owner %s failed GCM tag — key rotation or data reset; starting fresh",
-                    principal_id,
-                )
-                current = stats_mod.empty_stats()
-        else:
-            current = stats_mod.empty_stats()
-
-        if remove_dls is not None or remove_tokens is not None:
-            stats_mod.remove_document(
-                current,
-                field_dls=remove_dls or {},
-                blind_tokens=remove_tokens or set(),
-            )
-        if add_dls is not None or add_tokens is not None:
-            stats_mod.add_document(
-                current,
-                field_dls=add_dls or {},
-                blind_tokens=add_tokens or set(),
-            )
-
-        self._stats.put(principal_id, stats_mod.pack_stats(current, stats_key))
-
 
 __all__ = ["SseIndexer"]

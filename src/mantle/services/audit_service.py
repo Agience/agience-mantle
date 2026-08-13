@@ -18,11 +18,14 @@ Design goals:
 - **Batched + durable-enough**: a background asyncio task flushes the buffer into the
   ``access_events`` edge collection every ``_FLUSH_INTERVAL_S`` (or when a batch fills),
   and a final synchronous drain runs on shutdown.
-- **Append-only**: no update/delete surface (a per-event hash-chain for tamper-evidence
-  is a tracked follow-up).
+- **Append-only**: no update/delete surface.
 - **Backpressure, never silent**: if the sink can't keep up and the buffer exceeds
   ``_MAX_BUFFER``, the oldest events are dropped and a counter is logged — liveness over
   completeness under overload, surfaced rather than hidden.
+- **Retention is opt-in**: the log is kept indefinitely unless ``MANTLE_AUDIT_RETENTION_DAYS``
+  sets an age bound, in which case the flusher sweeps on a slow cadence. The reasoning for
+  the default, and the fact that events outlive the artifacts they name, is in
+  ``db/audit.py``.
 """
 from __future__ import annotations
 
@@ -43,10 +46,15 @@ _FLUSH_INTERVAL_S = 1.0
 _BATCH = 500
 _MAX_BUFFER = 20000
 
+#: How often the retention sweep runs while an age bound is configured. Retention is measured
+#: in days, so an hourly pass makes the boundary exact to well within its own unit while the
+#: delete stays a rare event on the write lock. With no bound set the sweep is never entered.
+_PRUNE_INTERVAL_S = 3600.0
+
 _buffer: "deque[dict]" = deque()
 _lock = threading.Lock()
 _dropped_total = 0
-_lost_total = 0        # events DRAINED but never written (a failed flush) — see `stats()`
+_lost_total = 0        # events drained but never written (a failed flush) — see `stats()`
 _task: Optional[asyncio.Task] = None
 _stopping = False
 
@@ -94,18 +102,17 @@ def _drain(n: int) -> list:
 
 
 def stats() -> dict:
-    """PUBLISHED counters for health monitoring — the only sanctioned way to read this service.
+    """Published counters for health monitoring — the sanctioned way to read this service.
 
-    `_dropped_total` was already being counted and was published NOWHERE, so backpressure drops were
-    invisible to anything but a log scrape. `lost_total` is its counterpart on the write side. Both
-    are absolute counts of access events this process failed to record:
+    `dropped_total` and `lost_total` are absolute counts of access events this
+    process failed to record:
 
       * `dropped_total` — refused at the door: the buffer was full (backpressure).
       * `lost_total`    — accepted, drained, then the insert failed. Strictly worse: the caller was
                           told the event was recorded.
 
-    Either being non-zero means the audit trail is incomplete, and it is a number rather than a
-    guess about a log line.
+    Either being non-zero means the audit trail is incomplete, as a number rather than
+    a guess from a log line.
     """
     return {
         "pending": pending(),
@@ -122,22 +129,16 @@ def pending() -> int:
 def flush_once(db: Database) -> int:
     """Batch-insert one drained batch of access edges. Returns count written.
 
-    ⚠ **0 does not mean "nothing happened".** It means EITHER the buffer was empty OR the write
-    failed and the batch was lost — the events are drained from the buffer before the insert, so a
-    failure loses them. Both callers below stop their loop on 0, which is correct (do not spin), but
-    it also means a failing flush is indistinguishable from an idle one at the call site, and at
-    shutdown (`drain_and_stop`) it silently abandons whatever is left.
-
-    The loss is therefore COUNTED, not just logged: `stats()["lost_total"]`. Audit is the data
-    structure, not a bolt-on — losing access events without a number attached is the one outcome
-    this service must never have.
+    A failed insert is counted, not just logged: `stats()["lost_total"]`. Losing
+    access events without a number attached is the one outcome this service must
+    never allow.
     """
     global _lost_total
     batch = _drain(_BATCH)
     if not batch:
         return 0
     try:
-        from mantle.db.lattice import audit as _lattice_audit
+        from mantle.db import audit as _lattice_audit
         return _lattice_audit.append_access_events(db.conn, batch)
     except Exception:
         _lost_total += len(batch)
@@ -146,13 +147,35 @@ def flush_once(db: Database) -> int:
         return 0
 
 
+def prune_once(db: Database) -> int:
+    """Apply the configured retention bound. Returns rows deleted; 0 when retention is
+    unlimited, which is the default and issues no statement.
+
+    Best-effort like the flush path: a failed prune is a log line, never a raise into the
+    caller — an audit trail that grows is a worse outcome than one that fails to shrink,
+    but neither may take down the worker."""
+    try:
+        from mantle.db import audit as _lattice_audit
+        return _lattice_audit.prune_access_events(db.conn)
+    except Exception:
+        logger.warning("audit retention prune failed", exc_info=True)
+        return 0
+
+
 async def _flusher(db: Database) -> None:
     logger.info("audit access-log flusher started (interval=%.1fs, batch=%d)", _FLUSH_INTERVAL_S, _BATCH)
+    # Elapsed against the loop clock, not wall time: only the cadence depends on it, and a
+    # monotonic clock cannot be walked backwards by an NTP correction into never sweeping.
+    next_prune = asyncio.get_running_loop().time()
     while not _stopping:
         try:
             # Keep draining while batches are full (catch up under load), then sleep.
             while flush_once(db) >= _BATCH:
                 await asyncio.sleep(0)
+            now = asyncio.get_running_loop().time()
+            if now >= next_prune:
+                next_prune = now + _PRUNE_INTERVAL_S
+                prune_once(db)
         except Exception:
             logger.debug("audit flusher iteration error", exc_info=True)
         await asyncio.sleep(_FLUSH_INTERVAL_S)
@@ -196,11 +219,7 @@ def get_artifact_access_log(
     Reads the persisted collection — events still buffered (< the flush interval)
     are not yet visible, which is acceptable for an audit log (near-real-time).
     """
-    # ⛔ A SECOND-BACKEND BRANCH LIVED BELOW THIS — a raw graph-query string behind
-    # `if MANTLE_DB == "lattice": ... else: <AQL>`. There is one store, so the condition was
-    # always true and the else was unreachable code that still had to be read and maintained.
-    # [John, 2026-07-23: "leave one path. the only path."]
-    from mantle.db.lattice import audit as _lattice_audit
+    from mantle.db import audit as _lattice_audit
     try:
         return _lattice_audit.access_log_of(
             db.conn, artifact_id, limit=limit, offset=offset, result=result)

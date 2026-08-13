@@ -1,11 +1,11 @@
-"""Encrypted posting-list manager for MANTLE-SSE (Step 2.6.3).
+"""Encrypted posting-list manager for MANTLE-SSE.
 
 A *posting list* is the encrypted unit of lexical storage: one blob per
 ``(principal_id, blind_token)``. Each posting list holds the entries for every
 artifact whose tokenized text — under the blind token's implicit
 ``(field, term)`` — produces that token. The S3 backing store sees only
-opaque hex-named blobs; plaintext terms never leave the indexer / query
-engine.
+opaque hex-named blobs; plaintext terms never leave the indexer / the
+narrowing.
 
 Wire format (binary, AES-256-GCM, mirrors ``cell.py``):
 
@@ -13,18 +13,24 @@ Wire format (binary, AES-256-GCM, mirrors ``cell.py``):
 
 Cell plaintext is canonical JSON (sorted keys, no whitespace) of either:
 
-- a posting list — ``{"entries": [<PostingEntry>, ...]}``
+- a posting list — ``{"entries": [<PostingEntry>, ...]}``, where a ``PostingEntry`` is
+  ``{"artifact_id", "collection_id", "field"}``
 - an artifact manifest — ``{"tokens": [<blind_token>, ...]}``
+
+Neither reader inspects the keys it is not asking for: :func:`deserialize_entries` hands an
+entry back whole, and :func:`deserialize_manifest` reads ``tokens`` and ignores the rest. That
+is what lets the entry and manifest shapes SHRINK — ``tf`` / ``dl`` / ``positions`` /
+``field_dls`` are gone with BM25 — without a reindex. Blobs written under the old shape still
+open, still match, and get smaller on their next write.
 
 Per-token / per-manifest keys are derived deterministically from the
 owner's SSE key via HKDF with distinct ``info`` prefixes
 (``"posting:<token>"`` vs ``"manifest:<artifact_id>"``) so the two key
 trees stay independent.
 
-This module knows nothing about S3, the indexer, or the query engine — by
-design. The :class:`PostingStore` Protocol is the storage boundary; an
-S3-backed implementation will live in ``mantle/search/mantle/wiring.py``
-alongside the existing ``S3CellStore``.
+This module knows nothing about S3, the indexer, or the narrowing — by
+design. The :class:`PostingStore` Protocol is the storage boundary; the
+S3-backed implementation lives in ``mantle/search/mantle/sse/s3_stores.py``.
 
 See ``.dev/features/mantle-sse-lexical-index.md`` § Posting List Contents
 and § Deletion / Revocation.
@@ -65,6 +71,38 @@ _HKDF_SALT_V1 = b"agience-mantle-sse-posting-v1"
 # or UUID). Both ids are fixed-length so length-prefixing isn't needed.
 _INFO_PREFIX_POSTING = b"posting:"
 _INFO_PREFIX_MANIFEST = b"manifest:"
+
+# ---------------------------------------------------------------------------
+# AEAD associated data — slot binding
+#
+# STATUS: wired. Every write path binds — ``sse/indexer.py`` passes
+# :func:`posting_aad` on posting blobs and :func:`manifest_aad` on manifests, and
+# ``sse/narrowing.py`` passes the same on the read side. The ``aad=`` parameters below
+# still default to None
+# because this module is a primitive: a caller that has no slot to name must be able
+# to say so, and the default is what the pre-binding corpus was written with.
+#
+# What CAN be bound here, and what cannot:
+#
+#   posting list   (principal_id, blind_token)   ← bindable
+#   manifest       (principal_id, artifact_id)   ← bindable
+#   collection                                   ← NOT bindable at this layer
+#
+# A posting list is multi-collection BY CONSTRUCTION: its unique key is
+# ``(artifact_id, collection_id)`` (see :func:`upsert_entry`), so one blob holds
+# entries for every collection that contains the term. There is no single
+# collection to bind, which is why cross-collection separation on the read path
+# is a plaintext post-filter and not a tag check. Making it cryptographic would
+# mean sharding posting lists per collection — a different index shape and a full
+# reindex, not an AAD change.
+#
+# So the binding this layer can add is over the SLOT, which HKDF already binds
+# into the key (``info="posting:<blind_token>"`` over a per-principal SSE key).
+# The AAD is therefore defence in depth — it makes a slot mix-up fail on the tag
+# even if a key-derivation bug ever handed back the wrong key — not new
+# separation. That is worth having and worth being honest about.
+_AAD_PREFIX_POSTING = b"sse-posting-aad-v1:"
+_AAD_PREFIX_MANIFEST = b"sse-manifest-aad-v1:"
 
 
 # ---------------------------------------------------------------------------
@@ -174,24 +212,84 @@ def _hkdf(*, ikm: bytes, info: bytes) -> bytes:
 # Encrypt / decrypt primitives (mirror cell.py)
 # ---------------------------------------------------------------------------
 
-def encrypt_blob(plaintext: bytes, key: bytes) -> bytes:
+def posting_aad(principal_id: str, blind_token: str) -> bytes:
+    """AEAD associated data binding a posting blob to its ``(principal, token)`` slot.
+
+    Wired at both call sites — ``sse/indexer.py`` binds on write and read, ``sse/narrowing.py``
+    binds on read. A blob written with an AAD does not open without it, so the two move
+    together; see the note beside :data:`_AAD_PREFIX_POSTING` for what the binding does and
+    does not separate.
+
+    The corpus is read in DUAL-READ. :func:`decrypt_blob` tries the bound AAD first and
+    falls back to the legacy unbound form, so blobs written before binding keep opening
+    and each is bound on its next write. ``allow_unbound=True`` is the reader default and
+    stays that way: with it, an unbound blob still opens; without it, an unbound blob is
+    indistinguishable from a tampered one.
+
+    Flipping ``allow_unbound=False`` is an OPERATIONAL decision, not a code change to make
+    casually. It is correct only once a reindex has completed on the store being read —
+    every posting list, manifest and stats blob rewritten — because from that moment any
+    unbound blob really is anomalous. Flipped early it converts "written before binding"
+    into :class:`PostingTampered`, i.e. a search that reports nothing found over an index
+    that is intact. SSE data is rebuildable by reindex, so the migration is available; what
+    is not available is knowing it finished from inside this module.
+
+    The principal id is length-prefixed so ``(p, t)`` cannot be re-partitioned
+    into a different pair with the same encoding.
+    """
+    if not principal_id:
+        raise ValueError("posting_aad requires a non-empty principal_id")
+    _validate_blind_token(blind_token)
+    return _AAD_PREFIX_POSTING + (
+        f"{len(principal_id.encode('utf-8'))}:{principal_id}:{blind_token}"
+    ).encode("utf-8")
+
+
+def manifest_aad(principal_id: str, artifact_id: str) -> bytes:
+    """AEAD associated data binding a manifest blob to its ``(principal, artifact)``
+    slot. Wired the same way and read under the same dual-read as :func:`posting_aad`."""
+    if not principal_id:
+        raise ValueError("manifest_aad requires a non-empty principal_id")
+    _validate_artifact_id(artifact_id)
+    return _AAD_PREFIX_MANIFEST + (
+        f"{len(principal_id.encode('utf-8'))}:{principal_id}:{artifact_id}"
+    ).encode("utf-8")
+
+
+def encrypt_blob(plaintext: bytes, key: bytes, *,
+                 aad: Optional[bytes] = None) -> bytes:
     """Encrypt ``plaintext`` under a 256-bit AES-GCM key.
 
     Returns ``nonce ‖ ciphertext ‖ tag``. A fresh 96-bit nonce is drawn from
     ``os.urandom`` for every call — never reuse a (key, nonce) pair.
+
+    ``aad`` binds the blob to its slot — build it with :func:`posting_aad` /
+    :func:`manifest_aad`, as every write path in ``sse/`` does. It defaults to ``None``
+    because this is the primitive rather than a slot-aware caller; ``None`` is also the
+    wire form the pre-binding corpus was written in, which is what
+    :func:`decrypt_blob`'s dual-read still opens.
     """
     _validate_aead_key(key)
     aead = AESGCM(key)
     nonce = os.urandom(_NONCE_BYTES)
-    return nonce + aead.encrypt(nonce, plaintext, associated_data=None)
+    return nonce + aead.encrypt(nonce, plaintext, associated_data=aad)
 
 
-def decrypt_blob(blob: bytes, key: bytes) -> bytes:
+def decrypt_blob(blob: bytes, key: bytes, *,
+                 aad: Optional[bytes] = None,
+                 allow_unbound: bool = True) -> bytes:
     """Decrypt a blob produced by :func:`encrypt_blob`.
 
-    Raises :class:`PostingTampered` on GCM tag failure (wrong key or
-    modified ciphertext). Raises :class:`PostingMalformed` if the blob
-    is shorter than the nonce + tag overhead.
+    Raises :class:`PostingTampered` on GCM tag failure (wrong key, modified
+    ciphertext, or — once ``aad`` is supplied — the wrong slot). Raises
+    :class:`PostingMalformed` if the blob is shorter than the nonce + tag
+    overhead.
+
+    **Dual-read.** When ``aad`` is supplied and does not authenticate, an
+    unbound (``associated_data=None``) attempt follows, so blobs written before
+    slot binding was enabled still open. Pass ``allow_unbound=False`` to drop
+    that fallback once a corpus is known fully migrated — at which point the
+    binding becomes enforcing rather than merely recorded.
     """
     _validate_aead_key(key)
     if len(blob) < _NONCE_BYTES + _GCM_TAG_BYTES:
@@ -199,11 +297,22 @@ def decrypt_blob(blob: bytes, key: bytes) -> bytes:
 
     nonce = blob[:_NONCE_BYTES]
     ciphertext_and_tag = blob[_NONCE_BYTES:]
+    aead = AESGCM(key)
     try:
-        return AESGCM(key).decrypt(nonce, ciphertext_and_tag, associated_data=None)
+        return aead.decrypt(nonce, ciphertext_and_tag, associated_data=aad)
+    except InvalidTag as exc:
+        if aad is None or not allow_unbound:
+            raise PostingTampered(
+                "posting GCM tag failed — wrong key, modified ciphertext"
+                + (", or wrong slot" if aad is not None else "")
+            ) from exc
+    try:
+        # Legacy: written before slot binding. Decrypt-only — writes always bind.
+        return aead.decrypt(nonce, ciphertext_and_tag, associated_data=None)
     except InvalidTag as exc:
         raise PostingTampered(
-            "posting GCM tag failed — wrong key or modified ciphertext"
+            "posting GCM tag failed under both the bound and the legacy unbound "
+            "associated data — wrong key, modified ciphertext, or wrong slot"
         ) from exc
 
 
@@ -250,59 +359,68 @@ def deserialize_entries(plaintext: bytes) -> List[dict]:
     return entries
 
 
-def pack_posting(entries: List[dict], key: bytes) -> bytes:
-    """Serialize + encrypt in one call. Returns the at-rest blob."""
-    return encrypt_blob(serialize_entries(entries), key)
+def pack_posting(entries: List[dict], key: bytes, *,
+                 aad: Optional[bytes] = None) -> bytes:
+    """Serialize + encrypt in one call. Returns the at-rest blob.
+
+    ``aad``: build it with :func:`posting_aad`, as ``sse/indexer.py`` does on every
+    write. Optional at this layer — the primitive does not require a slot — but a blob
+    packed unbound is one more blob the dual-read has to carry."""
+    return encrypt_blob(serialize_entries(entries), key, aad=aad)
 
 
-def unpack_posting(blob: bytes, key: bytes) -> List[dict]:
-    """Decrypt + deserialize. Inverse of :func:`pack_posting`."""
-    return deserialize_entries(decrypt_blob(blob, key))
+def unpack_posting(blob: bytes, key: bytes, *,
+                   aad: Optional[bytes] = None,
+                   allow_unbound: bool = True) -> List[dict]:
+    """Decrypt + deserialize. Inverse of :func:`pack_posting`.
+
+    Authentication happens first: a wrong ``aad`` raises before
+    :func:`deserialize_entries` ever sees a byte."""
+    return deserialize_entries(
+        decrypt_blob(blob, key, aad=aad, allow_unbound=allow_unbound))
 
 
 # ---------------------------------------------------------------------------
-# Manifest serialization (per-artifact tracker — tokens + field_dls)
+# Manifest serialization (per-artifact tracker — the blind tokens an artifact wrote)
 # ---------------------------------------------------------------------------
 
-def serialize_manifest(
-    blind_tokens: Iterable[str],
-    *,
-    field_dls: Optional[dict[str, int]] = None,
-) -> bytes:
+def serialize_manifest(blind_tokens: Iterable[str]) -> bytes:
     """Encode an artifact's manifest as canonical JSON.
 
     Wire shape::
 
-        {"tokens": ["<bt1>", ...], "field_dls": {"title": 6, ...}}
+        {"tokens": ["<bt1>", ...]}
 
     Tokens are de-duplicated and sorted so the on-disk representation is
     stable — useful for cache fingerprinting and for diffing manifests
-    during incremental updates. ``field_dls`` carries the per-field
-    document length (token count) the artifact was indexed at; the
-    indexer needs it on re-index to subtract the old document's
-    contribution from corpus stats before adding the new one.
+    during incremental updates. This is the shape the doc spec ("§ Deletion / Revocation")
+    describes: a flat list of blind tokens, and the one read revocation and re-index both need.
 
-    The doc spec ("§ Deletion / Revocation") describes the manifest as a
-    flat list of blind tokens. We enrich it here so a single read
-    suffices for both revocation (read tokens, scan posting lists) and
-    re-index (read tokens + field_dls, undo old stats contribution).
+    ``field_dls`` USED TO RIDE HERE. It carried the per-field document length the artifact was
+    indexed at, so the indexer could subtract the old document's contribution from the BM25
+    corpus statistics before adding the new one. There are no corpus statistics, so there is
+    nothing to subtract and nothing to carry. Its removal is pure subtraction on the wire:
+    :func:`deserialize_manifest` reads ``tokens`` and ignores every other key, so a manifest
+    written with ``field_dls`` still opens and still yields the same token list — it just
+    stops carrying the field the next time it is written. No reindex.
     """
     deduped = sorted({str(t) for t in blind_tokens if t})
-    dls = {str(k): int(v) for k, v in (field_dls or {}).items() if v}
-    payload = {"tokens": deduped, "field_dls": dls}
+    payload = {"tokens": deduped}
     # ensure_ascii=False per RFC 8785 — see the note in `search/mantle/cell.py`. Read back by
-    # `deserialize_manifest` via `json.loads`, so blobs written before this change still decode.
+    # `deserialize_manifest` via `json.loads`.
     return json.dumps(payload, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False).encode("utf-8")
 
 
-def deserialize_manifest(plaintext: bytes) -> tuple[List[str], dict[str, int]]:
+def deserialize_manifest(plaintext: bytes) -> List[str]:
     """Decode a manifest produced by :func:`serialize_manifest`.
 
-    Returns ``(tokens, field_dls)`` where tokens is a sorted list of
-    unique blind tokens and field_dls is the per-field document length
-    dict (may be empty for legacy manifests written before the field was
-    added). Raises :class:`PostingMalformed` if the JSON shape is wrong.
+    Returns the list of blind tokens. Raises :class:`PostingMalformed` if the JSON is not an
+    object or does not carry a ``tokens`` list.
+
+    ANY OTHER KEY IS IGNORED, which is what makes dropping ``field_dls`` a format change
+    needing no reindex: an older manifest carries it, this reads past it, and the token list —
+    the only thing the indexer and the deletion path ever wanted — is unchanged.
     """
     try:
         payload = json.loads(plaintext.decode("utf-8"))
@@ -320,38 +438,32 @@ def deserialize_manifest(plaintext: bytes) -> tuple[List[str], dict[str, int]]:
         raise PostingMalformed(
             f"manifest payload missing list 'tokens', got {type(tokens_raw).__name__}"
         )
-    tokens = [str(t) for t in tokens_raw]
-    dls_raw = payload.get("field_dls", {})
-    if not isinstance(dls_raw, dict):
-        raise PostingMalformed(
-            f"manifest payload 'field_dls' must be an object, "
-            f"got {type(dls_raw).__name__}"
-        )
-    try:
-        field_dls = {str(k): int(v) for k, v in dls_raw.items()}
-    except (TypeError, ValueError) as exc:
-        raise PostingMalformed(
-            f"manifest 'field_dls' contains non-integer values: {exc}"
-        ) from exc
-    return tokens, field_dls
+    return [str(t) for t in tokens_raw]
 
 
 def pack_manifest(
     blind_tokens: Iterable[str],
     key: bytes,
     *,
-    field_dls: Optional[dict[str, int]] = None,
+    aad: Optional[bytes] = None,
 ) -> bytes:
-    """Serialize + encrypt a manifest in one call."""
-    return encrypt_blob(serialize_manifest(blind_tokens, field_dls=field_dls), key)
+    """Serialize + encrypt a manifest in one call.
+
+    ``aad``: build it with :func:`manifest_aad`, as ``sse/indexer.py`` does on every
+    write. Optional at this layer for the same reason as :func:`pack_posting`."""
+    return encrypt_blob(serialize_manifest(blind_tokens), key, aad=aad)
 
 
-def unpack_manifest(blob: bytes, key: bytes) -> tuple[List[str], dict[str, int]]:
+def unpack_manifest(blob: bytes, key: bytes, *,
+                    aad: Optional[bytes] = None,
+                    allow_unbound: bool = True) -> List[str]:
     """Decrypt + deserialize a manifest. Inverse of :func:`pack_manifest`.
 
-    Returns ``(tokens, field_dls)``.
+    Returns the token list. Authentication happens first: a wrong ``aad`` raises before
+    :func:`deserialize_manifest` ever sees a byte.
     """
-    return deserialize_manifest(decrypt_blob(blob, key))
+    return deserialize_manifest(
+        decrypt_blob(blob, key, aad=aad, allow_unbound=allow_unbound))
 
 
 # ---------------------------------------------------------------------------
@@ -430,17 +542,28 @@ class PostingStore(Protocol):
     """Encrypted posting-list + manifest storage.
 
     The indexer writes both posting lists and per-artifact manifests; the
-    query engine reads only posting lists; the deletion path reads manifests
+    narrowing reads only posting lists; the deletion path reads manifests
     to find every posting list referencing the artifact, then rewrites each.
 
     Production S3 layout:
       ``{tenant}/{principal_id}/sse/posting/{blind_token}.enc``
       ``{tenant}/{principal_id}/sse/manifests/{artifact_id}.enc``
+
+    **`get_posting` should be safe to call concurrently from several threads.** A recall needs
+    one posting list per (term × field) and they are independent blobs, so nothing about them
+    forces a serial read; the reader that fanned them out across a thread pool went with the
+    BM25 path, and :class:`~.narrowing.TokenNarrower` issues them serially today. An
+    implementation that shares mutable state across calls — a cursor, a buffer, a
+    non-thread-safe client — must still guard it, because that is what makes fanning them out
+    again a change to one caller rather than to every store.
+    :class:`InMemoryPostingStore` holds an ``RLock`` for exactly this reason, and a boto3 client
+    is already safe for concurrent operations.
     """
 
     # Posting-list operations
     def get_posting(self, principal_id: str, blind_token: str) -> Optional[bytes]:
-        """Return the encrypted posting blob, or None."""
+        """Return the encrypted posting blob, or None. Concurrency-safe — see the class
+        docstring."""
 
     def put_posting(self, principal_id: str, blind_token: str, blob: bytes) -> None:
         """Persist (or overwrite) the posting blob."""
@@ -510,6 +633,9 @@ __all__ = [
     # Key derivation
     "derive_manifest_key",
     "derive_posting_key",
+    # Slot binding (AEAD associated data) — wired on every write path
+    "manifest_aad",
+    "posting_aad",
     # Crypto primitives
     "decrypt_blob",
     "encrypt_blob",

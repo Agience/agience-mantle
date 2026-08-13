@@ -107,11 +107,10 @@ class TestStripPossessive:
 
 
 class TestNoStopWordList:
-    """FAILURE MODE: a stop-list asserts by hand that a fixed set of words carries no
-    information, and it is the kind of thing that gets quietly reintroduced. Removed
-    2026-07-30 [John: "we shouldnt have a stopword list. that's a bogus algorithm in itself."]
-    — the corpus measures information (IDF), and BM25 already discounts common terms by
-    construction. There must be no list left to import."""
+    """No stop-word list exists in this module: a hand-asserted list of words that carries no
+    information is the kind of thing that gets quietly reintroduced, and the corpus already
+    measures information by other means — IDF, and BM25 discounts common terms by construction.
+    There must be no list left to import."""
 
     def test_no_stop_word_symbols_survive(self) -> None:
         from mantle.search.mantle.sse import tokenizer as _tk
@@ -295,7 +294,7 @@ class TestTokenize:
         assert tokenize("The quick brown fox") == ["the", "quick", "brown", "fox"]
 
     def test_keeps_common_words(self) -> None:
-        # Formerly `test_drops_stop_words`, asserting `== []`.
+        # No stop-word stage: common words are kept as tokens.
         assert tokenize("the and of with") == ["the", "and", "of", "with"]
 
     def test_strips_possessives(self) -> None:

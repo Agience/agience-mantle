@@ -1,20 +1,11 @@
-"""Mantle's data layer over the LATTICE — the store, not a surface over one.
+"""Mantle's data layer over the lattice — the store itself, not a surface over one.
 
-**MANTLE IS THE STANDALONE DB**: one SQLite file + FS-CAS content, opened in-process. Zero external
-DB processes.
+Mantle is the standalone database: one SQLite file plus FS-CAS content, opened in-process, with
+no external DB process.
 
-⚠ THIS MODULE'S HEADER USED TO DESCRIBE IT AS A COMPATIBILITY SURFACE — "lets the routers flip
-`import db.lattice as lattice` -> `import db.lattice_api as lattice` with call sites unchanged: same
-function names, same signatures". That framing was true during the flip and is now actively
-misleading: there is nothing to be compatible WITH. The function names and `db`-first signatures are
-simply this layer's shape, and where they still read as somebody else's they should be changed on
-their own merits, not preserved for a caller that no longer exists.
-[John, 2026-07-23: "leave one path. the only path. No constants, no fitting. no forcing."]
-
-Two behaviours remain deliberately deferred, and they are gaps, not compatibility:
-`_emit_artifact_change` (the change-event wire the stream router reads) and per-principal inline
-content encryption — the lattice keys content on the collection origin-root (`FileContentCache`,
-P9.3), and reconciling the two is §6d gap 4.
+Two behaviours are deliberately deferred: `_emit_artifact_change` (the change-event wire the
+stream router reads) and per-principal inline content encryption — the lattice keys content on
+the collection origin-root (`FileContentCache`, P9.3), and reconciling the two is §6d gap 4.
 """
 from __future__ import annotations
 
@@ -23,10 +14,28 @@ import logging
 import os
 from typing import Any, Dict, Optional, Type, TypeVar
 
+#: The one attenuation operator's column form. Safe to import at module scope from the data
+#: layer: `mantle.attenuation` is stdlib-only and imports nothing else in `mantle` — that
+#: dependency floor exists precisely so the enforcement points below the service layer can
+#: reach it. Aliased with a leading underscore so it does not join this module's public
+#: surface (`__all__`).
+from mantle.attenuation import propagates as _propagates
+
+#: Where the store lives when nobody says — `<BASE_DIR>/.data/mantle-lattice.db`, absolute.
+#: `mantle.config` is stdlib-only and imports nothing else in `mantle`, the same floor
+#: `mantle.attenuation` sits on, so the embeddable surface can reach it. Re-exported (not
+#: re-spelled) because `db/backend.py` needs the same answer: one constant, two readers.
+from mantle.config import DEFAULT_LATTICE_PATH  # noqa: F401  (re-export for db.backend)
+
 try:                                    # both path styles, like the rest of the lattice package
-    from mantle.db.lattice import open_lattice
+    from mantle.db import open_lattice
 except ImportError:                     # mantle dir itself on the path
-    from mantle.db.lattice import open_lattice
+    from mantle.db import open_lattice
+
+#: The one reading of a doc that carries no `state` — see `db/constants.STATE_WHEN_ABSENT`. The
+#: lineage predicates below match on it rather than on `doc.get("state")` so a stateless doc is
+#: resolved the same way here, in the entity layer, and in the index segment map.
+from mantle.db.constants import state_of
 
 try:
     from mantle.entities.artifact import Artifact as ArtifactEntity
@@ -41,7 +50,7 @@ except ImportError:
 T = TypeVar("T")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ordering keys — ported VERBATIM from db.store (pure math; no store in them).
+# Ordering keys — ported verbatim from db.store (pure math; no store in them).
 # ─────────────────────────────────────────────────────────────────────────────
 _ALPH = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
@@ -99,20 +108,20 @@ class LatticeDatabase:
 def open_database(path: Optional[str] = None, *, origin: Optional[str] = None) -> LatticeDatabase:
     """Open (or create) standalone Mantle's database. Env-configurable, zero external processes.
 
-    ⛔ SAY WHICH STORE WAS OPENED, ALWAYS. The default is the RELATIVE path `mantle-lattice.db`, so
-    an unset `MANTLE_LATTICE_PATH` silently opens — or CREATES — a store in whatever the working
-    directory happens to be. Measured 2026-07-31: mantle ran from the runtime dir, minted a 4 KB
-    `agience-home/mantle-lattice.db`, and reported "Found 5 artifacts to reindex" while the real
-    5.8 GB / 2.15 M-vertex store sat untouched on `D:`. Nothing errored, because a store with 5
-    artifacts in it is a perfectly valid store.
-
-    The startup log named the encryption key, the nonce secret, the issuer and all three URIs — and
-    never the one path that decides what this node actually serves. That absence is what made the
-    fault invisible; the log now carries it, absolute and resolved.
+    The startup log always names the resolved, absolute database path alongside the encryption
+    key, nonce secret, issuer, and URIs it already logs — the path that decides what this node
+    actually serves is as visible at boot as everything else that matters.
     """
-    raw = path or os.getenv("MANTLE_LATTICE_PATH", "mantle-lattice.db")
+    raw = path or os.getenv("MANTLE_LATTICE_PATH", str(DEFAULT_LATTICE_PATH))
     resolved = os.path.abspath(os.path.expanduser(str(raw)))
     origin = origin or os.getenv("MANTLE_ORIGIN") or os.getenv("EMBER_NODE_ID") or "mantle"
+
+    if raw == str(DEFAULT_LATTICE_PATH):
+        # The default names a directory nobody has necessarily created yet — `.data/` is runtime
+        # state, not a checked-in directory. SQLite will not create it, and the failure is an
+        # opaque "unable to open database file". A caller who supplied a path gets no such
+        # courtesy: a typo there should surface as a missing directory, not become one.
+        os.makedirs(os.path.dirname(resolved), exist_ok=True)
 
     exists = os.path.exists(resolved)
     size = os.path.getsize(resolved) if exists else 0
@@ -120,11 +129,14 @@ def open_database(path: Optional[str] = None, *, origin: Optional[str] = None) -
         "lattice store: %s (%s, %.1f MB) origin=%s  [MANTLE_LATTICE_PATH=%s]",
         resolved, "existing" if exists else "NEW — will be created",
         size / 1048576.0, origin, os.getenv("MANTLE_LATTICE_PATH") or "<unset, using default>")
-    if not os.getenv("MANTLE_LATTICE_PATH"):
+    # Only when the DEFAULT is what opened — a caller that passed `path` said which store it
+    # meant, and an env var it never consulted is not news.
+    if not path and not os.getenv("MANTLE_LATTICE_PATH"):
         logging.getLogger("mantle.db").warning(
-            "MANTLE_LATTICE_PATH is unset — falling back to the relative default %r, which resolves "
-            "against the CURRENT WORKING DIRECTORY (%s). If that is not the store you meant, this "
-            "node will come up healthy and serve an empty universe.", raw, os.getcwd())
+            "MANTLE_LATTICE_PATH is unset — falling back to the install-root default %s. It does "
+            "not follow the working directory, so it is the same store from wherever this node is "
+            "started; if it is not the store you meant, this node will come up healthy and serve "
+            "an empty universe.", resolved)
     return LatticeDatabase(resolved, origin=origin)
 
 
@@ -141,10 +153,9 @@ def _strip_nones(obj: Any) -> Any:
 
 def to_lattice_doc(entity: Any) -> Dict[str, Any]:
     """Entity → lattice doc. Mirrors `to_store_doc` minus the `_key` rename. Artifact content is
-    envelope-encrypted at this boundary via the SHARED `db.doc_boundary` implementation — same
-    MEC1 wire format and origin-root key principal as the store path, so the flip changes the
-    store, never the security posture. (Externalizing content to the encrypted FS-CAS
-    (`FileContentCache`) is the follow-on; it changes this boundary's internals only.)"""
+    envelope-encrypted at this boundary via the shared `db.doc_boundary` implementation — same
+    MEC1 wire format and origin-root key principal as the store path, so the security posture is
+    independent of which store is in use."""
     ent_type = getattr(entity, "PREFIX", None)
     if hasattr(entity, "to_dict") and callable(entity.to_dict):
         doc = entity.to_dict()
@@ -180,13 +191,8 @@ def from_lattice_doc(raw: Optional[Dict[str, Any]], cls: Type[T]) -> Optional[T]
 # Artifact CRUD — same names + `db`-first signatures as db.store
 # ─────────────────────────────────────────────────────────────────────────────
 def _stamp_origin_root(db: LatticeDatabase, entity: ArtifactEntity) -> None:
-    """Stamp `origin_root` by INHERITING it from the parent collection (store-identical).
-
-    ⛔ AN EARLIER DRAFT SELF-ROOTED CHILDREN (`root_id or id`). That silently gave every child its
-    OWN key principal — content encrypted under a fresh principal no grant reaches, so the very
-    first router-path artifact write was GrantDenied. The principal must be the COLLECTION's
-    immutable origin root (single point-read; a legacy unstamped parent falls back to the one-time
-    lineage walk). A top-level artifact IS its own root."""
+    """Stamp `origin_root` by inheriting it from the parent collection (store-identical), falling
+    back to a one-time lineage walk for a legacy parent. A top-level artifact is its own root."""
     if getattr(entity, "origin_root", None):
         return
     collection_id = getattr(entity, "collection_id", None)
@@ -255,7 +261,7 @@ def get_draft_artifact(db: LatticeDatabase, root_id: str,
                        collection_id: str) -> Optional[ArtifactEntity]:
     """Return the single draft record for (root_id, collection_id) if any."""
     for doc in _versions(db, root_id):
-        if doc.get("state") == "draft" and doc.get("collection_id") == collection_id:
+        if state_of(doc) == "draft" and doc.get("collection_id") == collection_id:
             return from_lattice_doc(doc, ArtifactEntity)
     return None
 
@@ -264,7 +270,7 @@ def get_latest_committed_artifact(db: LatticeDatabase, root_id: str,
                                   collection_id: Optional[str] = None) -> Optional[ArtifactEntity]:
     """Newest committed version for *root_id* (optionally restricted to a collection)."""
     for doc in reversed(_versions(db, root_id)):                 # newest first in proper time
-        if doc.get("state") != "committed":
+        if state_of(doc) != "committed":
             continue
         if collection_id and doc.get("collection_id") != collection_id:
             continue
@@ -272,18 +278,118 @@ def get_latest_committed_artifact(db: LatticeDatabase, root_id: str,
     return None
 
 
+def _current_in(docs: list, collection_id: str) -> Optional[Dict[str, Any]]:
+    """The current doc for one collection out of an ALREADY-FETCHED lineage: the draft if one
+    exists, else the newest committed version in that collection.
+
+    Split out from `get_current_in_collection` so a caller asking the same question of several
+    collections pays for the lineage once. Same predicates, same proper-time ordering."""
+    for doc in docs:
+        if state_of(doc) == "draft" and doc.get("collection_id") == collection_id:
+            return doc
+    for doc in reversed(docs):                                   # newest first in proper time
+        if state_of(doc) == "committed" and doc.get("collection_id") == collection_id:
+            return doc
+    return None
+
+
 def get_current_in_collection(db: LatticeDatabase, collection_id: str,
                               root_id: str) -> Optional[ArtifactEntity]:
     """The *current* artifact for (collection, root): the draft if one exists, else the latest
-    committed version in this collection."""
-    return (get_draft_artifact(db, root_id, collection_id)
-            or get_latest_committed_artifact(db, root_id, collection_id))
+    committed version in this collection.
+
+    One lineage fetch, not two: `get_draft_artifact` and `get_latest_committed_artifact` each
+    walk `versions_of(root_id)`, so calling them in sequence reads the same lineage twice."""
+    return from_lattice_doc(_current_in(_versions(db, root_id), collection_id), ArtifactEntity)
+
+
+def get_current_in_any_collection(db: LatticeDatabase, root_id: str,
+                                  collection_ids) -> Optional[ArtifactEntity]:
+    """The current artifact for `root_id` in the FIRST of `collection_ids` that holds one.
+
+    Collapses the collection axis: asking collection by collection re-reads the whole lineage once
+    per collection — O(collections) round trips for an answer that depends on one lineage. The
+    lineage is fetched once here and matched against the candidate collections in memory, in the
+    order given, so the answer is the one the collection-at-a-time loop produced.
+
+    The root axis is `get_current_in_any_collection_many`'s to collapse; this is the one-root
+    form and stays the right call for a caller that holds one root."""
+    ids = list(collection_ids or [])
+    if not ids:
+        return None
+    docs = _versions(db, root_id)
+    if not docs:
+        return None
+    for collection_id in ids:
+        doc = _current_in(docs, collection_id)
+        if doc is not None:
+            return from_lattice_doc(doc, ArtifactEntity)
+    return None
+
+
+def _versions_many(db: LatticeDatabase, root_ids) -> Dict[str, list]:
+    """Each distinct root's lineage docs, oldest → newest in proper time, in ONE store read.
+
+    The plural of `_versions`. Roots with no versions are absent from the mapping, so a caller
+    reads a miss the same way `_versions` reads `[]`."""
+    return db.artifacts.versions_of_many(root_ids) or {}
+
+
+def get_current_in_collection_many(db: LatticeDatabase, collection_id: str,
+                                   root_ids) -> Dict[str, ArtifactEntity]:
+    """`{root_id: current artifact}` for each named root as seen from ONE collection — the draft
+    if that collection holds one, else the newest version committed there.
+
+    The plural of `get_current_in_collection`, and the same two predicates in the same
+    proper-time order. Every lineage arrives in one chunked read
+    (`ArtifactStore.versions_of_many`), so a caller holding a page of roots pays for the read
+    once instead of once per root.
+
+    Roots are deduplicated. A root with no version in this collection is absent from the
+    mapping — the same answer the singular form gives as `None`."""
+    lineages = _versions_many(db, root_ids)
+    out: Dict[str, ArtifactEntity] = {}
+    for root_id, docs in lineages.items():
+        doc = _current_in(docs, collection_id)
+        if doc is not None:
+            out[root_id] = from_lattice_doc(doc, ArtifactEntity)
+    return out
+
+
+def get_current_in_any_collection_many(db: LatticeDatabase, root_ids,
+                                       collection_ids) -> Dict[str, ArtifactEntity]:
+    """`{root_id: current artifact}` for each named root in the FIRST of `collection_ids` that
+    holds one — "where can this caller see each of these roots", answered for the whole set.
+
+    The batch primitive behind `collection_service.get_collection_artifacts_batch_global`, which
+    keeps its `*_batch` name precisely because this exists: the siblings dropped that name while
+    the store published no multi-root lineage read and a per-root round trip was the floor, and
+    `ArtifactStore.versions_of_many` is what lifted it.
+
+    Both axes collapse here. The lineages are one chunked read for every root, and the candidate
+    collections are matched in memory per lineage, so a page of R roots over C accessible
+    collections costs `ceil(R / IN_CHUNK)` statements rather than R x C. Order within
+    `collection_ids` still decides which collection wins, so a root visible through more than one
+    resolves exactly as the root-at-a-time loop resolved it.
+
+    Roots are deduplicated, and a root visible through none of the candidates is absent."""
+    ids = list(collection_ids or [])
+    if not ids:
+        return {}
+    out: Dict[str, ArtifactEntity] = {}
+    for root_id, docs in _versions_many(db, root_ids).items():
+        for collection_id in ids:
+            doc = _current_in(docs, collection_id)
+            if doc is not None:
+                out[root_id] = from_lattice_doc(doc, ArtifactEntity)
+                break
+    return out
 
 
 def list_version_history(db: LatticeDatabase, root_id: str) -> list:
     """All committed versions for a root_id, newest first (proper-time order)."""
     return [from_lattice_doc(doc, ArtifactEntity)
-            for doc in reversed(_versions(db, root_id)) if doc.get("state") == "committed"]
+            for doc in reversed(_versions(db, root_id)) if state_of(doc) == "committed"]
 
 
 def list_draft_artifacts(db: LatticeDatabase, collection_id: str) -> list:
@@ -294,21 +400,12 @@ def list_draft_artifacts(db: LatticeDatabase, collection_id: str) -> list:
 
 def count_children(db: LatticeDatabase, root_id: str) -> int:
     """Count outbound containment edges from an artifact (as a container).
-
-    ⛔ Same defect as `has_children` above: `except Exception: return 0` served a fault as a
-    measurement. Removed 2026-07-31.
     """
     return len(db.graph.edges_of(root_id, label=_CONTAINS, direction="out"))
 
 
 def has_children(db: LatticeDatabase, root_id: str) -> bool:
     """Whether an artifact has any containment children.
-
-    ⛔ THIS CAUGHT EVERY EXCEPTION AND RETURNED `False` — served straight to clients as
-    `doc["has_children"]` by `artifacts_router`. A transient DB fault therefore made a POPULATED
-    container look empty to every caller, and the router's next line then forced `child_count` to 0
-    without even attempting the count. Nothing distinguished that from a genuinely childless
-    artifact. [John, 2026-07-31: fail loudly — let it 5xx.]
 
     "I could not ask" is not "no". A read that cannot run is an error, not a negative answer.
     """
@@ -343,7 +440,12 @@ def get_collection_by_id(db: LatticeDatabase, id: str) -> Optional[Any]:
 
 
 def update_collection(db: LatticeDatabase, entity: Any) -> Optional[Any]:
+    """A container update is an artifact update — same chokepoint as `create_collection`.
+
+    A rename or a description edit is the change a live tree is most likely to be showing
+    stale, so it announces itself exactly like any other artifact write."""
     db.artifacts.put_artifact(to_lattice_doc(entity))
+    _boundary.emit_artifact_change(entity, _boundary.UPDATED)
     return entity
 
 
@@ -473,17 +575,17 @@ def list_collection_artifacts(db: LatticeDatabase, collection_id: str, *,
         root = e.get("dst")
         versions = _versions(db, root)
         in_coll = [v for v in versions if v.get("collection_id") == collection_id]
-        current = (next((v for v in reversed(in_coll) if v.get("state") == "draft"), None)
+        current = (next((v for v in reversed(in_coll) if state_of(v) == "draft"), None)
                    or (in_coll[-1] if in_coll else None))
-        committed = [v for v in versions if v.get("state") == "committed"]
+        committed = [v for v in versions if state_of(v) == "committed"]
         chosen = current or (committed[-1] if committed else None)
         if chosen is None and draft_workspace_id:
             chosen = next((v for v in reversed(versions)
-                           if v.get("state") == "draft"
+                           if state_of(v) == "draft"
                            and v.get("collection_id") == draft_workspace_id), None)
         if chosen is None:
             continue
-        if not include_archived and chosen.get("state") == "archived":
+        if not include_archived and state_of(chosen) == "archived":
             continue
         d = {k: v for k, v in chosen.items() if k not in _LATTICE_INTERNAL}
         # Non-strict on the list path: one undecryptable row must not fail the page —
@@ -501,12 +603,8 @@ def list_collection_artifacts(db: LatticeDatabase, collection_id: str, *,
 
 def count_other_containers_for_root(db: LatticeDatabase, root_id: str,
                                     excluding_collection_id: str) -> int:
-    """How many OTHER containers still hold this root (shared-not-owned check before a destroy).
-
-    ⛔ NO error-swallow here: this count GATES DESTRUCTION. Returning 0 on a store error would
-    read as "not shared" and let a delete proceed on an unknown share count — the fail-OPEN
-    polarity. A store error propagates; the caller aborts loudly (pinned by
-    `test_scoped_deletion_and_urls.test_container_count_failure_fails_safe`)."""
+    """How many other containers still hold this root — the shared-not-owned check run before a
+    destroy."""
     edges = db.graph.edges_of(root_id, direction="in") or []
     return sum(1 for e in edges if e.get("src") != excluding_collection_id)
 
@@ -579,14 +677,7 @@ def get_origin_parent(db: LatticeDatabase, root_id: str):
 
 
 def get_origin_root(db: LatticeDatabase, artifact_id: str) -> str:
-    """Walk the immutable origin chain to the top-most ancestor — the stable principal id.
-
-    ⛔ `max_depth=32` REMOVED 2026-07-30. `visited` is the real termination guard and the graph
-    is finite, so the walk always terminates without it. The cap was a bare claim that origin
-    chains are never deeper than 32 — and on a longer chain it returned the DEEPEST ID REACHED
-    as if it were the root. That id is the stable principal used for cell-key derivation, so a
-    truncated walk meant a WRONG ENCRYPTION KEY, silently. Depth was described as 4, 10, 25, 32
-    and 64 across five files for this one lattice; nothing measured any of them."""
+    """Walk the immutable origin chain to the top-most ancestor — the stable principal id."""
     current = artifact_id
     visited = {current}
     while True:
@@ -605,10 +696,22 @@ def list_origin_descendants(db: LatticeDatabase, root_ids: list, action: str) ->
     edges whose `propagate` mask allows *action* (None mask = unrestricted). BFS,
     globally-unique vertices, seeds excluded.
 
-    ⛔ `max_depth=4` REMOVED 2026-07-30. `seen` is the real termination guard — every vertex is
-    admitted once and the graph is finite, so the BFS always drains. The cap silently truncated
-    the light-cone, so a grant more than 4 levels up produced a FALSE DENY indistinguishable
-    from "no such artifact"."""
+    The per-edge prune is `attenuation.propagates`, not a local membership test. It used to be
+    spelled `mask is not None and action not in mask` here and, separately and identically, in
+    `services.dependencies.check_access` — one rule written twice, which is the shape the
+    attenuation module exists to stop. `propagates` decodes the column through `Mask` and asks
+    `allows`, and the decoder is proved bit-for-bit equal to the old expression across every
+    known column shape × every action in `tests/test_attenuation_algebra.py`
+    (`test_the_decoder_reproduces_the_lattice_column_on_every_known_shape`), so no live edge
+    changes meaning: NULL still propagates everything, `'[]'` and the compact `"r"` form still
+    propagate nothing.
+
+    One deliberate difference, in the fail-closed direction: an *unknown* action name used to
+    pass a NULL mask (`action not in None` never ran, because the `is not None` short-circuited
+    first) and now propagates nothing, because `Mask.allows` answers False for any verb outside
+    CRUDEASIO. Both in-tree callers already reject unknown actions before reaching here
+    (`lightcone.resolve` returns the empty set, `check_access` raises 400), so this only closes
+    a hole for a future caller that does not."""
     if not root_ids:
         return set()
     seen = set(root_ids)
@@ -624,8 +727,7 @@ def list_origin_descendants(db: LatticeDatabase, root_ids: list, action: str) ->
             for e in edges:
                 if not _eprop(e, "is_origin"):
                     continue
-                mask = _prop_mask(e)
-                if mask is not None and action not in mask:
+                if not _propagates(_prop_mask(e), action):
                     continue                       # prune: the whole subtree behind this edge
                 dst = e.get("dst")
                 if not dst or dst in seen:
@@ -650,9 +752,35 @@ def get_relationship_target(db: LatticeDatabase, from_root_id: str,
     return None
 
 
+def _feed_doc(raw: Dict[str, Any], **overrides: Any) -> Dict[str, Any]:
+    """A stored doc reshaped into the descriptor the change feed carries.
+
+    The body never rides the feed, whichever side the doc came from. A doc read back out of the
+    store carries `content` as ciphertext (`to_lattice_doc` envelope-encrypts on the way in), so
+    forwarding it verbatim hands every subscriber a blob it holds no key for; an entity from a
+    write path carries the plaintext instead, because `to_lattice_doc` encrypts a fresh dict and
+    leaves the entity's own `content` untouched. Neither belongs on a wire that fans out to every
+    selected subscriber and, where a durable log is installed, into an un-ACL'd `event_log` row.
+
+    `event_bus.redacted_artifact` holds the rule and `event_bus.publish_event` enforces it at the
+    seam, so this is a local spelling of one decision rather than a second copy of it. The
+    identity, container and state are what a subscriber acts on; a reader with custody fetches
+    the content through the read chokepoint that decrypts it.
+    """
+    from mantle.events.event_bus import redacted_artifact
+    d = redacted_artifact(raw)
+    d.update(overrides)
+    return d
+
+
 def batch_commit_drafts(db: LatticeDatabase, collection_id: str, artifact_ids: list,
                         committed_by: str, committed_time: str) -> int:
-    """Flip a batch of in-collection drafts to `committed`. Returns docs updated."""
+    """Flip a batch of in-collection drafts to `committed`. Returns docs updated.
+
+    Writes the doc directly rather than through `update_artifact`, so the announcement is made
+    here — one event per document, because a subscriber filters per artifact and a single
+    batch-shaped event would reach nobody watching one of the artifacts in it. Emitted after
+    each write returns, matching how the boundary orders itself around a put."""
     updated = 0
     for aid in (artifact_ids or []):
         raw = db.artifacts.get_artifact(aid)
@@ -663,6 +791,7 @@ def batch_commit_drafts(db: LatticeDatabase, collection_id: str, artifact_ids: l
         raw["modified_by"] = committed_by
         raw["modified_time"] = committed_time
         db.artifacts.put_artifact(raw)
+        _boundary.emit_artifact_change(_feed_doc(raw), _boundary.UPDATED)
         updated += 1
     return updated
 
@@ -683,7 +812,16 @@ def delete_artifacts_by_root(db: LatticeDatabase, root_id: str) -> list:
 
 
 def archive_artifact(db: LatticeDatabase, user_id: str, artifact_id: str) -> bool:
-    """Soft delete: mark archived, gated on a `can_delete` grant on the parent collection."""
+    """Soft delete: mark archived, gated on a `can_delete` grant on the parent collection.
+
+    Announced as `artifact.deleted`, not `artifact.updated`: every container read filters
+    archived versions out (`_current_in`, `list_collection_artifacts`), so from a subscriber's
+    side the artifact has left the container, and a delete is the verb it must act on to stop
+    showing it. The container is readable here — it is on the doc being archived — so unlike a
+    hard delete this one can be announced at the write.
+
+    The descriptor states `modified_by` as the archiving user so the event carries the right
+    actor. It describes the act, not the stored doc: the doc's own provenance is untouched."""
     raw = db.artifacts.get_artifact(artifact_id)
     if raw is None:
         return False
@@ -696,28 +834,55 @@ def archive_artifact(db: LatticeDatabase, user_id: str, artifact_id: str) -> boo
         return False
     raw["state"] = "archived"
     db.artifacts.put_artifact(raw)
+    _boundary.emit_artifact_change(_feed_doc(raw, modified_by=user_id), _boundary.DELETED)
     return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BRICK 4 — grants (Group 4): the CRUDEASIO authorization plane
 #
-# Everything is an artifact — a grant included. The lattice scoped grants by putting them in their own
-# collection (COLLECTION_GRANTS); the lattice instead discriminates by a stamped
+# Everything is an artifact — a grant included. Where the store scoped grants by putting them in
+# their own collection (COLLECTION_GRANTS), the lattice instead discriminates by a stamped
 # `content_type = _GRANT_CT` on the doc (`Grant.from_dict` ignores unknown keys, so it never leaks
-# into the entity), and the grant's lifecycle `state` (active / revoked / pending_accept) rides the
-# vertex `state` filter — so "active grants" is a SQL-level cut, not a scan-and-sift.
+# into the entity), and the grant's lifecycle `state` (active / revoked / pending_accept) lives in
+# `doc` beside it.
+#
+# The narrowing predicate is the grantee or the resource, never the content type: every grant
+# shares one `ct`, so `ct` alone selects the whole authorization plane. `_grant_docs_by` is the
+# read shape for a question about one principal or one resource, and `state` / expiry are then
+# applied to that small set. `_grant_docs` — the whole plane — is for the two questions that
+# genuinely range over all of it.
 #
 # Expiry: store compared `expires_at > DATE_ISO8601(DATE_NOW())` as strings. `_unexpired` parses
 # both sides when it can (tolerating 'Z' vs '+00:00' — the string compare misorders those) and
 # falls back to the string compare only when parsing fails.
 # ─────────────────────────────────────────────────────────────────────────────
 try:
-    from mantle.entities.grant import Grant as GrantEntity
+    from mantle.entities.grant import Grant as GrantEntity, mask_of as _mask_of
 except ImportError:
-    from mantle.entities.grant import Grant as GrantEntity
+    from mantle.entities.grant import Grant as GrantEntity, mask_of as _mask_of
 
 _GRANT_CT = "application/vnd.agience.grant+json"
+
+
+def _doc_mask(d: Dict[str, Any]):
+    """A raw grant DOCUMENT's authority as the one attenuation `Mask` — bits AND effect.
+
+    The lattice reads grants as dicts and never as entities on the hot paths, so the natural
+    spelling here was `d.get("can_read")` — half the question. A `deny`-effect grant carries
+    the bits naming what it denies, so the bare `.get` answers True for it and the grant reads
+    as authorizing. That is audit S1, in the encoding the entity-side detectors cannot see.
+
+    `SimpleNamespace` rather than handing the mapping straight to `mask_of`: `grant_is_allow`
+    is `getattr`-duck-typed, and a dict would present as having no `effect` at all — closed,
+    but wrong in a way that would deny every grant in the store. The namespace makes the doc
+    look exactly like the entity to the predicates, so no part of the effect vocabulary or the
+    flag set is restated here. `Grant.from_dict` is deliberately not used: its `can_read=True`
+    default would WIDEN a doc that is missing the column, which is the wrong direction for a
+    decoder feeding an authorization decision.
+    """
+    from types import SimpleNamespace
+    return _mask_of(SimpleNamespace(**d))
 
 
 def _to_grant_doc(entity: Any) -> Dict[str, Any]:
@@ -727,7 +892,51 @@ def _to_grant_doc(entity: Any) -> Dict[str, Any]:
 
 
 def _grant_docs(db: LatticeDatabase, *, state: Optional[str] = None):
+    """EVERY grant in the store, optionally narrowed to one lifecycle state.
+
+    The whole-plane read. `ix_v_ct` narrows it to the grant bucket and no further — all grants
+    share one content type — so its cost is the number of grants in the store, not the number
+    the caller is actually asking about. That is the right shape for the two questions that
+    genuinely range over the whole authorization plane (`access.gated_collections`,
+    `access.gated_owner_map`) and the wrong shape for "what does this principal hold", which is
+    `_grant_docs_by`."""
     return db.artifacts.list_artifacts(content_type=_GRANT_CT, state=state)
+
+
+# A `LIMIT` that silently truncates an authorization answer is a security defect, not a slow
+# path: the caller cannot tell a principal with no grant on a resource from a principal whose
+# grant fell off the end of the page. So the seek takes a ceiling far above any real grant
+# fan-out (a principal holds tens of grants; a resource, hundreds), and saturating it falls back
+# to the exhaustive scan rather than returning a short list. The answer is exact at any size; the
+# seek is what makes the ordinary size cheap.
+_GRANT_SEEK_CEILING = 20_000
+
+
+def _grant_docs_by(db: LatticeDatabase, field: str, value: Any) -> list:
+    """Grant docs whose `doc.<field>` equals `value` — an index seek, not a scan.
+
+    `field` is `grantee_id` or `resource_id`, each backed by a partial expression index
+    (`schema.ix_v_grantee` / `ix_v_resource`). This is what makes an authorization cost
+    O(this principal's grants) instead of O(every active grant on the platform), which matters
+    because the light-cone resolver runs it on nearly every authenticated request.
+
+    Returns docs in ANY lifecycle state, filtered by nothing but the field — `list_by_doc_field`
+    applies no `state` predicate, so each caller states its own (`== "active"`, or
+    `!= "archived"` for the admin view) and the answer stays identical to the whole-plane read
+    it replaces. Expiry likewise stays with the caller: `expires_at` is a comparison against now,
+    not an equality, so no index can serve it."""
+    if not value:
+        return []
+    try:
+        rows = db.artifacts.list_by_doc_field(
+            content_type=_GRANT_CT, field=field, value=value, limit=_GRANT_SEEK_CEILING)
+    except (AttributeError, ValueError):
+        rows = None                       # a store without the seek — fall through to the scan
+    if rows is not None and len(rows) < _GRANT_SEEK_CEILING:
+        return rows
+    return [d for d in db.artifacts.list_artifacts(content_type=_GRANT_CT,
+                                                   include_archived=True)
+            if d.get(field) == value]
 
 
 def _unexpired(doc: Dict[str, Any]) -> bool:
@@ -764,34 +973,64 @@ def update_grant(db: LatticeDatabase, entity: Any) -> Optional[Any]:
 
 def get_active_grants_for_principal_resource(db: LatticeDatabase, grantee_id: str,
                                              resource_id: str) -> list:
-    return [from_lattice_doc(d, GrantEntity) for d in _grant_docs(db, state="active")
-            if d.get("grantee_id") == grantee_id
+    """The direct grants one principal holds on one resource — the light-cone hot path.
+
+    Seeks by `grantee_id` rather than by `resource_id` because a principal's grant count is
+    bounded by what that person was given, while a resource's is bounded by how widely it was
+    shared; the former is the smaller and steadier of the two."""
+    return [from_lattice_doc(d, GrantEntity) for d in _grant_docs_by(db, "grantee_id", grantee_id)
+            if d.get("state") == "active"
             and d.get("resource_id") == resource_id
             and _unexpired(d)]
 
 
 def get_active_grants_for_grantee(db: LatticeDatabase, grantee_id: str,
-                                  grantee_type: str = "api_key") -> list:
-    return [from_lattice_doc(d, GrantEntity) for d in _grant_docs(db, state="active")
-            if d.get("grantee_id") == grantee_id
+                                  grantee_type: str = "user") -> list:
+    return [from_lattice_doc(d, GrantEntity) for d in _grant_docs_by(db, "grantee_id", grantee_id)
+            if d.get("state") == "active"
             and d.get("grantee_type") == grantee_type
             and _unexpired(d)]
 
 
 def get_active_collection_ids_for_user(db: LatticeDatabase, user_id: str) -> list:
-    """The user's read light-cone: every resource an active, unexpired, readable user-grant reaches."""
-    return [d["resource_id"] for d in _grant_docs(db, state="active")
-            if d.get("grantee_id") == user_id
+    """The user's read light-cone: every resource an active, unexpired user-grant AUTHORIZES a
+    read on. This is what `db.access.reachable_collections` walks outward from, so it
+    is the seed of the whole read decision on the embeddable surface.
+
+    `_doc_mask(d).allows("read")` and not `d.get("can_read")`: the bare column read is True for
+    a `deny`-effect grant too — a deny grant's bits name the actions it denies — so a grant
+    written to say "this user must not read this" seeded the reader's light cone with it. Same
+    defect as `access.invokable_resources`, one layer down, and it failed OPEN for reads.
+
+    Deny is then subtracted, matching the deny-first precedence `services.dependencies.
+    check_access` enforces, so holding both an allow and a deny on the same resource denies
+    whichever order the store returns them in. The subtraction is DIRECT-only: containment
+    expansion happens in the caller, so a deny on a child does not prune that child out of the
+    cone its allowed parent projects. That is a known partial — narrower than before, not as
+    narrow as `check_access`, which re-tests deny at every level of its walk — and it is the
+    fail-closed direction at every step, never the open one.
+
+    Order is preserved (a list, deduplicated by the store's own seek order) because callers
+    treat it as a sequence.
+    """
+    docs = [d for d in _grant_docs_by(db, "grantee_id", user_id)
+            if d.get("state") == "active"
             and d.get("grantee_type") == "user"
-            and d.get("can_read")
             and d.get("resource_id")
             and _unexpired(d)]
+    masked = [(d["resource_id"], _doc_mask(d)) for d in docs]
+    denied = {rid for rid, m in masked if m.is_deny and m.carries("read")}
+    return [rid for rid, m in masked if m.allows("read") and rid not in denied]
 
 
 def get_grants_for_collection(db: LatticeDatabase, collection_id: str) -> list:
-    """ALL grants on a resource, any state (the admin/share management view)."""
-    return [from_lattice_doc(d, GrantEntity) for d in _grant_docs(db)
-            if d.get("resource_id") == collection_id]
+    """ALL grants on a resource, any state (the admin/share management view).
+
+    Head-only: `!= "archived"` is what the whole-plane read applied through
+    `list_artifacts`, restated here because the seek carries no state predicate of its own."""
+    return [from_lattice_doc(d, GrantEntity)
+            for d in _grant_docs_by(db, "resource_id", collection_id)
+            if state_of(d) != "archived"]
 
 
 def upsert_user_collection_grant(db: LatticeDatabase, *, user_id: str, collection_id: str,
@@ -839,18 +1078,22 @@ def upsert_user_collection_grant(db: LatticeDatabase, *, user_id: str, collectio
 
 
 def get_active_grants_by_key(db: LatticeDatabase, token: str) -> list:
-    """Grant-key auth: hash the presented token, match `grantee_type == "grant_key"`."""
-    try:
-        from mantle.services import auth_service
-    except ImportError:
-        from mantle.services import auth_service
+    """Grant-key auth: hash the presented token, match `grantee_type == "grant_key"`.
+
+    This finds only the ROOT grant. A bundle root carries no `resource_id` of its own,
+    so a caller that stops here sees an empty-handed key; expanding the members and
+    applying the root's ceiling is `grant_key_service.resolve`, which is what the auth
+    path actually uses. This stays as the storage-layer primitive underneath it.
+    """
+    from mantle.services.grant_key_service import hash_token
     return get_active_grants_for_grantee(
-        db, grantee_id=auth_service.hash_api_key(token), grantee_type="grant_key")
+        db, grantee_id=hash_token(token), grantee_type="grant_key")
 
 
 def get_active_grant_key_grants_for_collection(db: LatticeDatabase, collection_id: str) -> list:
-    return [from_lattice_doc(d, GrantEntity) for d in _grant_docs(db, state="active")
-            if d.get("resource_id") == collection_id
+    return [from_lattice_doc(d, GrantEntity)
+            for d in _grant_docs_by(db, "resource_id", collection_id)
+            if d.get("state") == "active"
             and d.get("grantee_type") == "grant_key"
             and _unexpired(d)]
 
@@ -879,24 +1122,15 @@ def get_containers_for_user(db: LatticeDatabase, user_id: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BRICK 6 — commits (Group 5) + API keys / server credentials / server JWKs
+# BRICK 6 — commits (Group 5)
 #
 # Same move as grants: each store side-collection becomes a stamped `content_type` plane in the
 # one store. Commit provenance (`get_commit_by_id` / `get_commits_for_collection`) keeps store's
 # RAW-dict return shape — the routers render those directly.
 # ─────────────────────────────────────────────────────────────────────────────
-try:
-    from mantle.entities.api_key import APIKey as APIKeyEntity
-    from mantle.entities.server_credential import ServerCredential as ServerCredentialEntity
-except ImportError:
-    from mantle.entities.api_key import APIKey as APIKeyEntity
-    from mantle.entities.server_credential import ServerCredential as ServerCredentialEntity
 
 _COMMIT_CT = "application/vnd.agience.commit+json"
 _COMMIT_ITEM_CT = "application/vnd.agience.commit-item+json"
-_API_KEY_CT = "application/vnd.agience.api-key+json"
-_SERVER_CRED_CT = "application/vnd.agience.server-credential+json"
-_SERVER_JWK_CT = "application/vnd.agience.server-jwk+json"
 
 
 def _put_typed(db: LatticeDatabase, entity: Any, ct: str) -> Any:
@@ -946,97 +1180,6 @@ def get_commits_for_collection(db: LatticeDatabase, collection_id: str) -> list:
     return out
 
 
-# ── API keys ─────────────────────────────────────────────────────────────────
-def create_api_key(db: LatticeDatabase, entity: Any) -> Any:
-    return _put_typed(db, entity, _API_KEY_CT)
-
-
-def get_api_key_by_hash(db: LatticeDatabase, key_hash: str) -> Optional[Any]:
-    """Active, unexpired key matching this hash (the auth hot path)."""
-    for d in _typed_docs(db, _API_KEY_CT):
-        if d.get("key_hash") == key_hash and d.get("is_active"):
-            if not _unexpired(d):
-                return None                        # store: an expired match ends the lookup
-            return from_lattice_doc(d, APIKeyEntity)
-    return None
-
-
-def get_api_key_by_id(db: LatticeDatabase, id: str) -> Optional[Any]:
-    return _get_typed(db, id, _API_KEY_CT, APIKeyEntity)
-
-
-def get_api_keys_by_user(db: LatticeDatabase, user_id: str) -> list:
-    return [from_lattice_doc(d, APIKeyEntity) for d in _typed_docs(db, _API_KEY_CT)
-            if d.get("user_id") == user_id]
-
-
-def update_api_key(db: LatticeDatabase, entity: Any) -> Optional[Any]:
-    return _put_typed(db, entity, _API_KEY_CT)
-
-
-def update_api_key_last_used(db: LatticeDatabase, key_id: str, timestamp: str) -> bool:
-    raw = db.artifacts.get_artifact(key_id.split("/")[-1])
-    if raw is None or raw.get("content_type") != _API_KEY_CT:
-        return False
-    raw["last_used_at"] = timestamp
-    db.artifacts.put_artifact(raw)
-    return True
-
-
-def delete_api_key(db: LatticeDatabase, id: str) -> bool:
-    try:
-        db.artifacts.delete_artifact(id)
-        return True
-    except Exception:
-        return False
-
-
-# ── server credentials ───────────────────────────────────────────────────────
-def create_server_credential(db: LatticeDatabase, entity: Any) -> Any:
-    return _put_typed(db, entity, _SERVER_CRED_CT)
-
-
-def get_server_credential_by_client_id(db: LatticeDatabase, client_id: str) -> Optional[Any]:
-    for d in _typed_docs(db, _SERVER_CRED_CT):
-        if d.get("client_id") == client_id and d.get("is_active"):
-            return from_lattice_doc(d, ServerCredentialEntity)
-    return None
-
-
-def get_server_credential_by_id(db: LatticeDatabase, id: str) -> Optional[Any]:
-    return _get_typed(db, id, _SERVER_CRED_CT, ServerCredentialEntity)
-
-
-def get_server_credentials_by_user(db: LatticeDatabase, user_id: str) -> list:
-    return [from_lattice_doc(d, ServerCredentialEntity) for d in _typed_docs(db, _SERVER_CRED_CT)
-            if d.get("user_id") == user_id]
-
-
-def get_all_server_credentials(db: LatticeDatabase) -> list:
-    return [from_lattice_doc(d, ServerCredentialEntity) for d in _typed_docs(db, _SERVER_CRED_CT)]
-
-
-def update_server_credential(db: LatticeDatabase, entity: Any) -> Optional[Any]:
-    return _put_typed(db, entity, _SERVER_CRED_CT)
-
-
-def update_server_credential_last_used(db: LatticeDatabase, cred_id: str, timestamp: str) -> bool:
-    raw = db.artifacts.get_artifact(cred_id.split("/")[-1])
-    if raw is None or raw.get("content_type") != _SERVER_CRED_CT:
-        return False
-    raw["last_used_at"] = timestamp
-    db.artifacts.put_artifact(raw)
-    return True
-
-
-def delete_server_credential(db: LatticeDatabase, id: str) -> bool:
-    try:
-        db.artifacts.delete_artifact(id)
-        return True
-    except Exception:
-        return False
-
-
 # ── WHERE-index materialization bookkeeping ──────────────────────────────────
 # A membership set: "this artifact version has been sent for WHERE indexing". Namespaced ids —
 # the marker for artifact X must not collide with X itself in the shared id space.
@@ -1072,8 +1215,13 @@ _COLLECTION_TO_CT = {COLLECTION_GRANTS: _GRANT_CT}
 #: The typed side-planes that share the vertex table. An "artifacts" query must NOT see them —
 #: in store they were separate collections, and that scoping is part of the contract.
 _SIDE_PLANE_CTS = frozenset({
-    _GRANT_CT, _COMMIT_CT, _COMMIT_ITEM_CT, _API_KEY_CT,
-    _SERVER_CRED_CT, _SERVER_JWK_CT, _MATERIALIZED_CT,
+    _GRANT_CT, _COMMIT_CT, _COMMIT_ITEM_CT, _MATERIALIZED_CT,
+    # Retired planes. Nothing writes these, but a lattice provisioned by an older version may
+    # still hold their rows, and scoping is about what a query may SEE — dropping the name here
+    # would surface those rows in `artifacts` results.
+    "application/vnd.agience.api-key+json",
+    "application/vnd.agience.server-credential+json",
+    "application/vnd.agience.server-jwk+json",
 })
 
 # The stream router imports the decrypt hook under this name; ONE boundary either way.
@@ -1111,16 +1259,25 @@ def get_artifacts_by_creator_id(db: LatticeDatabase, creator_id: str) -> list:
             if d.get("content_type") not in _SIDE_PLANE_CTS]
 
 
-def get_collection_ids_for_root(db: LatticeDatabase, root_id: str) -> list:
-    """Every collection (excluding workspaces) holding an edge to this root."""
-    out = []
+def _collection_ids_for_root(db: LatticeDatabase, root_id: str,
+                             is_workspace: Dict[str, bool]) -> list:
+    """`get_collection_ids_for_root` with the workspace verdict carried in from outside.
+
+    Deciding whether a container is a workspace costs one artifact read, and the same handful of
+    containers recur across every root in a batch — so the verdict is memoized by the caller and
+    the read happens once per container rather than once per (root, container) pair."""
+    out: list = []
     try:
         for e in (db.graph.edges_of(root_id, direction="in") or []):
             cid = e.get("src")
             if not cid or cid in out:
                 continue
-            col = db.artifacts.get_artifact(cid)
-            if col is not None and col.get("content_type") == _WORKSPACE_CT:
+            verdict = is_workspace.get(cid)
+            if verdict is None:
+                col = db.artifacts.get_artifact(cid)
+                verdict = col is not None and col.get("content_type") == _WORKSPACE_CT
+                is_workspace[cid] = verdict
+            if verdict:
                 continue
             out.append(cid)
     except Exception:
@@ -1128,39 +1285,34 @@ def get_collection_ids_for_root(db: LatticeDatabase, root_id: str) -> list:
     return out
 
 
+def get_collection_ids_for_root(db: LatticeDatabase, root_id: str) -> list:
+    """Every collection (excluding workspaces) holding an edge to this root."""
+    return _collection_ids_for_root(db, root_id, {})
+
+
 def batch_get_collection_ids_for_roots(db: LatticeDatabase, root_ids: list) -> Dict[str, list]:
-    return {r: get_collection_ids_for_root(db, r) for r in (root_ids or [])}
+    """`{root_id -> collection ids}` for many roots, sharing one workspace-verdict cache.
+
+    Still one edge read per root — containment is indexed per root and there is no cross-root
+    edge query — but the container reads behind the workspace filter collapse to one per
+    distinct container across the whole batch."""
+    is_workspace: Dict[str, bool] = {}
+    return {r: _collection_ids_for_root(db, r, is_workspace) for r in (root_ids or [])}
 
 
 def list_committed_artifacts_by_context_content_type(db: LatticeDatabase, content_type: str, *,
                                                      created_by: Optional[str] = None) -> list:
-    """COMMITTED artifacts whose ``context.content_type`` matches (trust-config loads).
+    """Committed artifacts whose ``context.content_type`` matches (trust-config loads).
     `created_by` narrows to one principal — the trust boundary: a label alone never confers
     trust, only provenance does.
 
-    ⛔ THIS FULL-SCANNED THE LATTICE AND HUNG MANTLE'S BOOT. It passed neither `content_type` nor
-    a limit, so `list_artifacts` emitted `SELECT doc FROM vertex WHERE json_extract(doc,'$.state')
-    = ? AND created_by = ? ORDER BY id` — `state` is a JSON function (unindexed) and `created_by`
-    has no index either, so SQLite read and sorted all 2.15M rows and this loop ran `json.loads`
-    on every one of them. To find FIVE artifacts.
-
-    MEASURED 2026-08-01 on 71 (5.8 GB lattice). `seed_platform_issuer_artifacts` runs inside the
-    FastAPI lifespan, so the port never opened: py-spy showed the boot parked in exactly this call,
-    and crystal logged `upstream 127.0.0.1:8082 unreachable` on a loop the whole time — a service
-    that looks crashed while it is quietly scanning a table.
-
-        indexed `ct` lookup          21.6 ms   -> the 5 issuer rows
-        the scan this used to do     minutes   (~7.8 s of raw reads + 2.15M json.loads + a sort)
-
-    `ct` IS indexed (`ix_v_ct`), and both callers already write the value they search for into the
-    artifact's own `content_type` — issuers at `services/issuers.py:144`, secrets at
-    `routers/secrets_router.py:230` (which even guards on `art.content_type != SECRET_CT`). So the
-    narrowing is EXACT here, not a heuristic. Verified on the live store: all 5 issuer rows carry
-    `ct`, `context.content_type` and `state='committed'` in agreement.
-
-    The `context.content_type` test below STAYS and remains authoritative — `ct` narrows, context
-    decides. A row whose two disagree is a writer bug, and it will now be excluded rather than
-    silently changing what this returns. [[limit-bounds-output-not-work]]"""
+    The query first narrows by the indexed `content_type` column (`ix_v_ct`), then confirms the
+    match against `context.content_type`, which stays authoritative: `content_type` narrows,
+    context decides. The caller already writes the value it searches for into the artifact's own
+    `content_type` (issuers, at `services/issuers.py`), so the
+    narrowing is exact rather than a heuristic. A row whose `content_type` and
+    `context.content_type` disagree is a writer bug, and is excluded rather than silently
+    included."""
     out = []
     for d in db.artifacts.list_artifacts(state="committed", created_by=created_by,
                                          content_type=content_type):
@@ -1175,25 +1327,14 @@ def list_committed_artifacts_by_context_content_type(db: LatticeDatabase, conten
     return out
 
 
-# ── server JWK registry ──────────────────────────────────────────────────────
-def upsert_server_jwk(db: LatticeDatabase, server_client_id: str, public_jwk: dict) -> None:
-    db.artifacts.put_artifact({"id": server_client_id, "public_jwk": public_jwk,
-                               "content_type": _SERVER_JWK_CT})
-
-
-def get_server_jwk(db: LatticeDatabase, server_client_id: str) -> Optional[dict]:
-    raw = db.artifacts.get_artifact(server_client_id)
-    if raw is None or raw.get("content_type") != _SERVER_JWK_CT:
-        return None
-    return raw.get("public_jwk")
-
-
 __all__ = [
     "LatticeDatabase", "open_database",
     "after_key", "mid_key",
     "to_lattice_doc", "from_lattice_doc",
     "create_artifact", "get_artifact", "update_artifact", "delete_artifact",
     "get_draft_artifact", "get_latest_committed_artifact", "get_current_in_collection",
+    "get_current_in_any_collection",
+    "get_current_in_collection_many", "get_current_in_any_collection_many",
     "list_version_history", "list_draft_artifacts",
     "count_children", "has_children",
     "CollectionEntity",
@@ -1212,24 +1353,12 @@ __all__ = [
     "get_relationship_target",
     "batch_commit_drafts", "delete_artifacts_by_root", "archive_artifact",
     "create_commit", "create_commit_items", "get_commit_by_id", "get_commits_for_collection",
-    "APIKeyEntity", "create_api_key", "get_api_key_by_hash", "get_api_key_by_id",
-    "get_api_keys_by_user", "update_api_key", "update_api_key_last_used", "delete_api_key",
-    "ServerCredentialEntity", "create_server_credential", "get_server_credential_by_client_id",
-    "get_server_credential_by_id", "get_server_credentials_by_user",
-    "get_all_server_credentials", "update_server_credential",
-    "update_server_credential_last_used", "delete_server_credential",
-    "upsert_server_jwk", "get_server_jwk",
     "get_collections_by_owner_and_type", "is_materialized", "mark_materialized",
 ]
 
 
 def typed_method(artifacts, name):
     """The typed lattice-store method `name`, or None on a store that does not have it.
-
-    ⚠ MOVED FROM `ember/surface/stats.py::_typed` ON 2026-07-31. It probes THIS module's own typed
-    API, so it lived one repo away from the thing it was asking about — and `store/content_tier.py`
-    imported ember's SERVE SURFACE to get it, which is why a content tier looked coupled to a stats
-    page.
 
     Absence means "this store predates the typed rewrite" — it never means "the answer is empty".
     Every caller must therefore fall back to a path that can FAIL, never to a default."""

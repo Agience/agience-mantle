@@ -6,8 +6,8 @@ NOT indexed — unless indexing is requested eagerly. The search / anchor index
 control: never embed the long tail nobody reads. Purely local — no economics, no
 sharing (see INFORMATION-GAUGE-DB-IMPLEMENTATION.md §5, first-release scope).
 
-Controlled by ``MANTLE_LAZY_INDEX`` (default OFF → today's eager-on-write
-behaviour, so enabling is an explicit opt-in) plus a per-write ``index`` hint.
+Controlled by ``MANTLE_LAZY_INDEX`` (default OFF → eager-on-write, so
+enabling is an explicit opt-in) plus a per-write ``index`` hint.
 """
 from __future__ import annotations
 
@@ -24,14 +24,14 @@ _TRUTHY = {"1", "true", "yes", "on"}
 
 def lazy_index_default() -> bool:
     """Deployment default: leave new artifacts latent (defer indexing to first
-    access)? ``MANTLE_LAZY_INDEX`` — default OFF (eager-on-write, unchanged)."""
+    access)? ``MANTLE_LAZY_INDEX`` — default OFF (eager-on-write)."""
     return (os.getenv("MANTLE_LAZY_INDEX", "") or "").strip().lower() in _TRUTHY
 
 
 def resolve_lazy(index_hint: Optional[str] = None) -> bool:
     """Should this write be latent (defer indexing)? A per-write ``index`` hint
-    wins; otherwise the deployment default. ``"eager"`` indexes now (today's
-    behaviour); ``"lazy"`` defers to first access."""
+    wins; otherwise the deployment default. ``"eager"`` indexes immediately;
+    ``"lazy"`` defers to first access."""
     if index_hint == "lazy":
         return True
     if index_hint == "eager":

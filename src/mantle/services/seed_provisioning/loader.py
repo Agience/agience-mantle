@@ -1,7 +1,6 @@
 """Declarative bootstrap artifact loader.
 
-Replaces the imperative ``services/seed_provisioning/*.py`` modules with a
-data-driven seed pipeline:
+A data-driven seed pipeline:
 
     seed_from_artifacts(store_db, Path(os.environ["AGIENCE_SEEDS_ROOT"])) → SeedReport
 
@@ -42,8 +41,8 @@ from mantle.db.backend import (
 )
 from mantle.entities.artifact import Artifact as ArtifactEntity
 from mantle.entities.collection import Collection as CollectionEntity, COLLECTION_CONTENT_TYPE
-from origin import config
-from origin.config import AGIENCE_PLATFORM_USER_ID
+from mantle import config
+from mantle.config import AGIENCE_PLATFORM_USER_ID
 from mantle.services.platform_topology import get_id_optional, register_id
 
 logger = logging.getLogger(__name__)
@@ -111,7 +110,7 @@ def _keys_dir() -> Path:
     val = os.getenv("KEYS_DIR")
     if val:
         return Path(val)
-    from origin import config
+    from mantle import config
     return config.KEYS_DIR
 
 
@@ -389,7 +388,11 @@ def _apply_artifact_card(
         report.artifacts_skipped += 1
         return
     try:
-        artifact = ArtifactEntity(
+        # Bound to its own name, not to `artifact`: the failure handler below reports
+        # `artifact.path`, which is a field of the _RawArtifact this was called with and
+        # not of the entity being built. Rebinding would make every create failure raise
+        # AttributeError out of the handler and abort the whole seed run.
+        entity = ArtifactEntity(
             id=artifact_uuid,
             root_id=artifact_uuid,
             collection_id=_primary_collection_id(body),
@@ -400,7 +403,7 @@ def _apply_artifact_card(
             created_by=AGIENCE_PLATFORM_USER_ID,
             created_time=now,
         )
-        db_create_artifact(store_db, artifact)
+        db_create_artifact(store_db, entity)
         report.artifacts_added += 1
         logger.info("Seeded artifact %s/%s (id=%s)", namespace, slug, artifact_uuid)
     except Exception as exc:

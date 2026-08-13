@@ -1,18 +1,15 @@
-"""The content key roots at the collection's ORIGIN ROOT — never at ``created_by``.
+"""The content key roots at the collection's origin root — never at ``created_by``.
 
-``oracle.py`` states the rule: *"The principal is the collection's immutable origin
-root, NOT an 'owner' / created_by. Agience has no owners — access is by grant."* The
-search path always obeyed it; artifact content did not, so one artifact had TWO key
-roots — cells under the origin root, content under a user id.
+``oracle.py`` states the rule: "The principal is the collection's immutable origin
+root, NOT an 'owner' / created_by. Agience has no owners — access is by grant."
 
-Rooting crypto at ``created_by`` is not merely inconsistent, it is destructive.
-``created_by`` is PROVENANCE, and provenance gets corrected — LATTICE §3 decides
-John's two identities are folded into one. But ``created_by`` was both the HKDF root
-AND the GCM AAD, so folding it leaves every blob written under the dropped value
-simultaneously underivable and unauthenticatable. A metadata correction would have
-silently destroyed readability.
+Rooting crypto at ``created_by`` would be destructive: ``created_by`` is
+provenance, and provenance can be corrected (for example, two identities folded
+into one). ``created_by`` also doubles as the GCM AAD, so if it were the crypto
+root, correcting it would leave every blob written under the old value
+simultaneously underivable and unauthenticatable.
 
-``db/lattice/content_cache.collection_key`` already documents the same rule for the
+``db/content_cache.collection_key`` documents the same rule for the
 target store. These tests pin it for the artifact path.
 """
 from __future__ import annotations
@@ -32,7 +29,7 @@ class TestOriginRootIsInherited:
         assert a.origin_root == "art-1"
 
     def test_child_is_not_silently_self_rooted(self):
-        """An unstamped child must be VISIBLY unstamped.
+        """An unstamped child must be visibly unstamped.
 
         Defaulting it to its own id would be worse than leaving it empty: the child
         would claim to be a root, get its own key tree, and be silently orphaned from
@@ -47,12 +44,10 @@ class TestOriginRootIsInherited:
         assert a.origin_root == "root-9"
 
     def test_survives_the_storage_round_trip(self):
-        """It must not be dropped by to_dict/from_dict.
-
-        This is the ``content_encrypted`` lesson: a field the entity does not model
-        is silently lost on save, and a LOST KEY ROOT is recomputed or defaulted on
-        the next write — re-keying content whose ciphertext was written under the old
-        value, irrecoverably.
+        """It must not be dropped by to_dict/from_dict: a field the entity does not
+        model is silently lost on save, and a lost key root would be recomputed or
+        defaulted on the next write, re-keying content whose ciphertext was written
+        under the old value irrecoverably.
         """
         a = Artifact(id="art-4", collection_id="col-1", origin_root="root-9")
         assert Artifact.from_dict(a.to_dict()).origin_root == "root-9"
@@ -73,20 +68,14 @@ class TestContentKeyPrincipal:
         assert principal == "root-7"
 
     def test_created_by_is_the_transitional_fallback_only(self):
-        """Legacy rows keep working until the backfill runs — see
-        scripts/backfill_origin_root. This assertion is expected to be DELETED once
-        the fallback is removed."""
+        """Rows without an origin_root fall back to created_by until the backfill
+        in scripts/backfill_origin_root has run."""
         assert doc_boundary.content_key_principal({"created_by": "user-alice"}) == "user-alice"
 
     def test_no_root_at_all_fails_the_write(self):
-        """⛔ Previously this stored PLAINTEXT.
-
-        The guard read ``if not content or not owner: return`` — so an artifact with
-        no ``created_by`` skipped encryption entirely and was persisted unencrypted,
-        returning BEFORE the try/except that refuses to persist plaintext. Silent and
-        permanent: a blob with no ``MEC1`` magic reads back as legacy plaintext
-        forever. LATTICE §2.1 measures 80 such rows on node 71.
-        """
+        """An artifact with neither an origin_root nor a created_by has no content
+        key principal to encrypt under, and must fail loudly rather than being
+        persisted unencrypted."""
         with pytest.raises(doc_boundary.ContentEncryptionError):
             doc_boundary.content_key_principal({"id": "art-5", "collection_id": "col-1"})
 
@@ -103,11 +92,8 @@ class TestContentKeyPrincipal:
 
 class TestNoLineageWalkOnTheHotPath:
     def test_resolving_the_key_principal_touches_no_database(self, monkeypatch):
-        """⚠ REGRESSION GUARD. An earlier fix resolved the root via
-        ``resolve_cell_principal(next(get_store_db()), ...)``, which put a database
-        round trip on EVERY artifact write — 42s of connect timeouts per test, and a
-        new the lattice dependency in the layer that is supposed to be store-agnostic
-        while the lattice is being retired. The root travels with the row; nothing here
+        """Resolving the content key principal must not touch the database: the
+        root travels with the row, and this layer is store-agnostic. Nothing here
         may look anything up.
         """
         def _boom(*a, **kw):

@@ -51,7 +51,7 @@ def trust_setup(tmp_path, monkeypatch):
     keys: dict = {}
     trust_anchors: dict = {}
 
-    for name in ("origin", "mantle", "chorus"):
+    for name in ("origin", "mantle", "crystal"):
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         priv_pem = key.private_bytes(
             encoding=serialization.Encoding.PEM,
@@ -87,7 +87,7 @@ def test_load_manifest_parses_fields(trust_setup):
     assert manifest.issuer == "https://platform.test"
     assert manifest.artifact_id == "test-authority-id"
     assert manifest.bootstrap_token_hash == "abc123"
-    assert set(manifest.trust_anchors.keys()) == {"origin", "mantle", "chorus"}
+    assert set(manifest.trust_anchors.keys()) == {"origin", "mantle", "crystal"}
 
 
 def test_load_manifest_caches_result(trust_setup):
@@ -165,7 +165,7 @@ def test_verify_service_jwt_rejects_wrong_audience(trust_setup):
 
     with pytest.raises(JWTError):
         authority_trust.verify_service_jwt(
-            token, expected_issuer="origin", expected_audience="chorus"
+            token, expected_issuer="origin", expected_audience="crystal"
         )
 
 
@@ -194,9 +194,18 @@ def test_verify_service_jwt_rejects_expired_token(trust_setup):
 def test_verify_service_jwt_rejects_tampered_signature(trust_setup):
     service_identity.init_service_identity("origin")
     token = service_identity.sign_service_jwt(audience="mantle")
-    # Flip a byte in the signature (last segment of the JWT)
+    # Tamper at the byte level, not the character level: a 32-byte signature is 43 base64url
+    # characters, and the last character carries only 2 significant bits, so 4 of the 64 possible
+    # final characters decode to identical bytes. Flipping a byte instead of a character guarantees
+    # the tamper changes the underlying signature. Shares this property with
+    # `test_verify_jwt_signature_check_always_runs`.
+    import base64
+
     head, payload, sig = token.split(".")
-    tampered_sig = sig[:-2] + ("AB" if sig[-2:] != "AB" else "CD")
+    raw = base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4))
+    flipped = bytes([raw[0] ^ 0x01]) + raw[1:]
+    assert flipped != raw, "the tamper must change the signature BYTES, not just its rendering"
+    tampered_sig = base64.urlsafe_b64encode(flipped).rstrip(b"=").decode()
     bad_token = f"{head}.{payload}.{tampered_sig}"
 
     with pytest.raises(JWTError):
@@ -232,13 +241,13 @@ def test_verify_service_jwt_rejects_when_anchor_missing(trust_setup):
 def test_verify_delegation_jwt_accepts_valid_token(trust_setup):
     service_identity.init_service_identity("mantle")
     token = service_identity.sign_delegation_jwt(
-        audience="chorus", user_sub="user-123"
+        audience="crystal", user_sub="user-123"
     )
 
     claims = authority_trust.verify_delegation_jwt(
         token,
         expected_issuer="mantle",
-        expected_audience="chorus",
+        expected_audience="crystal",
         expected_actor="mantle",
     )
     assert claims["sub"] == "user-123"
@@ -249,24 +258,24 @@ def test_verify_delegation_jwt_accepts_valid_token(trust_setup):
 def test_verify_delegation_jwt_rejects_service_token(trust_setup):
     """A `principal_type=service` token must NOT pass delegation verification."""
     service_identity.init_service_identity("mantle")
-    token = service_identity.sign_service_jwt(audience="chorus")
+    token = service_identity.sign_service_jwt(audience="crystal")
 
     with pytest.raises(JWTError, match="principal_type"):
         authority_trust.verify_delegation_jwt(
-            token, expected_issuer="mantle", expected_audience="chorus"
+            token, expected_issuer="mantle", expected_audience="crystal"
         )
 
 
 def test_verify_delegation_jwt_rejects_wrong_actor(trust_setup):
     """If the verifier expects a specific actor, a different one is rejected."""
     service_identity.init_service_identity("mantle")
-    token = service_identity.sign_delegation_jwt(audience="chorus", user_sub="u1")
+    token = service_identity.sign_delegation_jwt(audience="crystal", user_sub="u1")
 
     with pytest.raises(JWTError, match="act.sub"):
         authority_trust.verify_delegation_jwt(
             token,
             expected_issuer="mantle",
-            expected_audience="chorus",
+            expected_audience="crystal",
             expected_actor="origin",
         )
 
@@ -274,10 +283,10 @@ def test_verify_delegation_jwt_rejects_wrong_actor(trust_setup):
 def test_verify_delegation_jwt_actor_check_optional(trust_setup):
     """Omitting expected_actor skips the actor check (still validates type/sig/aud/iss)."""
     service_identity.init_service_identity("mantle")
-    token = service_identity.sign_delegation_jwt(audience="chorus", user_sub="u1")
+    token = service_identity.sign_delegation_jwt(audience="crystal", user_sub="u1")
 
     claims = authority_trust.verify_delegation_jwt(
-        token, expected_issuer="mantle", expected_audience="chorus"
+        token, expected_issuer="mantle", expected_audience="crystal"
     )
     assert claims["sub"] == "u1"
 
@@ -339,11 +348,32 @@ def test_verify_jwt_rejects_unmatched_audience_list(trust_setup):
 
 
 def test_verify_jwt_signature_check_always_runs(trust_setup):
-    """Even with all claim checks disabled, signature must still be valid."""
+    """Even with all claim checks disabled, the signature must still be valid.
+
+    The tamper is derived from the byte it replaces, so the result cannot coincide with the
+    original at any input; the test asserts that difference before relying on it. A tamper that
+    could coincide with the original would let a removed signature check still look green.
+    """
     service_identity.init_service_identity("origin")
     token = service_identity.sign_service_jwt(audience="anything")
     head, payload, sig = token.split(".")
-    bad = f"{head}.{payload}.{sig[:-2]}AB"
+
+    # Tamper at the byte level, not the character level: a 32-byte signature is 43 base64url
+    # characters, and the last character carries only 2 significant bits, so 4 of the 64 possible
+    # final characters decode to identical signature bytes. Flipping the last character alone would
+    # sometimes leave the signature unchanged. Decode, flip a byte, re-encode.
+    import base64
+
+    raw = base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4))
+    flipped = bytes([raw[0] ^ 0x01]) + raw[1:]
+    assert flipped != raw, "the tamper must change the signature BYTES"
+    bad_sig = base64.urlsafe_b64encode(flipped).rstrip(b"=").decode()
+
+    bad = f"{head}.{payload}.{bad_sig}"
     with pytest.raises(JWTError):
         authority_trust.verify_jwt(bad, expected_issuer_service="origin")
+
+    # The positive control. Without it, a `verify_jwt` that rejected everything would pass the
+    # assertion above — "it raised" is not evidence that the signature is what was checked.
+    authority_trust.verify_jwt(token, expected_issuer_service="origin")
 

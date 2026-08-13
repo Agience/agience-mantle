@@ -3,8 +3,8 @@
 The inverse of ``loader.seed_from_artifacts``: walk a collection's contents
 (artifacts + nested sub-collections + containment edges) and emit the same
 ``namespace/slug/content_type/context/content/edges`` seed dicts the loader reads
-back. This is the basis for collection import/export and a future "seed bank"
-(pull a collection from another Agience instance).
+back. This is the basis for collection import/export — pulling a collection's
+declarative representation for reuse on another Agience instance.
 
 CONTENT ONLY — grants are deliberately NOT exported. Grants are per-deployment
 access records keyed by user ids that won't exist on another instance; the
@@ -27,11 +27,6 @@ from mantle.db.backend import get_collection_by_id, list_collection_artifacts
 from mantle.entities.collection import COLLECTION_CONTENT_TYPE
 
 _WORKSPACE_CONTENT_TYPE = "application/vnd.agience.workspace+json"
-# ⛔ `_MAX_DEPTH = 25` as a TRUNCATION removed 2026-07-30. `seen` is the cycle guard (the comment
-# here said so itself), so the depth test only cut the walk short — and a truncated export was
-# returned as a SUCCESSFUL one. Data loss presented as a completed export is the worst shape a
-# bound can take. What remains is an operational guard on Python's own call stack, and it RAISES:
-# an export either contains everything or fails loudly.
 _RECURSION_CEILING = 500  # stack depth, not a claim about how deep containment goes
 
 

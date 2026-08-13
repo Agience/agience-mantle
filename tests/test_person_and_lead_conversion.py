@@ -11,7 +11,7 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 
 BACKEND = Path(__file__).resolve().parents[1]
@@ -56,11 +56,15 @@ def test_ensure_person_artifact_creates(monkeypatch):
     # Homed in People, not the inbox.
     assert edges == [("people-col", e.id)]
     assert e.collection_id == "people-col"
-    # Owner gets read + update on their own card.
+    # Owner gets read + update + DELETE on their own card. Delete is the one that makes the
+    # card erasable by its subject — it holds their plaintext email and display name, and
+    # `DELETE /artifacts/{id}` resolves through this grant like any other artifact's.
     assert len(grants) == 1
     assert grants[0].resource_id == e.id
     assert grants[0].grantee_id == "u-1"
+    assert grants[0].can_read is True
     assert grants[0].can_update is True
+    assert grants[0].can_delete is True
 
 
 def test_ensure_person_artifact_idempotent(monkeypatch):
@@ -75,11 +79,29 @@ def test_ensure_person_artifact_idempotent(monkeypatch):
     monkeypatch.setattr(up, "db_add_artifact_to_collection", lambda db, c, ch, **kw: None)
     # Owner grant already present → no duplicate.
     monkeypatch.setattr(up, "db_get_grants_for_principal_resource",
-                        lambda db, g, r: [SimpleNamespace(can_update=True)])
+                        lambda db, g, r: [SimpleNamespace(can_update=True, can_delete=True)])
     monkeypatch.setattr(up, "db_create_grant",
                         lambda db, g: (_ for _ in ()).throw(AssertionError("should not create")))
     up._ensure_person_artifact(MagicMock(), UserContext(id="u-1", inbox_id="inbox-1"))
     assert created == []
+
+
+def test_owner_grant_widens_a_card_that_cannot_be_deleted(monkeypatch):
+    """A card carrying only read+update is widened on the owner's next login.
+
+    Idempotence is measured against the grant the owner should hold, not against "some grant
+    exists" — otherwise a card issued under the narrower pair stays undeletable by its subject
+    for the life of the account, and the fix reaches new members only.
+    """
+    grants: list = []
+    monkeypatch.setattr(up, "db_get_grants_for_principal_resource",
+                        lambda db, g, r: [SimpleNamespace(can_update=True, can_delete=False)])
+    monkeypatch.setattr(up, "db_create_grant", lambda db, g: grants.append(g))
+
+    up._ensure_person_owner_grant(MagicMock(), "person-1", "u-1")
+
+    assert len(grants) == 1
+    assert grants[0].can_delete is True
 
 
 def test_person_display_name_falls_back_to_email_local_part(monkeypatch):
@@ -185,29 +207,38 @@ def test_convert_leads_noop_without_email_or_collection(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Welcome email (sent as the platform operator so the email secret resolves)
+# PII egress: provisioning sends nothing anywhere
 # ---------------------------------------------------------------------------
 
-def test_send_welcome_email_sends_as_operator(monkeypatch):
-    calls: list = []
-    monkeypatch.setattr("mantle.services.platform_settings_service.settings.get",
-                        lambda key, *a, **k: "op-1" if key == "platform.operator_id" else None)
-    monkeypatch.setattr("mantle.services.server_registry.resolve_name_to_id", lambda name: "iris-uuid")
-    monkeypatch.setattr("mantle.services.chorus_client.call_tool",
-                        lambda sid, tool, args, *, user_id: calls.append((sid, tool, args, user_id)))
+def test_first_login_has_no_outbound_email_path():
+    """First login is a local write, not a message to anyone.
 
-    up._send_welcome_email(MagicMock(), UserContext(id="u-1", email="jane@x.com", name="Jane", inbox_id="i"))
+    Provisioning holds a new member's email and display name at exactly the moment nobody has
+    consented to anything, so an automatic outbound call from here hands that pair to another
+    service as a side effect of signing in. Asserted against the module's source rather than by
+    mocking a sender, because the property is *that no sender is reachable from here* — a mock
+    can only prove the one path it was pointed at.
+    """
+    import inspect
 
-    assert len(calls) == 1
-    sid, tool, args, user_id = calls[0]
-    assert sid == "iris-uuid"
-    assert tool == "send_email"
-    assert user_id == "op-1"           # sent as the operator (holds secret read)
-    assert args["to"] == "jane@x.com"  # delivered to the new user
+    src = inspect.getsource(up)
+    for token in ("send_email", "chorus_client", "welcome"):
+        assert token not in src, "user_provisioning reaches an outbound path: %r" % token
 
 
-def test_send_welcome_email_noop_without_email(monkeypatch):
-    calls: list = []
-    monkeypatch.setattr("mantle.services.chorus_client.call_tool", lambda *a, **k: calls.append(1))
-    up._send_welcome_email(MagicMock(), UserContext(id="u-1", email=None, inbox_id="i"))
-    assert calls == []
+def test_provision_user_never_logs_the_email(caplog):
+    """The email is data in the store, not a line in the log — logs travel further."""
+    import logging
+
+    with caplog.at_level(logging.DEBUG):
+        with (
+            patch.object(up, "_seeds_base", return_value=None),
+            patch.object(up, "_ensure_inbox_workspace", return_value="ws-1"),
+            patch.object(up, "_materialize_inbox"),
+            patch.object(up, "_ensure_person_artifact", return_value=True),
+            patch.object(up, "_convert_leads_for_person"),
+            patch("mantle.services.person_service.get_user_by_id", return_value=None),
+        ):
+            up.provision_user(MagicMock(), "u-1", email="jane@x.com", name="Jane")
+
+    assert "jane@x.com" not in caplog.text

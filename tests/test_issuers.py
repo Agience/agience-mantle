@@ -90,7 +90,7 @@ class TestVerifierRefresh:
         gv.return_value.refresh_from_db.assert_called_once_with(fake_db)
 
     def test_filter_matches_issuer_events_only(self):
-        from mantle import event_bus
+        from mantle.events import event_bus
         from mantle.services import issuers
         flt = event_bus.EventFilter(
             content_type=issuers.ISSUER_CONTENT_TYPE,
@@ -110,7 +110,7 @@ class TestVerifierRefresh:
 
     async def test_watch_refreshes_on_published_issuer_event(self):
         import asyncio
-        from mantle import event_bus
+        from mantle.events import event_bus
         from mantle.services import issuers
 
         event_bus.set_event_loop(asyncio.get_event_loop())
@@ -201,19 +201,19 @@ class TestAdminCreateRevoke:
 
 class TestIssuerRouter:
     async def test_create_requires_admin(self, client):
-        with patch("mantle.routers.issuers_router.require_platform_admin",
+        with patch("mantle.routers.system_router.require_platform_admin",
                    side_effect=HTTPException(status_code=403, detail="nope")):
-            r = await client.post("/issuers", json={"issuer": "https://idp.test",
+            r = await client.post("/system/issuers", json={"issuer": "https://idp.test",
                                                     "jwks": {"keys": []}})
         assert r.status_code == 403
 
     async def test_create_dispatches_to_service_as_admin(self, client):
         with (
-            patch("mantle.routers.issuers_router.require_platform_admin", return_value="admin-1"),
+            patch("mantle.routers.system_router.require_platform_admin", return_value="admin-1"),
             patch("mantle.services.issuers.create_issuer_artifact",
                   return_value=SimpleNamespace(id="new-id")) as svc,
         ):
-            r = await client.post("/issuers", json={"issuer": "https://idp.test",
+            r = await client.post("/system/issuers", json={"issuer": "https://idp.test",
                                                     "audience": "aud", "jwks": {"keys": []}})
         assert r.status_code == 201
         assert r.json()["id"] == "new-id"
@@ -233,9 +233,14 @@ class TestSeedPlatformIssuers:
             patch("mantle.services.peer_signing.get_system_principal_id", return_value="SYS"),
             patch("mantle.services.issuers.list_issuer_artifacts", return_value=[]),
             patch("mantle.services.oidc._read_authority_manifest", return_value=manifest),
-            patch("origin.config.AUTHORITY_ISSUER", "https://auth.test"),
-            patch("origin.config.TRUSTED_ISSUERS",
-                  [{"issuer": "https://ext.test", "jwks": {"keys": []}}], create=True),
+            patch("mantle.config.AUTHORITY_ISSUER", "https://auth.test"),
+            # No `create=True`: `TRUSTED_ISSUERS` exists, and production reads it as
+            # `getattr(config, "TRUSTED_ISSUERS", [])`. If the symbol were ever removed, that
+            # getattr would silently fall back to `[]` while `create=True` kept manufacturing a
+            # phantom trust list here — the test would keep proving external issuers are seeded
+            # from a name nothing reads.
+            patch("mantle.config.TRUSTED_ISSUERS",
+                  [{"issuer": "https://ext.test", "jwks": {"keys": []}}]),
             patch("mantle.services.issuers.create_issuer_artifact",
                   side_effect=lambda db, **kw: created.append(kw)),
         ):
@@ -259,8 +264,8 @@ class TestSeedPlatformIssuers:
             patch("mantle.services.peer_signing.get_system_principal_id", return_value="SYS"),
             patch("mantle.services.issuers.list_issuer_artifacts", return_value=[existing]),
             patch("mantle.services.oidc._read_authority_manifest", return_value=manifest),
-            patch("origin.config.AUTHORITY_ISSUER", None),
-            patch("origin.config.TRUSTED_ISSUERS", [], create=True),
+            patch("mantle.config.AUTHORITY_ISSUER", None),
+            patch("mantle.config.TRUSTED_ISSUERS", []),   # see above: no `create=True`
             patch("mantle.services.issuers.create_issuer_artifact",
                   side_effect=lambda db, **kw: created.append(kw)),
         ):
@@ -288,8 +293,8 @@ class TestContainerEmitsChangeEvent:
 
 class TestArtifactsAuthoritative:
     def test_artifact_issuer_overrides_manifest_anchor(self):
-        # conftest writes a manifest with origin/mantle/chorus anchors; the verifier
-        # loads them. A platform issuer ARTIFACT for the same iss must WIN (artifacts
+        # conftest writes a manifest with origin/mantle/peer anchors; the verifier
+        # loads them. A platform issuer artifact for the same iss must win (artifacts
         # authoritative), while the manifest still fills the gaps (fallback).
         v = OidcVerifier(trusted_issuers=[])
         assert "origin" in v._by_iss          # seeded from the test manifest

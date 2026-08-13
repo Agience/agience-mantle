@@ -1,9 +1,7 @@
-"""MANTLE-SSE — encrypted lexical search (Step 2.6 scaffolding).
+"""MANTLE-SSE — encrypted lexical search.
 
-Per `.dev/features/mantle-sse-lexical-index.md`. Replaces the legacy BM25 index with
-blind-token posting lists encrypted in S3. Once 2.6 lands fully, the
-`search` (the legacy lexical index) container can be retired entirely — completing the
-four-container reduction.
+Per `.dev/features/mantle-sse-lexical-index.md`. The canonical lexical backend:
+blind-token posting lists encrypted in S3.
 
 Design summary:
 
@@ -11,12 +9,11 @@ Design summary:
   produces opaque tokens. The S3 backing store sees only hex strings — never
   plaintext terms.
 - **Posting lists**: per-blind-token JSON (entries: artifact_id, collection_id,
-  field, tf, dl, positions), AES-256-GCM encrypted with HKDF-derived
-  per-token keys.
-- **Corpus stats**: per-owner aggregates (doc_count, avg_dl, df) encrypted
-  with the owner's SSE key. Updated incrementally on commit.
-- **BM25**: standard Okapi BM25 with field boosting, computed in-process
-  after decrypting the relevant posting lists.
+  field), AES-256-GCM encrypted with HKDF-derived per-token keys.
+- **Narrowing, not scoring**: a query's stems are looked up and MET against the light cone.
+  The lookup counts how many stems each artifact matched, which is what orders a recall with
+  no query vector. There is no corpus statistic, no IDF, no term frequency and no document
+  length anywhere in this package.
 - **Authorization**: same light-cone BFS as the MANTLE vector layer. Both
   index paths share the authorized scope.
 
@@ -26,27 +23,20 @@ Layered atop the existing MANTLE vector infrastructure:
   context for owner SSE keys.
 - :class:`LightConeResolver` (existing) — reused unchanged.
 - New SSE modules below — tokenizer, blind tokens, posting list manager,
-  BM25 scorer, corpus stats, indexer, query engine.
+  indexer, narrowing.
 
-After Step 2.6.9 (2026-05-09) the ``MANTLE_SSE_ENABLED`` flag is gone —
-SSE is the canonical lexical backend. Phasing reference (historical):
+Module map:
 
-- **2.6.0** — Package scaffolding + config flag (this commit).
-- **2.6.1** — Tokenizer (English analysis: lowercase → possessive →
+- :mod:`.tokenizer` — English analysis pipeline (lowercase → possessive →
   stop words → Porter stemmer).
-- **2.6.2** — Blind token generator (HMAC + field prefix + prefix tokens
-  for title/tags).
-- **2.6.3** — Posting list manager (S3 CRUD; HKDF + AES-256-GCM per
+- :mod:`.blind_tokens` — HMAC-based token generator (field prefix + prefix
+  tokens for title/tags).
+- :mod:`.posting` — posting list manager (S3 CRUD; HKDF + AES-256-GCM per
   blind token; manifest tracking per artifact).
-- **2.6.4** — Corpus stats manager (per-owner aggregates).
-- **2.6.5** — BM25 scorer (in-process, field-boosted via existing
-  ``mantle/search/weights/*.json`` presets).
-- **2.6.6** — Indexer + commit-path hook (parallel to ``MantleIndexer``).
-- **2.6.7** — Query engine (constant-width batch lookup, BM25 scoring).
-- **2.6.8** — Unified accessor (RRF fusion of MANTLE vector + SSE lexical;
-  no the legacy lexical index arm).
-- **2.6.9** — Migration: re-index existing artifacts via SSE; retire
-  the legacy lexical index; drop ``search`` service from compose. Done 2026-05-09.
+- :mod:`.indexer` — commit-path indexer (parallel to ``MantleIndexer``).
+- :mod:`.narrowing` — blind-token membership + query coverage: which artifacts carry these
+  stems, and how many of them each one carries. Same posting lists, no corpus statistic.
+- :mod:`.s3_stores` / :mod:`.file_stores` — production storage backends.
 """
 
 from __future__ import annotations
@@ -78,8 +68,10 @@ from .posting import (
     deserialize_manifest,
     encrypt_blob,
     entry_count,
+    manifest_aad,
     pack_manifest,
     pack_posting,
+    posting_aad,
     remove_artifact_collection_entries,
     remove_artifact_entries,
     serialize_entries,
@@ -88,32 +80,10 @@ from .posting import (
     unpack_posting,
     upsert_entry,
 )
+from .file_stores import FilePostingStore
 from .indexer import SseIndexer
-from .query import SseHit, SseQueryEngine
-from .s3_stores import S3PostingStore, S3StatsStore
-from .scorer import (
-    DEFAULT_B,
-    DEFAULT_FIELD_BOOST,
-    DEFAULT_K1,
-    TokenHit,
-    bm25_term_score,
-    idf,
-    normalized_tf,
-    score_query,
-)
-from .stats import (
-    InMemoryStatsStore,
-    Stats,
-    StatsStore,
-    add_document,
-    derive_stats_key,
-    deserialize_stats,
-    empty_stats,
-    pack_stats,
-    remove_document,
-    serialize_stats,
-    unpack_stats,
-)
+from .narrowing import Coverage, CoverageLookup, TokenNarrower, phrase_stems
+from .s3_stores import S3PostingStore
 from .tokenizer import (
     porter_stem,
     split_words,
@@ -139,12 +109,17 @@ __all__ = [
     "blind_tokens_for_terms",
     "prefix_blind_token",
     "prefix_blind_tokens",
-    # Posting list manager (Step 2.6.3)
+    # Posting list manager
     "PostingError",
     "PostingMalformed",
     "PostingTampered",
     "derive_posting_key",
     "derive_manifest_key",
+    # Slot binding (AEAD associated data) — the write paths in `sse/` bind every blob,
+    # so the AAD builders belong on the same surface as the key derivations they pair with:
+    # a caller that can reach `encrypt_blob` must be able to reach the slot it binds to.
+    "posting_aad",
+    "manifest_aad",
     "encrypt_blob",
     "decrypt_blob",
     "serialize_entries",
@@ -162,65 +137,44 @@ __all__ = [
     "artifact_ids_in_entries",
     "PostingStore",
     "InMemoryPostingStore",
-    # Corpus stats (Step 2.6.4)
-    "Stats",
-    "derive_stats_key",
-    "serialize_stats",
-    "deserialize_stats",
-    "pack_stats",
-    "unpack_stats",
-    "empty_stats",
-    "add_document",
-    "remove_document",
-    "StatsStore",
-    "InMemoryStatsStore",
-    # BM25 scorer (Step 2.6.5)
-    "DEFAULT_K1",
-    "DEFAULT_B",
-    "DEFAULT_FIELD_BOOST",
-    "TokenHit",
-    "idf",
-    "normalized_tf",
-    "bm25_term_score",
-    "score_query",
-    # Commit-path indexer (Step 2.6.6)
+    # Commit-path indexer
     "SseIndexer",
-    # Query engine (Step 2.6.7)
-    "SseHit",
-    "SseQueryEngine",
-    # Unified accessor (Step 2.6.8)
-    "MantleUnifiedAccessor",
-    "HitSource",
-    "UnifiedHit",
-    # S3-backed production stores (Step 2.6.9)
+    # Blind-token narrowing — membership, and how much of the query each member matched
+    "Coverage",
+    "CoverageLookup",
+    "TokenNarrower",
+    "phrase_stems",
+    # S3-backed production store
     "S3PostingStore",
-    "S3StatsStore",
-    # Router-shape adapter (Step 2.6.9)
+    # File-backed production store — the standalone index
+    "FilePostingStore",
+    # Router-shape adapter
     "MantleSseSearchAccessor",
 ]
 
 
-# ── the entangled two, made LAZY (PEP 562) ───────────────────────────────────────────────────────
-# ⛔ WHY: EAGERLY IMPORTING THESE MADE THE LEXICAL ARM UNSHIPPABLE, AND HID IT.
+# ── `router_accessor`, resolved lazily (PEP 562) ─────────────────────────────────────────
 #
-# `router_accessor` needs `embeddings` + `..lightcone` + `..oracle`; `unified` needs `..engine` +
-# `services.acting_principal`. They are the VECTOR-arm and custody integration — precisely what an
-# embedding consumer does not want (EREA §5: "Not requested: the vector arm. Model-dependent, and a
-# data store does no reasoning"). While this package imported them at module scope, `import
-# ...sse.tokenizer` pulled in numpy and the whole custody hierarchy, so the ten dependency-clean
-# modules could not be imported — let alone shipped — without the two that are not.
+# It needs `embeddings` + `..lightcone` + `..oracle` + `..engine`: the vector-arm and custody
+# integration, which a pure lexical/blind-token caller does not need — the vector arm is
+# model-dependent, and a data store does no reasoning. Importing it at module scope would pull
+# numpy and the whole custody hierarchy into every import of this package, including the
+# dependency-clean modules that don't touch either.
 #
-# It also created a genuine CYCLE once `oracle` began importing `.sse.keys` (the key contract):
-# oracle → sse/__init__ → router_accessor → oracle, partially initialized.
+# `narrowing` is NOT lazy, and the reason is worth stating because it looks like it should be. It
+# catches `MasterKeyMissing` — the refusal a key provider raises for a principal that has never
+# been written to — and an `except` matches on the CLASS OBJECT, so the catch must name the same
+# class the raise does. When that class was defined in `..oracle`, honouring the constraint meant
+# a module-scope import of the whole custodian, and an eager import here would have put it behind
+# every import of this package, including `tokenizer` and `posting`. The class now lives in
+# `..custody`, which defines the two refusals and nothing else, so the catch costs an import of
+# two names and `narrowing` is eager with the rest of the lexical core.
 #
-# PEP 562 `__getattr__` keeps the public API EXACTLY as it was — `from ...sse import
-# MantleUnifiedAccessor` still works — while making the cost land only on the caller who asks. The
-# names stay in `__all__` because they are still exported; what changed is WHEN they are resolved.
+# PEP 562 `__getattr__` keeps the public API as-is — `from ...sse import MantleSseSearchAccessor`
+# still works — while the import cost lands only on the caller who asks for the name. It stays in
+# `__all__` because it is still exported; resolution just happens on first access.
 _LAZY = {
     "MantleSseSearchAccessor": ".router_accessor",
-    "MantleUnifiedAccessor": ".unified",
-    "HitSource": ".unified",
-    "UnifiedHit": ".unified",
 }
 
 

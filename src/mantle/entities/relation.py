@@ -1,7 +1,7 @@
 """Edge relation kinds — the information-centric typing of graph edges.
 
 Build-side vocabulary of the Information Gauge DB design (see
-``agience-pharos/dev/features/INFORMATION-GAUGE-DB-IMPLEMENTATION.md`` §0/§3). An
+``agience-pharos/features/INFORMATION-GAUGE-DB-IMPLEMENTATION.md`` §0/§3). An
 edge is named for *what it does to information*, never by a physics analogy. Five
 kinds exist across the field, but only two are carried by the ``edges``
 (``collection_artifacts``) collection; the rest are represented in their own

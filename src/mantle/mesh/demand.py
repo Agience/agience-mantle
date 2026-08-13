@@ -1,25 +1,18 @@
-"""The demand cache — what a LIMITED ember holds is shaped by use, and stays within its envelope.
+"""The demand cache — what a limited ember holds is shaped by use, and stays within its envelope.
 
-A reached row carries a MASS. Each reach accretes it (+1); time decays it — demurrage, the 2nd law,
-through the ONE decay kernel in `prism.law` (`cool(dt, tau) = exp(-dt/tau)`), never a bare `math.exp`.
-When the cache exceeds the node's MEASURED envelope, the coldest rows (lowest decayed mass) are
-evicted; the authoritative copy still lives in the substrate, so a later reach restores it. This is
-what makes a node STAY limited rather than merely start empty.
+A reached row carries a mass. Each reach accretes it (+1); time decays it — demurrage, the 2nd law,
+through the exponential decay kernel (`cool(dt, tau) = exp(-dt/tau)`). When the cache exceeds the
+node's measured envelope, the coldest rows (lowest decayed mass) are evicted; the authoritative copy
+still lives in the substrate, so a later reach restores it. This is what keeps a node limited rather
+than merely starting empty.
 
 Own-authored rows carry no demand entry (they were authored, not reached) and are therefore never
 selected for eviction — a node never sheds its own observations, only its cache of others'.
 
-Decay lives HERE, not in the store: the mantle lattice is dependency-free, and `prism.law` is the ember
-layer's to import. The store holds only the raw `(mass, ts)`.
-
-⚠ IT STAYS IN MANTLE, AND THE KERNEL MOVED INSTEAD (2026-07-31). It was briefly moved to ember to
-escape the layering rule (mantle may not import beam) — but `mesh/sync.py` calls `demand.touch` on
-every reached row, so the module belongs with the store that holds the demand rows. What did not
-belong in beam was the KERNEL: `law.cool` is a primitive, and it now lives in `prism.law`, which
-both mantle and beam may reach.
-
-That also deleted the `except ImportError -> math.exp(-dt/tau)` fallback — a second decay kernel
-hiding in an except branch. See `_cool`.
+Decay lives here, not in the store: the mantle lattice is dependency-free, and this cache is not the
+store. The formula is inlined rather than imported from `prism.law` — no other consumer needs this
+node's local eviction ranking to match anything else bit-for-bit, so there is nothing to single-source
+against. The store holds only the raw `(mass, ts)`.
 """
 from __future__ import annotations
 
@@ -28,7 +21,16 @@ import os
 import time
 from typing import Any, Dict
 
-from prism import law as _law       # the ONE decay kernel (2nd law) — no fallback, see _cool
+#: Rows per keyset page while walking the demand cache. Declared here rather than imported from
+#: `db.vertex` on purpose: this module duck-types the store (`hasattr(v, "demand_count")`)
+#: so that any implementation can serve it, and a hard import would quietly make one of them
+#: mandatory. It is passed as the LIMIT and is the same name the end-of-walk test reads, so the
+#: two can never disagree.
+#:
+#: A per-round MEMORY bound only — the eviction decision is identical at any page size, since the
+#: full `scored` list is built either way. A different value would be right if the measured
+#: envelope (`budget_rows`) could not hold a page alongside that list.
+_PAGE = 5000
 
 
 def _now() -> float:
@@ -36,34 +38,33 @@ def _now() -> float:
 
 
 def _tau() -> float:
-    """The demand decay time (seconds) — a FLAGGED SEAM, default honest (~1 day). It SHOULD be
-    measured from the access trajectory (`optics.fit_dynamics(...).rates()`) where one exists; until
-    then it is a declared tunable, not a hidden constant. Larger tau = a longer memory."""
+    """The demand decay time (seconds) — a flagged seam, default honest (~1 day). Measurable from
+    the access trajectory (`optics.fit_dynamics(...).rates()`) where one exists; a declared tunable,
+    not a hidden constant, everywhere else. Larger tau = a longer memory."""
     return max(1e-9, float(os.getenv("EMBER_DEMAND_TAU", "86400")))
 
 
 def _cool(dt: float, tau: float) -> float:
-    """Decay to now through THE kernel. No fallback, deliberately.
+    """Decay to now: the fraction of a stock that survives `dt` at decay time `tau`.
 
-    ⚠ THE `except: _law = None` FALLBACK WAS DELETED WITH THE MOVE (2026-07-31). It read
-    `math.exp(-dt / tau)` with the comment "identical kernel; only if beam is unavailable" — a
-    SECOND implementation of the decay law, hiding in an except branch, which the single-source rule
-    exists to forbid ("optics MEASURES the scale, law APPLIES the kernel; no bare exp(-x/scale)").
-    Identical today is not identical after the next change to `law.cool`, and the divergence would
-    appear only on hosts where the import failed — the hardest possible place to notice it.
-
-    It existed because this module lived in mantle, which may not import beam. Now it lives in
-    ember, which may, so there is nothing to fall back FROM."""
-    return float(_law.cool(max(0.0, float(dt)), tau=tau))
+    `exp(-dt/tau)`, `dt` clamped at 0 so a negative travel survives whole. `tau` is taken as a
+    limit at `tau -> 0+`: an instantaneous decay survives at 0 for any positive `dt`, at 1 at
+    `dt == 0` — the same limit `prism.law._survive` takes, reproduced here because this is the
+    one caller of it in the whole codebase."""
+    dt = max(0.0, float(dt))
+    tau = float(tau)
+    if not (tau > 0.0):
+        return 0.0 if dt > 0.0 else 1.0
+    return math.exp(-dt / tau)
 
 
 def touch(store, artifact_id: str) -> None:
-    """A reach or access is DEMAND. Decay the item's mass to now, then add one. A held row with no
+    """A reach or access is demand. Decay the item's mass to now, then add one. A held row with no
     demand entry (own-authored) simply gains one on its first *reach* and is otherwise untouched."""
     v = getattr(store, "artifacts", None)
     if v is None or not hasattr(v, "demand_set"):
         return
-    # Demand tracks HELD artifacts only — one demand row per held row, never an orphan. Touching an id
+    # Demand tracks held artifacts only — one demand row per held row, never an orphan. Touching an id
     # the node does not hold (e.g. a peer discovered but whose peer-artifact is not held) is a no-op,
     # so the cache invariant stays: a demand entry ⇒ a held, evictable row.
     if v.get_artifact(str(artifact_id)) is None:
@@ -80,10 +81,10 @@ def current_mass(d: Dict[str, float], *, now: float, tau: float) -> float:
 
 
 def budget_rows(store) -> int:
-    """Max cache rows, DERIVED from the MEASURED envelope: `envelope_bytes · fraction / bytes_per_row`.
+    """Max cache rows, derived from the measured envelope: `envelope_bytes · fraction / bytes_per_row`.
     The envelope (cgroup mem / data-volume free) and the bytes-per-row are measured; the fraction of
     the envelope to spend on the cache index, and the bytes-per-row estimate when it can't be
-    measured, are FLAGGED SEAMS (default honest), per 'no arbitrary caps — leave a flagged seam'."""
+    measured, are flagged seams (default honest), per 'no arbitrary caps — leave a flagged seam'."""
     frac = max(0.0, float(os.getenv("EMBER_CACHE_FRACTION", "0.25")))
     bpr = max(1.0, float(os.getenv("EMBER_BYTES_PER_ROW", "2048")))     # ~an index row; measured seam
     env_bytes = 0
@@ -99,7 +100,7 @@ def budget_rows(store) -> int:
 
 
 def evict(store, *, budget: int) -> Dict[str, Any]:
-    """Evict the COLDEST cache rows (lowest decayed mass) until the cache is within `budget`. Only
+    """Evict the coldest cache rows (lowest decayed mass) until the cache is within `budget`. Only
     demand rows (reached copies) are candidates, so own-authored rows are never shed. The
     authoritative row survives in the substrate; a re-reach restores it."""
     v = getattr(store, "artifacts", None)
@@ -111,13 +112,15 @@ def evict(store, *, budget: int) -> Dict[str, Any]:
     now, tau = _now(), _tau()
     scored, after = [], ""
     while True:                     # walk the (bounded) cache once, decaying each to now
-        page = v.demand_page(after=after, limit=5000)
+        page = v.demand_page(after=after, limit=_PAGE)
         if not page:
             break
         for d in page:
             scored.append((current_mass(d, now=now, tau=tau), d["id"]))
         after = page[-1]["id"]
-        if len(page) < 5000:
+        # A short page is the last page — true against the LIMIT THAT WAS ASKED FOR, so it is
+        # tested against that same name and never a second literal.
+        if len(page) < _PAGE:
             break
     scored.sort()                   # coldest (lowest decayed mass) first
     evicted = 0

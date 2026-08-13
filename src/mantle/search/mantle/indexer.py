@@ -1,10 +1,10 @@
 """MantleIndexer — commit-path AES-256-GCM cell encryption + S3 upload.
 
-Step 2.2b.iii implementation. Combines:
+Combines:
 
-- :class:`OracleService` (Step 2.2a) — derives per-cell AES-256-GCM keys
-- :func:`cell.pack_cell` / :func:`cell.unpack_cell` (Step 2.2b.i) — round-trip crypto
-- :class:`CellStore` (this step) — abstract storage
+- :class:`OracleService` — derives per-cell AES-256-GCM keys
+- :func:`cell.pack_cell` / :func:`cell.unpack_cell` — round-trip crypto
+- :class:`CellStore` — abstract storage
 
 One cell per ``(principal_id, collection_id, cluster_id)`` where the cluster is the
 routing anchor (canonical plan §5.1: the AnchorSet IS the partition). Every
@@ -82,13 +82,23 @@ class MantleIndexer:
                 raise ValueError("each chunk must carry embedding")
 
         # Route each chunk to its nearest-anchor cell (canonical plan §5.1).
-        # The AnchorSet is mandatory (bootstrapped from the seed corpus on first
-        # use); routing has no flat fallback. Re-routing after an AnchorSet
-        # change is handled by a full reindex, not here.
+        #
+        # The AnchorSet is mandatory and PROVISIONED — nothing derives one, here or on first
+        # use — so on an unprovisioned node this raises `AnchorSetNotProvisioned` and no cell is
+        # ever written. Routing has no flat fallback, and the caller
+        # (`ingest.pipeline_unified`) checks the set before reaching this so a write is skipped
+        # on the vector arm rather than failed. Re-routing after an AnchorSet change is handled
+        # by a full reindex, not here.
         from mantle.search.anchors.routing import route_vector
-        from mantle.search.anchors.store import require_live_anchorset
+        from mantle.search.anchors.store import record_indexed_geometry, require_live_anchorset
 
+        # `require_live_anchorset` gates: it refuses a set that does not name the same space as
+        # the one these cells were written under, and warns when the vocabulary moved within it.
         anchorset = require_live_anchorset()
+        # This is the write that makes the claim, so this is where the claim is recorded. A read
+        # never records — a query must not be able to make a store look indexed under whatever
+        # set happens to be loaded.
+        record_indexed_geometry(anchorset)
         groups: dict[str, List[dict]] = {}
         for chunk in chunks:
             cluster = route_vector(anchorset, chunk.get("embedding"))
@@ -179,7 +189,7 @@ class MantleIndexer:
     ) -> List[dict]:
         """Decrypt a single (owner, collection, cluster) cell and return its
         chunk records. Convenience for tests + admin tooling; production callers
-        go through :class:`MantleQueryEngine` (Step 2.3).
+        go through :class:`MantleQueryEngine`.
         """
         blob = self._cells.get(principal_id, collection_id, cluster_id)
         if blob is None:

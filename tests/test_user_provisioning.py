@@ -13,28 +13,15 @@ from mantle.services.bootstrap_types import ALL_PLATFORM_COLLECTION_SLUGS
 from ._package_root import seeds_root  # noqa: E402 — single source of the package tree location
 SEEDS_BASE = seeds_root()
 
-# Platform collections a first-login user is granted on.
-#
-# 🔴 THIS WAS A HAND-TYPED LIST OF 10 WHILE THE ASSERTIONS BELOW SAID 11 (fixed 2026-07-30). The
-# tests read `assert len(grants) == len(_USER_GRANT_SLUGS) == 11`, which cannot hold for a 10-item
-# list — so the file failed the moment the seed tree was actually supplied, and the number looked
-# like the suspect. MEASURED, it was not: the 11 is RIGHT and the LIST was short.
-#
-#   · the seed tree carries ELEVEN user grant files (`package/seeds/user/grants/*.yaml`) and the
-#     admin set names ELEVEN resources (`seeds/admin/grants/platform-admin.yaml`);
-#   · `ALL_PLATFORM_COLLECTION_SLUGS` (bootstrap_types.py) holds ELEVEN;
-#   · the one the list omitted was `agience-anchorset` — which is NOT retired. It is
-#     `ANCHORSET_COLLECTION_SLUG`, it is in `ALL_PLATFORM_COLLECTION_SLUGS` and in
-#     `USER_READABLE_SEED_SLUGS`, it has a platform collection seed (`anchorset-collection.yaml`),
-#     and `test_anchor_repo.py` asserts the repo registers it.
-#   · the mechanism of the loss: this list also drove the `_registry` fixture, so the omitted slug
-#     had no registered id, the loader logged *"unresolved grant resource 'agience/agience-
-#     anchorset'"* and DROPPED the grant. The list under-registered the platform and then measured
-#     its own omission — 10 grants — while the count constant remembered the truth.
-#
-# So it is DERIVED now, not typed. A duplicated roster is a seam; the platform constant is the one
-# place that knows which collections exist. `test_the_seed_tree_and_the_platform_list_agree` below
-# supplies the INDEPENDENT oracle so this cannot become self-confirming.
+# Platform collections a first-login user is granted on, derived from
+# ALL_PLATFORM_COLLECTION_SLUGS rather than hand-typed: the platform constant is the one place
+# that knows which collections exist (currently eleven, matching the eleven user grant files
+# under `package/seeds/user/grants/*.yaml` and the eleven resources named in
+# `seeds/admin/grants/platform-admin.yaml`). A duplicated roster here would be a seam — a slug
+# omitted from a hand-maintained list resolves to nothing, so the loader just logs
+# "unresolved grant resource" and drops the grant rather than raising.
+# `test_the_seed_tree_and_the_platform_list_agree` below checks the seed files on disk against
+# this constant independently, so the two cannot silently agree with each other by construction.
 _USER_GRANT_SLUGS = list(ALL_PLATFORM_COLLECTION_SLUGS)
 
 
@@ -66,7 +53,6 @@ def _provision(is_admin: bool = False):
         patch("mantle.services.person_service.get_user_by_id", return_value=None),
         patch("mantle.services.seed_provisioning.user_provisioning._ensure_person_artifact", return_value=False),
         patch("mantle.services.seed_provisioning.user_provisioning._convert_leads_for_person"),
-        patch("mantle.services.seed_provisioning.user_provisioning._send_welcome_email"),
     ):
         from mantle.services.seed_provisioning import user_provisioning
         user_provisioning.provision_user(MagicMock(), "user-9", seeds_base=SEEDS_BASE)
@@ -74,7 +60,7 @@ def _provision(is_admin: bool = False):
 
 
 def _seeded_grant_slugs(subdir: str) -> set[str]:
-    """Collection slugs the SEED FILES themselves name — read off disk, so it is independent of
+    """Collection slugs the seed files themselves name — read off disk, so it is independent of
     both `ALL_PLATFORM_COLLECTION_SLUGS` and of anything `provision_user` does."""
     import yaml
 
@@ -88,17 +74,17 @@ def _seeded_grant_slugs(subdir: str) -> set[str]:
 
 
 def test_the_seed_tree_and_the_platform_list_agree():
-    """THE ORACLE for the counts below, and the check that was missing.
+    """Cross-checks `ALL_PLATFORM_COLLECTION_SLUGS` against the grant seed files on disk — the
+    one comparison independent of `_USER_GRANT_SLUGS` itself.
 
-    FAILURE MODE, stated first: with `_USER_GRANT_SLUGS` derived from
-    `ALL_PLATFORM_COLLECTION_SLUGS`, `len(grants) == len(_USER_GRANT_SLUGS)` would pass even if the
-    seed tree had drifted — every grant file that resolves is counted, and one that does NOT resolve
-    is merely logged and dropped, so a missing slug shows up as agreement between two numbers that
-    came from the same place. This test compares the platform's list against the FILES ON DISK, the
-    one comparison that can see the drift. Drop `agience-anchorset` from either side and it fails."""
+    Because `_USER_GRANT_SLUGS` is derived from `ALL_PLATFORM_COLLECTION_SLUGS`,
+    `len(grants) == len(_USER_GRANT_SLUGS)` alone would pass even if the seed tree had drifted:
+    a grant file that fails to resolve is logged and dropped rather than counted, so a missing
+    slug would not show up as a length mismatch. Comparing against the files on disk catches
+    that case. Drop `agience-anchorset` from either side and this fails."""
     assert _seeded_grant_slugs("user") == set(_USER_GRANT_SLUGS), (
         "user grant seeds and ALL_PLATFORM_COLLECTION_SLUGS disagree — a grant file naming a "
-        "collection the platform does not list is silently DROPPED (logged as 'unresolved grant "
+        "collection the platform does not list is silently dropped (logged as 'unresolved grant "
         "resource'), and a listed collection with no grant file is simply never granted")
     assert _seeded_grant_slugs("admin") == set(_USER_GRANT_SLUGS), (
         "the admin grant set does not cover exactly the platform collections")
@@ -122,8 +108,7 @@ def test_provision_designated_admin_adds_full_grants():
     platform collection, on top of the base user reads — same grant format, just
     a fuller set. The admin grants are applied last, so they win."""
     grants, _, _ = _provision(is_admin=True)
-    # one user read + one admin grant per platform collection. Was a hard-coded 22 against a
-    # 10-item roster; derived now for the reason recorded at `_USER_GRANT_SLUGS`.
+    # one user read + one admin grant per platform collection.
     assert len(grants) == 2 * len(_USER_GRANT_SLUGS)
     by_res_last = {g["collection_id"]: g for g in grants}  # admin set applied last
     for slug in _USER_GRANT_SLUGS:

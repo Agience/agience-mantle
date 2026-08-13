@@ -229,14 +229,41 @@ class TestAtRestEncryption:
         assert b'"artifact_id"' not in raw_blob
 
     def test_decryption_requires_correct_collection_key(self, indexer):
-        """A blob encrypted under col-A cannot be decrypted with col-B's key."""
+        """A blob encrypted under col-A cannot be decrypted with col-B's key.
+
+        The AAD is held CORRECT here so the only thing varying is the key —
+        otherwise a passing test proves nothing about which of the two failed.
+        """
         indexer.index_artifact("owner-1", "col-A", [_chunk("art-1", 0, vec_seed=1)], self_request("owner-1", "update"))
         cluster = _sole_cluster(indexer._cells, "owner-1", "col-A")
         raw_blob = indexer._cells.get("owner-1", "col-A", cluster)
         wrong_key = indexer._oracle.derive_cell_key("owner-1", "col-B", cluster, self_request("owner-1", "update"))
-        from mantle.search.mantle.cell import CellTampered
+        from mantle.search.mantle.cell import CellTampered, cell_aad
         with pytest.raises(CellTampered):
-            unpack_cell(raw_blob, wrong_key, collection_id="col-A")
+            unpack_cell(raw_blob, wrong_key, collection_id=cell_aad("col-A", cluster))
+
+    def test_decryption_requires_correct_aad_even_with_the_right_key(self, indexer):
+        """The other half of the binding: CORRECT key, WRONG slot → still fails.
+
+        This is the case invariant #3 is actually about — a blob moved to another
+        collection or another anchor must fail authentication even for a holder of
+        the real cell key. Nothing else in the suite varied the AAD alone.
+        """
+        indexer.index_artifact("owner-1", "col-A", [_chunk("art-1", 0, vec_seed=1)], self_request("owner-1", "update"))
+        cluster = _sole_cluster(indexer._cells, "owner-1", "col-A")
+        raw_blob = indexer._cells.get("owner-1", "col-A", cluster)
+        right_key = indexer._oracle.derive_cell_key("owner-1", "col-A", cluster, self_request("owner-1", "update"))
+        from mantle.search.mantle.cell import CellTampered, cell_aad
+
+        # Sanity: the right key + right AAD DOES open it, so the failures below
+        # are attributable to the AAD and nothing else.
+        assert unpack_cell(raw_blob, right_key, collection_id=cell_aad("col-A", cluster))
+
+        for wrong_aad in (cell_aad("col-B", cluster),          # re-homed collection
+                          cell_aad("col-A", "anchor-elsewhere"),  # re-homed anchor
+                          "col-A"):                            # collection-only (no anchor)
+            with pytest.raises(CellTampered):
+                unpack_cell(raw_blob, right_key, collection_id=wrong_aad)
 
 
 # ---------------------------------------------------------------------------
@@ -260,9 +287,11 @@ class TestMultiOwnerIsolation:
         cb = _sole_cluster(indexer._cells, "owner-B", "col-X")
         b_blob = indexer._cells.get("owner-B", "col-X", cb)
         a_key = indexer._oracle.derive_cell_key("owner-A", "col-X", cb, self_request("owner-A", "update"))
-        from mantle.search.mantle.cell import CellTampered
+        from mantle.search.mantle.cell import CellTampered, cell_aad
+        # Correct AAD — owner-A and owner-B genuinely share (collection, anchor)
+        # here, so the ONLY difference is the per-principal key.
         with pytest.raises(CellTampered):
-            unpack_cell(b_blob, a_key, collection_id="col-X")
+            unpack_cell(b_blob, a_key, collection_id=cell_aad("col-X", cb))
 
 
 def test_os_urandom_works():

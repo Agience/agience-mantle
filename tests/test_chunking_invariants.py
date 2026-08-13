@@ -1,18 +1,8 @@
-"""`search/ingest/chunking.py` — the ingest-side invariants. Previously untested.
+"""`search/ingest/chunking.py` — the ingest-side invariants.
 
-Added to the security audit at John's request (2026-07-29). Like `event_dispatcher`, this module
-scores near-zero on authorization vocabulary, and its real exposure is elsewhere:
-
-  * **A STANDING RULE.** This module used to size chunks with `tiktoken.get_encoding("cl100k_base")`
-    — OpenAI's trained BPE merge table, fetched from their CDN on first use. Deleted 2026-07-22
-    under the no-models rule ("ALL MODELS OUT"), which also removed an outbound network call from
-    the ingest path. Nothing prevents its return except a comment, so the rule is pinned by AST.
-  * **SILENT CONTENT LOSS.** Chunks are what gets indexed. A word that lands in no chunk is a word
-    that cannot be found — and the search returns a confident, incomplete answer rather than an
-    error. That failure is invisible from the outside, so it is asserted directly.
-  * **AN OPERATOR-SETTABLE HANG.** `overlap >= chunk_size` makes the stride zero. The code guards
-    it (`if step <= 0: step = size_words`), and the guard is load-bearing because both values come
-    from config an operator can set.
+This module scores near-zero on authorization vocabulary, and its real exposure is elsewhere: a
+standing rule against trained tokenizers, content loss during chunking, and hangs from degenerate
+chunk-size/overlap arguments.
 """
 from __future__ import annotations
 
@@ -25,18 +15,15 @@ from mantle.search.ingest.chunking import (chunk_text, count_words,
                                     extract_text_from_context,
                                     should_chunk_content)
 
-# ⚠ DEPTH FIXED 2026-07-31: the suite moved from `src/mantle/tests/` to `<repo>/tests/`, so the
-# package is reached from the repo root now, not from a parent. Both of these failed with a
-# FileNotFoundError naming the wrong path — loud, which is the right way for a path bug to fail.
 MODULE = (pathlib.Path(__file__).resolve().parents[1] / "src" / "mantle"
           / "search" / "ingest" / "chunking.py")
 
 
 # ── the standing rule ────────────────────────────────────────────────────────
 def test_no_trained_tokenizer_is_imported():
-    """⛔ [[no-trained-weights]]. A downloaded merge table is still trained weights — someone else's
-    frequency statistics. Checked by AST rather than by importing, so a lazy in-function import
-    (the shape it had) is caught too."""
+    """[[no-trained-weights]]: a downloaded merge table is still trained weights — someone else's
+    frequency statistics. Checked by AST rather than by importing, so a lazy in-function import is
+    caught too."""
     tree = ast.parse(MODULE.read_text(encoding="utf-8"), filename=str(MODULE))
     roots = set()
     for node in ast.walk(tree):
@@ -80,8 +67,8 @@ def test_chunk_spans_are_contiguous_and_advancing():
 # ── the operator-settable hang ───────────────────────────────────────────────
 @pytest.mark.parametrize("size,overlap", [(100, 100), (100, 200), (100, 10_000), (1, 1)])
 def test_overlap_at_or_above_chunk_size_terminates(size, overlap):
-    """⛔ THE GUARD. Zero (or negative) stride would loop forever building chunks until memory went;
-    both numbers are operator config. Degenerate config steps a full chunk instead."""
+    """Zero (or negative) stride would loop forever building chunks until memory went; both
+    numbers are operator config. Degenerate config steps a full chunk instead."""
     chunks = chunk_text(" ".join("w%d" % i for i in range(500)), chunk_size=size, overlap=overlap)
     assert chunks and chunks[-1]["end_word"] == 500
 

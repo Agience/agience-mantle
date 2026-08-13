@@ -287,3 +287,106 @@ class TestGetAllByCategory:
         svc.invalidate_cache()
         assert svc._cache == {}
         assert svc.is_loaded is False
+
+
+class TestSettingMapAgreesWithDefaults:
+    """`config._SETTING_MAP` names keys in this table. A key spelled differently in the
+    two places resolves to None on every lookup — the DB row is never consulted, the
+    module variable keeps its Phase-1 default forever, and nothing reports it. That is a
+    silent failure, so it is asserted rather than left to review."""
+
+    def test_every_mapped_key_has_a_default(self):
+        from mantle import config
+
+        missing = sorted(k for k in config._SETTING_MAP if k not in DEFAULTS)
+        assert missing == [], (
+            f"_SETTING_MAP keys absent from DEFAULTS (unreachable from the store): {missing}")
+
+    def test_every_mapped_key_targets_a_real_module_variable(self):
+        from mantle import config
+
+        absent = sorted(
+            var for var, _conv in config._SETTING_MAP.values() if not hasattr(config, var))
+        assert absent == [], f"_SETTING_MAP targets non-existent config variables: {absent}"
+
+    def test_csv_list_keys_are_mapped_keys(self):
+        from mantle import config
+
+        assert config._CSV_LIST_KEYS <= set(config._SETTING_MAP)
+
+
+def _phase1_config():
+    """`config` as an UNCONFIGURED node imports it — Phase-1 defaults, nothing rebound.
+
+    Executed into a private module namespace rather than reloaded, because reloading
+    `mantle.config` would rebind the singleton every other module already holds a
+    reference to. `config.py` calls nothing at import (`load_env` is explicit, from
+    `main.py`), so this reads the environment and returns.
+    """
+    import importlib.util
+
+    from mantle import config
+
+    spec = importlib.util.spec_from_file_location("_config_phase1", config.__file__)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestTheStoreNeverOverridesAConfigDefault:
+    """The layering is `env var > stored row > config's Phase-1 default`, and the third
+    term is the one with no natural defence.
+
+    `get()` falls back to DEFAULTS and so NEVER returns None, which means
+    `config.load_settings_from_db()` takes the store's answer even on a node that has
+    configured nothing at all. A literal default written in this table is therefore not a
+    fallback — it overwrites `config.py`'s own default on every such node, silently and
+    at every boot. Nothing surfaces the substitution: the variable simply holds a value
+    no module claims to have chosen.
+
+    So DEFAULTS mirrors the Phase-1 attributes instead of restating them, and that is
+    what these assert. This class of failure is invisible at runtime — it is legible only
+    by comparing two files, or by reading a boot log closely enough to notice a URI
+    change between the identity line and the first outbound call.
+    """
+
+    def _unconfigured(self, monkeypatch):
+        from mantle import config
+
+        for var, _conv in config._SETTING_MAP.values():
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.delenv("AUTHORITY_ISSUER", raising=False)
+        return _phase1_config()
+
+    def test_every_stored_default_equals_the_config_default_it_would_replace(
+            self, monkeypatch):
+        from mantle import config
+
+        phase1 = self._unconfigured(monkeypatch)
+        svc = PlatformSettingsService()          # empty cache: every get() hits DEFAULTS
+
+        for key, (var, converter) in config._SETTING_MAP.items():
+            raw = svc.get(key)
+            assert raw is not None, f"{key!r} is unreachable from the store"
+            if key in config._CSV_LIST_KEYS:
+                value = config._csv_list(raw)
+            elif converter is not None:
+                value = converter(raw)
+            else:
+                value = raw
+            assert value == getattr(phase1, var), (
+                f"the store's default for {key!r} resolves to {value!r} and would "
+                f"overwrite config's own default for {var} ({getattr(phase1, var)!r}) "
+                f"on any node where {var} is unset")
+
+    def test_a_standalone_node_does_not_name_itself_as_its_token_authority(
+            self, monkeypatch):
+        """`AUTHORITY_ISSUER` derives from `ORIGIN_URI`, so an `ORIGIN_URI` default
+        pointing at Mantle's own port makes a default node demand user tokens issued
+        by itself — and sends its Origin client to its own door."""
+        phase1 = self._unconfigured(monkeypatch)
+        svc = PlatformSettingsService()
+
+        assert svc.get("branding.origin_uri") != phase1.MANTLE_URI
+        assert phase1.ORIGIN_URI != phase1.MANTLE_URI
+        assert phase1.AUTHORITY_ISSUER != phase1.MANTLE_URI

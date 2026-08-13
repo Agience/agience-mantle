@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Migrate a local CAS from PER-COLLECTION at-rest keys to the ONE shared key (mantle §1).
+"""Migrate a local CAS from per-collection at-rest keys to the one shared key (mantle §1).
 
     python -m mantle.scripts.mantle_cas_rekey --cas <dir> --keys-dir <dir> --db <lattice.db>
     python -m mantle.scripts.mantle_cas_rekey ... --dry-run        # report only, touch nothing
-
-⛔ WHY A SCRIPT AT ALL, WHEN THE CACHE MIGRATES ITSELF ON READ.
 
 `FileContentCache.get()` rewrites a legacy object under the shared key the moment it is read, so a
 node converges on its own with no downtime and no re-fetch. That is the *safe* path and it is
@@ -13,20 +11,11 @@ enough for correctness. This script exists for the two things lazy migration can
   1. **An answer to "is this store fully migrated?"** -- the lazy path only touches what someone
      happens to read. Cold objects stay legacy indefinitely, and you cannot retire the
      `legacy_key_for_collection` wiring until you know none are left.
-  2. **A count of what CANNOT be opened by either key** — objects that are neither shared-keyed nor
-     legacy-keyed under any collection this store knows about. Those are the real casualties of the
-     pre-§1 destruction (EREA measured 6 across 39 roots), and they need a re-fetch from the durable
-     tier, not a re-key. Lazily, each one surfaces as a single confusing read error months apart.
+  2. **A count of what cannot be opened by either key** — objects that are neither shared-keyed nor
+     legacy-keyed under any collection this store knows about. Those are objects whose original
+     bytes are unrecoverable under any key, and they need a re-fetch from the durable tier, not a
+     re-key. Lazily, each one surfaces as a single confusing read error months apart.
 
-⛔ THIS SCRIPT NEVER DELETES. Not a legacy object, not an unreadable one, not a stray file. The bug
-it exists to clean up after was a delete-on-a-guess; the fix does not get to make the same move.
-Rewrites are atomic (tmp + os.replace), so a kill mid-run leaves every object readable under one key
-or the other, and re-running resumes.
-
-⚠ VERIFICATION IS NOT OPTIONAL AND HAPPENS BEFORE THE REWRITE. Every object is decrypted AND
-sha256-checked against its own ref before anything is written back. Re-keying unverified bytes would
-launder corruption into a valid-looking object under the CURRENT key, where it would decrypt cleanly
-and be trusted forever — strictly worse than leaving it broken.
 """
 from __future__ import annotations
 
@@ -40,32 +29,25 @@ from pathlib import Path
 
 COLLECTION_CT = "application/vnd.agience.collection+json"
 
+#: How many unreadable refs to name individually before summarising the rest. A presentation
+#: bound on one terminal report, not a judgement about the data: the count and the percentage
+#: above it are always exact and always complete, and nothing branches on this number. Read
+#: once, the tail count derives from the same slice that gets printed, so the two always agree.
+#: A different value would be right if this report were being machine-read rather than
+#: eyeballed, in which case the answer is a file, not a bigger cap.
+_LIST_CAP = 40
+
 
 def _legacy_roots(db_path: str, *, extra_cts=(), extra_roots=()) -> set:
-    """The set of `origin_root` values the OLD scheme could have keyed on. Read-only.
+    """The set of `origin_root` values the per-collection key scheme could have keyed on. Read-only.
 
-    ⛔ THIS USED TO KEY OFF ONE HARDCODED CONTENT TYPE, AND THAT WAS A REAL DEFECT.
+    It reads `WHERE ct = 'application/vnd.agience.collection+json'` and builds
+    `collection_id -> origin_root`. A consumer that names its own collection type gets an empty
+    map from this alone — true of every consumer of a general-purpose store, which is the entire
+    point of shipping one. That is why `extra_cts` and `extra_roots` exist: without them, a store
+    whose collections use a different content type has every object classified `unreadable`,
+    indistinguishable from total data loss on a `remote=None` node.
 
-    It read `WHERE ct = 'application/vnd.agience.collection+json'` and built
-    `collection_id -> origin_root`. **Any consumer that names its own collection type got an EMPTY
-    map** — which is every consumer of a general-purpose store, and is the entire point of shipping
-    one. MEASURED by EREA (2026-07-29) on a reconstructed 39-collection / 487-blob corpus whose
-    collections are `application/vnd.erea.project+json`: 0 keys derived, **487/487 objects
-    classified `unreadable`**, reported as "needs a re-fetch from the durable tier" — which on a
-    `remote=None` node reads as total data loss. A false alarm that could have provoked a
-    destructive recovery.
-
-    ⭐ THE FIX IS TO READ WHAT THE DERIVATION ACTUALLY CONSUMES. `collection_key` takes an
-    `origin_root`, not a collection artifact — so the content type was never load-bearing, only
-    incidental to how the roots happened to be discovered. `origin_root` is a REAL COLUMN
-    (`schema.py`) with its own index `ix_v_root`, so `SELECT DISTINCT` is an index scan, not a
-    corpus dereference. It is also strictly WIDER than the old query: it covers roots whose
-    collection artifact was archived, is of an unknown type, or never existed.
-
-    ⚠ THE COLUMN IS A MIGRATION, SO IT MAY BE ABSENT OR NULL. `schema._VERTEX_ADDED_COLUMNS` adds
-    `origin_root` to stores that predate it, and MEASURED on node 45 some stores lack it entirely;
-    rows written before the backfill carry NULL. So a missing column falls back to the old
-    doc-scan, and both sources are UNIONed rather than either being trusted alone.
     """
     roots = set(str(r) for r in extra_roots if r)
     con = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
@@ -121,8 +103,12 @@ def main(argv=None) -> int:
                          "discovery cannot see a root at all.")
     args = ap.parse_args(argv)
 
-    from mantle.db.lattice.content_cache import (CacheCorrupt, ContentKeyMismatch,
-                                                 collection_key, shared_content_key)
+    # The wire format is imported, never restated. This script reads and rewrites the very blobs
+    # `content_cache` writes, so a second copy of the nonce/tag lengths here is a copy that can
+    # silently disagree with the writer.
+    from mantle.db.content_cache import (CacheCorrupt, ContentKeyMismatch,
+                                                 collection_key, shared_content_key,
+                                                 _MIN_BLOB_BYTES, _NONCE_BYTES)
     from cryptography.exceptions import InvalidTag
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -145,11 +131,6 @@ def main(argv=None) -> int:
     print("cas=%s  objects keyed by: shared + %d legacy origin_root key(s)%s"
           % (args.cas, len(legacy_keys), "  [DRY RUN]" if args.dry_run else ""))
 
-    # ⛔ NO KEYS + OBJECTS PRESENT = A DISCOVERY FAULT, AND IT MUST NOT BE REPORTED AS DATA LOSS.
-    # With an empty legacy set every object fails both the shared key and the (empty) legacy set,
-    # and the old code classified all of them `unreadable` — "needs a re-fetch from the durable
-    # tier", which on a `remote=None` node reads as total loss and invites a destructive recovery.
-    # Refusing here is the difference between "I could not look" and "it is gone". (EREA, 487/487.)
     if not legacy_keys and any(True for _ in _walk(args.cas)):
         print(
             "\nFATAL: the CAS holds objects but NO legacy origin_root was discovered, so nothing\n"
@@ -158,9 +139,10 @@ def main(argv=None) -> int:
             "and is almost certainly wrong.\n\n"
             "  * If this store is already fully migrated, there is nothing to do — the objects\n"
             "    open under the shared key and a re-key pass is unnecessary.\n"
-            "  * If it holds pre-§1 objects, discovery failed. `origin_root` is read from its own\n"
-            "    indexed column; a store predating that column, or one never backfilled, needs\n"
-            "    --collection-ct <your collection type> or --legacy-root <root> to name them.\n\n"
+            "  * If it holds objects keyed under a legacy origin_root, discovery failed.\n"
+            "    `origin_root` is read from its own indexed column; a store with no such column,\n"
+            "    or one never backfilled, needs --collection-ct <your collection type> or\n"
+            "    --legacy-root <root> to name them.\n\n"
             "Nothing was read, written or deleted.", file=sys.stderr)
         return 2
 
@@ -179,25 +161,25 @@ def main(argv=None) -> int:
             counts["failed"] += 1
             print("  ! unreadable file %s (%s)" % (ref, e))
             continue
-        if len(blob) < 13:
+        if len(blob) < _MIN_BLOB_BYTES:
             counts["corrupt"] += 1        # provably not a ciphertext; still NOT deleted here
-            unreadable.append((ref, "too short to hold a nonce"))
+            unreadable.append((ref, "too short to hold a nonce+tag (%d < %d bytes)"
+                                    % (len(blob), _MIN_BLOB_BYTES)))
             continue
         # 1) already migrated?
         try:
-            AESGCM(shared).decrypt(blob[:12], blob[12:], aad)
+            AESGCM(shared).decrypt(blob[:_NONCE_BYTES], blob[_NONCE_BYTES:], aad)
             counts["already_shared"] += 1
             continue
         except InvalidTag:
             pass
-        # 2) openable under some legacy origin_root key? try them ALL — the CAS does not record
-        #    which root wrote an object, and after §1's damage the writer may not be the root that
-        #    references it. (EREA measured exactly this: the only blobs that failed were the
-        #    cross-collection references to shared refs.)
+        # 2) openable under some legacy origin_root key? try them all — the CAS does not record
+        #    which root wrote an object, and the writer may not be the root that references it, so
+        #    the cross-collection references to shared refs need every key tried.
         plain = None
         for k in legacy_keys.values():
             try:
-                plain = AESGCM(k).decrypt(blob[:12], blob[12:], aad)
+                plain = AESGCM(k).decrypt(blob[:_NONCE_BYTES], blob[_NONCE_BYTES:], aad)
                 break
             except InvalidTag:
                 continue
@@ -206,7 +188,7 @@ def main(argv=None) -> int:
             unreadable.append((ref, "opens under neither the shared key nor any of the %d legacy "
                                     "origin_root key(s)" % len(legacy_keys)))
             continue
-        # 3) VERIFY BEFORE REWRITING — see the module docstring.
+        # 3) verify before rewriting — see the module docstring.
         if hashlib.sha256(plain).hexdigest() != ref[4:]:
             counts["corrupt"] += 1
             unreadable.append((ref, "decrypts but does not hash to its own address"))
@@ -214,7 +196,7 @@ def main(argv=None) -> int:
         if args.dry_run:
             counts["rekeyed"] += 1
             continue
-        nonce = os.urandom(12)
+        nonce = os.urandom(_NONCE_BYTES)
         try:
             import tempfile
             fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
@@ -239,26 +221,29 @@ def main(argv=None) -> int:
     for k in ("already_shared", "rekeyed", "unreadable", "corrupt", "failed"):
         print("  %-15s %d" % (k, counts[k]))
     if unreadable:
-        # ⛔ STATE THE POSSIBILITIES; DO NOT ASSERT LOSS. The earlier wording ("these need a
-        # re-fetch from the durable tier") named ONE cause as if it were established. It is not
-        # distinguishable from here — a key the run never had produces byte-identical evidence to a
-        # genuinely destroyed object, and on a `remote=None` node the confident version reads as
-        # total data loss and invites a destructive recovery.
         pct = (100.0 * len(unreadable) / total) if total else 0.0
         print("\nWARNING: %d of %d object(s) (%.0f%%) opened under NO key this run. "
               "NOTHING WAS DELETED." % (len(unreadable), total, pct))
-        if pct >= 50.0:
-            print("  ⚠ THAT PROPORTION POINTS AT THIS RUN, NOT AT THE DATA. A key you did not have\n"
-                  "    fails exactly like a destroyed object. Before treating ANY of these as lost,\n"
-                  "    confirm the legacy key set is complete (%d root(s) discovered) — see\n"
-                  "    --collection-ct / --legacy-root." % len(legacy_keys))
+        # No threshold gates this warning. The null this rate has to be read against is computed,
+        # not typed: if the discovered key set is complete then every object opens under some key,
+        # so the expected unreadable count is exactly zero — `if unreadable:` above already tests
+        # against that null, and there is no second, larger rate at which the key set becomes newly
+        # suspect. A run missing one of two roots is just as incomplete as one missing both, so the
+        # advice below (confirm the key set before calling anything lost) applies at any nonzero
+        # rate. `pct` is reported alongside it so the reader has the number and the context together.
+        print("  ⚠ THIS MAY POINT AT THIS RUN, NOT AT THE DATA. A key you did not have fails\n"
+              "    exactly like a destroyed object, and that is true of the first object as much\n"
+              "    as the thousandth. Before treating ANY of these as lost, confirm the legacy\n"
+              "    key set is complete (%d root(s) discovered) — see --collection-ct /\n"
+              "    --legacy-root." % len(legacy_keys))
         print("  Each is one of: (a) written under an origin_root not in the %d discovered, "
-              "(b) altered on disk, or (c) destroyed by the pre-§1 defect and in need of "
+              "(b) altered on disk, or (c) unrecoverable under any known key and in need of "
               "a re-fetch. This run cannot tell them apart." % len(legacy_keys))
-        for ref, why in unreadable[:40]:
+        shown = unreadable[:_LIST_CAP]
+        for ref, why in shown:
             print("    %s  -- %s" % (ref, why))
-        if len(unreadable) > 40:
-            print("    ... and %d more" % (len(unreadable) - 40))
+        if len(unreadable) > len(shown):
+            print("    ... and %d more" % (len(unreadable) - len(shown)))
     # A store is fully migrated only when nothing needed a key that is not the shared one.
     if counts["rekeyed"] == 0 and not unreadable and not args.dry_run:
         print("\nFULLY MIGRATED: every object opens under the shared key. The "

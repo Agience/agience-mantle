@@ -25,7 +25,6 @@ from mantle.services.bootstrap_types import (
     HOST_ARTIFACT_SLUG,
     AGENCY_ARTIFACT_SLUG,
     AGENT_ARTIFACT_SLUG_PREFIX,
-    SERVER_ARTIFACT_SLUG_PREFIX,
     PLATFORM_AGENT_SLUGS,
 )
 
@@ -82,15 +81,18 @@ def clear_registry() -> None:
 # ---------------------------------------------------------------------------
 
 def _all_platform_slugs() -> list[str]:
-    """Return every slug that needs an ID mapping."""
-    from mantle.services import server_registry
+    """Return every slug that needs an ID mapping.
 
+    The set is static — the platform collections, the singleton authority/host/agency
+    artifacts, the core server, and one artifact per platform agent persona. Nothing
+    here is derived from a runtime registry: any other slug a seed introduces resolves
+    through :func:`register_id` when the loader applies it.
+    """
     slugs: list[str] = []
     slugs.extend(ALL_PLATFORM_COLLECTION_SLUGS)
     slugs.extend([AUTHORITY_ARTIFACT_SLUG, HOST_ARTIFACT_SLUG, AGENCY_ARTIFACT_SLUG])
     slugs.append(AGIENCE_CORE_SLUG)
     slugs.extend(f"{AGENT_ARTIFACT_SLUG_PREFIX}{s}" for s in PLATFORM_AGENT_SLUGS)
-    slugs.extend(f"{SERVER_ARTIFACT_SLUG_PREFIX}{name}" for name in server_registry.all_names())
     return slugs
 
 
@@ -104,8 +106,7 @@ def pre_resolve_platform_ids(store_db: Database) -> None:
     them to ``platform_settings``. This function reloads those on subsequent
     boots so ``get_id(slug)`` callers resolve before the seed run re-registers
     them. Slugs absent from settings simply stay unregistered until the loader
-    seeds them (the platform trigger re-runs ``server_registry.populate_ids``
-    after seeding for exactly this reason).
+    seeds them, at which point it registers each id it derived.
 
     Resolution order for each slug:
       1. Already in registry (e.g. test setup) → skip

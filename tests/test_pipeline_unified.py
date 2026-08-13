@@ -1,16 +1,15 @@
-﻿"""Tests for the unified indexing pipeline (post lexical-backend retirement).
+﻿"""Tests for the unified indexing pipeline.
 
-After Step 2.6.9 part 2 the pipeline writes to MANTLE vector cells +
-MANTLE-SSE posting lists. The legacy BM25 index path and its
-``_prepare_base_doc`` shape are gone.
+The pipeline writes to MANTLE vector cells and MANTLE-SSE posting lists only.
 
-These tests target the surviving public surface:
+These tests cover the public surface:
 
 - ``_extract_artifact_fields`` produces the long-form per-field text
   dict the SSE indexer wants.
 - ``index_artifact`` calls the SSE + MANTLE hooks routed to the segment
   for the artifact's state (committed/draft/archived — each a separate
-  index), and purges the other segments so a state change moves the entry.
+  index) and does not touch the other segments; vacating a segment on a
+  state transition is ``move_artifact_segments``'s job.
 - ``index_artifacts_batch`` aggregates across the list (all states).
 - ``delete_artifact_from_index`` removes from every segment when
   ``principal_id`` / ``collection_id`` are supplied.
@@ -67,7 +66,7 @@ def _fake_get_store_db():
 
 
 def _fake_get_origin_root(db, collection_id):
-    """Refuses anything that is not a real handle — a generator object is not one.
+    """Raises on anything that is not a real handle — a generator object is not one.
 
     The real ``db.store.get_origin_root`` runs an AQL query and would raise on a
     generator too; making that explicit here is what lets the test see the fallback
@@ -75,7 +74,7 @@ def _fake_get_origin_root(db, collection_id):
     """
     if db is not _FAKE_DB:
         raise TypeError("not a database handle: %r" % (db,))
-    # ws-child is NOT its own origin root — that gap is where the defect lives.
+    # ws-child is not its own origin root — that gap is where the defect lives.
     return {"ws-child": "origin-root-1"}.get(collection_id, collection_id)
 
 
@@ -193,7 +192,7 @@ class TestIndexArtifact:
             sse.return_value = pipeline_unified.ARM_WRITTEN
             vec_mock.return_value = pipeline_unified.ARM_WRITTEN
             outcome = pipeline_unified.index_artifact(_archived_artifact(), "ws-1")
-        # Archived is no longer skipped — it indexes into its own segment.
+        # Archived indexes into its own segment, the same as any other state.
         assert outcome.sse == pipeline_unified.ARM_WRITTEN
         assert outcome.vector == pipeline_unified.ARM_WRITTEN
         assert not outcome.failed
@@ -214,7 +213,7 @@ class TestIndexArtifact:
             patch.object(pipeline_unified, "_mantle_index_artifact") as vec_mock,
         ):
             outcome = pipeline_unified.index_artifact(artifact, "ws-1")
-        # Nothing to index is a SKIP, not a failure — the distinction is the point
+        # Nothing to index is a skip, not a failure — the distinction is the point
         # of IndexOutcome. Both must be visible; neither may read as "written".
         assert outcome.wrote_nothing
         assert not outcome.failed
@@ -352,12 +351,11 @@ class TestDeleteArtifact:
             assert c.args == ("user-1", "art-1")
 
     def test_deletion_actually_removes_the_postings_it_reports_removing(self):
-        """The de-index principal must be the SAME one the write path used.
+        """The de-index principal must be the same one the write path used.
 
-        This asserts the EFFECT — that the postings are gone — not the return value.
-        The defect it pins (`resolve_cell_principal(get_store_db(), ...)` with no
-        ``next(...)``) returned ``True`` while removing nothing, so any test asserting
-        truthiness passed against the bug.
+        This asserts the effect — that the postings are gone — not the return value. A missing
+        ``next(...)`` on ``resolve_cell_principal(get_store_db(), ...)`` would return ``True``
+        while removing nothing, so a test asserting only truthiness would not catch that.
 
         ``ws-child``'s origin root is ``origin-root-1``, so the two differ: the write
         path keys postings under the origin root, and a de-index that falls back to
@@ -378,7 +376,7 @@ class TestDeleteArtifact:
             # background work). `origin-root-1` is the principal being written into.
             acting_as("origin-root-1", principal_type="user"),
         ):
-            # WRITE through the real path — it resolves the principal from a real handle.
+            # Write through the real path — it resolves the principal from a real handle.
             pipeline_unified._sse_index_artifact(
                 artifact, "ws-child", {"content": "the secret the user deleted"},
             )
@@ -386,7 +384,7 @@ class TestDeleteArtifact:
                 "precondition: the write path must key postings under the ORIGIN ROOT"
             )
 
-            # DELETE through the real path, supplying only what the seven callers supply.
+            # Delete through the real path, supplying only what the seven callers supply.
             ok = pipeline_unified.delete_artifact_from_index(
                 "art-1", "art-1", collection_id="ws-child",
             )
@@ -397,7 +395,7 @@ class TestDeleteArtifact:
             % (sse_index.postings,)
         )
         # Only meaningful once the effect above holds — reporting success is correct
-        # ONLY because the removal happened.
+        # only because the removal happened.
         assert ok is True
 
     def test_no_owner_skips_both_arms(self):
@@ -408,12 +406,9 @@ class TestDeleteArtifact:
             patch.object(pipeline_unified, "_sse_remove_artifact") as sse,
         ):
             ok = pipeline_unified.delete_artifact_from_index("v-1")
-        # Skipping both arms without identity is correct and still asserted below. What was WRONG
-        # was calling that success: every production caller omits principal_id/collection_id, so
-        # this branch is the ONLY branch they ever take — a hard delete purged the lattice and S3, this
-        # returned True, and the artifact's chunks and postings (with their plaintext text) stayed
-        # searchable forever. The test asserted the lie, so the assertion is corrected rather than
-        # the code being softened to match it; the two behavioural assertions are unchanged.
+        # Skipping both arms without identity is correct, and the return value must say so: a
+        # hard delete that purges the lattice and S3 must not report success while the artifact's
+        # chunks and postings (with their plaintext text) remain searchable.
         assert ok is False
         vec_mock.assert_not_called()
         sse.assert_not_called()
@@ -453,13 +448,12 @@ class TestGetArtifactEmbeddings:
 
 
 # ---------------------------------------------------------------------------
-# What the pipeline REPORTS about what it did
+# What the pipeline reports about what it did
 # ---------------------------------------------------------------------------
 #
-# THE DEFECT THESE PIN (observed on a live boot, 2026-07-31): both arms swallow
-# their own exceptions by design — one arm must not lose the other, and neither
-# must fail the commit — and `index_artifact` then returned a flat `True` anyway.
-# A reindex whose every SSE write was refused with GrantDenied reported
+# The property these tests pin: both arms swallow their own exceptions by design — one arm must
+# not lose the other, and neither must fail the commit — so `index_artifact` must not report a
+# flat success regardless. A reindex whose every SSE write raised `GrantDenied` must not report
 # `{"indexed": 5, "failed": 0}` over an empty index.
 
 
@@ -517,8 +511,8 @@ class TestIndexOutcomeReporting:
                 [_committed_artifact()], "ws-1",
             )
 
-        # FAILURE MODE: this returned `True` unconditionally, so a bulk index in
-        # which every artifact failed produced the same value as a clean run.
+        # Fails if this returns `True` unconditionally, so a bulk index in which
+        # every artifact failed produces the same value as a clean run.
         assert ok is False
 
 
@@ -555,9 +549,58 @@ class TestPlatformTrustConfigIsNotASearchTarget:
         assert outcome.wrote_nothing and not outcome.failed
 
     def test_ordinary_artifacts_are_still_indexed(self):
-        """NEGATIVE CONTROL: the exclusion must be narrow, or it silently empties
+        """Negative control: the exclusion must be narrow, or it silently empties
         the index and every assertion above still passes."""
         from mantle.search.ingest import pipeline_unified
 
         assert pipeline_unified.is_indexable(_committed_artifact())
         assert not pipeline_unified.is_indexable(self._issuer_artifact())
+
+
+class TestASecretIsNotASearchTarget:
+    """A credential's value IS its content — an API key, a client secret, a refresh
+    token. Indexing it tokenizes that value into the SSE posting lists and lets a
+    recall hit hydrate the decrypted value into a result.
+
+    Nothing about that leaks: the cells are encrypted at rest and every posting and
+    hydration is cut by the same light cone that guards the read path. It is a wider
+    surface — a secret reachable by SEARCH as well as by direct read, and a second
+    representation of the plaintext in a second store. The index does not carry one.
+    """
+
+    @staticmethod
+    def _credential_artifact():
+        from mantle.services.bootstrap_types import CREDENTIAL_CONTENT_TYPE
+
+        art = _committed_artifact()
+        art.content_type = CREDENTIAL_CONTENT_TYPE
+        return art
+
+    def test_credential_content_type_is_non_indexable(self):
+        from mantle.services.bootstrap_types import CREDENTIAL_CONTENT_TYPE
+        from mantle.search.ingest import pipeline_unified
+
+        assert CREDENTIAL_CONTENT_TYPE in pipeline_unified.NON_INDEXABLE_CONTENT_TYPES
+        assert not pipeline_unified.is_indexable(self._credential_artifact())
+
+    def test_credential_reaches_neither_arm(self):
+        """A credential sits in an ordinary collection, unlike an issuer artifact —
+        so it is the gate, not the missing scope, that has to stop it."""
+        from mantle.search.ingest import pipeline_unified
+
+        artifact = self._credential_artifact()
+        assert artifact.collection_id, "the point of this case is a normal collection"
+
+        with (
+            patch.object(pipeline_unified, "_sse_index_artifact") as sse,
+            patch.object(pipeline_unified, "_mantle_index_artifact") as vec_mock,
+            patch.object(
+                pipeline_unified, "extract_text_from_artifact",
+                return_value="sk-live-not-in-the-index",
+            ),
+        ):
+            outcome = pipeline_unified.index_artifact(artifact, artifact.id)
+
+        sse.assert_not_called()
+        vec_mock.assert_not_called()
+        assert outcome.wrote_nothing and not outcome.failed

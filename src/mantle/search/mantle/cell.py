@@ -1,4 +1,4 @@
-"""Cell encryption + serialization (Step 2.2b.i).
+"""Cell encryption + serialization.
 
 A MANTLE *cell* is the unit of encrypted storage that holds a set of indexed
 artifact chunks for one ``(principal_id, collection_id, cluster_id)`` tuple.
@@ -17,7 +17,7 @@ blob is fully self-contained — decryption only needs the cell key.
 Cell plaintext is JSON-encoded UTF-8 bytes. Each cell holds a list of
 *chunk records* (artifact_id, chunk_id, embedding, optional metadata).
 
-This module does NOT know about S3, FAISS, or the OracleService — by design.
+This module does not know about S3, FAISS, or the OracleService — by design.
 Callers wire those together. That keeps the crypto correctness reviewable in
 isolation and lets the encrypted-search engine compose against any storage
 backend (S3 today, IPFS / encrypted filesystem later).
@@ -65,10 +65,29 @@ class CellMalformed(CellError):
 # Encryption
 # ---------------------------------------------------------------------------
 
+def _require_aad(collection_id: str) -> bytes:
+    """The AAD bytes for a cell — REQUIRED, never ``None``.
+
+    An empty (or non-string) value used to fall through to
+    ``associated_data=None``, which silently produced an *unbound* cell: the blob
+    would then open under any key derived for any slot, defeating invariant #3.
+    That fallback is gone. The caller must name the context/anchor it is writing,
+    and :func:`cell_aad` is the one formula that builds the value.
+    """
+    if not isinstance(collection_id, str) or not collection_id:
+        raise ValueError(
+            "collection_id (the cell AAD) is required and must be a non-empty string — "
+            "build it with cell_aad(collection_id, cluster_id). An empty value would bind "
+            "the blob to nothing, letting it be presented under the wrong key or moved to "
+            "the wrong slot without failing authentication."
+        )
+    return collection_id.encode("utf-8")
+
+
 def encrypt_cell(
     plaintext: bytes,
     key: bytes,
-    collection_id: str = "",
+    collection_id: str,
 ) -> bytes:
     """Encrypt ``plaintext`` with a 256-bit AES-GCM ``key``.
 
@@ -77,10 +96,11 @@ def encrypt_cell(
 
     ``collection_id`` is bound as AEAD associated data so that a cell blob
     cannot be decrypted under a key derived for a different collection.
+    It is **required** and must be non-empty — see :func:`_require_aad`.
     """
     if len(key) != _KEY_BYTES:
         raise ValueError(f"cell key must be {_KEY_BYTES} bytes, got {len(key)}")
-    aad = collection_id.encode("utf-8") if collection_id else None
+    aad = _require_aad(collection_id)
     aead = AESGCM(key)
     nonce = os.urandom(_NONCE_BYTES)
     ciphertext_and_tag = aead.encrypt(nonce, plaintext, associated_data=aad)
@@ -90,24 +110,24 @@ def encrypt_cell(
 def decrypt_cell(
     blob: bytes,
     key: bytes,
-    collection_id: str = "",
+    collection_id: str,
 ) -> bytes:
     """Decrypt + authenticate a cell blob produced by :func:`encrypt_cell`.
 
-    Raises :class:`CellTampered` if the GCM tag fails (wrong key or modified
-    ciphertext). Raises :class:`CellMalformed` if the blob is shorter than
-    the nonce + tag overhead.
+    Raises :class:`CellTampered` if the GCM tag fails (wrong key, modified
+    ciphertext, or the wrong AAD). Raises :class:`CellMalformed` if the blob is
+    shorter than the nonce + tag overhead.
 
-    ``collection_id`` must match the value supplied at encryption time;
-    a mismatch causes a :class:`CellTampered` error before any deserialization
-    of cell contents occurs.
+    ``collection_id`` is **required** and must match the value supplied at
+    encryption time; a mismatch causes a :class:`CellTampered` error before any
+    deserialization of cell contents occurs.
     """
     if len(key) != _KEY_BYTES:
         raise ValueError(f"cell key must be {_KEY_BYTES} bytes, got {len(key)}")
+    aad = _require_aad(collection_id)
     if len(blob) < _NONCE_BYTES + 16:  # 16 bytes for the GCM tag
         raise CellMalformed(f"cell blob too short ({len(blob)} bytes)")
 
-    aad = collection_id.encode("utf-8") if collection_id else None
     nonce = blob[:_NONCE_BYTES]
     ciphertext_and_tag = blob[_NONCE_BYTES:]
     aead = AESGCM(key)
@@ -131,7 +151,16 @@ def cell_aad(collection_id: str, cluster_id: str) -> str:
     different anchor. ``cluster_id`` is required (routing has no flat fallback,
     so there is no anchor-less cell). Pass the result as the ``collection_id``
     argument to :func:`encrypt_cell` / :func:`decrypt_cell`.
+
+    BOTH halves are required. An empty half would make the AAD of one slot a
+    prefix/suffix of another's ("" + ":" + anchor collides across every
+    collection), which is the same unbound-blob failure ``_require_aad`` exists
+    to prevent — so it raises here rather than producing a half-bound string.
     """
+    if not isinstance(collection_id, str) or not collection_id:
+        raise ValueError("cell_aad requires a non-empty collection_id")
+    if not isinstance(cluster_id, str) or not cluster_id:
+        raise ValueError("cell_aad requires a non-empty cluster_id")
     return f"{collection_id}:{cluster_id}"
 
 
@@ -145,13 +174,11 @@ def serialize_chunks(chunks: List[dict]) -> bytes:
     fingerprint cell contents.
     """
     # `ensure_ascii=False` is required, not stylistic: the docstring above offers these bytes for
-    # FINGERPRINTING, and RFC 8785 canonical JSON emits raw UTF-8. With the default `ensure_ascii=True`
-    # a non-ASCII chunk serializes to `\uXXXX` escapes, so the same logical input produces different
-    # bytes here than under the canonicaliser of record (`prism/canonical.py`) — i.e. two different
-    # fingerprints for one input, the divergence class that already existed inside this workspace.
-    # Reading is unaffected: `deserialize_chunks` uses `json.loads`, which accepts both spellings, so
-    # blobs written before this change still decode. (Contract Builder, 2026-07-29 — this line was
-    # invisible to `canonical_json_check.py` until its BOM blind spot was fixed.)
+    # fingerprinting, and RFC 8785 canonical JSON emits raw UTF-8. With the default `ensure_ascii=True`
+    # a non-ASCII chunk serializes to `\uXXXX` escapes, so the same logical input would produce
+    # different bytes here than under the canonicaliser of record (`prism/canonical.py`) — i.e. two
+    # different fingerprints for one input.
+    # Reading is unaffected: `deserialize_chunks` uses `json.loads`, which accepts both spellings.
     return json.dumps(chunks, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False).encode("utf-8")
 
@@ -181,16 +208,18 @@ def deserialize_chunks(plaintext: bytes) -> List[dict]:
 def pack_cell(
     chunks: List[dict],
     key: bytes,
-    collection_id: str = "",
+    collection_id: str,
 ) -> bytes:
-    """Encode + encrypt in one call. Returns the encrypted blob ready for storage."""
+    """Encode + encrypt in one call. Returns the encrypted blob ready for storage.
+
+    ``collection_id`` is the required AAD — build it with :func:`cell_aad`."""
     return encrypt_cell(serialize_chunks(chunks), key, collection_id=collection_id)
 
 
 def unpack_cell(
     blob: bytes,
     key: bytes,
-    collection_id: str = "",
+    collection_id: str,
 ) -> List[dict]:
     """Decrypt + decode in one call. The inverse of :func:`pack_cell`."""
     return deserialize_chunks(decrypt_cell(blob, key, collection_id=collection_id))

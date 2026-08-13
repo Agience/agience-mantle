@@ -1,41 +1,28 @@
 """ERASURE — wipe everything attached to one higgs, and nothing else.
 
-[John, 2026-07-23: *"for my account, how can I reset or wipe everything attached to my higgs"*]
+For a system whose whole ontology is grounding / grants / conscious observation (§13.11.7), being
+able to remove your own portion is the same right as being able to add to it.
 
-There was no answer to that question before this file. For a system whose whole ontology is
-grounding / grants / conscious observation (§13.11.7), being able to remove your own portion is not
-a feature — it is the same right as being able to add to it, and its absence was a hole.
+Two categories distinguish what erasure touches from what it leaves alone:
 
-═══════════════════════════════════════════════════════════════════════════════
-⛔ THE ONE DISTINCTION THAT MAKES THIS SAFE: GROUNDED vs OBSERVED
-═══════════════════════════════════════════════════════════════════════════════
-A higgs is a PORTION of the one field, rooted at an identity. Two things look superficially alike
-and must never be confused:
-
-  * **GROUNDED at you** — you authored it, or it lives in your private collection. It is yours, and
+  * Grounded at you — you authored it, or it lives in your private collection. It is yours, and
     erasure removes it.
-  * **REACHED by you** — the commons you looked at. WordNet, Wikipedia, anything CC/OA. Observing a
-    thing does not attach it to you, and deleting it would be deleting THE TRAINING SET.
+  * Reached by you — the commons you looked at. WordNet, Wikipedia, anything CC/OA. Observing a
+    thing does not attach it to you, and deleting it would delete the training set.
 
-That is exactly the cut John drew in the same breath: *"remove any artifact that isn't the training
-set."* So erasure is defined POSITIVELY — it collects what is provably grounded at this person and
-removes that. It never works by exclusion ("everything except the corpus"), because an exclusion
-list is a premonition: the first artifact class nobody thought of is destroyed silently.
+Erasure is defined positively: it collects what is provably grounded at this person and removes
+that. It never works by exclusion ("everything except the corpus"), because an exclusion list
+misses whatever class nobody thought to name — that artifact would be destroyed silently.
 
-⚠ **AND IT REFUSES WHAT IT CANNOT PROVE.** An artifact whose `created_by` cannot be resolved to this
-person, and which is not in their private collection, is NOT erased — it is REPORTED as unresolved.
-An erasure that guesses is an erasure that takes someone else's work with it, and unlike every other
-mistake in this codebase that one cannot be measured afterwards, because the evidence is gone.
-
-═══════════════════════════════════════════════════════════════════════════════
-DRY RUN BY DEFAULT
-═══════════════════════════════════════════════════════════════════════════════
-`erase()` reports and changes nothing unless `apply=True` is passed explicitly. The inventory is the
-product; the deletion is a separate decision made by a human who has read it.
+`erase()` reports and changes nothing unless `apply=True` is passed explicitly. The inventory is
+the product; the deletion is a separate decision made by a human who has read it.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Iterable, List, Optional, Set
+
+logger = logging.getLogger(__name__)
 
 
 def _person_ids(store, person: str) -> Set[str]:
@@ -44,10 +31,7 @@ def _person_ids(store, person: str) -> Set[str]:
     Both are needed: rows are stamped with the resolved uuid, while collections and grants are keyed
     on the raw principal string. Erasing on one alone leaves the other half attached."""
     ids = {str(person)}
-    # ⚠ ASK THE RUNNER, DO NOT IMPORT ONE. Resolving a claim to its person vertex mints an artifact,
-    # which is a runner act; mantle may not import ember. Unwired returns None and the raw claim
-    # stands alone — which is honest, and is why the caller must not treat one id as "all of them".
-    from mantle import runner_hooks
+    from mantle.system import runner_hooks     # author resolution lives here (mantle -> ember is a one-way street)
     try:
         ref = runner_hooks.author_ref(store, person)
     except Exception:
@@ -57,7 +41,7 @@ def _person_ids(store, person: str) -> Set[str]:
     return {i for i in ids if i}
 
 
-# The classes of thing a higgs is made of. Named explicitly so the inventory is READABLE — an
+# The classes of thing a higgs is made of. Named explicitly so the inventory is readable — an
 # erasure report that says "417 artifacts" tells its reader nothing about what they are losing.
 CLASSES = (
     ("private", "artifacts in your private collection"),
@@ -66,16 +50,10 @@ CLASSES = (
     ("identity", "your person artifact itself"),
 )
 
-# ⛔ THE REGISTRY IS GROUNDED AT THE SYSTEM, NOT AT WHOEVER RAN BOOTSTRAP.
-# MEASURED on the live store: `op.math.add` and 24 sibling operators are stamped `created_by` the
-# principal that happened to mint them — which on that node was `anonymous@public` — and carry no
-# collection, no provenance and no citation. A `created_by == me` sweep would have DELETED THE
-# ARITHMETIC OPERATORS as one person's private work. They are the ontology: operators, the type and
-# edge-type registries, rungs, collections, citations, content-type definitions.
 #
-# This is the grounding question John already framed (§13.11.7): the operators are grounded at THE
-# FOUNDATION, the commons at ground zero, and only the observer's own work at the observer. So these
-# are reported as `not_yours` rather than silently skipped — "I found these and they are not yours to
+# This is the grounding question framed in §13.11.7: the operators are grounded at the foundation,
+# the commons at ground zero, and only the observer's own work at the observer. So these are
+# reported as `not_yours` rather than silently skipped — "I found these and they are not yours to
 # erase" is a different and more useful statement than not mentioning them.
 _REGISTRY_TYPES = ("operator+json", "vtype+json", "etype+json", "rung+json", "collection+json",
                    "content-type+json", "x-citation", "shard-done+json", "form-mesh+json")
@@ -91,8 +69,7 @@ def attached(store, person: str, *, include_identity: bool = False) -> Dict[str,
     `include_identity` decides between a RESET (keep the person, drop everything they made) and a
     full erasure (the person goes too). They are genuinely different acts and the caller must say
     which, rather than one being a silent default."""
-    ids = _person_ids(store, person)   # ⚠ was: from ember import genesis as g — unused since
-                                       # author resolution moved to runner_hooks (mantle ↛ ember)
+    ids = _person_ids(store, person)   # author resolution lives in runner_hooks (mantle ↛ ember)
     private_ids = {"private.%s" % p for p in ids}
     found: Dict[str, List[str]] = {k: [] for k, _d in CLASSES}
     not_yours: List[str] = []
@@ -120,10 +97,6 @@ def attached(store, person: str, *, include_identity: bool = False) -> Dict[str,
             found["private"].append(aid)
             continue
         if made_by in ids:
-            # ⚠ AUTHORSHIP OF A COMMONS ROW IS NOT OWNERSHIP OF IT. The stage-0 ingest stamps every
-            # synset with the operator's principal, so a naive "created_by == me" sweep would take
-            # the entire training set. A row that carries a source citation was INGESTED, not
-            # authored: it is the commons, reached and not grounded.
             if _is_registry(ct):
                 not_yours.append(aid)          # the ontology: grounded at the foundation
                 continue
@@ -139,12 +112,50 @@ def attached(store, person: str, *, include_identity: bool = False) -> Dict[str,
             "unresolved": unresolved}
 
 
+def _container_of(store, aid: str) -> str:
+    """The collection an artifact is in, read BEFORE it is erased.
+
+    Only the container is taken, and only so the event can be addressed. An event addressed to
+    the artifact's own id reaches nobody watching the collection it lived in, which is precisely
+    the subscriber that still holds state keyed on it."""
+    try:
+        return str((store.artifacts.get_artifact(aid) or {}).get("collection_id") or "")
+    except Exception:
+        return ""
+
+
+def _announce_erased(aid: str, container_id: str) -> None:
+    """Tell the change feed one artifact is gone.
+
+    **The event carries an id and a delete verb and nothing else.** No field is read off the
+    erased doc — not a title, not a content type, not an author. An erasure that announced what
+    it erased would put the erased data on a feed every wildcard subscriber can read, and the
+    announcement would outlive the thing it was announcing in every subscriber's log. What a
+    subscriber needs in order to comply is exactly the id it must drop.
+
+    Best-effort, like every emit on a write path: a feed that cannot be written to must never
+    stop an erasure from completing. The deletion is the right being exercised; the event is
+    only how derived state learns to follow.
+    """
+    try:
+        from mantle.db.doc_boundary import DELETED, emit_artifact_change
+        emit_artifact_change({"id": aid, "collection_id": container_id}, DELETED)
+    except Exception:
+        logger.debug("erasure event emit failed for %s", aid, exc_info=True)
+
+
 def erase(store, person: str, *, apply: bool = False,
           include_identity: bool = False) -> Dict[str, Any]:
     """Remove everything grounded at this higgs. **DRY RUN unless `apply=True`.**
 
     Returns the inventory plus what was actually removed, so the report is the same shape either
-    way and a caller can diff a dry run against the real one."""
+    way and a caller can diff a dry run against the real one.
+
+    Each removal is announced on the change feed, after the delete succeeds — a subscriber
+    holding derived state keyed on these ids is the one place erased data can survive the
+    erasure, so it is the one deletion where being told matters most. A row that failed to
+    delete is not announced: an event for an artifact still present is a subscriber dropping
+    state the store still has."""
     inv = attached(store, person, include_identity=include_identity)
     if not apply:
         inv["applied"] = False
@@ -152,15 +163,17 @@ def erase(store, person: str, *, apply: bool = False,
     removed, failed = [], []
     for _cls, ids in inv["found"].items():
         for aid in ids:
+            container = _container_of(store, aid)
             try:
                 store.artifacts.delete_artifact(aid)
                 removed.append(aid)
+                _announce_erased(aid, container)
             except Exception as e:
                 failed.append("%s: %s" % (aid, type(e).__name__))
     inv["applied"] = True
     inv["removed"] = len(removed)
     inv["failed"] = failed
-    # A partial erasure REPORTED is recoverable; a partial erasure reported as complete is not.
+    # A partial erasure that is reported is recoverable; one reported as complete is not.
     inv["complete"] = not failed and len(removed) == inv["total"]
     return inv
 

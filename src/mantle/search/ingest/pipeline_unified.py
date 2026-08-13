@@ -1,4 +1,4 @@
-"""Unified artifact indexing pipeline (post lexical-backend retirement).
+"""Unified artifact indexing pipeline.
 
 Every artifact — regardless of content type — goes through the same path:
 
@@ -10,9 +10,27 @@ Both arms are unconditional once the wiring prerequisites (Oracle, S3,
 the lattice) are met. No feature flags. The router converts missing
 prerequisites to 503 (no plaintext fallback by design).
 
-The legacy lexical index was retired in Step 2.6.9 part 2 — the previous BM25 path,
-the `bulk_index_documents` calls, and the `_prepare_base_doc` shape
-that mirrored the legacy lexical document went away with it.
+The vector arm has one prerequisite the wiring cannot supply: a provisioned **AnchorSet**, the
+coordinate system every chunk is routed against. Nothing in Mantle derives one, so a node
+nobody has provisioned has none, and on that node :func:`_mantle_index_artifact` returns
+``ARM_SKIPPED`` for every write while the lexical arm indexes normally. That is the state of a
+fresh install, not an error: the write succeeds, the artifact is still narrowed to by its
+terms, a WARNING names the gap, and recall answers ordered by how much of the query each hit
+matched (``ordering: "coverage"``, an integer stem count as each score) until an operator
+provisions anchors. See
+:mod:`mantle.search.anchors.store`.
+
+Vector ingress
+--------------
+The vector arm's embed step has no model behind it — Mantle never embeds. A write may
+carry a vector the writer already computed (``vector=`` here, validated at the router
+by ``api/vectors.py``), and it enters through the ordinary provider seam as a
+:class:`embeddings.WriterSuppliedEmbeddings`. A vector-bearing write indexes as ONE
+chunk: the supplied vector describes the artifact, and distributing it over several
+chunks would attribute to each of them a claim the writer made about the whole.
+
+Without a vector nothing changes: the provider resolves against the long-term cache
+and returns empty for anything it has never seen, and the arm skips.
 
 See `.dev/features/mantle-mvp.md` and
 `.dev/features/mantle-sse-lexical-index.md`.
@@ -24,7 +42,11 @@ import logging
 import time
 from typing import Optional
 
-from mantle.embeddings import Embeddings, model_id as emb_model_id
+from mantle.search.embeddings import (
+    Embeddings,
+    WriterSuppliedEmbeddings,
+    model_id as emb_model_id,
+)
 from mantle.entities.artifact import Artifact
 
 from mantle.search.ingest.chunking import (
@@ -38,65 +60,78 @@ from mantle.search.ingest.tags import (
 )
 from mantle.search.mantle.oracle import MasterKeyMissing
 from mantle.services.acting_principal import KeyCustodyDenied
+from mantle.services.bootstrap_types import CREDENTIAL_CONTENT_TYPE
 from mantle.services.ingest_runner_service import extract_text_from_artifact
+from mantle.services.issuers import ISSUER_CONTENT_TYPE
 
 logger = logging.getLogger(__name__)
 
 _embeddings = Embeddings()
 
 
-# Each artifact STATE indexes into its own physically separate index segment
+# Each artifact state indexes into its own physically separate index segment
 # (separate S3 prefixes — see search.mantle.wiring._segment_prefixes). The
 # segment name equals the state name. States are mutually exclusive, so an
 # artifact's entry lives in exactly one segment; a transition (draft→committed,
-# →archived, unarchive) MOVES it (index into the new segment, purge the others).
+# →archived, unarchive) moves it (index into the new segment, purge the others).
 _SEGMENTS = ("committed", "draft", "archived")
 
 
 def _segment_for_state(state: str) -> str:
-    """Map an artifact state to its index segment (1:1; unknown → committed)."""
-    return state if state in _SEGMENTS else Artifact.STATE_COMMITTED
+    """Map an artifact state to its index segment (1:1).
+
+    An absent or unrecognised state resolves to `Artifact.STATE_WHEN_ABSENT` — the single
+    definition of what a doc with no `state` is in (`db/constants`), which every other reader
+    derives from too. A second answer here would file a stateless doc into one tree and the entity
+    layer would move it to another on the next write."""
+    return state if state in _SEGMENTS else Artifact.STATE_WHEN_ABSENT
 
 
-#: Content types that are PLATFORM TRUST CONFIGURATION, not user content, and are
-#: therefore never indexed. The criterion — apply it before adding anything here:
+#: Content types that are never indexed. Two criteria admit an entry, and an artifact
+#: qualifies under one of them or it is indexed like everything else.
 #:
-#:   1. The record is owned by the system principal and read back by a
-#:      ``created_by`` + content-type query, NOT through the grant ledger.
-#:   2. It is deliberately grantless. There is no principal who should be able to
+#: **1 — platform trust configuration, not user content.** All three must hold:
+#:
+#:   a. The record is owned by the system principal and read back by a
+#:      ``created_by`` + content-type query, not through the grant ledger.
+#:   b. It is deliberately grantless. There is no principal who should be able to
 #:      find it by searching, because a grant that made it indexable would also make
 #:      the platform's own trust config a search result for whoever held that grant.
-#:   3. It carries no collection. ``create_issuer_artifact`` sets ``collection_id=""``.
+#:   c. It carries no collection. ``create_issuer_artifact`` sets ``collection_id=""``.
 #:
-#: ⛔ WHY THIS EXISTS RATHER THAN A GRANT. The bulk reindex walks every artifact and
-#: applies the root-artifact convention ``collection_id or artifact.id``, so a record
-#: with no collection is handed its OWN id as one, and the encrypted-search layer then
-#: asks the ledger whether the system principal may write into a principal that is an
-#: issuer's id. That answer is permanently no. The visible symptom was five
-#: ``GrantDenied`` tracebacks per boot; the cause is platform trust config being
-#: pushed through a per-principal user-content index. Granting the system principal
-#: ``update`` on its own trust records clears the log and makes the config searchable.
+#: **2 — the artifact's content IS a secret.** A credential's value is its content: an
+#: API key, an OAuth client secret, a refresh token. Indexing it tokenizes that value
+#: into the SSE posting lists, and a recall hit hydrates the decrypted value into
+#: ``SearchHit.content`` — so the secret becomes reachable by SEARCH as well as by
+#: direct read.
 #:
-#: This is NOT the storage-plane exclusion (``lattice_api._SIDE_PLANE_CTS``): issuer
-#: artifacts ARE artifacts — governable, audited, versioned — and must stay visible to
-#: the artifact API. They are only excluded from SEARCH.
+#: That is not a leak. Cells stay encrypted at rest, and every posting and every
+#: hydration is cut by the same light cone that guards the read path, so no principal
+#: learns anything it could not already fetch by id. It is a WIDER SURFACE, chosen
+#: rather than inherited: recall answers a question nobody needs answered about a
+#: secret ("which of these contains this string?"), and a full-text index is a second
+#: representation of the plaintext, in a second store, with a second decrypt path and
+#: a second set of ways to be wrong. A secret is not something you full-text search,
+#: so the index does not carry one. Reaching a credential stays a matter of naming it
+#: — through the artifact it hangs off, which is indexed and searchable as usual.
+#:
+#: This is a different exclusion from the storage-plane one (``lattice_api._SIDE_PLANE_CTS``):
+#: everything named here is still an artifact — governable, audited, versioned — and stays
+#: fully visible to the artifact API, content included. It is excluded only from search.
 NON_INDEXABLE_CONTENT_TYPES = frozenset({
-    "application/vnd.agience.issuer+json",
+    ISSUER_CONTENT_TYPE,                       # criterion 1
+    CREDENTIAL_CONTENT_TYPE,                   # criterion 2
 })
 
 
 def is_indexable(artifact: Artifact) -> bool:
-    """False for platform trust-config artifacts — see :data:`NON_INDEXABLE_CONTENT_TYPES`."""
+    """False for trust config and for secret material — see
+    :data:`NON_INDEXABLE_CONTENT_TYPES`."""
     return getattr(artifact, "content_type", None) not in NON_INDEXABLE_CONTENT_TYPES
 
 
 # ---- Per-arm outcome -------------------------------------------------------
 #
-# ⛔ AN ARM THAT FAILS MUST NOT BE REPORTED AS AN ARM THAT WROTE. Both arms swallow
-# their own exceptions by design — one arm failing must not lose the other, and
-# neither must fail the COMMIT that triggered the index. `index_artifact` then
-# returned a flat `True` regardless, so a run in which every SSE write was refused
-# reported `{"indexed": N, "failed": 0}` over an empty index.
 #
 # SKIPPED is a distinct third answer: "this arm had nothing to do here" (no content,
 # prerequisites absent, no AnchorSet provisioned) is not a failure, and counting it
@@ -109,7 +144,7 @@ ARM_FAILED = "failed"
 class IndexOutcome:
     """What each arm did for one artifact.
 
-    Truthy iff no arm FAILED, so ``if index_artifact(...)`` callers keep their
+    Truthy iff no arm failed, so ``if index_artifact(...)`` callers keep their
     meaning; the per-arm detail is available to callers that report counts.
     """
 
@@ -206,61 +241,6 @@ def _content_chunks(content: str) -> list[dict]:
     return [{"chunk_id": 0, "text": content}]
 
 
-def _reconcile_native(embeddings: list):
-    """Reconcile raw embeddings → native anchor-relative codes against the live
-    AnchorSet. Returns ``(codes_or_None, anchorset_model_id_or_None)``, where
-    ``codes`` aligns 1:1 with ``embeddings`` (``None`` per item whose dimension
-    doesn't match the anchors).
-
-    Geometry layer (canonical plan §1) — no keys/auth. The caller ensures the
-    AnchorSet exists first (``require_live_anchorset``); this returns ``None``
-    only on an unexpected absence (defensive).
-    """
-    try:
-        from mantle.search.anchors.reconciler import Reconciler
-        from mantle.search.anchors.store import get_crosswalks, get_live_anchorset
-    except Exception:
-        return None, None
-    aset = get_live_anchorset()
-    if aset is None or len(aset) == 0:
-        return None, None
-    try:
-        rec = Reconciler(aset, crosswalks=get_crosswalks())
-        codes = [
-            rec.to_native(emb).to_dict()
-            if (emb is not None and len(emb) == aset.dim)
-            else None
-            for emb in embeddings
-        ]
-        return codes, aset.model_id
-    except Exception:
-        logger.debug("MANTLE: native reconcile skipped", exc_info=True)
-        return None, aset.model_id
-
-
-def _density_layers(embeddings: list):
-    """Per-chunk density-zoom layer (L0/L1/L2 + density) over the live AnchorSet,
-    aligned 1:1 with ``embeddings`` (``None`` per item that can't be placed).
-    The caller ensures the AnchorSet exists first; returns ``None`` only on an
-    unexpected absence (defensive). Geometry layer (§1)."""
-    try:
-        from mantle.search.anchors.store import get_density_zoom
-    except Exception:
-        return None
-    dz = get_density_zoom()
-    if dz is None:
-        return None
-    dim = dz.anchorset.dim
-    out = []
-    for emb in embeddings:
-        if emb is None or len(emb) != dim:
-            out.append(None)
-        else:
-            layer, dens = dz.layer(emb)
-            out.append((layer, round(float(dens), 4)))
-    return out
-
-
 # ============================================================
 #  MANTLE vector hook — encrypted IVF, chunks + embeddings
 # ============================================================
@@ -272,11 +252,22 @@ def _mantle_index_artifact(
     fields: dict[str, str],
     *,
     segment: str = "committed",
+    vector=None,
 ) -> str:
     """Chunk + embed the artifact's content, write to MANTLE cells.
 
+    ``vector`` is a writer-supplied :class:`api.vectors.SuppliedVector` when the write
+    carried one. It selects both the provider (the vector itself, through
+    :class:`embeddings.WriterSuppliedEmbeddings`) and the chunking (one chunk, since the
+    vector describes the artifact rather than any part of it).
+
     Returns :data:`ARM_WRITTEN` / :data:`ARM_SKIPPED` / :data:`ARM_FAILED`; see
     :func:`_sse_index_artifact` for why the status is a return value and not a log line.
+
+    On a node with no provisioned AnchorSet this returns :data:`ARM_SKIPPED` for every
+    artifact — the write still succeeds and still indexes lexically. That is the fresh-install
+    state and it does not clear itself; see the AnchorSet check below and
+    :mod:`mantle.search.anchors.store`.
     """
     content = fields.get("content", "")
     if not content:
@@ -287,24 +278,25 @@ def _mantle_index_artifact(
 
     artifact_root = artifact.root_id or artifact.id
 
-    # Chunk + embed (shared chunker — see _content_chunks). On the bulk-reindex
-    # path these exact texts were already embedded in batch, so this call is a
-    # cache hit (no per-artifact round-trip).
-    chunks = _content_chunks(content)
-    # ⛔ FIXED 2026-07-20 (kept as a post-mortem — the code below is CORRECT, do not 'restore' it).
-    # WAS: `texts` was filtered but `chunks[i]` was not, so the indices did not correspond.
-    # `texts` dropped every chunk with falsy text while the record loop below still indexed the
-    # UNFILTERED `chunks[i]`. One skipped chunk shifts every later pairing by one, so the
-    # embedding of text i was stored with chunk i's `chunk_id` and `text` — a silent, permanent
-    # text↔vector mispairing that no layer can detect (both values are individually well-formed).
-    # Keep the surviving chunks alongside their texts so the two lists are aligned by construction
-    # rather than by the assumption that nothing was ever filtered out.
-    embedded_chunks = [c for c in chunks if c.get("text")]
+    if vector is not None:
+        # One vector, one chunk. The writer embedded this artifact, not a window of it,
+        # so the record's text is the artifact's text and there is nothing to split.
+        embedded_chunks = [{"chunk_id": 0, "text": content}]
+        embedder = Embeddings(WriterSuppliedEmbeddings(vector.values, vector.space_id))
+        supplied_space_id = vector.space_id
+    else:
+        # Chunk + embed (shared chunker — see _content_chunks). On the bulk-reindex
+        # path these exact texts were already embedded in batch, so this call is a
+        # cache hit (no per-artifact round-trip).
+        embedded_chunks = [c for c in _content_chunks(content) if c.get("text")]
+        embedder = _embeddings
+        supplied_space_id = None
+
     texts = [c["text"] for c in embedded_chunks]
     if not texts:
         return ARM_SKIPPED
     try:
-        embeddings = _embeddings(texts)
+        embeddings = embedder(texts)
     except Exception:
         logger.warning(
             "MANTLE: embedding failed for artifact %s",
@@ -314,16 +306,15 @@ def _mantle_index_artifact(
     if not any(embeddings):
         return ARM_SKIPPED
 
-    # The AnchorSet is the one coordinate system (canonical plan §3). It is
-    # PROVISIONED, never derived here (deriving it locally mints region ids no peer
-    # computes), so its absence is a deployment state, not an error: skip the vector
-    # arm and let the commit succeed.
+    # The AnchorSet is the one coordinate system (canonical plan §3). It is seeded by a client,
+    # never derived here (deriving it locally mints region ids no peer computes), so its absence
+    # is a deployment state, not an error: skip the vector arm and let the commit succeed.
     try:
         from mantle.search.anchors.store import (
             AnchorSetNotProvisioned,
             require_live_anchorset,
         )
-        require_live_anchorset()
+        anchorset = require_live_anchorset()
     except AnchorSetNotProvisioned:
         # One line, no traceback: the exception's message is self-contained, and this
         # state is a provisioning gap rather than a fault in this call path.
@@ -339,26 +330,14 @@ def _mantle_index_artifact(
         )
         return ARM_SKIPPED
 
-    # Native language: reconcile raw vectors → sparse anchor-relative codes,
-    # plus a density-zoom layer. Provenance: model_id per chunk.
-    native_codes, anchorset_model_id = _reconcile_native(embeddings)
-    density = _density_layers(embeddings)
-    chunk_model_id = anchorset_model_id or emb_model_id()
+    # Provenance is the space the vector actually came from. A writer-supplied vector
+    # lives in the space the writer named, so its own name is recorded rather than the
+    # AnchorSet's — labelling it with the local space is what would make two
+    # incomparable vectors look comparable later.
+    chunk_model_id = supplied_space_id or anchorset.model_id or emb_model_id()
 
     mantle_chunks = []
     for i, emb in enumerate(embeddings):
-        # ⛔ FIXED 2026-07-20 (post-mortem; the `if not emb` below is CORRECT as written).
-        # WAS: the guard tested `emb is None`, but the failure sentinel is `[]`, so it caught nothing.
-        # `Embeddings.__call__` ends `return [v if v else [] for v in cached]` (embeddings.py:366):
-        # a vector that could not be produced comes back as an EMPTY LIST. `[] is None` is False,
-        # so an empty embedding was packed into a record, and `route_vector` then raised ValueError
-        # (routing.py:33) from inside the grouping loop in `MantleIndexer.index_artifact` — BEFORE
-        # any cell was written. That exception is swallowed by the broad `except Exception` below,
-        # so ONE unembeddable chunk silently discarded the WHOLE artifact's vectors while the
-        # commit still reported success. `if not any(embeddings)` above only catches the all-empty
-        # batch, never the partial one (e.g. 39 chunks cached, 1 chunk's embedder call failed).
-        # This same file already gets it right at `_reconcile_native` (`emb is None or len(emb) !=
-        # dim`) — this call site was the outlier.
         if not emb:
             continue
         record = {
@@ -368,10 +347,11 @@ def _mantle_index_artifact(
             "text": embedded_chunks[i].get("text", ""),
             "model_id": chunk_model_id,
         }
-        if native_codes is not None and native_codes[i] is not None:
-            record["native"] = native_codes[i]
-        if density is not None and density[i] is not None:
-            record["density_layer"], record["density"] = density[i]
+        if supplied_space_id:
+            # The space a writer named for their own vector, kept as they gave it. It is the
+            # record of which coordinate system these numbers are statements in, which is the
+            # one thing that cannot be recovered from the numbers.
+            record["space_id"] = supplied_space_id
         mantle_chunks.append(record)
     if not mantle_chunks:
         return ARM_SKIPPED
@@ -395,7 +375,7 @@ def _mantle_index_artifact(
         logger.debug("MANTLE indexer prerequisites missing; skipping")
         return ARM_SKIPPED
 
-    # The cell-key principal is the collection's immutable origin root (NOT
+    # The cell-key principal is the collection's immutable origin root (not
     # created_by / ownership) — index and query resolve it identically, so the
     # same key is derived at both ends. See search.mantle.principal.
     principal_id = resolve_cell_principal(store_db, collection_id)
@@ -422,29 +402,18 @@ def _mantle_index_artifact(
 
 
 def _ingest_key_request(principal_id: str):
-    """The key request for a WRITE into ``principal_id``'s cells, as the acting caller.
+    """The key request for a write into ``principal_id``'s cells, as the acting caller.
 
-    ⚠ THIS WAS THE KNOWN GAP, AND IT IS NOW CLOSED. What stood here said the acting
-    user *is* known at several call sites but "is used only for queue accounting and
-    never reaches indexing", so the check enforced was ``KeyPurpose.SELF`` —
-    requester == the container's own origin root. Both sides were derived from the
-    data, so it proved only that a write into a container could obtain that
-    container's key. It could not prove the acting user was allowed to write there;
-    that rested entirely on ``check_access`` at the router.
-
-    The acting principal now reaches this layer (:mod:`services.acting_principal`),
-    so the question the light cone answers is the real one: *may THIS caller write
-    into this context?* — ``GRANT`` with ``action="update"``.
-
-    This is the fix §5 "Ingest identity" asked for: *"nothing proves the acting user
-    could write there"*. Now the grant ledger does, in the same place and by the same
-    code path as the query arm.
+    The acting principal reaches this layer (:mod:`services.acting_principal`), so the
+    question the light cone answers is the real one: *may this caller write into this
+    context?* — ``GRANT`` with ``action="update"``. The grant ledger checks it, in the
+    same place and by the same code path as the query arm.
 
     System-initiated indexing — ``collection_service`` auto-index on create, the
     ``init_search`` bulk reindex, the seed path — has no request context and must
     therefore declare its identity explicitly with
     :func:`services.acting_principal.system_acting_context`. It runs as the platform
-    system principal and is checked like any other principal; it is NOT exempt.
+    system principal and is checked like any other principal; it is not exempt.
     Anything that forgets raises ``NoActingPrincipal`` rather than quietly indexing
     under an unchecked identity.
     """
@@ -458,7 +427,7 @@ def _ingest_key_request(principal_id: str):
 
 
 def _read_key_request(principal_id: str):
-    """The key request for READING a principal's cells back (not writing them).
+    """The key request for reading a principal's cells back (not writing them).
 
     Same identity rule as :func:`_ingest_key_request`, but ``action="read"`` — so a
     caller who may read but not write is not refused, and a read never mints a
@@ -594,7 +563,7 @@ def move_artifact_segments(
 ) -> None:
     """Remove the artifact's root from the given index segments.
 
-    Called at a STATE TRANSITION to vacate the segment(s) the artifact is leaving
+    Called at a state transition to vacate the segment(s) the artifact is leaving
     (the new segment is (re)indexed separately). The index is root-keyed, and a
     root can legitimately occupy two segments at once — a committed version and a
     WIP draft of the same root coexist — so we never blanket-purge "all others";
@@ -611,7 +580,7 @@ def move_artifact_segments(
         return
     try:
         from mantle.search.mantle.wiring import build_indexer
-        # Availability gate FIRST — build_indexer doesn't use the db handle, and
+        # Availability gate first — build_indexer doesn't use the db handle, and
         # resolving the handle is the expensive part. This makes the whole thing
         # a fast no-op where search isn't wired (e.g. tests with no S3/oracle),
         # before any DB connection is attempted.
@@ -640,13 +609,13 @@ def move_artifact_segments(
 
 
 def get_artifact_embeddings(artifact: Artifact, collection_id: str) -> list[dict]:
-    """Return the artifact's stored MANTLE vector chunk records (its CURRENT state's
-    segment): each ``{chunk_id, embedding, model_id, ...}``, ordered by chunk_id.
+    """Return the artifact's stored MANTLE vector chunk records for its current state's
+    segment: each ``{chunk_id, embedding, model_id, ...}``, ordered by chunk_id.
 
     Reads the vectors back out of the encrypted cells — the inverse of indexing.
     Empty if the vector arm isn't wired (no cell store) or the artifact has
-    nothing stored (e.g. a container, or lexical-only deploy — the norm since
-    the embeddings-provider removal, 2026-07-22; see embeddings.py)."""
+    nothing stored (e.g. a container, or a lexical-only deploy with no embeddings
+    provider configured; see search/embeddings.py)."""
     if not collection_id:
         return []
     segment = _segment_for_state(artifact.state)
@@ -664,9 +633,7 @@ def get_artifact_embeddings(artifact: Artifact, collection_id: str) -> list[dict
         root = artifact.root_id or artifact.id
         chunks = [
             c for c in indexer.collection_chunks(
-                # READ, not update: this reads vectors back out. It used to reuse the
-                # ingest request, claiming `action="update"` for what is plainly a
-                # read — which would demand write rights to look at your own data.
+                # read, not update: this reads vectors back out.
                 principal_id, collection_id, _read_key_request(principal_id),
             )
             if c.get("artifact_id") == root
@@ -677,10 +644,6 @@ def get_artifact_embeddings(artifact: Artifact, collection_id: str) -> list[dict
         # Never indexed, so there is nothing to read back. Genuinely empty.
         return []
     except KeyCustodyDenied:
-        # ⛔ DO NOT SWALLOW. The blanket handler below turns any failure into an
-        # empty list, which for a REFUSAL means "you are not authorized" is reported
-        # as "this artifact has no embeddings" — indistinguishable from the ordinary
-        # empty case, and fail-open in exactly the way this work exists to remove.
         raise
     except Exception:
         logger.debug(
@@ -696,26 +659,29 @@ def index_artifact(
     *,
     is_head: bool = True,
     fields: Optional[dict[str, str]] = None,
+    vector=None,
 ) -> IndexOutcome:
-    """Index one artifact into the index segment for its CURRENT state.
+    """Index one artifact into the index segment for its current state.
 
     ``draft`` / ``committed`` / ``archived`` each have a separate physical index
     (separate S3 prefixes per arm), so the artifact is written into the segment
-    matching its state. This does NOT touch the other segments — a root may hold
+    matching its state. This does not touch the other segments — a root may hold
     a committed version *and* a WIP draft simultaneously; vacating a segment on a
     state transition is the caller's job via :func:`move_artifact_segments`.
-    (Previously only committed was indexed and archived was skipped entirely.)
 
-    ``is_head`` is preserved for caller compatibility but no longer drives index
+    ``is_head`` is preserved for caller compatibility and does not drive index
     branching (versioning is artifact-level). ``fields`` may be supplied by the
     caller — the bulk reindex extracts them once and prewarms the embeddings
     cache, then passes them here so this path neither re-extracts nor makes a
     per-artifact embed round-trip. When ``None`` they are extracted here.
 
-    Returns an :class:`IndexOutcome` naming what EACH arm did. It is truthy iff no
+    ``vector`` is a writer-supplied :class:`api.vectors.SuppliedVector` when the write
+    carried one; it feeds the vector arm and is ignored by the lexical arm, which reads
+    text. Nothing else in the pipeline changes shape when it is ``None``.
+
+    Returns an :class:`IndexOutcome` naming what each arm did. It is truthy iff no
     arm failed, so ``if index_artifact(...)`` keeps its meaning, and "both arms were
-    refused" is distinguishable from "both arms wrote" — the previous unconditional
-    ``return True`` made those two the same value.
+    refused" is distinguishable from "both arms wrote".
     """
     segment = _segment_for_state(artifact.state)
     try:
@@ -738,10 +704,12 @@ def index_artifact(
             )
         outcome = IndexOutcome(
             sse=_sse_index_artifact(artifact, collection_id, fields, segment=segment),
-            vector=_mantle_index_artifact(artifact, collection_id, fields, segment=segment),
+            vector=_mantle_index_artifact(
+                artifact, collection_id, fields, segment=segment, vector=vector,
+            ),
         )
-        # Name the per-arm result. The previous line read "Indexed artifact %s"
-        # unconditionally, including for an artifact whose every arm was refused.
+        # Name the per-arm result rather than logging a single unconditional success line,
+        # so an artifact whose every arm was refused doesn't read as indexed.
         logger.log(
             logging.WARNING if outcome.failed else logging.INFO,
             "Indexed artifact %s in collection %s (segment=%s): sse=%s vector=%s",
@@ -760,11 +728,9 @@ def index_artifact(
 #  Bulk reindex prep: extract fields once + batch-warm embeddings
 # ============================================================
 
-# Texts per Embeddings() call when prewarming the bulk reindex. Historically
-# this batched HTTP round-trips to the (now removed, 2026-07-22 — see
-# embeddings.py) remote embedder; today a batch resolves from the long-term
-# cache only (previously embedded texts) and uncached texts come back empty,
-# so the batching just bounds per-call list size.
+# Texts per Embeddings() call when prewarming the bulk reindex. A batch resolves from
+# the long-term cache only — texts already embedded resolve, uncached texts come back
+# empty — so this bounds per-call list size.
 EMBED_BATCH_SIZE = 64
 
 
@@ -776,15 +742,15 @@ def prepare_reindex_items(
     """Prepare a bulk-reindex work list with the embeddings cache prewarmed.
 
     For each ``(collection_id, artifact)``: extract its analyzable fields once
-    (skipping archived / field-less artifacts) and collect every UNIQUE MANTLE
-    chunk text across ALL artifacts. Then embed those texts in batched HTTP
+    (skipping archived / field-less artifacts) and collect every unique MANTLE
+    chunk text across all artifacts. Then embed those texts in batched HTTP
     calls, which populates the long-term embeddings cache.
 
     The returned ``(collection_id, artifact, fields)`` tuples feed
     :func:`index_artifact` (pass ``fields=...``); its per-artifact embed then
     hits the warm cache instead of making one round-trip per artifact.
 
-    Built for a COLD cache — the batched prewarm IS the fast path, not an
+    Built for a cold cache — the batched prewarm is the fast path, not an
     optimization that assumes prior warmth. Identical texts (boilerplate shared
     across artifacts) are embedded once.
     """
@@ -793,7 +759,7 @@ def prepare_reindex_items(
     seen: set[str] = set()
 
     for collection_id, artifact in items:
-        # All states are indexed now (into their own segment); the prewarm cache
+        # All states are indexed (into their own segment); the prewarm cache
         # is keyed by chunk text, so it's segment-agnostic.
         try:
             fields = _extract_artifact_fields(artifact)
@@ -847,10 +813,9 @@ def index_artifacts_batch(
 
     Each artifact runs its own SSE + MANTLE flow. Embedding batching
     happens inside :func:`_mantle_index_artifact` — the MANTLE indexer
-    handles per-artifact embedding without cross-artifact batching
-    after the lexical-backend retirement (the previous bulk path was the legacy lexical index-
-    specific). For very large bulk reindex jobs, the admin command
-    runs many of these in parallel via the index queue.
+    handles per-artifact embedding without cross-artifact batching.
+    For very large bulk reindex jobs, the admin command runs many of
+    these in parallel via the index queue.
     """
     if not artifacts:
         return True
@@ -894,29 +859,26 @@ def delete_artifact_from_index(
     arm scans the artifact's manifest and removes from every posting
     list it appears in regardless of collection.
 
-    Callers without ``principal_id`` (legacy pre-Step-2.6 paths) get a
-    no-op — there's nothing to remove without identity.
+    Callers without ``principal_id`` get a no-op — there's nothing to
+    remove without identity.
     """
     try:
         root = root_id or version_id
-        # Resolve identity here rather than at seven call sites — the SAME derivation the write
+        # Resolve identity here rather than at seven call sites — the same derivation the write
         # path uses (`resolve_cell_principal`, above), so index and de-index agree on the key by
         # construction instead of by convention. Callers need only pass `collection_id`.
-        # NOTE the artifact row is ALREADY DELETED by the time this runs (workspace_service purges
+        # The artifact row is already deleted by the time this runs (workspace_service purges
         # the lattice first), so the principal cannot be recovered from the artifact — it has to come
-        # from the container, which still exists. That is why `collection_id` is the argument the
-        # callers were changed to supply.
+        # from the container, which still exists. That is why `collection_id` is the argument
+        # callers supply.
         if collection_id and not principal_id:
             try:
                 from mantle.services.dependencies import get_store_db
                 from mantle.search.mantle.principal import resolve_cell_principal
-                # `next(...)` is NOT optional: get_store_db is a GENERATOR function, so a bare
-                # call yields a generator object, not a Database. get_origin_root then
-                # raises, resolve_cell_principal swallows it and falls back to `collection_id`
-                # (principal.py:31-32) — a plausible-looking value that is the WRONG key whenever a
-                # collection is not its own origin root. Both gates below would then pass and this
-                # function would log success and return True having removed nothing. Matches the
-                # six other uses in this file (293, 331, 372, 407, 454, 483).
+                # `next(...)` is not optional: `get_store_db` is a generator function, so a bare
+                # call yields a generator object, not a Database — `get_origin_root` would then
+                # raise, and the caller must not swallow that into a wrong-but-plausible fallback.
+                # Matches every other use of `get_store_db()` in this file.
                 principal_id = resolve_cell_principal(next(get_store_db()), collection_id)
             except Exception:
                 logger.warning(
@@ -924,32 +886,13 @@ def delete_artifact_from_index(
                     "collection %s — nothing will be removed from the index",
                     version_id, collection_id, exc_info=True,
                 )
-        # Hard delete: the artifact is gone for good, so purge it from EVERY
+        # Hard delete: the artifact is gone for good, so purge it from every
         # segment (we don't track which state it was last indexed under).
         for seg in _SEGMENTS:
             if principal_id and collection_id:
                 _mantle_remove_artifact(principal_id, collection_id, root, segment=seg)
             if principal_id:
                 _sse_remove_artifact(principal_id, root, segment=seg)
-        # ⛔ HISTORY — THIS TWICE REPORTED SUCCESS WHILE REMOVING NOTHING.
-        # Both removal arms above are gated on `principal_id` / `collection_id`, which default to
-        # None. Round 1: every production call site omitted them, so a hard delete purged the lattice
-        # and S3, logged "Deleted artifact ... from search", returned True — and left the MANTLE
-        # vector chunks and SSE postings in place permanently, including the `text` field carried
-        # on each chunk (encrypted at rest inside the cell, but decrypted by the owning
-        # principal's own search path — a RETENTION failure, not a plaintext-at-rest one). Nothing
-        # ever reclaims it: `move_artifact_segments` only runs on state transitions and
-        # `reindex_all_artifacts` only adds.
-        # All seven callers now pass `collection_id`, and the block above resolves the principal.
-        # Round 2: that fix restored the same lie one layer down — the `next(...)` above was
-        # missing, so the principal silently fell back to `collection_id`, both gates passed, and
-        # this returned True having removed nothing. Fixed; pinned by
-        # `test_deletion_actually_removes_the_postings_it_reports_removing`, which asserts the
-        # EFFECT (postings gone) rather than the return value, because the return value was the
-        # part that lied.
-        # The rule this codebase keeps relearning: a failed or skipped operation must never be
-        # indistinguishable from a completed one — and a gate is only honest if the value it
-        # inspects cannot be a plausible wrong answer.
         if not (principal_id and collection_id):
             logger.warning(
                 "delete_artifact_from_index(%s): no principal_id/collection_id supplied, so NOTHING "
@@ -979,19 +922,23 @@ def enqueue_index_artifact(
     is_head: bool = True,
     tenant_id: Optional[str] = None,
     vacate: Optional[list[str]] = None,
+    vector=None,
 ) -> None:
     """Enqueue an artifact for async indexing; falls back to sync.
 
-    ``vacate`` names index segment(s) the artifact is LEAVING on a state
+    ``vacate`` names index segment(s) the artifact is leaving on a state
     transition — they're removed in the same job, right after (re)indexing into
     the new state's segment. Folding the move into this one job keeps the
     transition atomic from the caller's view and gives a single mock point.
+
+    ``vector`` rides the job. It is captured by the closure rather than re-read later,
+    because the write that carried it has already returned by the time the job runs.
     """
     def _act() -> bool:
-        outcome = index_artifact(artifact, collection_id, is_head=is_head)
+        outcome = index_artifact(artifact, collection_id, is_head=is_head, vector=vector)
         if vacate:
             move_artifact_segments(artifact, collection_id, remove_from=vacate)
-        # bool(outcome) is False iff an arm FAILED — a skip is not a job failure.
+        # bool(outcome) is False iff an arm failed — a skip is not a job failure.
         return bool(outcome)
 
     desc = f"index artifact {artifact.id} -> {collection_id}"

@@ -1,13 +1,13 @@
 """`/mcp` — Model Context Protocol over Streamable HTTP.
 
 The load-bearing test here is `test_mcp_dispatches_into_the_same_handler_as_rest`. MCP is a second
-DOOR onto the store, and the failure that matters is not a malformed JSON-RPC envelope — it is a
-second door that reaches further than the first. Every tool must dispatch into the REST handler
+entry point onto the store, and the failure that matters is not a malformed JSON-RPC envelope — it
+is a second door that reaches further than the first. Every tool must dispatch into the REST handler
 that owns the operation, carrying the same `AuthContext`, so the light-cone decides once. A tool
 that ran its own query would pass every protocol test in this file and still be a bypass.
 
 The rest of the file pins the protocol edges that clients actually trip on: notifications must get
-no response body, a failed tool is a RESULT with `isError` rather than a JSON-RPC error, and the
+no response body, a failed tool is a result with `isError` rather than a JSON-RPC error, and the
 absent GET stream must refuse rather than hang.
 """
 from __future__ import annotations
@@ -41,7 +41,8 @@ async def test_tools_list_advertises_schemas(client):
     r = await client.post("/mcp", json=_rpc("tools/list"))
     tools = r.json()["result"]["tools"]
     names = {t["name"] for t in tools}
-    assert names == {"list_artifacts", "get_artifact", "get_children"}
+    assert names == {"list_artifacts", "get_artifact", "get_children",
+                     "create_artifact", "update_artifact", "delete_artifact", "recall"}
     for t in tools:
         assert t["inputSchema"]["type"] == "object"
         # additionalProperties:false is what makes a client's argument typo an error rather than a
@@ -64,12 +65,8 @@ async def test_unknown_method_is_a_jsonrpc_error(client):
 # ── the rule: one authorization path ──────────────────────────────────────────────────────────
 @pytest.mark.anyio
 async def test_mcp_dispatches_into_the_same_handler_as_rest(client):
-    """⛔ THE LOAD-BEARING ONE. A tool must call the REST handler, not query the store itself.
-
-    Patching the handler and asserting it was reached proves the dispatch is real. If someone
-    later 'optimises' a tool by talking to the store directly, this test fails — which is the
-    only automatic warning that MCP has grown an authorization path of its own.
-    """
+    """Patching the handler and asserting it was reached proves the dispatch is real. A tool that
+    talks to the store directly instead of the REST handler fails this test."""
     with patch("mantle.routers.artifacts_router.read_artifact") as handler:
         async def _ok(**kwargs):
             return {"id": kwargs["artifact_id"], "content_type": "text/plain"}
@@ -85,6 +82,55 @@ async def test_mcp_dispatches_into_the_same_handler_as_rest(client):
 
 
 @pytest.mark.anyio
+async def test_update_artifact_dispatches_into_the_same_handler_as_rest(client):
+    with patch("mantle.routers.artifacts_router.update_artifact") as handler:
+        async def _ok(**kwargs):
+            return {"id": kwargs["artifact_id"], "name": kwargs["body"].name}
+        handler.side_effect = _ok
+        r = await client.post("/mcp", json=_rpc(
+            "tools/call",
+            {"name": "update_artifact", "arguments": {"artifact_id": "art-1", "name": "renamed"}}))
+
+    assert r.status_code == 200
+    assert handler.called, "update_artifact did not reach the REST handler"
+    assert handler.call_args.kwargs["artifact_id"] == "art-1"
+    assert handler.call_args.kwargs["body"].name == "renamed"
+    assert handler.call_args.kwargs["auth"].principal_id == "user-123"
+
+
+@pytest.mark.anyio
+async def test_delete_artifact_dispatches_into_the_same_handler_as_rest(client):
+    with patch("mantle.routers.artifacts_router.delete_artifact") as handler:
+        async def _ok(**kwargs):
+            return {"id": kwargs["artifact_id"], "deleted": True}
+        handler.side_effect = _ok
+        r = await client.post("/mcp", json=_rpc(
+            "tools/call", {"name": "delete_artifact", "arguments": {"artifact_id": "art-1"}}))
+
+    assert r.status_code == 200
+    assert handler.called, "delete_artifact did not reach the REST handler"
+    assert handler.call_args.kwargs["artifact_id"] == "art-1"
+    assert handler.call_args.kwargs["auth"].principal_id == "user-123"
+    assert handler.call_args.kwargs["cascade"] is False, (
+        "cascade must default to False when the tool call omits it"
+    )
+
+
+@pytest.mark.anyio
+async def test_delete_artifact_forwards_cascade_true(client):
+    with patch("mantle.routers.artifacts_router.delete_artifact") as handler:
+        async def _ok(**kwargs):
+            return {"id": kwargs["artifact_id"], "deleted": True}
+        handler.side_effect = _ok
+        r = await client.post("/mcp", json=_rpc(
+            "tools/call",
+            {"name": "delete_artifact", "arguments": {"artifact_id": "art-1", "cascade": True}}))
+
+    assert r.status_code == 200
+    assert handler.call_args.kwargs["cascade"] is True
+
+
+@pytest.mark.anyio
 async def test_every_tool_reaches_a_handler(client):
     """No tool may be advertised without a handler behind it — the manifest-vs-implementation gap."""
     from mantle.routers import mcp_router as mcp
@@ -97,7 +143,7 @@ async def test_every_tool_reaches_a_handler(client):
 # ── tool results ──────────────────────────────────────────────────────────────────────────────
 @pytest.mark.anyio
 async def test_a_failing_tool_is_a_result_with_isError_not_a_protocol_error(client):
-    """A tool that raises must come back as a RESULT the model can read and adapt to.
+    """A tool that raises must come back as a result the model can read and adapt to.
 
     Returning a JSON-RPC error instead hides the reason from the model and reads as a broken
     server rather than a failed call."""
@@ -129,7 +175,6 @@ async def test_a_missing_required_argument_is_invalid_params(client):
 @pytest.mark.anyio
 async def test_a_notification_gets_202_and_no_body(client):
     """A notification has no `id`, so the client is not waiting for a reply.
-
     Answering one is a protocol violation that some clients surface as a hang."""
     r = await client.post("/mcp", json={"jsonrpc": "2.0", "method": "notifications/initialized"})
     assert r.status_code == 202
@@ -202,8 +247,8 @@ async def test_root_defaults_to_json_when_accept_is_absent(client):
 
 @pytest.mark.anyio
 async def test_root_varies_on_accept(client):
-    """⛔ Without `Vary: Accept` a cache keyed on URL alone can serve the HTML body to a JSON
-    client (or the reverse). It only breaks behind a CDN, so nothing local would catch it."""
+    """Without `Vary: Accept` a cache keyed on URL alone can serve the HTML body to a JSON
+    client (or the reverse)."""
     for accept in ("text/html", "application/json"):
         r = await client.get("/", headers={"accept": accept})
         assert "accept" in r.headers.get("vary", "").lower()

@@ -2,7 +2,7 @@
 dimension of the E2E suite.
 
 The suite generates an RSA keypair in-process, exposes its public JWKS (which an
-admin registers with Mantle via `POST /issuers`), and mints signed JWTs for
+admin registers with Mantle via `POST /system/issuers`), and mints signed JWTs for
 arbitrary subjects. Because Mantle namespaces external-IdP users by
 `uuid5(tenant, sub)`, two issuers minting the same `sub` map to two DISTINCT
 Mantle users — that is exactly the tenant-isolation lever we exercise.

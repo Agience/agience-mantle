@@ -1,11 +1,12 @@
-"""`db.lattice_identity_legacy`'s twin over the standalone lattice (MANTLE_DB=lattice).
+"""The identity planes over the standalone lattice.
 
-Same function names and signatures; each store side-collection (people / platform_settings /
-passkey_credentials / otp_codes) becomes a stamped-`content_type` plane in the one store, ids
-namespaced by plane so they can never collide with artifacts or each other. Plain-dict in,
-plain-dict out — exactly the store module's contract (`id` key, no store internals).
+Each identity collection (people / platform_settings / passkey_credentials / otp_codes) is a
+stamped-`content_type` plane in the one store, with ids namespaced by plane so they can never
+collide with artifacts or each other. Plain-dict in, plain-dict out — exactly the store module's
+contract (`id` key, no store internals).
 
-Selected by `db.identity_backend`; call sites keep importing one module.
+`db.identity_backend` is the import point every call site uses; this module is what it delegates
+to, so nothing outside imports it by name.
 """
 from __future__ import annotations
 
@@ -110,6 +111,7 @@ def get_person_by_id(db, person_id: str) -> Optional[dict]:
 
 
 def create_person(db, person_dict: dict) -> Optional[str]:
+    key: Optional[str] = None
     try:
         now = _now_iso()
         person_dict.setdefault("created_time", now)
@@ -122,13 +124,27 @@ def create_person(db, person_dict: dict) -> Optional[str]:
         _PEOPLE.put(db, key, {k: v for k, v in person_dict.items() if k != "_key"})
         return key
     except Exception:
-        logger.exception("Error creating person %s", person_dict.get("email"))
+        # The person id, never the email: a log line is the one copy of an identity
+        # record that leaves the encrypted store, and the id names the row just as
+        # precisely for anyone diagnosing this.
+        logger.exception("Error creating person %s", key)
         return None
 
 
 def update_person(db, person_id: str, updates: dict) -> bool:
     updates["modified_time"] = _now_iso()
     return _PEOPLE.update(db, person_id, updates)
+
+
+def delete_person(db, person_id: str) -> bool:
+    """Remove a person record — email, provider subject, password hash and all.
+
+    The people plane gets the same delete its sibling planes have. A plane whose rows
+    can only be written is a plane whose subject cannot leave: the identity record is
+    the last plaintext an erasure has to reach, and `shard/erasure.py` clears artifacts,
+    not this. False when there is no such row (the same shape as the siblings).
+    """
+    return _PEOPLE.delete(db, person_id)
 
 
 def list_all_people(db) -> List[dict]:

@@ -13,6 +13,8 @@ See: .dev/features/unified-artifact-api.md
 """
 
 from typing import Optional, Dict, Any
+
+from mantle.attenuation import ACTIONS, FLAG_OF, Mask
 from .base import BaseEntity
 
 
@@ -26,10 +28,21 @@ class Grant(BaseEntity):
 
     # Valid grantee types
     GRANTEE_USER = "user"
-    GRANTEE_API_KEY = "api_key"
     GRANTEE_INVITE = "invite"
     GRANTEE_GROUP = "group"
     GRANTEE_GRANT_KEY = "grant_key"
+    #: A grant held BY another grant — the bundle edge.
+    #:
+    #: This is what makes a grant composable. A "bundle" is not a separate entity: it
+    #: is a ``grant_key`` grant whose ``grantee_id`` other grants name as THEIR
+    #: grantee. Expanding a bundle is therefore the same lookup as expanding any
+    #: other grantee (`get_active_grants_for_grantee`), which is why composition
+    #: needed no new storage, no new edge label, and no second traversal.
+    #:
+    #: Members carry their own independent CRUDEASIO bits, so one bundle can be
+    #: read on one collection and read/write on another. See
+    #: :func:`services.grant_key_service.resolve_bundle`.
+    GRANTEE_GRANT = "grant"
 
     # Valid states
     STATE_ACTIVE = "active"
@@ -80,6 +93,64 @@ class Grant(BaseEntity):
         },
     }
 
+    #: CRUDEASIO action name -> permission attribute. The single source of truth;
+    #: `services.dependencies` and `services.grant_store` both read it rather than
+    #: keeping parallel copies, because a map that disagrees about which flag gates
+    #: which action is a silent authorization bug.
+    #:
+    #: Derived from :mod:`mantle.attenuation`, which owns the action vocabulary because it
+    #: owns the operator those actions are composed by. The entity still owns the *storage*
+    #: shape (one boolean column per action, named `can_<action>`); what moved out is only
+    #: the list of actions, so the mask type and the ledger cannot come to disagree about
+    #: what CRUDEASIO contains.
+    ACTION_FLAGS: Dict[str, str] = {action: FLAG_OF[action] for action in ACTIONS}
+
+    #: Every permission attribute, in CRUDEASIO order.
+    PERMISSION_FLAGS = tuple(ACTION_FLAGS.values())
+
+    def to_mask(self) -> Mask:
+        """This grant as an attenuation :class:`~mantle.attenuation.Mask`. See :func:`mask_of`."""
+        return mask_of(self)
+
+    def masked_by(self, ceiling: "Grant") -> "Grant":
+        """This grant's authority met with *ceiling*'s — the bundle ceiling.
+
+        The bundle rule: a member grant is only ever as strong as the bundle grant
+        that carries it, so revoking a bit on the bundle revokes it across every
+        member at once without touching them. Intersection only ever removes
+        permission, which is what makes it safe to apply unconditionally.
+
+        The narrowing is :meth:`Mask.__and__` — the *one* attenuation operator, shared with
+        the light-cone path (`search.mantle.lightcone`) and with the `edge.propagate`
+        column. It is not re-implemented here, because the two implementations this replaced
+        disagreed about the zero element and one of them was wrong.
+
+        Two details the operator does not decide, and this method must:
+
+        * **Bits are written back effect-blind.** A deny grant's CRUDEASIO bits say *which
+          actions it denies* — `check_access` tests ``grant_is_deny(g) and getattr(g, flag)``
+          — so masking must not clear them just because the composed authority is a deny.
+        * **The effect string is only ever escalated toward deny.** A grant whose effect is
+          already not a recognized allow confers nothing anyway; rewriting its string would
+          lose information without changing any decision.
+
+        Returns a detached copy — the stored member grant is never mutated, so the
+        ceiling stays a property of the presented credential rather than something
+        that could bake itself into the record.
+        """
+        masked = Grant.from_dict(self.to_dict())
+        narrowed = mask_of(self) & mask_of(ceiling)
+        for flag, value in narrowed.to_flags().items():
+            setattr(masked, flag, value)
+        # Deny is the absorbing element: a deny member inside an allow bundle must stay a
+        # deny, and an allow member under a ceiling that is not a recognized allow becomes
+        # one. The second half is why this reads the composed mask rather than the ceiling
+        # alone — `grant_is_allow` is positive matching, so an unrecognized ceiling effect
+        # narrows to deny instead of passing through.
+        if grant_is_allow(self) and not narrowed.is_allow:
+            masked.effect = self.EFFECT_DENY
+        return masked
+
     @classmethod
     def permissions_for_role(cls, role: str) -> Dict[str, bool]:
         """Return the CRUDEASIO bit pattern for a named role.
@@ -120,6 +191,15 @@ class Grant(BaseEntity):
         target_entity_type: Optional[str] = None,    # "email" | "user_id" | "google_id" | "domain"
         max_claims: Optional[int] = None,            # None = unlimited, 0 = frozen, 1 = single-use
         claims_count: int = 0,
+        # Bearer-key grants (grantee_type == "grant_key" only)
+        #: Non-secret tail of the raw token ("…a1b2"), for humans picking a key out of a
+        #: list. The secret itself is never stored — `grantee_id` holds only its hash.
+        key_hint: Optional[str] = None,
+        last_used_at: Optional[str] = None,
+        #: Demand a signed challenge header alongside the token (bot protection on
+        #: inbound webhook keys). Enforced by `dependencies.check_inbound_nonce`,
+        #: which routes must opt into explicitly.
+        requires_nonce: bool = False,
         # Lifecycle
         state: str = "active",
         id: Optional[str] = None,
@@ -162,6 +242,10 @@ class Grant(BaseEntity):
         self.target_entity_type = target_entity_type
         self.max_claims = max_claims
         self.claims_count = claims_count
+        # Bearer-key
+        self.key_hint = key_hint
+        self.last_used_at = last_used_at
+        self.requires_nonce = requires_nonce
         # Lifecycle
         self.state = state
         self.name = name
@@ -212,6 +296,10 @@ class Grant(BaseEntity):
             "target_entity_type": self.target_entity_type,
             "max_claims": self.max_claims,
             "claims_count": self.claims_count,
+            # Bearer-key
+            "key_hint": self.key_hint,
+            "last_used_at": self.last_used_at,
+            "requires_nonce": self.requires_nonce,
             # Lifecycle
             "state": self.state,
             "name": self.name,
@@ -256,6 +344,10 @@ class Grant(BaseEntity):
             target_entity_type=data.get("target_entity_type"),
             max_claims=data.get("max_claims"),
             claims_count=data.get("claims_count", 0),
+            # Bearer-key
+            key_hint=data.get("key_hint"),
+            last_used_at=data.get("last_used_at"),
+            requires_nonce=data.get("requires_nonce", False),
             # Lifecycle
             state=data.get("state", "active"),
             name=data.get("name"),
@@ -275,12 +367,6 @@ class Grant(BaseEntity):
 # Effect predicates — module-level, duck-typed on purpose
 # ---------------------------------------------------------------------------
 #
-# ⛔ ENFORCEMENT USED TO BE ASYMMETRIC: `== "deny"` to detect a deny, but
-# `!= "deny"` to detect an allow. Any value that was not exactly the lowercase
-# string "deny" therefore fell through BOTH checks and counted as an ALLOW — so
-# a grant stored as "DENY", "Deny", or " deny" did the precise opposite of what
-# it says. A deny grant that silently allows is worse than no deny grant at all,
-# because it reads as protection in the data.
 #
 # These are FUNCTIONS, not just entity methods, because grant-like objects reach
 # the enforcement path from several producers (entities, AQL row shims, test
@@ -305,3 +391,22 @@ def grant_is_allow(grant: Any) -> bool:
     what makes an unknown value fail closed instead of open.
     """
     return _effect_of(grant) == Grant.EFFECT_ALLOW
+
+
+def mask_of(grant: Any) -> Mask:
+    """*grant* as an attenuation :class:`~mantle.attenuation.Mask` — the adapter between the
+    ledger's boolean columns and the one operator.
+
+    This is the only place the two halves of a grant's authority are joined into one value:
+    its nine CRUDEASIO booleans, and whether it is an allow at all. Every enforcement point
+    that used to write ``getattr(grant, flag_attr, False)`` should ask
+    ``mask_of(grant).allows(action)`` instead — the bare `getattr` answers only half the
+    question, which is precisely how a deny grant came to read as authorizing on the
+    light-cone path.
+
+    Duck-typed for the same reason the effect predicates are: grant-like objects reach
+    enforcement from several producers, and authorization must not depend on which one built
+    the object. ``allow`` comes from :func:`grant_is_allow`, so an unrecognized effect lands
+    as a non-allow mask and confers nothing.
+    """
+    return Mask.from_flags(grant, allow=grant_is_allow(grant))

@@ -189,7 +189,7 @@ def seed_platform_issuer_artifacts(db: Any) -> int:
         if isinstance(ctx, dict) and ctx.get("issuer"):
             existing.add(ctx["issuer"])
 
-    from origin import config
+    from mantle import config
     from mantle.services.oidc import _read_authority_manifest
 
     desired: List[Dict[str, Any]] = []
@@ -289,7 +289,7 @@ async def watch_issuer_changes() -> None:
 
     Runs for the app's lifetime (started in the lifespan). The throttled
     refresh-on-miss in ``resolve_auth`` is the fallback for missed events."""
-    from mantle import event_bus
+    from mantle.events import event_bus
     flt = event_bus.EventFilter(
         content_type=ISSUER_CONTENT_TYPE, event_names=_ISSUER_EVENT_NAMES,
     )

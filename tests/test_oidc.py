@@ -81,9 +81,9 @@ def test_rejects_bad_signature():
 
 
 def test_rejects_external_issuer_without_bound_audience():
-    """Confused-deputy guard (multi-tenant): a trusted EXTERNAL issuer that binds no
-    audience must have its tokens REJECTED — otherwise a token it minted for a
-    DIFFERENT relying party would be accepted here, a cross-tenant hole."""
+    """Confused-deputy guard (multi-tenant): a trusted external issuer that binds no
+    audience must have its tokens rejected — otherwise a token it minted for a
+    different relying party would be accepted here, a cross-tenant hole."""
     priv, jwk = _keypair_and_jwk("k1")
     iss = "https://idp.example/"
     # external issuer (role defaults to external), NO audience configured.
@@ -94,9 +94,10 @@ def test_rejects_external_issuer_without_bound_audience():
 
 
 def test_platform_role_issuer_verifies_without_audience():
-    """An internal platform-role anchor is NOT an external tenant (`_external`), so it
+    """An internal platform-role anchor is not an external tenant (`_external`), so it
     keeps verifying without a per-issuer audience — its aud is validated downstream,
-    not here. Guards against the confused-deputy fix breaking internal service auth."""
+    not here. Internal service auth must keep working under the confused-deputy guard
+    above."""
     priv, jwk = _keypair_and_jwk("k1")
     iss = "mantle"  # platform-service anchor-style issuer
     v = OidcVerifier([{"issuer": iss, "role": "platform", "jwks": {"keys": [jwk]}}])
@@ -125,7 +126,7 @@ def test_external_user_id_is_deterministic():
 
 
 def test_same_sub_different_idp_yields_different_users():
-    """The multi-tenant guarantee: a colliding `sub` across two IdPs must NOT
+    """The multi-tenant guarantee: a colliding `sub` across two IdPs must not
     map to the same Agience user."""
     v = _multi_tenant_verifier()
     entra = v.external_user_id({"iss": "https://login.microsoftonline.com/entra/v2.0", "sub": "12345"})

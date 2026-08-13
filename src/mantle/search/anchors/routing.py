@@ -1,15 +1,13 @@
 """Anchor routing — map vectors/queries to cells (cluster = routing anchor).
 
-The AnchorSet IS the partition (canonical plan §5.1): a chunk lands in the cell
+The AnchorSet is the partition (canonical plan §5.1): a chunk lands in the cell
 of its nearest anchor; a query fans out to its ``nprobe`` nearest anchors. Pure
 geometry — no keys/auth (the §1 invariant).
 
-There is ONE path: every vector is anchor-routed. The AnchorSet is mandatory
-(``store.require_live_anchorset`` returns the provisioned set, or raises — it is never derived on
-first use and it grows as the manifold grows). There is no flat cell, no
-unrouted fallback, and no legacy partition — a vector that cannot be placed
-against the anchors (empty set, dimension mismatch) is an error, not a second
-path.
+Every vector is anchor-routed; there is no other path. The AnchorSet is mandatory
+(``store.require_live_anchorset`` returns the seeded set, or raises — nothing here derives one,
+on first use or ever). There is no flat cell and no unrouted fallback — a vector that cannot be
+placed against the anchors (empty set, dimension mismatch) is an error, not a second path.
 """
 
 from __future__ import annotations
@@ -22,28 +20,25 @@ import numpy as np
 from .anchorset import AnchorSet
 
 __all__ = [
-    "route_vector", "route_query",
+    "DEFAULT_NPROBE", "route_vector", "route_query",
     "RouteDecision", "QueryRoute", "route_vector_scored", "route_query_scored",
 ]
 
 
-# ── THE ASSIGNMENT IS DISCRETE; THE EVIDENCE FOR IT IS NOT ────────────────────────────────
-# A cell MUST be picked — an artifact lands in exactly one cell, and that discreteness is
-# correct, not a defect. What was wrong is that the *evidence* for the pick was thrown away
-# the instant it was made: `near[0][0].anchor_id` returned the winner and dropped every
-# cosine that produced it. Two anchors at 0.7001 and 0.7000 then produce an assignment that
-# is, from outside, an unauditable coin flip — indistinguishable in the record from one at
-# 0.91 against 0.12.
+# An artifact lands in exactly one cell — the assignment is discrete — but the evidence for
+# the pick is worth keeping alongside it. `route_vector`/`route_query` return just the
+# winner; `route_vector_scored`/`route_query_scored` below are companion functions that also
+# return the margin between the winner and the runner-up, so an assignment at 0.7001 vs.
+# 0.7000 is distinguishable in the record from one at 0.91 vs. 0.12.
 #
-# WHY THE MARGIN IS WORTH CARRYING: it is the prerequisite for ever migrating an IC epoch
-# affordably. When the anchor vocabulary shifts, a re-cell of the whole corpus is ~6.25M
-# artifacts. With the margin recorded at write time, the re-cell is a FILTER: only artifacts
-# whose winning margin is smaller than the epoch's perturbation can possibly change cell.
-# Without it there is no such filter and the only sound answer is "re-cell everything".
+# The margin is the prerequisite for migrating an IC epoch affordably: when the anchor
+# vocabulary shifts, a re-cell of the whole corpus is on the order of millions of artifacts.
+# With the margin recorded at write time, the re-cell can be a filter — only artifacts whose
+# winning margin is smaller than the epoch's perturbation can possibly change cell.
 #
-# These are COMPANION functions, not replacements. `route_vector`/`route_query` keep their
-# exact return types — `mantle.mesh.anchor_routing`, `search.mantle.indexer` and
-# `search.mantle.engine` all call them positionally and unpack the result directly.
+# `route_vector`/`route_query` keep their exact return types, since `mantle.mesh.anchor_routing`,
+# `search.mantle.indexer` and `search.mantle.engine` all call them positionally and unpack the
+# result directly.
 
 
 @dataclass(frozen=True)
@@ -57,7 +52,7 @@ class RouteDecision:
         exactly one anchor — there is no contest, which is itself the honest reading.
     margin
         ``score - runner_up_score``, i.e. how decisively the winner won. ``float('inf')``
-        when there is no runner-up (uncontested), NEVER 0.0 — a one-anchor set is maximally
+        when there is no runner-up (uncontested), never 0.0 — a one-anchor set is maximally
         decided, and reporting it as a tie would invert the meaning.
     """
 
@@ -123,30 +118,22 @@ def route_vector(anchorset: AnchorSet, vec: Sequence[float] | np.ndarray) -> str
     return near[0][0].anchor_id
 
 
-# How wide a query fans out is NOT a property of the system — it is a property of the QUERY, and
-# `route_query_scored`'s own docstring already said so: "eight probes at 0.71/0.70/0.70/… is a query
-# sitting on a cell boundary, and eight probes at 0.94/0.31/… is a query that only needed one."
-# It described the derivation and then returned eight either way.
-#
-# `nprobe=None` now means DERIVED: probe generously, then keep the probes up to where the cosine
-# series breaks (`beam.resolution.signal_end` — the sharpest proportional drop, scale-invariant, no
-# constant). A boundary query keeps its whole plateau; a decisive query keeps one. An explicit
-# `nprobe` is still honored, because a caller bounding COST is making a claim about a machine, which
-# is theirs to make — but it can no longer silently decide how much of the space a question spans.
-_SCAN = 32          # how many probes to LOOK at before cutting. Cost, not meaning.
+#: How many cells a query opens. Cost, not meaning: every probe is one more cell to fetch and
+#: decrypt, and the cosine over the union decides the answer either way. Eight is the width at
+#: which a query sitting on a cell boundary still sees the neighbours it is between. A caller
+#: bounding its own cost passes its own number — that is a claim about their machine, and it is
+#: theirs to make.
+DEFAULT_NPROBE = 8
 
 
 def route_query(
     anchorset: AnchorSet,
     vec: Sequence[float] | np.ndarray,
     *,
-    nprobe: int | None = None,
+    nprobe: int = DEFAULT_NPROBE,
 ) -> List[str]:
     """Candidate cluster ids (nearest anchors) a query must search. The nearest
     anchor — the cell a matching item would index into — is always first.
-
-    With `nprobe=None` the count is derived from where the cosine series breaks; pass an int to
-    bound the scan explicitly.
 
     Raises :class:`ValueError` when the AnchorSet cannot place the query (empty
     set or embedding/anchor dimension mismatch). There is no flat fallback.
@@ -165,9 +152,9 @@ def route_vector_scored(
     entry out of an argpartition that already scanned every anchor — the matmul, which is the
     whole cost, is unchanged.
 
-    (``route_vector`` is deliberately NOT re-implemented in terms of this. It is the hot
-    ingest path — one call per chunk across the corpus — and it should not pay even a
-    two-element sort for evidence its caller has not asked for.)
+    (``route_vector`` is not implemented in terms of this. It is the hot ingest path — one
+    call per chunk across the corpus — and it should not pay even a two-element sort for
+    evidence its caller has not asked for.)
     """
     near = anchorset.nearest(vec, k=2)
     if not near:
@@ -193,7 +180,7 @@ def route_query_scored(
     anchorset: AnchorSet,
     vec: Sequence[float] | np.ndarray,
     *,
-    nprobe: int | None = None,
+    nprobe: int = DEFAULT_NPROBE,
 ) -> QueryRoute:
     """:func:`route_query` with every probe's cosine kept.
 
@@ -202,16 +189,12 @@ def route_query_scored(
     query sitting on a cell boundary, and eight probes at 0.94/0.31/… is a query that only
     needed one. Both look identical in the current return value.
     """
-    k = max(1, int(nprobe)) if nprobe is not None else _SCAN
-    near = anchorset.nearest(vec, k=k)
+    near = anchorset.nearest(vec, k=max(1, int(nprobe)))
     if not near:
         raise ValueError(
             "route_query_scored: AnchorSet produced no nearest anchor "
             "(empty AnchorSet or embedding/anchor dimension mismatch)"
         )
-    if nprobe is None:
-        from ..resolution import signal_end
-        near = near[:signal_end([float(s) for _, s in near])]
     ids = [a.anchor_id for a, _ in near]
     scores = [float(s) for _, s in near]
     # Uncontested (a single candidate) is infinite margin, not zero — see RouteDecision.

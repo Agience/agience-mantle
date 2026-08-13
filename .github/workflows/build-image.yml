@@ -1,0 +1,167 @@
+name: build-image
+# Build the mantle image ONCE and publish it by DIGEST.
+#
+#   push to main  -> :edge
+#   tag v*        -> :stable + :<version>
+#
+# ⭐ THE DIGEST IS THE ARTIFACT. This workflow's real output is not a tag — it is
+# `ghcr.io/<owner>/agience-mantle@sha256:…`, printed in the summary and consumed verbatim by
+# `agience-cloud`'s deploy workflow. Tags are mutable pointers: `:stable` means one thing on Tuesday
+# and another on Wednesday, so two boxes told to run `:stable` a week apart are running different
+# code while every dashboard reports agreement. A digest cannot drift. mantle.agience.ai and
+# mantle.foresightreports.agience.ai are promoted the SAME digest or the promotion did not happen.
+#
+# ⚠ THE BUILD CONTEXT IS `prism`, AND ONLY `prism`. `agience-origin`'s workflow checks out
+# `agience-beam` as a `core` context; copying that shape here would be wrong twice — mantle's floor
+# is neither `beam` (which it may not import) nor `origin` (wrong licence direction: Apache image,
+# AGPL package). It is `agience-prism-py`.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+# ⛔ THE IMAGE NAME CANNOT BE BUILT HERE, BECAUSE IT HAS TO BE LOWERCASED [2026-08-13]. This was
+# `ghcr.io/${{ github.repository_owner }}/agience-mantle`, and the owner is spelled `Agience`, so
+# every build resolved to `ghcr.io/Agience/agience-mantle` and buildx refused it: "repository name
+# must be lowercase". GitHub's expression language has no case function — contains, startsWith,
+# endsWith, format, join, toJSON, fromJSON, hashFiles, and that is the whole list — so nothing at
+# workflow-`env` scope can do it, and a hardcoded `agience` would publish this repo's image from
+# anyone's fork. It is computed in a step instead, where a shell exists. See `image.outputs.name`.
+
+jobs:
+  test:
+    # ⛔ THE IMAGE IS GATED ON THE SUITE. An image that builds is not an image that works, and this
+    # one is promoted straight to a box holding a 29 GB lattice. Building first and testing later
+    # would publish a digest that a human then has to remember not to deploy.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # ⚠ prism IS REQUIRED TO RUN THE SUITE, not just to build the image. Without it the tests fail
+      # at collection with ModuleNotFoundError, which reads as a broken workflow rather than a
+      # missing dependency — the failure mode this whole cut exists to make impossible.
+      - name: Checkout agience-prism-py
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/agience-prism-py
+          path: .prism
+          # Falls back to the job's own GITHUB_TOKEN when the PAT is absent. Supplying an
+          # EMPTY token is a hard error ('Input required and not supplied'), which is a worse
+          # failure than the Not Found it replaces.
+          token: ${{ secrets.WORKSPACE_READ_TOKEN || github.token }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      # ⚠ setuptools IS NOT PRESENT ON 3.12 AND THE SUITE NEEDS IT AT RUNTIME, not just for build
+      # isolation. `tests/test_wheel_ships_its_data.py` shells out to `import setuptools.build_meta`
+      # to build a wheel and then reads what it shipped; without setuptools INSTALLED that spawn
+      # fails and four packaging tests report "the wheel did not build" — a packaging verdict that
+      # is really a missing interpreter dependency. Build isolation does not help: it provisions a
+      # separate environment that this subprocess never sees.
+      - run: python -m pip install --upgrade pip setuptools wheel
+      - run: python -m pip install ./.prism
+      - run: python -m pip install -r src/mantle/requirements.txt
+      # ⚠ THE TEST TOOLING COMES FROM `[dev]`, NOT FROM requirements.txt. That file is the runtime
+      # install for the image, so pytest and its plugins are not in it — installing them here keeps
+      # the production image free of test dependencies without leaving the suite unable to run.
+      # `agience-prism-py` is already satisfied by the `./.prism` install above, so this resolves
+      # without reaching an index for it.
+      - run: python -m pip install -e '.[dev]'
+      # Bare `pytest` — the package is declared, so PYTHONPATH must NOT be set here.
+      #
+      # ⛔ ONE FILE IS IGNORED, AND NOT BECAUSE IT FAILS. `test_the_apache_store_is_a_product.py`
+      # measures that mantle keeps working with `ember`/`entroptics`/`beam` BLOCKED. On a runner
+      # none of the three is installed, so blocking them blocks nothing and all 15 tests are
+      # vacuous — which the file's own positive control
+      # (`test_the_blocked_packages_are_really_installed_here`) detects and reports as a failure,
+      # correctly. Running it here would mean 14 meaningless passes guarded by one red.
+      #
+      # The alternative — installing ember and entroptics on the runner — was rejected [John,
+      # 2026-08-13]: it drags AGPL packages into the CI of an Apache-licensed image purely to prove
+      # mantle does not depend on them. The file keeps its full force on a developer box, which is
+      # the only place its premise holds.
+      - run: pytest --ignore=tests/test_the_apache_store_is_a_product.py
+        env:
+          # eigh is not thread-safe in this stack; one thread is the only safe setting in CI too.
+          OPENBLAS_NUM_THREADS: "1"
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      image: ${{ steps.image.outputs.name }}
+    steps:
+      # Registry names are lowercase; GitHub owner names are not. `${GITHUB_REPOSITORY_OWNER,,}`
+      # would be shorter, but that is a bashism and this `run:` is only bash by default — `tr`
+      # keeps it true under any shell a future edit might select.
+      - name: Resolve the image name (lowercase — the registry requires it)
+        id: image
+        run: |
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          printf 'name=ghcr.io/%s/agience-mantle\n' "$owner" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+      # The trust floor, supplied to the build as a named context (COPY --from=prism …).
+      - name: Checkout agience-prism-py (build context)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/agience-prism-py
+          path: .prism
+          # Falls back to the job's own GITHUB_TOKEN when the PAT is absent. Supplying an
+          # EMPTY token is a hard error ('Input required and not supplied'), which is a worse
+          # failure than the Not Found it replaces.
+          token: ${{ secrets.WORKSPACE_READ_TOKEN || github.token }}
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            printf 'tags=%s:stable,%s:%s\n' "$IMAGE" "$IMAGE" "${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            printf 'tags=%s:edge\n' "$IMAGE" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          # The Dockerfile lives under `build/`; the build CONTEXT stays the repo root, because
+          # the Dockerfile copies `src/mantle/` and `src/mantle/requirements.txt` by repo-relative
+          # path.
+          file: build/Dockerfile
+          build-contexts: prism=.prism
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ⚠ THE DIGEST MUST BE READABLE BY A HUMAN AND BY THE DEPLOY. Buried in a step output it is
+      # findable only by someone who already knows where to look; the deploy is a copy-paste away.
+      - name: Publish the digest
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+        run: |
+          printf '### mantle image\n\n```\n%s@%s\n```\n\nDeploy with `agience-cloud` → **deploy-mantle** → paste this digest.\n' \
+            "$IMAGE" "${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"

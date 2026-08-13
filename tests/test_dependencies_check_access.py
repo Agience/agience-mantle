@@ -246,9 +246,7 @@ class TestLightConeTraversal:
         assert result.can_read is True
 
     def test_deep_chain_still_inherits_the_grant(self):
-        """FAILURE MODE: before 2026-07-30 the walk stopped at _MAX_ORIGIN_DEPTH=10 and fell
-        through to 404 — a SILENT FALSE DENY on an artifact the principal genuinely holds, and
-        indistinguishable from "no such artifact". A grant 25 levels up must now be found."""
+        """A grant 25 levels up the origin chain must be found; the walk must not stop early."""
         db = _lattice_with({"_key": "art-1", "root_id": "art-1"})
         granted = "ancestor-25"
         hops = {"n": 0}
@@ -283,7 +281,7 @@ class TestLightConeTraversal:
 
     def test_endless_chain_is_a_loud_500_not_a_silent_404(self):
         """A malformed store returning fresh ids forever must be reported as a broken lattice,
-        never as "you are not granted" — the old cap collapsed those two answers into one."""
+        never as "you are not granted"."""
         db = _lattice_with({"_key": "art-1", "root_id": "art-1"})
 
         with (
@@ -313,15 +311,32 @@ class TestRequirePlatformAdmin:
             assert require_platform_admin(_user("user-1"), MagicMock()) == "user-1"
 
     def test_bootstrap_mismatch_falls_through_to_grant_check(self):
-        """When operator ID doesn't match, the canonical the lattice grant check runs."""
+        """When operator ID doesn't match, the canonical lattice grant check runs."""
         fake_settings = SimpleNamespace(get=lambda key: "other-operator")
-        auth_grant = _make_grant("authority-uuid", "update")
+        auth_grant = _make_grant("authority-uuid", "admin")
         with (
             patch("mantle.services.platform_settings_service.settings", fake_settings),
             patch(_STORE_GRANTS, return_value=[auth_grant]),
             patch("mantle.services.dependencies.get_id", return_value="authority-uuid"),
         ):
             assert require_platform_admin(_user("user-1"), MagicMock()) == "user-1"
+
+    def test_can_update_on_the_authority_collection_is_not_platform_admin(self):
+        """Editing the authority container must not escalate to appointing admins.
+
+        The gate requires `can_admin`; `can_update` alone must not pass it.
+        See tests/test_platform_admin_predicate.py.
+        """
+        fake_settings = SimpleNamespace(get=lambda key: "other-operator")
+        editor_grant = _make_grant("authority-uuid", "read", "update")
+        with (
+            patch("mantle.services.platform_settings_service.settings", fake_settings),
+            patch(_STORE_GRANTS, return_value=[editor_grant]),
+            patch("mantle.services.dependencies.get_id", return_value="authority-uuid"),
+        ):
+            with pytest.raises(HTTPException) as ei:
+                require_platform_admin(_user("user-1"), MagicMock())
+        assert ei.value.status_code == 403
 
     def test_no_grant_returns_403(self):
         fake_settings = SimpleNamespace(get=lambda key: None)

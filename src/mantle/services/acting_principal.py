@@ -1,53 +1,27 @@
 """The acting principal — the delegation chain, carried below the router.
 
-WHY THIS EXISTS
----------------
-Key issuance is grant-gated in ``search/mantle/oracle.py``, but until this module
-existed the oracle had no way to learn WHO was asking. Every layer below the HTTP
-router re-derived a "principal" from the *data* rather than from the *caller*:
+Key issuance is grant-gated in ``search/mantle/oracle.py``, and this is how the oracle
+learns who is asking.
 
-* content encryption used ``doc["created_by"]`` — read off the very document being
-  decrypted, then passed as BOTH sides of ``requester_id == principal_id``;
-* ingest used ``resolve_cell_principal(collection)`` — the container's origin root.
-
-Both are lineage, not identity. A check comparing a value to itself is not a check,
-and that is what made ``KeyPurpose.SELF`` an unauthenticated skeleton key: the caller
-supplied both operands, so the grant verifier was never consulted at all.
-
-IDENTITY IS DELEGATED (§4B, John, 2026-07-21)
----------------------------------------------
-This does not carry a bare principal id, because a bare id cannot answer the
-questions an audit actually asks. It carries the chain Origin already mints::
+Identity is delegated (§4B)::
 
     subject ──delegates──▶ actor (operator/server) ──runs on──▶ host
                                     │
                                     └──▶ authority (issuer) vouches for all of it
 
-That is exactly the shape of Origin's delegation JWT — ``sub`` / ``act.sub`` /
-``host_id`` / ``iss`` (``origin/services/auth_service.py:97-133``) — and
-``resolve_auth`` already unpacks all four into ``AuthContext``
-(``services/dependencies.py:311-318``). Before this module they were extracted at the
-router and then dropped. Nothing new is invented here; the existing chain is simply
-carried the rest of the way down.
+That is the shape of Origin's delegation JWT — ``sub`` / ``act.sub`` / ``host_id`` /
+``iss`` (``origin/services/auth_service.py:97-133``) — which ``resolve_auth`` already
+unpacks into ``AuthContext`` (``services/dependencies.py:311-318``). Nothing new is
+invented; the existing chain is carried the rest of the way down.
 
-FAIL CLOSED
------------
-Ambient authority is a real smell: code can forget to set it, and ambient state that
-defaults to "allowed" is worse than no check. So the default is NOT a permissive
-identity — it is *absent*, and ``require_acting_principal()`` RAISES. No acting
-principal means no key. A background job that forgets to declare its identity fails
-loudly at the point of key issuance rather than quietly acquiring one.
+Fail closed: this is deliberately not a token — contrast a contextvar that carries a
+raw bearer, as an application tier typically does. It holds an already-verified chain, so
+nothing below the router re-parses or re-trusts a credential. Verification stays at
+the boundary; this is only the result of it.
 
-Deliberately NOT a token (contrast ``agience-chorus``'s contextvar, which carries a
-raw bearer): this holds an already-verified chain, so nothing below the router
-re-parses or re-trusts a credential. Verification stays at the boundary; this is only
-the result of it.
+Usage: on the request path, the auth dependency sets it — nothing else to do.
 
-USAGE
------
-Request path — set by the auth dependency, nothing else to do.
-
-Background / system path — declare it EXPLICITLY at the entry point::
+On a background / system path, declare it explicitly at the entry point::
 
     from mantle.services.system_identity import system_acting_context
 
@@ -57,14 +31,6 @@ Background / system path — declare it EXPLICITLY at the entry point::
 ``acting_as`` / ``system_acting_context`` are context managers that restore the
 previous value in a ``finally``, so they nest correctly and cannot strand an identity
 on the thread or task that runs next.
-
-⛔ THIS MODULE IS STDLIB-ONLY, AND THAT IS A CONTRACT, NOT AN ACCIDENT.
-It is on Mantle's EMBEDDABLE distribution surface — ``db/doc_boundary.py`` imports
-``KeyCustodyDenied`` from here, so anyone embedding the store (artifacts, collections,
-grants, content) imports this module. ``system_acting_context`` used to live here and
-reached for ``origin.service_identity``; it now lives in ``services/system_identity.py``,
-behind the ``service`` extra. Keep platform imports out of this file — enforced by
-``tests/test_embeddable_surface.py``.
 """
 from __future__ import annotations
 
@@ -86,27 +52,22 @@ __all__ = [
     "set_acting_principal",
     "reset_acting_principal",
 ]
-# NOTE: `system_acting_context` is NOT here — it moved to `services.system_identity` so this
+# `system_acting_context` lives in `services.system_identity`, not here, so this
 # module stays stdlib-only for the embeddable store surface. See `__getattr__` at the bottom.
 
 
 class KeyCustodyDenied(PermissionError):
     """Base for every refusal to issue key material. ``GrantDenied`` subclasses it.
 
-    ⚠ EXISTS SO REFUSALS ARE CAUGHT STRUCTURALLY, NOT BY ENUMERATION. The unified
-    accessor deliberately re-raises authorization failures and swallows everything
-    else, so a flaky vector arm degrades to SSE-only::
-
         except (KeyCustodyDenied, SystemicKeyFailure):
             raise                       # "not authorized" must not become "no results"
         except Exception:
             ...                         # degrade to SSE-only
 
-    With a hand-listed tuple, any NEW refusal type is silently swallowed by the
-    blanket clause below it — "you are not authorized" quietly becomes a narrower
-    result set, which is the fail-open shape this work exists to remove. A shared
-    base means a new refusal is caught the day it is written, without anyone
-    remembering to update the tuple.
+    A shared base means any new refusal type is caught by the first clause
+    automatically, without a hand-listed tuple that a new subclass could silently
+    fall through into the second — turning "not authorized" into a quietly narrower
+    result set.
 
     Deliberately narrower than ``PermissionError`` itself: catching that would also
     trap an unrelated OS/storage permission error and convert a degradable fault
@@ -147,7 +108,7 @@ class ActingPrincipal:
     #: principal, whose authority roots to the operator.
     principal_id: str
 
-    #: ``user | api_key | server | mcp_client | grant_key | service | delegation``.
+    #: ``user | server | mcp_client | grant_key | service | delegation``.
     principal_type: str = "user"
 
     #: ``act.sub`` — the operator/server actually running, when this is a delegated
@@ -161,11 +122,8 @@ class ActingPrincipal:
 
     #: ``iss`` — the authority that vouched for the chain.
     authority: Optional[str] = None
+    #: The delegation's ``scope`` claim, when present. Recorded for audit.
 
-    #: The delegation's ``scope`` claim, when present. Recorded for audit. ⚠ NOT yet
-    #: enforced as a ceiling — ``resolve_auth`` does not extract ``scope`` today, so
-    #: bounding is by the subject's grant set. Narrowing by scope is a separate
-    #: change and must not be assumed here.
     scope: Optional[str] = None
 
     #: Where this identity came from — ``request`` | ``system`` | ``test``.
@@ -232,7 +190,19 @@ def acting_from_auth(auth) -> ActingPrincipal:
     than in ``dependencies`` so this module has no import-time dependency on FastAPI
     — background code and tests import it freely.
     """
+    principal_type = getattr(auth, "principal_type", "user") or "user"
+    actor = getattr(auth, "actor", None)
+
+    # A grant key acts as ITSELF — it is its own principal, not a stand-in for whoever
+    # issued it. A grant key holds its permissions directly, so there is no owning
+    # user to promote: `principal_id` is the root grant's id and the light cone
+    # resolves against the key's own grants.
+    #
+    # This is the honest shape for a detached credential — it keeps a leaked key's
+    # actions attributable to the key in the audit log rather than to a person who
+    # was not present.
     principal_id = getattr(auth, "principal_id", "") or getattr(auth, "user_id", "") or ""
+
     if not principal_id:
         raise NoActingPrincipal(
             "AuthContext carries no principal_id; refusing to construct an "
@@ -240,8 +210,8 @@ def acting_from_auth(auth) -> ActingPrincipal:
         )
     return ActingPrincipal(
         principal_id=str(principal_id),
-        principal_type=getattr(auth, "principal_type", "user") or "user",
-        actor=getattr(auth, "actor", None),
+        principal_type=principal_type,
+        actor=actor,
         host_id=getattr(auth, "host_id", None),
         authority=getattr(auth, "authority", None),
         source="request",
@@ -292,8 +262,8 @@ def propagate(fn):
     must be called on the submitting thread::
 
         with ThreadPoolExecutor(max_workers=n) as pool:
-            pool.submit(propagate(work), item)      # ✅ captured here, on this thread
-            pool.submit(work, item)                 # ⛔ worker gets an empty context
+            pool.submit(propagate(work), item)      # captured here, on this thread
+            pool.submit(work, item)                 # not propagated — starts from an empty context
 
     Each call returns a private copy, so wrapped callables are independent and safe
     to submit concurrently.
@@ -307,15 +277,10 @@ def propagate(fn):
 
 
 def __getattr__(name: str):
-    """`system_acting_context` MOVED to `services.system_identity` — fail loudly, not silently.
+    """`system_acting_context` lives in `services.system_identity`, not here.
 
-    ⛔ DELIBERATELY NOT A RE-EXPORT. A module-level `from .system_identity import …` would put
-    this module's dependency set back where it was: importing `acting_principal` would drag in a
-    module that reaches for `origin`, which is exactly the coupling the split removed. The point
-    was to make this file provably stdlib-only, and a convenience alias would undo that.
-
-    So callers update their import. This hook exists only so the failure names the fix instead of
-    surfacing as a bare AttributeError."""
+    This hook makes the failure name the fix instead of surfacing as a bare
+    AttributeError."""
     if name == "system_acting_context":
         raise ImportError(
             "system_acting_context has MOVED to `services.system_identity` (or "

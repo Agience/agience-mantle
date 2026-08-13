@@ -1,8 +1,6 @@
 """Unit tests for services.workspace_service.
 
 Covers the artifact-lifecycle spine:
-  - Commit token HMAC round-trip + tampering detection
-  - CommitActor resolution for user vs api_key principals
   - _safe_parse_context tolerates None / bad JSON
   - Workspace CRUD: create, get/owner-mismatch 404, update, delete
   - Artifact create / list / get with collection-scope guard
@@ -14,8 +12,6 @@ Covers the artifact-lifecycle spine:
       409 on editing archived
   - delete_artifact removes edges only when no other versions remain
   - revert_artifact drops draft and returns latest committed
-  - commit_workspace_to_collections: dry_run plan, full apply (state flip),
-    actor stamping, batch_commit_drafts call shape
   - move_workspace_artifact picks a fractional mid_key between neighbours
 """
 
@@ -61,14 +57,6 @@ def _patch_grants():
 
     Tests that specifically validate the no-grant 404 path must explicitly
     override this fixture or patch the same target with return_value=[].
-
-    It used to grant `can_read` only, because `can_read` was all `get_workspace`
-    ever checked — including for update and delete, which was the defect. Now
-    that the required verb is per-call-site, this stub grants the whole set so it
-    keeps meaning "the grant check is not what this test is about". Tests that
-    care about a SPECIFIC verb must override it; see
-    `test_scoped_deletion_and_urls.py` and `test_authz_ceilings.py` for the
-    checks that actually exercise authorization.
     """
     allow_grant = GrantEntity(
         resource_id="ws-1",
@@ -149,63 +137,10 @@ def _artifact(
 
 
 # ---------------------------------------------------------------------------
-# Commit token HMAC
-# ---------------------------------------------------------------------------
-
-class TestCommitToken:
-    def test_round_trip_valid(self):
-        tok = ws_svc.generate_commit_token("ws-1", "user-1", ["a", "b"])
-        assert ws_svc.validate_commit_token(tok, "ws-1", "user-1", ["a", "b"])
-
-    def test_id_order_does_not_matter(self):
-        tok = ws_svc.generate_commit_token("ws-1", "user-1", ["b", "a"])
-        # Same set, different order — payload sorts before signing.
-        assert ws_svc.validate_commit_token(tok, "ws-1", "user-1", ["a", "b"])
-
-    def test_tampered_workspace_id_rejected(self):
-        tok = ws_svc.generate_commit_token("ws-1", "user-1", ["a"])
-        assert not ws_svc.validate_commit_token(tok, "ws-2", "user-1", ["a"])
-
-    def test_tampered_user_id_rejected(self):
-        tok = ws_svc.generate_commit_token("ws-1", "user-1", ["a"])
-        assert not ws_svc.validate_commit_token(tok, "ws-1", "user-2", ["a"])
-
-    def test_tampered_artifact_set_rejected(self):
-        tok = ws_svc.generate_commit_token("ws-1", "user-1", ["a"])
-        assert not ws_svc.validate_commit_token(tok, "ws-1", "user-1", ["a", "extra"])
-
-    def test_missing_or_malformed_token_rejected(self):
-        assert not ws_svc.validate_commit_token(None, "ws", "u", [])
-        assert not ws_svc.validate_commit_token("", "ws", "u", [])
-        assert not ws_svc.validate_commit_token("no-dot", "ws", "u", [])
-        assert not ws_svc.validate_commit_token("notanint.sig", "ws", "u", [])
-
-    def test_expired_token_rejected(self):
-        with patch("mantle.services.workspace_service.time.time", side_effect=[0, ws_svc._COMMIT_TOKEN_TTL_SECONDS + 1]):
-            tok = ws_svc.generate_commit_token("ws-1", "u", None)
-        assert not ws_svc.validate_commit_token(tok, "ws-1", "u", None)
-
-
-# ---------------------------------------------------------------------------
-# CommitActor / helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 class TestHelpers:
-    def test_resolve_commit_actor_user_principal(self):
-        actor = ws_svc._resolve_commit_actor("user-1", api_key=None)
-        assert actor.actor_type == "user"
-        assert actor.actor_id == "user-1"
-        assert actor.subject_user_id == "user-1"
-        assert actor.api_key_id is None
-
-    def test_resolve_commit_actor_api_key_principal(self):
-        api_key = SimpleNamespace(id="key-9")
-        actor = ws_svc._resolve_commit_actor("user-1", api_key=api_key)
-        assert actor.actor_type == "api_key"
-        assert actor.actor_id == "key-9"
-        assert actor.subject_user_id == "user-1"
-        assert actor.api_key_id == "key-9"
-
     def test_safe_parse_context_handles_none(self):
         assert ws_svc._safe_parse_context(None) == {}
 
@@ -277,7 +212,7 @@ class TestWorkspaceCrud:
         ):
             art = ws_svc.create_workspace_artifact(
                 db, "user-1", "ws-1", context="{}", content="", order_key="a0",
-                enqueue_index=False, dispatch_handlers=False,
+                enqueue_index=False,
             )
         grant.assert_called_once()
         kw = grant.call_args.kwargs
@@ -329,6 +264,129 @@ class TestWorkspaceCrud:
         update.assert_not_called()
         ensure.assert_not_called()
 
+    def test_update_workspace_replaces_content(self):
+        """A top-level artifact's BODY can be rewritten, and the rewrite reindexes.
+
+        Every artifact created without a `container_id` is a top-level one carrying content
+        (`create_container`'s own `content` parameter), so this is the ordinary edit path for a
+        note, a transcript or a captured file — not an exotic case. It used to accept the new
+        body and drop it: `update_workspace` had no `content` parameter at all, so the router's
+        top-level branch had nothing to hand it to and returned 200 unchanged. A writer that
+        cannot rewrite an artifact has to create a second one, which is how a store ends up
+        holding several copies of the same file with nothing marking which is current.
+        """
+        db = MagicMock()
+        ws = _ws()
+        with (
+            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=ws),
+            patch("mantle.services.workspace_service.store.update_collection") as update,
+            patch("mantle.services.collection_service.ensure_collection_descriptor") as ensure,
+        ):
+            out = ws_svc.update_workspace(
+                db, "user-1", "ws-1", name=None, description=None, content="rewritten body",
+            )
+        assert out.content == "rewritten body"
+        update.assert_called_once()
+        ensure.assert_called_once_with(db, ws)
+
+    def test_update_workspace_archives_a_top_level_artifact(self):
+        """`state: "archived"` on a top-level artifact retires it, and moves its index segment.
+
+        This was a silent no-op: the router's top-level branch never passed `state`, and
+        `update_workspace` had no parameter to receive it, so the call returned 200 with the
+        row untouched. Archiving is the only remediation that retires a superseded copy
+        WITHOUT destroying it — `delete_artifact` was the sole working alternative — so every
+        artifact created outside a collection, which is every note, transcript and captured
+        file, could only be forgotten by being erased.
+
+        The segment move is half the fix and the half that matters for recall: each state is a
+        separately keyed tree, so an archived artifact is not filtered out of a committed
+        search, it is absent from the tree being searched.
+        """
+        db = MagicMock()
+        ws = _ws()
+        with (
+            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=ws),
+            patch("mantle.services.workspace_service.store.update_collection") as update,
+            patch("mantle.search.ingest.pipeline_unified.enqueue_index_artifact") as enqueue,
+        ):
+            out = ws_svc.update_workspace(
+                db, "user-1", "ws-1", name=None, description=None, state="archived",
+            )
+        assert out.state == CollectionEntity.STATE_ARCHIVED
+        update.assert_called_once()
+        enqueue.assert_called_once()
+        # The container id is the artifact's OWN id: a top-level artifact is its own
+        # container, and passing `collection_id` (empty here) would move nothing.
+        assert enqueue.call_args.args[1] == "ws-1"
+        assert enqueue.call_args.kwargs["vacate"] == ["committed", "draft"]
+
+    def test_update_workspace_unarchives_to_committed_not_draft(self):
+        """Unarchiving a top-level artifact returns it to `committed`.
+
+        Deliberately different from `update_artifact`, which unarchives a collection member to
+        `draft`. That is right for a member because a commit path is waiting for it; a
+        top-level artifact has none — `create_container` writes `committed` directly and
+        nothing here promotes a draft — so unarchiving into draft would strand it in a segment
+        the default recall does not search and no path could move it out of.
+        """
+        db = MagicMock()
+        ws = _ws()
+        ws.state = CollectionEntity.STATE_ARCHIVED
+        with (
+            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=ws),
+            patch("mantle.services.workspace_service.store.update_collection"),
+            patch("mantle.search.ingest.pipeline_unified.enqueue_index_artifact") as enqueue,
+        ):
+            out = ws_svc.update_workspace(
+                db, "user-1", "ws-1", name=None, description=None, state="committed",
+            )
+        assert out.state == CollectionEntity.STATE_COMMITTED
+        assert enqueue.call_args.kwargs["vacate"] == ["archived"]
+
+    def test_update_workspace_refuses_to_edit_an_archived_artifact(self):
+        """Editing an archived top-level artifact is a 409, not a silent revival.
+
+        Matches `update_artifact`'s behaviour for a collection member, for the same reason: an
+        archived artifact has been retired, and a write that quietly un-retired it would defeat
+        the retirement.
+        """
+        db = MagicMock()
+        ws = _ws()
+        ws.state = CollectionEntity.STATE_ARCHIVED
+        with (
+            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=ws),
+            patch("mantle.services.workspace_service.store.update_collection") as update,
+        ):
+            with pytest.raises(HTTPException) as exc:
+                ws_svc.update_workspace(
+                    db, "user-1", "ws-1", name=None, description=None, content="new body",
+                )
+        assert exc.value.status_code == 409
+        update.assert_not_called()
+
+    def test_update_workspace_noop_when_content_unchanged(self):
+        """Re-storing an identical body is not an edit — no write, no reindex.
+
+        The hook that captures every Write/Edit re-sends a file's whole content each time, and
+        an editor that saves without changing anything is common, so this is the difference
+        between a store that grows only when something actually changed and one that churns a
+        version per keystroke.
+        """
+        db = MagicMock()
+        ws = _ws()
+        ws.content = "same body"
+        with (
+            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=ws),
+            patch("mantle.services.workspace_service.store.update_collection") as update,
+            patch("mantle.services.collection_service.ensure_collection_descriptor") as ensure,
+        ):
+            ws_svc.update_workspace(
+                db, "user-1", "ws-1", name=None, description=None, content="same body",
+            )
+        update.assert_not_called()
+        ensure.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Artifact CRUD
@@ -366,7 +424,6 @@ class TestUpdateArtifactStateMachine:
     @pytest.fixture(autouse=True)
     def _silence_side_effects(self):
         with (
-            patch("mantle.services.workspace_service._dispatch_handlers"),
             patch("mantle.services.workspace_service._emit_event"),
         ):
             yield
@@ -630,7 +687,6 @@ class TestDeleteRevert:
     @pytest.fixture(autouse=True)
     def _silence(self):
         with (
-            patch("mantle.services.workspace_service._dispatch_handlers"),
             patch("mantle.services.workspace_service._emit_event"),
             patch("mantle.search.ingest.pipeline_unified.delete_artifact_from_index"),
             patch("mantle.search.ingest.pipeline_unified.enqueue_index_artifact"),
@@ -645,11 +701,78 @@ class TestDeleteRevert:
             patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
             patch("mantle.services.workspace_service.store.list_version_history", return_value=[art]),
             patch("mantle.services.workspace_service.store.get_draft_artifact", return_value=art),
+            patch("mantle.services.workspace_service.store.list_collection_artifacts", return_value=[]),
             patch("mantle.services.workspace_service.store.delete_artifact"),
             patch("mantle.services.workspace_service.store.remove_all_edges_for_root") as remove_edges,
         ):
             ws_svc.delete_artifact(db, "user-1", "ws-1", "a-1")
         remove_edges.assert_called_once_with(db, art.root_id)
+
+    def test_delete_detaches_a_sub_collections_members_by_default(self):
+        """`a-1` is itself a container here (it has members), a shape the old code never
+        checked for at all — it deleted the container's own row and left the members' edges
+        pointing at an id that no longer resolved to anything. The default must detach them
+        instead, the same rule `delete_workspace` applies to a top-level container."""
+        db = MagicMock()
+        art = _artifact()
+        with (
+            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
+            patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
+            patch("mantle.services.workspace_service.store.list_version_history", return_value=[art]),
+            patch("mantle.services.workspace_service.store.get_draft_artifact", return_value=art),
+            patch("mantle.services.workspace_service.store.list_collection_artifacts",
+                  return_value=[{"id": "child-1", "root_id": "child-root-1"}]),
+            patch("mantle.services.workspace_service.store.delete_artifact"),
+            patch("mantle.services.workspace_service.store.remove_all_edges_for_root"),
+            patch("mantle.services.workspace_service.store.delete_artifacts_by_root") as destroy,
+            patch("mantle.services.workspace_service.store.remove_artifact_from_collection") as evict,
+            patch("mantle.services.workspace_service.store.count_other_containers_for_root") as shared_check,
+        ):
+            ws_svc.delete_artifact(db, "user-1", "ws-1", "a-1")
+        assert not destroy.called, "a sub-collection's member was destroyed by the default delete"
+        assert not shared_check.called, "share-count only matters to the cascade branch"
+        evict.assert_called_once_with(db, "a-1", "child-root-1")
+
+    def test_delete_cascade_true_destroys_a_sub_collections_exclusive_members(self):
+        db = MagicMock()
+        art = _artifact()
+        with (
+            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
+            patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
+            patch("mantle.services.workspace_service.store.list_version_history", return_value=[art]),
+            patch("mantle.services.workspace_service.store.get_draft_artifact", return_value=art),
+            patch("mantle.services.workspace_service.store.list_collection_artifacts",
+                  return_value=[{"id": "child-1", "root_id": "child-root-1"}]),
+            patch("mantle.services.workspace_service.store.delete_artifact"),
+            patch("mantle.services.workspace_service.store.remove_all_edges_for_root") as nuke_edges,
+            patch("mantle.services.workspace_service.store.delete_artifacts_by_root") as destroy,
+            patch("mantle.services.workspace_service.store.remove_artifact_from_collection") as evict,
+            patch("mantle.services.workspace_service.store.count_other_containers_for_root", return_value=0),
+            patch("mantle.search.ingest.pipeline_unified.delete_artifact_from_index"),
+        ):
+            ws_svc.delete_artifact(db, "user-1", "ws-1", "a-1", cascade=True)
+        destroy.assert_any_call(db, "child-root-1")
+        nuke_edges.assert_any_call(db, "child-root-1")
+        evict.assert_not_called()
+
+    def test_delete_refuses_without_the_containing_collection(self):
+        """A delete that cannot name its container is refused, not degraded.
+
+        Both cleanup arms — the object-storage content and the search index — are keyed on the
+        collection id. Without it the vertex row goes and the artifact's plaintext chunks stay
+        searchable, so the call reports a successful delete having left the readable copy in
+        place. Raising is the only outcome that does not lie about what happened.
+        """
+        db = MagicMock()
+        with (
+            patch("mantle.services.workspace_service.get_workspace_artifact") as fetched,
+            patch("mantle.services.workspace_service.store.delete_artifact") as deleted,
+        ):
+            with pytest.raises(HTTPException) as exc:
+                ws_svc.delete_artifact(db, "user-1", "", "a-1")
+        assert exc.value.status_code == 400
+        fetched.assert_not_called()
+        deleted.assert_not_called()
 
     def test_delete_keeps_edges_when_other_versions_exist(self):
         db = MagicMock()
@@ -708,97 +831,6 @@ class TestDeleteRevert:
             ),
         ):
             assert ws_svc.revert_artifact(db, db, "user-1", "ws-1", "a-1") is None
-
-
-# ---------------------------------------------------------------------------
-# commit_workspace_to_collections
-# ---------------------------------------------------------------------------
-
-class TestCommitWorkspace:
-    @pytest.fixture(autouse=True)
-    def _silence(self):
-        with (
-            patch("mantle.services.workspace_service._emit_event"),
-            patch("mantle.search.ingest.pipeline_unified.enqueue_index_artifact"),
-        ):
-            yield
-
-    def test_dry_run_returns_plan_without_mutation(self):
-        db = MagicMock()
-        drafts = [_artifact("d-1"), _artifact("d-2")]
-        with (
-            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
-            patch("mantle.services.workspace_service.store.list_draft_artifacts", return_value=drafts),
-            patch("mantle.services.workspace_service.store.batch_commit_drafts") as batch,
-        ):
-            resp = ws_svc.commit_workspace_to_collections(
-                db, db, "user-1", "ws-1", dry_run=True
-            )
-        batch.assert_not_called()
-        assert resp.dry_run is True
-        assert resp.plan.total_artifacts == 2
-        # commit_token only present on dry-run / no-op responses
-        assert resp.commit_token is not None
-
-    def test_apply_flips_state_via_batch_commit(self):
-        db = MagicMock()
-        drafts = [_artifact("d-1"), _artifact("d-2")]
-        with (
-            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
-            patch("mantle.services.workspace_service.store.list_draft_artifacts", return_value=drafts),
-            patch(
-                "mantle.services.workspace_service.store.batch_commit_drafts", return_value=2
-            ) as batch,
-            patch("mantle.services.workspace_service.store.create_commit"),
-            patch("mantle.services.workspace_service.store.create_commit_items"),
-        ):
-            resp = ws_svc.commit_workspace_to_collections(
-                db, db, "user-1", "ws-1", dry_run=False
-            )
-        batch.assert_called_once()
-        assert batch.call_args.kwargs["collection_id"] == "ws-1"
-        assert sorted(batch.call_args.kwargs["artifact_ids"]) == ["d-1", "d-2"]
-        assert resp.dry_run is False
-        assert resp.commit_token is None
-
-    def test_filters_by_artifact_ids_subset(self):
-        db = MagicMock()
-        drafts = [_artifact("d-1"), _artifact("d-2"), _artifact("d-3")]
-        with (
-            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
-            patch("mantle.services.workspace_service.store.list_draft_artifacts", return_value=drafts),
-            patch("mantle.services.workspace_service.store.batch_commit_drafts", return_value=2),
-            patch("mantle.services.workspace_service.store.create_commit"),
-            patch("mantle.services.workspace_service.store.create_commit_items"),
-        ):
-            resp = ws_svc.commit_workspace_to_collections(
-                db, db, "user-1", "ws-1", artifact_ids=["d-1", "d-3"], dry_run=False
-            )
-        assert {c.artifact_id for c in resp.plan.artifacts} == {"d-1", "d-3"}
-
-    def test_no_drafts_returns_empty_plan(self):
-        db = MagicMock()
-        with (
-            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
-            patch("mantle.services.workspace_service.store.list_draft_artifacts", return_value=[]),
-        ):
-            resp = ws_svc.commit_workspace_to_collections(
-                db, db, "user-1", "ws-1", dry_run=False
-            )
-        assert resp.plan.total_artifacts == 0
-        assert resp.updated_workspace_artifacts == []
-
-    def test_actor_resolution_user_principal(self):
-        db = MagicMock()
-        with (
-            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
-            patch("mantle.services.workspace_service.store.list_draft_artifacts", return_value=[]),
-        ):
-            resp = ws_svc.commit_workspace_to_collections(
-                db, db, "user-1", "ws-1", dry_run=True
-            )
-        assert resp.actor.actor_type == "user"
-        assert resp.actor.actor_id == "user-1"
 
 
 # ---------------------------------------------------------------------------
