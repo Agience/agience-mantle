@@ -1,29 +1,26 @@
 """Drift guards: the static platform seed files must stay in lock-step with the
-manifest-/code-derived sources of truth. Adding a persona, server, or default
-LLM connection without its seed file (or vice-versa) fails CI here — converting
-the "two-place edit" risk of static seeds into an enforced invariant.
+code-derived sources of truth. Adding a persona or a platform collection without
+its seed file (or vice-versa) fails CI here — converting the "two-place edit" risk
+of static seeds into an enforced invariant.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 import yaml
 
 from mantle.services.bootstrap_types import (
     AGENT_CONTENT_TYPE,
     ALL_PLATFORM_COLLECTION_SLUGS,
-    MCP_SERVER_CONTENT_TYPE,
     PLATFORM_AGENT_SLUGS,
 )
 
 _COLLECTION_CONTENT_TYPE = "application/vnd.agience.collection+json"
 
 # Flat trigger/kind layout: seeds/<platform|admin|user>/<artifacts|grants>/.
-# The categorical subfolders (agents/, servers/, llm/) are gone — a seed's
+# There are no categorical subfolders (agents/, servers/, llm/) — a seed's
 # category is read from its `content_type`, not its directory, because
 # containment is expressed by each artifact's `contained_by` slug reference.
-_REPO = Path(__file__).resolve().parents[3]
 from ._package_root import seeds_root, types_root  # noqa: E402 — single source
 _PLATFORM_ARTIFACTS = seeds_root() / "platform" / "artifacts"
 _USER_GRANTS = seeds_root() / "user" / "grants"
@@ -55,23 +52,12 @@ def _grant_resources(grant_dir: Path) -> set[str]:
     return out
 
 
-@pytest.mark.skip(reason=(
-    "Personas now self-register with Mantle at runtime (services.server_registry "
-    "is dynamic, not manifest-derived), so Mantle has no static persona list to "
-    "drift-check seed files against — that's a Chorus concern. Reconciling the seed "
-    "MCP-server files vs dynamic registration is a separate follow-up."
-))
-def test_server_seed_files_match_manifest():
-    ...
-
-
 def test_agent_seed_files_match_persona_list():
     slugs = {b["slug"] for b in _load(AGENT_CONTENT_TYPE)}
     assert slugs == {f"agience-agent-{s}" for s in PLATFORM_AGENT_SLUGS}
 
 
-# test_llm_seed_files_match_connection_list removed 2026-07-22 with its subject:
-# the LLM connection seeds are gone (no-models rule — universal). The collection-
+# There are no LLM connection seeds (no-models rule — universal). The collection-
 # and grant-coverage guards below enforce their absence via the canonical lists.
 
 

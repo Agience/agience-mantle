@@ -3,11 +3,44 @@ Query Parser v3.1 - Natural Language First
 
 Key Features:
 - Natural language default (no operators required)
-- @ namespace for controls (@hybrid:, @lang:, @top_k:)
 - Auto-quoting for multi-word terms with +/~
 - Soft parsing with graceful degradation
-- Hybrid is opt-in (via ~ terms or @hybrid:on)
+- `~term` marks a term semantic, which selects which text the query path embeds
 - Exact phrase support (="text" standalone, field:="text" fielded)
+
+The `@name:value` namespace is a LEXER feature and nothing more. `_extract_controls` lifts
+those tokens out of the term stream — so `@lang:en` does not become a search term — and records
+them on `ParsedQuery.controls`, which is parse output that no retrieval decision reads. There is
+no control here that turns an arm on or off: the semantic arm runs when the request carries a
+query vector and this node has a provisioned AnchorSet, both of which are facts about the
+request and the node rather than about the query string.
+
+`field:value` is NOT the same kind of output, and that is the one asymmetry in this module.
+`_extract_filters` lifts a filter out of the term list and records it on `ParsedQuery.filters`,
+and that list is READ: `search.field_filters.compile_filters` turns it into a predicate over
+artifact docs, and `sse.router_accessor` hands that predicate to
+`lightcone.resolve_authorized_scope`, which applies it to the authorized artifact set
+before either retrieval arm runs. So `type:pdf` narrows a recall, on both arms, and the terms
+that reach the index are the terms only.
+
+A `word:value` token is a filter ONLY when `word` is a known field, and this module holds no
+list of its own to decide that: it asks `field_filters.is_filter_field`, which reads the same
+`FILTERABLE_FIELDS` / `FIELD_ALIASES` / `REFUSED_FIELDS` mappings the resolver resolves against.
+One roster, two readings. A list here that had to be kept in step by hand would eventually admit
+a word the resolver cannot resolve, and that gap is exactly the class of bug being closed —
+`STANDARD_FIELDS` was such a list, read by nothing, naming `state`, a field the retrieval path
+refuses.
+
+Anything else keeps its colon and stays a term, so `https://example.com`, `3:30`, `C:\\Users\\john`
+and `16:9` are ordinary searches rather than 400s. The cost is that a typo — `titel:foo` — is a
+search term that finds nothing instead of an error naming it; see `field_filters` for why that
+trade is taken and why there is no did-you-mean here.
+
+This module still decides nothing beyond grammar. What a resolvable field IS, and what happens
+when one carries an operator it cannot take, belongs to `field_filters`.
+
+Both lists reach a caller through `__str__` — the recall response echoes it as `parsed_query`.
+The response's `applied_filters` is the narrower claim: what was applied, not merely understood.
 """
 
 import re
@@ -95,10 +128,20 @@ class ParsedQuery:
     # Core search terms (topics)
     terms: List[Term] = field(default_factory=list)
     
-    # Field filters (type:, tag:, size:, etc.)
+    # Field filters (`type:`, `tag:`, `created_at:>`, …) — the one parse output that a
+    # retrieval decision READS. `search.field_filters.compile_filters` validates every entry
+    # and compiles it into a predicate over artifact docs; `lightcone.resolve_authorized_scope`
+    # narrows the authorized artifact set with it before either arm retrieves, so a filter
+    # here is a filter in the result, on both arms, and inside `total`.
+    #
+    # Every entry is therefore load-bearing, which is why a filter this parser accepts and
+    # the retrieval path cannot resolve FAILS the request instead of being dropped. That
+    # asymmetry with `controls` below is deliberate: an inert control the caller can see is
+    # harmless, an inert FILTER returns a wrong result set that looks like a right one.
     filters: List[FieldFilter] = field(default_factory=list)
-    
-    # Control parameters (@hybrid:, @lang:, etc.)
+
+    # Control parameters (`@name:value`) — see the module docstring. Lifted out of the
+    # term stream and recorded; no retrieval decision reads them.
     controls: Dict[str, str] = field(default_factory=dict)
     
     # Auto-corrections applied
@@ -119,31 +162,13 @@ class ParsedQuery:
         """Check if query is completely empty"""
         return not self.has_topics() and not self.has_filters()
     
-    def should_use_hybrid(self) -> bool:
-        """
-        Determine if hybrid search should be used.
-        
-        Default: BM25 only (fast, predictable, Google-like behavior)
-        
-        Hybrid trigger rules (opt-in only):
-        1. Explicit @hybrid:on control, OR
-        2. Query contains ~ semantic modifier terms
-        
-        This matches industry standard: lexical/BM25 by default, semantic as opt-in feature.
-        """
-        # Check explicit control
-        if self.controls.get("hybrid") == "off":
-            return False
-        if self.controls.get("hybrid") == "on":
-            return True
-        
-        # Check if any terms have semantic modifier (~)
-        # If user explicitly requests semantic search, enable hybrid
-        has_semantic_terms = any(t.modifier == TermModifier.SEMANTIC for t in self.terms)
-        
-        # Default: BM25 only (no automatic hybrid)
-        return has_semantic_terms
-    
+    # NO `should_use_hybrid`. There is no query-side switch for the semantic arm, so there is
+    # nothing here to derive one from. The arm runs when the request carries a query vector and
+    # this node has a provisioned AnchorSet; a predicate over the query string could not move
+    # either of those, and one that named itself as if it could is the reason `@hybrid:on` read
+    # as a working control while gating nothing. What the ~ modifier DOES do is select which
+    # text gets embedded, and `router_accessor._embed_or_none` reads `terms` for that directly.
+
     def __str__(self):
         """Canonical string representation"""
         parts = []
@@ -174,17 +199,14 @@ class QueryParser:
     QUOTED_PATTERN = re.compile(r'([+!~=])?"([^"]+)"')
     TERM_PATTERN = re.compile(r'([+!~=])?(\S+)')
     
-    # Standard fields (no metadata. prefix needed)
-    STANDARD_FIELDS = {
-        "title", "description", "tags", "tag", "content", "state",
-        "type", "content_type", "filename", "size",
-        "created_at", "updated_at", "owner_id", "collection_id"
-    }
-    
-    # ⛔ `STOPWORDS` REMOVED 2026-07-30 — a hand-authored claim about which words carry no
-    # information, and it had ZERO consumers. [John: "we shouldnt have a stopword list. that's a
-    # bogus algorithm in itself."] Information is measured by the corpus (IDF), not declared.
-    
+    # NO field registry here. Which words are fields is a question about what an artifact doc
+    # carries and what the store can answer, not about grammar, and it is answered in one
+    # place: `search.field_filters.is_filter_field`, over `FILTERABLE_FIELDS` (plus
+    # `REFUSED_FIELDS` for the ones refused with a reason). The parser recognizes the SHAPE
+    # `field:value`, ASKS whether the word is a field, and hands on only what is; the resolver
+    # still decides whether the operator and value mean anything.
+
+
     def __init__(self):
         self.corrections = []
     
@@ -237,14 +259,17 @@ class QueryParser:
     
     def _extract_filters(self, query: str) -> Tuple[str, List[FieldFilter]]:
         """
-        Extract field:value filters with operators.
-        
+        Extract field:value filters with operators, for KNOWN fields only.
+
         Handles:
         - field:value
         - field:=  "quoted value"
         - !field:value
         - field:>value, field:<value
         - field:~value
+
+        A colon-bearing token whose word is not a known field is left in the term stream
+        untouched and unquoted — it is a search term, not a malformed filter.
         """
         filters = []
         remaining_parts = []
@@ -328,11 +353,24 @@ class QueryParser:
             return None, 0
         
         field, rest = parts
-        
+
         # Validate field name
         if not field or not field.replace("_", "").isalnum():
             return None, 0
-        
+
+        # And it must be a field the resolver knows. Asked, never listed here — see the
+        # module docstring. The import is deferred because `field_filters` imports
+        # `FieldFilter` from this module; deferring it here rather than there keeps the
+        # dependency pointing the way it reads, from grammar to meaning, and costs one
+        # `sys.modules` lookup per colon-bearing token.
+        #
+        # Returning `(None, 0)` is what makes `https://example.com` a search term: the caller
+        # puts the token back into the term stream verbatim, colon and all, unquoted.
+        from .field_filters import is_filter_field
+
+        if not is_filter_field(field):
+            return None, 0
+
         # Determine operator
         operator = FieldOperator.EQUALS
         value = rest
@@ -467,14 +505,13 @@ if __name__ == "__main__":
         'budget !"internal only"',
         "type:pdf tag:budget",
         "type:pdf,docx size:>1000",
-        "+innovation +strategy type:pdf @hybrid:off",
+        "+innovation +strategy type:pdf @lang:en",
         "tag:~ai !tag:draft,archive",
     ]
-    
+
     for q in test_queries:
         parsed = parser.parse(q)
         print(f"\nQuery: {q}")
         print(f"Parsed: {parsed}")
-        print(f"Hybrid: {parsed.should_use_hybrid()}")
         if parsed.corrections:
             print(f"Corrections: {parsed.corrections}")

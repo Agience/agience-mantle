@@ -3,8 +3,7 @@
 The runtime slug → UUID registry that the entire platform depends on for
 collection lookups during request handling. Strict get_id() must raise on a
 missing slug; get_id_optional() must return None. pre_resolve_platform_ids()
-must register every category of slug (collections, singleton artifacts, agents,
-LLM connections, MCP servers).
+must register every category of slug (collections, singleton artifacts, agents).
 """
 
 from __future__ import annotations
@@ -90,8 +89,7 @@ class TestPreResolvePlatformIds:
     def test_leaves_missing_slugs_unregistered(self, empty_registry):
         """Fallback-only: pre_resolve never mints IDs. A slug with no persisted
         mapping stays unregistered — the declarative seed loader derives and
-        persists it on the fresh-DB bootstrap run (and the platform trigger then
-        re-runs server_registry.populate_ids)."""
+        persists it on the fresh-DB bootstrap run, registering each id as it goes."""
         mock_settings = MagicMock()
         mock_settings.get.return_value = None
         mock_settings.set_many = MagicMock()

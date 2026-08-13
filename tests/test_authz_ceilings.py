@@ -1,16 +1,19 @@
-"""§2.9 authorization: API-key ceiling, resource-filter breadth, deny symmetry.
+"""§2.9 authorization: the grant-key ceiling, bundle masking, deny symmetry.
 
-Three live-fire defects on a running Mantle:
+Three invariants this file pins:
 
-1. **API-key principals authorized as their owning USER.** `check_access`
-   resolved grants against `auth.user_id` and never consulted the key's own
-   scopes, so a read-only integration key carried the owner's full CRUDEASIO.
-2. **`resource_filters: {}` meant "access everything"** — broader than the
-   documented default, and settable from one request body.
-3. **`Grant.effect` enforcement was asymmetric** — `== "deny"` to detect a deny
-   but `!= "deny"` to detect an allow, so `"DENY"` counted as an ALLOW.
+1. A grant-key principal is authorized against the grants the KEY holds, never
+   against its issuer's — a leaked key must not widen to the person who minted it.
+2. A bundle grant is a ceiling: a member is only ever as strong as the bundle
+   carrying it, so clearing a bit on the bundle clears it across every member.
+3. `Grant.effect` matching is symmetric: allow and deny are each matched
+   positively, so no spelling of one can be read as the other.
 
-Positive controls accompany every rejection assertion (working rule 4).
+Positive controls accompany every rejection assertion.
+
+Invariants 1 and 2 protect the same property: a bearer credential narrows and never
+widens. It is expressed directly in CRUDEASIO bits, not in a second permission grammar
+layered on top of them.
 """
 
 from __future__ import annotations
@@ -20,7 +23,6 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
-from mantle.entities.api_key import APIKey
 from mantle.entities.grant import Grant
 
 # Resolved lazily, not imported at module scope. A module-level import raises
@@ -49,13 +51,6 @@ def grant_is_deny(g):
     return _sym("mantle.entities.grant", "grant_is_deny", "deny detection is an unnormalized compare")(g)
 
 
-def _enforce_api_key_ceiling(auth, action):
-    return _sym(
-        "mantle.services.dependencies", "_enforce_api_key_ceiling",
-        "API keys authorize as their owning user and inherit full CRUDEASIO",
-    )(auth, action)
-
-
 # ---------------------------------------------------------------------------
 # 3. Deny/allow symmetry
 # ---------------------------------------------------------------------------
@@ -63,7 +58,7 @@ def _enforce_api_key_ceiling(auth, action):
 
 @pytest.mark.parametrize("effect", ["DENY", "Deny", " deny ", "deny"])
 def test_casing_variants_of_deny_are_denies(effect):
-    """THE REGRESSION: any spelling of deny must deny, never silently allow."""
+    """Any spelling of deny must deny, never silently allow."""
     g = SimpleNamespace(effect=effect)
 
     assert grant_is_deny(g) is True, f"{effect!r} must be treated as a deny"
@@ -75,7 +70,7 @@ def test_casing_variants_of_deny_are_denies(effect):
 
 @pytest.mark.parametrize("effect", ["allow", "ALLOW", " Allow "])
 def test_casing_variants_of_allow_are_allows(effect):
-    """POSITIVE CONTROL: real allows must still allow."""
+    """Positive control: real allows must still allow."""
     g = SimpleNamespace(effect=effect)
 
     assert grant_is_allow(g) is True
@@ -102,11 +97,9 @@ def test_grant_entity_normalizes_effect_on_construction():
 
 
 def test_effect_predicates_work_on_duck_typed_grants():
-    """Grant-like objects reach enforcement from several producers.
-
-    Coupling authorization to one class is how the first version of this fix
-    broke five existing tests: the enforcement path receives AQL row shims and
-    test doubles, not only `Grant` entities.
+    """Grant-like objects reach enforcement from several producers: the enforcement path receives
+    AQL row shims and test doubles, not only `Grant` entities, so the predicates must work on any
+    duck-typed object with an `effect` attribute, not just the `Grant` class.
     """
     assert grant_is_deny(SimpleNamespace(effect="deny")) is True
     assert grant_is_allow(SimpleNamespace(effect="allow")) is True
@@ -114,134 +107,144 @@ def test_effect_predicates_work_on_duck_typed_grants():
 
 
 # ---------------------------------------------------------------------------
-# 1. The API-key ceiling
+# 1. A grant key authorizes as ITSELF
 # ---------------------------------------------------------------------------
 
 
-def _auth_for_key(scopes):
-    return SimpleNamespace(
-        principal_type="api_key",
-        api_key_entity=APIKey(id="k1", user_id="owner", scopes=scopes),
+def _key_auth(grants):
+    """An AuthContext as `resolve_auth` builds one for a grant key: no user_id."""
+    from mantle.services.dependencies import AuthContext
+
+    return AuthContext(
+        principal_id="key-grant-1",
+        principal_type="grant_key",
+        user_id=None,
+        grants=grants,
+        grant_key_id="key-grant-1",
+        bearer_grant=grants[0] if grants else None,
     )
 
 
+def _readable_grant(resource_id="res-1", **flags):
+    bits = {"can_read": True}
+    bits.update(flags)
+    return Grant(resource_id, Grant.GRANTEE_GRANT_KEY, "hash", "owner", **bits)
+
+
+def _check(auth, action, grants_for_resource):
+    """Run check_access against a stub store in which `res-1` exists."""
+    from unittest.mock import MagicMock, patch
+
+    from mantle.services import dependencies
+
+    db = MagicMock()
+    with (
+        patch("mantle.db.backend.get_raw_artifact",
+              return_value={"id": "res-1", "root_id": "res-1"}),
+        patch("mantle.db.backend.get_active_grants_for_principal_resource",
+              return_value=grants_for_resource),
+        patch("mantle.db.backend.get_origin_parent", return_value=None),
+    ):
+        return dependencies.check_access(auth, "res-1", action, db)
+
+
 def test_readonly_key_cannot_perform_writes():
-    """THE REGRESSION: a read-only key must not inherit the owner's write access."""
-    auth = _auth_for_key(["resource:*:read"])
+    """A read-only key must not reach a write, even where its issuer could."""
+    auth = _key_auth([_readable_grant()])
+    # The issuer holds everything on this resource. Were the key authorized as the
+    # user, every one of these would succeed.
+    issuer_grants = [Grant("res-1", Grant.GRANTEE_USER, "owner", "owner",
+                           **{f: True for f in Grant.PERMISSION_FLAGS})]
 
     for action in ("update", "delete", "create", "admin", "share"):
         with pytest.raises(HTTPException) as exc:
-            _enforce_api_key_ceiling(auth, action)
-        assert exc.value.status_code == 403, (
-            f"a read-only API key was permitted to '{action}' — it inherits the "
-            "owning user's full CRUDEASIO"
+            _check(auth, action, issuer_grants)
+        assert exc.value.status_code == 404, (
+            f"a read-only grant key was permitted to '{action}' — it authorized as "
+            "its issuing user instead of as itself"
         )
 
 
 def test_readonly_key_can_still_read_positive_control():
-    """POSITIVE CONTROL: without this, the test above passes if EVERYTHING is denied."""
-    auth = _auth_for_key(["resource:*:read"])
+    """Positive control: without this, the test above would pass if all were denied."""
+    auth = _key_auth([_readable_grant()])
+    assert _check(auth, "read", []) is not None
 
-    _enforce_api_key_ceiling(auth, "read")  # must not raise
 
+def test_key_is_permitted_exactly_its_own_bits():
+    auth = _key_auth([_readable_grant(can_update=True)])
 
-def test_scoped_key_is_permitted_exactly_its_scopes():
-    auth = _auth_for_key(["resource:*:read", "resource:*:write"])
-
-    _enforce_api_key_ceiling(auth, "read")
-    _enforce_api_key_ceiling(auth, "update")  # 'update' maps to the write scope
-
+    assert _check(auth, "read", []) is not None
+    assert _check(auth, "update", []) is not None
     with pytest.raises(HTTPException):
-        _enforce_api_key_ceiling(auth, "delete")
+        _check(auth, "delete", [])
 
 
-def test_non_api_key_principals_are_unaffected():
-    """The ceiling applies only to API keys; users authorize purely on grants."""
-    for principal in ("user", "server", "mcp_client", "delegation"):
-        _enforce_api_key_ceiling(
-            SimpleNamespace(principal_type=principal, api_key_entity=None), "delete"
-        )  # must not raise
-
-
-def test_missing_key_entity_fails_closed():
+def test_key_carrying_no_grants_reaches_nothing():
     """If we cannot establish what the key may do, it may do nothing."""
-    auth = SimpleNamespace(principal_type="api_key", api_key_entity=None)
-
     with pytest.raises(HTTPException) as exc:
-        _enforce_api_key_ceiling(auth, "read")
-    assert exc.value.status_code == 403
+        _check(_key_auth([]), "read", [])
+    assert exc.value.status_code == 404
 
 
-def test_unmapped_action_fails_closed():
-    auth = _auth_for_key(["resource:*:read"])
-
-    with pytest.raises(HTTPException):
-        _enforce_api_key_ceiling(auth, "some_new_verb")
+def test_key_cannot_reach_a_resource_it_does_not_carry():
+    """A key readable on one resource must not read another."""
+    auth = _key_auth([_readable_grant(resource_id="other-resource")])
+    with pytest.raises(HTTPException) as exc:
+        _check(auth, "read", [])
+    assert exc.value.status_code == 404
 
 
 # ---------------------------------------------------------------------------
-# 2. resource_filters breadth
+# 2. The bundle ceiling
 # ---------------------------------------------------------------------------
 
 
-def test_empty_filters_are_not_broader_than_the_default():
-    """THE REGRESSION: `{}` used to return True for EVERY resource type."""
-    key = APIKey(id="k1", user_id="u", resource_filters={})
+def test_bundle_ceiling_narrows_its_members():
+    """A member cannot exceed the bundle carrying it."""
+    member = Grant("res-1", Grant.GRANTEE_GRANT, "bundle-1", "owner",
+                   can_read=True, can_update=True, can_delete=True)
+    read_only_bundle = Grant("", Grant.GRANTEE_GRANT_KEY, "hash", "owner", can_read=True)
 
-    assert key.can_access_resource("workspaces") is True, "default reach preserved"
-    assert key.can_access_resource("collections") is True, "default reach preserved"
-    assert key.can_access_resource("tools") is False, (
-        "an empty filter map granted access to every resource type — broader "
-        "than the documented default, from one request body"
+    masked = member.masked_by(read_only_bundle)
+
+    assert masked.can_read is True, "the ceiling must not remove what it allows"
+    assert masked.can_update is False, (
+        "a member kept write access through a read-only bundle — narrowing the "
+        "bundle would then narrow nothing"
     )
-    assert key.can_access_resource("secrets") is False
+    assert masked.can_delete is False
 
 
-def test_explicit_filters_still_apply_positive_control():
-    key = APIKey(id="k1", user_id="u", resource_filters={"collections": ["c1"]})
+def test_masking_never_widens():
+    """A permissive bundle must not add bits the member never had."""
+    member = Grant("res-1", Grant.GRANTEE_GRANT, "bundle-1", "owner", can_read=True)
+    open_bundle = Grant("", Grant.GRANTEE_GRANT_KEY, "hash", "owner",
+                        **{f: True for f in Grant.PERMISSION_FLAGS})
 
-    assert key.can_access_resource("collections", "c1") is True
-    assert key.can_access_resource("collections", "c2") is False
-    assert key.can_access_resource("workspaces") is False
+    masked = member.masked_by(open_bundle)
 
-
-def test_router_rejects_explicitly_empty_resource_filters():
-    from mantle.routers.api_keys_router import _reject_empty_resource_filters
-
-    with pytest.raises(HTTPException) as exc:
-        _reject_empty_resource_filters({})
-    assert exc.value.status_code == 400
-
-    # POSITIVE CONTROLS: omitted (None) and populated maps are both fine.
-    _reject_empty_resource_filters(None)
-    _reject_empty_resource_filters({"workspaces": "*"})
+    assert masked.can_read is True
+    for flag in ("can_update", "can_delete", "can_admin", "can_share"):
+        assert getattr(masked, flag) is False, f"{flag} was granted by the ceiling"
 
 
-def test_api_key_router_handlers_have_no_undefined_payload_refs():
-    """Regression on a bug introduced while writing this fix.
+def test_masking_does_not_mutate_the_stored_member():
+    """The ceiling is a property of the presented credential, not of the record."""
+    member = Grant("res-1", Grant.GRANTEE_GRANT, "bundle-1", "owner",
+                   can_read=True, can_update=True)
+    member.masked_by(Grant("", Grant.GRANTEE_GRANT_KEY, "h", "owner", can_read=True))
 
-    `_reject_empty_resource_filters` was first inserted into `get_api_key`, which
-    takes no `payload` — a guaranteed NameError on every GET /api-keys/{id}. The
-    suite did not catch it because nothing covers that handler, so the shape is
-    asserted directly here.
-    """
-    import ast
-    import inspect
+    assert member.can_update is True, "masking wrote its narrowing back into the member"
 
-    from mantle.routers import api_keys_router
 
-    tree = ast.parse(inspect.getsource(api_keys_router))
-    offenders = []
-    for fn in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
-        params = {a.arg for a in fn.args.args} | {a.arg for a in fn.args.kwonlyargs}
-        used = {
-            n.id for n in ast.walk(fn)
-            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
-        }
-        if "payload" in used and "payload" not in params:
-            offenders.append(fn.name)
+def test_deny_bundle_makes_members_deny():
+    """A deny ceiling must not resolve to a permissive member."""
+    member = Grant("res-1", Grant.GRANTEE_GRANT, "bundle-1", "owner", can_read=True)
+    deny_bundle = Grant("", Grant.GRANTEE_GRANT_KEY, "h", "owner",
+                        effect="deny", can_read=True)
 
-    assert not offenders, f"handlers reference an undefined `payload`: {offenders}"
+    assert member.masked_by(deny_bundle).is_deny() is True
 
 
 # ---------------------------------------------------------------------------
@@ -250,11 +253,10 @@ def test_api_key_router_handlers_have_no_undefined_payload_refs():
 
 
 def test_read_only_grant_cannot_update_or_delete_a_workspace():
-    """THE REGRESSION: get_workspace authorized everything on `can_read`.
-
-    It is the only authorization in front of update_workspace / delete_workspace
-    / update_workspace_context / binding / rotate-key, so read access conferred
-    the right to rewrite or destroy the workspace.
+    """`get_workspace` is the only authorization in front of update_workspace / delete_workspace
+    / update_workspace_context / binding / rotate-key, so it must check the verb requested rather
+    than only `can_read` — otherwise read access would confer the right to rewrite or destroy the
+    workspace.
     """
     from unittest.mock import MagicMock, patch
 
@@ -281,8 +283,8 @@ def test_read_only_grant_cannot_update_or_delete_a_workspace():
 
 
 def test_deny_grant_blocks_workspace_access():
-    """The old check was `any(g.can_read ...)` — it ignored `effect` entirely,
-    so an explicit deny did nothing here."""
+    """An explicit deny grant must block access even when a matching `can_read` grant exists —
+    the check must honor `effect`, not only the read flag."""
     from unittest.mock import MagicMock, patch
 
     from mantle.services import workspace_service
@@ -302,11 +304,8 @@ def test_deny_grant_blocks_workspace_access():
 
 
 def test_every_workspace_write_path_declares_its_verb():
-    """No call site may silently inherit the default `read`.
-
-    The defect was that update/delete authorized on read. This asserts the
-    mutating entry points each name their own verb, so a new one cannot quietly
-    pick up read-level authorization.
+    """No call site may silently inherit the default `read`. Every mutating entry point must name
+    its own verb explicitly, so a new one cannot quietly pick up read-level authorization.
     """
     import ast
     import inspect
@@ -318,7 +317,7 @@ def test_every_workspace_write_path_declares_its_verb():
         "update_workspace", "delete_workspace", "update_workspace_context",
         "create_workspace_artifact", "create_workspace_artifacts_bulk",
         "update_artifact", "revert_artifact", "add_artifact_to_workspace",
-        "move_workspace_artifact", "commit_workspace_to_collections",
+        "move_workspace_artifact",
     }
 
     offenders = []
@@ -338,12 +337,10 @@ def test_every_workspace_write_path_declares_its_verb():
 
 
 def test_grant_on_root_id_is_honoured_for_a_version():
-    """A grant written on root_id must authorize its versions.
-
-    The direct check uses the VERSION id and the light-cone starts at root_id but
-    only checks its PARENTS — so a grant on root_id itself was skipped, and the
-    owner of a versioned artifact could be refused their own artifact. Fail-closed
-    (a false denial), which is why it went unnoticed.
+    """A grant written on root_id must authorize its versions. The direct check uses the version
+    id, and the light-cone starting at root_id only walks its parents, so root_id itself must also
+    be checked explicitly — otherwise a grant on root_id would not authorize the versions it is
+    meant to cover.
     """
     from unittest.mock import MagicMock, patch
 
@@ -358,8 +355,8 @@ def test_grant_on_root_id_is_honoured_for_a_version():
         return [grant] if resource_id == "r1" else []
 
     auth = MagicMock(
-        principal_type="user", user_id="u1", api_key_entity=None,
-        principal_id="u1", api_key_id=None, authority=None,
+        principal_type="user", user_id="u1", grants=[],
+        principal_id="u1", grant_key_id=None, authority=None,
     )
 
     with (

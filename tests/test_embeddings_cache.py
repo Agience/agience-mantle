@@ -2,7 +2,7 @@
 
 import pytest
 
-from mantle.embeddings_cache import EmbeddingsCache
+from mantle.search.embeddings_cache import EmbeddingsCache
 
 
 def test_cache_roundtrip_and_namespacing(tmp_path):
@@ -21,7 +21,7 @@ def test_cache_roundtrip_and_namespacing(tmp_path):
 
 
 def test_embeddings_facade_caches(tmp_path, monkeypatch):
-    import mantle.embeddings as E
+    import mantle.search.embeddings as E
 
     monkeypatch.setenv("EMBEDDINGS_CACHE", "1")
     monkeypatch.setenv("EMBEDDINGS_CACHE_PATH", str(tmp_path / "facade.sqlite"))
@@ -50,3 +50,61 @@ def test_embeddings_facade_caches(tmp_path, monkeypatch):
     assert calls["texts"][-1] == "new"
 
     E.reset_provider()
+
+
+def test_the_connection_is_reused_across_calls(tmp_path, monkeypatch):
+    """A fresh `sqlite3.connect` per call means a file open, a page-header read and a
+    `journal_mode=WAL` round trip on every lookup — the cache would spend more on its own
+    bookkeeping than the lookup it exists to save. `journal_mode` is a durable property of the
+    FILE, so it belongs on the connection, not on the query."""
+    import sqlite3
+
+    opens = {"n": 0}
+    real_connect = sqlite3.connect
+
+    def counting_connect(*a, **kw):
+        opens["n"] += 1
+        return real_connect(*a, **kw)
+
+    monkeypatch.setattr(sqlite3, "connect", counting_connect)
+
+    c = EmbeddingsCache(str(tmp_path / "reuse.sqlite"))
+    after_construction = opens["n"]
+    assert after_construction == 1
+
+    for _ in range(5):
+        c.put_many("m1", ["a"], [[1.0, 2.0]])
+        assert c.get_many("m1", ["a"])[0] == pytest.approx([1.0, 2.0], abs=1e-6)
+        c.count()
+
+    assert opens["n"] == after_construction
+
+
+def test_each_thread_gets_its_own_connection(tmp_path):
+    """A `sqlite3.Connection` cannot be used from two threads, so the reuse has to be
+    per-thread — and every thread must still see the same durable rows."""
+    import threading
+
+    c = EmbeddingsCache(str(tmp_path / "threads.sqlite"))
+    c.put_many("m1", ["shared"], [[7.0]])
+
+    seen: dict[int, object] = {}
+    errors: list[BaseException] = []
+
+    def worker(i):
+        try:
+            c.put_many("m1", ["t%d" % i], [[float(i)]])
+            assert c.get_many("m1", ["shared"])[0] == pytest.approx([7.0], abs=1e-6)
+            seen[i] = c._local.conn
+        except BaseException as exc:      # noqa: BLE001 — surfaced below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    assert len({id(conn) for conn in seen.values()}) == 4
+    assert c.count() == 5

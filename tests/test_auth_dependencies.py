@@ -8,14 +8,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from mantle.entities.api_key import APIKey as APIKeyEntity
 from mantle.entities.grant import Grant as GrantEntity
 from mantle.services.dependencies import resolve_auth, require_platform_admin, AuthContext
-from origin.config import AUTHORITY_ISSUER
+from mantle.config import AUTHORITY_ISSUER
 
 
-def test_resolve_auth_rejects_deprecated_api_key_jwt():
-    """Deprecated API-key JWTs (with api_key_id claim) are rejected."""
+def test_resolve_auth_rejects_retired_api_key_jwt():
+    """A JWT from the decommissioned API-key system is rejected on its own terms.
+
+    It carries a `sub`, so the danger is not that it is accepted as an API key but
+    that it falls through and is honoured as an ordinary USER token for that subject.
+    """
     payload = {
         "sub": "user-123",
         "aud": AUTHORITY_ISSUER,
@@ -27,8 +30,18 @@ def test_resolve_auth_rejects_deprecated_api_key_jwt():
         with pytest.raises(HTTPException) as exc_info:
             resolve_auth(token="jwt-token", store_db=MagicMock())
 
-    assert exc_info.value.status_code == 403
-    assert "API-key JWT not accepted" in exc_info.value.detail
+    assert exc_info.value.status_code == 401
+    assert "retired" in exc_info.value.detail
+
+
+def test_resolve_auth_rejects_retired_agc_bearer_key():
+    """A raw `agc_` key names its own retirement rather than reading as malformed."""
+    with patch("mantle.services.dependencies.verify_token", return_value=None):
+        with pytest.raises(HTTPException) as exc_info:
+            resolve_auth(token="agc_deadbeef", store_db=MagicMock())
+
+    assert exc_info.value.status_code == 401
+    assert "retired" in exc_info.value.detail
 
 
 def test_resolve_auth_accepts_user_jwt():
@@ -45,54 +58,75 @@ def test_resolve_auth_accepts_user_jwt():
     assert ctx.principal_type == "user"
     assert ctx.user_id == "user-123"
     assert ctx.principal_id == "user-123"
-    assert ctx.api_key_entity is None
+    assert ctx.grant_key_id is None
     assert ctx.bearer_grant is None
 
 
-def test_resolve_auth_accepts_direct_api_key():
-    """Direct API keys (agc_xxx) are resolved with grants loaded."""
-    api_key = APIKeyEntity(
-        id="key-123",
-        user_id="user-123",
-        name="service-agent",
-        scopes=["resource:*:search"],
-        resource_filters={"workspaces": ["ws-1"]},
+def test_resolve_auth_accepts_grant_key_with_bundle_expanded():
+    """A grant key resolves to its ROOT plus every member, each already masked.
+
+    The expansion happens once, here, so no downstream consumer has to know whether
+    the credential was a single-resource key or a bundle.
+    """
+    root = GrantEntity(
+        id="bundle-1", resource_id="", grantee_type="grant_key",
+        grantee_id="hash-1", granted_by="user-1",
+        can_read=True, can_update=True,
+    )
+    member_rw = GrantEntity(
+        id="m-rw", resource_id="col-rw", grantee_type="grant",
+        grantee_id="bundle-1", granted_by="user-1",
+        can_read=True, can_update=True,
+    )
+    # Carries delete, which the bundle does not — masking must strip it.
+    member_ro = GrantEntity(
+        id="m-ro", resource_id="col-ro", grantee_type="grant",
+        grantee_id="bundle-1", granted_by="user-1",
+        can_read=True, can_delete=True,
     )
 
-    mock_grants = [
-        GrantEntity(
-            resource_id="col-1",
-            grantee_type="api_key",
-            grantee_id="key-123",
-            granted_by="user-123",
-            can_read=True,
-        )
-    ]
+    def _by_grantee(_db, grantee_id, grantee_type="user"):
+        if grantee_type == "grant_key":
+            return [root]
+        if grantee_type == "grant" and grantee_id == "bundle-1":
+            return [member_rw, member_ro]
+        return []
 
-    # Sovereign: api-key verification reads Mantle's own lattice (LocalBackend).
-    with patch("mantle.db.backend.get_api_key_by_hash", return_value=api_key), \
-         patch("mantle.db.backend.get_active_grants_for_grantee", return_value=mock_grants):
-        ctx = resolve_auth(token="agc_test_key", store_db=MagicMock())
+    with patch("mantle.services.dependencies.verify_token", return_value=None), \
+         patch("mantle.db.backend.get_active_grants_for_grantee", side_effect=_by_grantee), \
+         patch("mantle.db.backend.update_grant", return_value=None):
+        ctx = resolve_auth(token="agk_test_key", store_db=MagicMock())
 
-    assert ctx.principal_type == "api_key"
-    assert ctx.user_id == "user-123"
-    assert ctx.api_key_id == "key-123"
-    assert ctx.api_key_entity is not None
-    assert ctx.api_key_entity.name == "service-agent"
-    assert len(ctx.grants) == 1
-    assert ctx.grants[0].resource_id == "col-1"
+    assert ctx.principal_type == "grant_key"
+    assert ctx.user_id is None, "a key must not carry its issuer's identity"
+    assert ctx.grant_key_id == "bundle-1"
+
+    by_resource = {g.resource_id: g for g in ctx.grants}
+    # The bundle root has no resource of its own, so it contributes nothing directly.
+    assert set(by_resource) == {"col-rw", "col-ro"}
+    assert by_resource["col-rw"].can_update is True
+    assert by_resource["col-ro"].can_delete is False, (
+        "a member kept a permission the bundle ceiling does not allow"
+    )
 
 
 def test_resolve_auth_parses_artifact_prefix():
-    """API keys with artifact prefix ({artifact_id}:agc_xxx) populate target_artifact_id."""
-    api_key = APIKeyEntity(id="key-1", user_id="user-1")
+    """`{artifact_id}:agk_xxx` populates target_artifact_id (card keys)."""
+    grant = GrantEntity(
+        id="key-1", resource_id="ws-1", grantee_type="grant_key",
+        grantee_id="hash-1", granted_by="user-1", can_read=True,
+    )
 
-    with patch("mantle.db.backend.get_api_key_by_hash", return_value=api_key), \
-         patch("mantle.db.backend.get_active_grants_for_grantee", return_value=[]):
-        ctx = resolve_auth(token="art_123:agc_test_key", store_db=MagicMock())
+    def _by_grantee(_db, grantee_id, grantee_type="user"):
+        return [grant] if grantee_type == "grant_key" else []
+
+    with patch("mantle.services.dependencies.verify_token", return_value=None), \
+         patch("mantle.db.backend.get_active_grants_for_grantee", side_effect=_by_grantee), \
+         patch("mantle.db.backend.update_grant", return_value=None):
+        ctx = resolve_auth(token="art_123:agk_test_key", store_db=MagicMock())
 
     assert ctx.target_artifact_id == "art_123"
-    assert ctx.principal_type == "api_key"
+    assert ctx.principal_type == "grant_key"
 
 
 def test_resolve_auth_accepts_grant_key_in_bearer():
@@ -109,9 +143,13 @@ def test_resolve_auth_accepts_grant_key_in_bearer():
         can_read=True,
     )
 
+    def _by_grantee(_db, grantee_id, grantee_type="user"):
+        return [grant] if grantee_type == "grant_key" else []
+
     with patch("mantle.services.dependencies.verify_token", return_value=None), \
-         patch("mantle.services.dependencies.db_store.get_active_grants_by_key", return_value=[grant]):
-        ctx = resolve_auth(token="grant-key-value", store_db=MagicMock())
+         patch("mantle.db.backend.get_active_grants_for_grantee", side_effect=_by_grantee), \
+         patch("mantle.db.backend.update_grant", return_value=None):
+        ctx = resolve_auth(token="agk_grant-key-value", store_db=MagicMock())
 
     assert ctx.principal_type == "grant_key"
     assert ctx.user_id is None
@@ -119,8 +157,14 @@ def test_resolve_auth_accepts_grant_key_in_bearer():
     assert len(ctx.grants) == 1
 
 
-def test_resolve_auth_server_jwt():
-    """Server JWTs return principal_type=server with no user_id."""
+def test_resolve_auth_rejects_a_server_jwt():
+    """A `server` principal names nothing here, so it is a 401 — not a user.
+
+    Mantle registers no servers and issues no server credentials: a server is an
+    ordinary `vnd.agience.server+json` artifact, and an artifact is not a principal.
+    The rejection has to be by NAME, because the fall-through branch is the user
+    branch and it would read `sub` — `server/<client_id>` — as a person.
+    """
     payload = {
         "sub": "server/my-server",
         "aud": "agience",
@@ -130,18 +174,37 @@ def test_resolve_auth_server_jwt():
     }
 
     with patch("mantle.services.dependencies.verify_token", return_value=payload):
-        ctx = resolve_auth(token="server-jwt", store_db=MagicMock())
+        with pytest.raises(HTTPException) as exc_info:
+            resolve_auth(token="server-jwt", store_db=MagicMock())
 
-    assert ctx.principal_type == "server"
-    assert ctx.user_id is None
-    assert ctx.server_id == "srv-1"
-    assert ctx.principal_id == "my-server"
+    assert exc_info.value.status_code == 401
+
+
+def test_a_server_jwt_is_never_resolved_as_a_user():
+    """The regression the 401 above exists to prevent: with no branch of its own, a
+    server token would land in the default user branch and be handed a user identity
+    built from `server/<client_id>`. Asserted on a payload carrying the audience the
+    user branch accepts, so nothing but the principal-type check can be refusing it."""
+    from mantle import config
+
+    payload = {
+        "sub": "server/my-server",
+        "aud": config.AUTHORITY_ISSUER,
+        "principal_type": "server",
+        "client_id": "my-server",
+    }
+
+    with patch("mantle.services.dependencies.verify_token", return_value=payload):
+        with pytest.raises(HTTPException) as exc_info:
+            resolve_auth(token="server-jwt", store_db=MagicMock())
+
+    assert exc_info.value.status_code == 401
 
 
 def test_resolve_auth_invalid_token_raises_401():
     """Completely invalid tokens raise 401."""
     with patch("mantle.services.dependencies.verify_token", return_value=None), \
-         patch("mantle.services.dependencies.db_store.get_active_grants_by_key", return_value=[]):
+         patch("mantle.db.backend.get_active_grants_for_grantee", return_value=[]):
         with pytest.raises(HTTPException) as exc_info:
             resolve_auth(token="garbage", store_db=MagicMock())
 
@@ -238,7 +301,7 @@ def test_resolve_auth_delegation_missing_aud():
 
 
 # ---------------------------------------------------------------------------
-# Operator confinement — the platform.operator_id fast-path is honored ONLY in the
+# Operator confinement — the platform.operator_id fast-path is honored only in the
 # bootstrap window (before any admin grant exists on the authority collection), so
 # the operator is not a standing config-flag backdoor into platform admin (and thus
 # into minting trusted issuers). See .dev/features/issuer-merge-bootstrap.md §3b.
@@ -253,7 +316,7 @@ def _admin_grant():
 
 
 def test_operator_fastpath_open_before_any_authority_grant():
-    """Bootstrap window OPEN: operator config flag confers admin while no authority
+    """Bootstrap window open: operator config flag confers admin while no authority
     grant exists yet (resolves the chicken-and-egg)."""
     with (
         patch("mantle.services.platform_settings_service.settings.get", return_value="op-1"),
@@ -264,7 +327,7 @@ def test_operator_fastpath_open_before_any_authority_grant():
 
 
 def test_operator_fastpath_closes_after_authority_admin_grant():
-    """Bootstrap window CLOSED: once an admin grant exists on the authority
+    """Bootstrap window closed: once an admin grant exists on the authority
     collection, the operator flag is inert — an operator without their own grant is
     rejected."""
     with (
@@ -288,3 +351,121 @@ def test_operator_with_own_grant_passes_after_window_closed():
         patch("mantle.db.backend.get_active_grants_for_principal_resource", return_value=[_admin_grant()]),
     ):
         assert require_platform_admin(_operator_auth(), MagicMock()) == "op-1"
+
+
+# ---------------------------------------------------------------------------
+# Thread offload — the request-path seam
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_offload_sync_runs_the_call_off_the_event_loop():
+    """Nothing in the store is awaitable, so a sync call made directly from an `async def`
+    handler holds the loop for its whole duration and every concurrent request waits behind it.
+    The seam is worth nothing if the work stays on the loop thread."""
+    import threading
+
+    from mantle.services.dependencies import offload_sync
+
+    loop_thread = threading.get_ident()
+    ran_on = await offload_sync(threading.get_ident)
+    assert ran_on != loop_thread
+
+
+@pytest.mark.anyio
+async def test_offload_sync_passes_arguments_and_propagates_exceptions():
+    """An `HTTPException` raised in the worker still has to become its response."""
+    from mantle.services.dependencies import offload_sync
+
+    assert await offload_sync(lambda a, b=0: a + b, 1, b=2) == 3
+
+    def boom():
+        raise HTTPException(status_code=418, detail="teapot")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await offload_sync(boom)
+    assert exc_info.value.status_code == 418
+
+
+@pytest.mark.anyio
+async def test_get_auth_publishes_the_acting_principal_on_the_loop_side():
+    """Contextvars are COPIED into the worker, not shared: a value set inside it does not come
+    back. So the acting principal must be published after the awaited call returns, or key
+    issuance runs under an absent identity."""
+    from mantle.services import dependencies as deps
+    from mantle.services.acting_principal import current_acting_principal
+
+    auth = AuthContext(principal_id="user-1", principal_type="user", user_id="user-1")
+    with patch.object(deps, "resolve_auth", return_value=auth):
+        got = await deps.get_auth(token="whatever", store_db=MagicMock(), request=None)
+
+    assert got is auth
+    acting = current_acting_principal()
+    assert acting is not None and acting.principal_id == "user-1"
+
+
+@pytest.mark.anyio
+async def test_offload_sync_carries_the_acting_principal_INTO_the_worker():
+    """The direction the route handlers depend on.
+
+    A value set in the worker does not come back — which is why `get_auth` publishes on the loop
+    side — but the context is COPIED IN, and that is load-bearing now that the list/read/search/
+    create handlers run their store work through here: the key oracle reads the acting principal
+    from inside those calls. If the copy did not happen, every offloaded read would run under an
+    absent identity and key derivation would fail closed.
+    """
+    from mantle.services.acting_principal import (
+        ActingPrincipal,
+        current_acting_principal,
+        set_acting_principal,
+    )
+    from mantle.services.dependencies import offload_sync
+
+    set_acting_principal(ActingPrincipal(principal_id="user-9", principal_type="user"))
+    seen = await offload_sync(current_acting_principal)
+    assert seen is not None and seen.principal_id == "user-9"
+
+
+def test_the_hot_handlers_do_not_call_the_store_from_the_event_loop():
+    """`offload_sync` with two call sites was a primitive, not a change.
+
+    `check_access` is the gate on the front of nearly every route and is several queries plus an
+    audit write, so an `async def` handler that calls it bare holds the loop for all of it. This
+    walks the routers' own ASTs rather than trusting a grep: a bare call inside an `async def` is
+    the exact shape being ruled out, and the same call inside a plain `def` helper is fine —
+    that helper is what gets handed across whole.
+    """
+    import ast
+    import inspect
+
+    from mantle.routers import artifacts_router, grants_router, system_router
+
+    offenders = []
+    for module in (artifacts_router, grants_router, system_router):
+        tree = ast.parse(inspect.getsource(module))
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.AsyncFunctionDef):
+                continue
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.Call):
+                    continue
+                name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+                if name != "check_access":
+                    continue
+                # `offload_sync(check_access, ...)` passes it as a value, never calls it.
+                offenders.append(f"{module.__name__}.{fn.name}")
+    assert offenders == [], f"check_access called on the event loop in: {offenders}"
+
+
+def test_get_store_db_stays_a_sync_generator():
+    """FastAPI runs a sync generator dependency in its worker thread pool. Rewriting this as
+    `async def` would move the store open — schema creation included, on the first request of a
+    process — onto the event loop, where it blocks every other request. The offload belongs on
+    the work, not on the handle."""
+    import inspect
+
+    from mantle.services.dependencies import get_store_db
+
+    assert inspect.isgeneratorfunction(get_store_db)
+    assert not inspect.isasyncgenfunction(get_store_db)
+    assert not inspect.iscoroutinefunction(get_store_db)

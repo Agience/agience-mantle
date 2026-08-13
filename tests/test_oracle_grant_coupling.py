@@ -3,16 +3,16 @@
 Canonical plan section 5.3 (single-node state): *couple key/anchor-position
 issuance to the grant check immediately so the trust boundary matches the target.*
 
-These tests assert a CRYPTOGRAPHIC-CUSTODY property, not a code path. The question
+These tests assert a cryptographic-custody property, not a code path. The question
 they answer is not "does the permission check run" but "can an unauthorized caller
-obtain key material by any route the API allows". So every test here asserts a
-FAILURE for the unauthorized caller, and a matching success for the authorized one
--- a test that only proves the happy path would have passed against the old,
-broken oracle too.
+obtain key material by any route the API allows". Every test here asserts a
+failure for the unauthorized caller, and a matching success for the authorized one,
+because a test that only proves the happy path would pass against an oracle that
+issued keys to anyone.
 
-The defect being locked out: ``get_or_create_master_key(principal_id)`` used to
-mint or unwrap ANY principal's key for ANY caller. The identity came from the
-object being read, never from the requester, so there was no requester to deny.
+Identity for a key request comes from the requester, never from the object being
+read: ``get_or_create_master_key`` derives access from ``requester_id``, so there
+is always a requester to check against a grant.
 """
 
 from __future__ import annotations
@@ -42,14 +42,6 @@ MALLORY = "user-mallory"  # holds none
 class _Verifier:
     """Authorizes ALICE for (PRINCIPAL, COLLECTION), and any principal for its own
     contexts. Everyone else: denied.
-
-    ⚠ The self-context arm is new, and it is a real semantic change rather than a
-    test convenience. ``KeyPurpose.SELF`` used to RETURN from the oracle before the
-    verifier was consulted, so a principal reached its own key without any grant at
-    all — that early return was the skeleton key. SELF now narrows the check instead
-    of skipping it, which means even a principal asking for its own key must hold a
-    grant reaching itself. This models the production arrangement where a collection
-    carries an owner/admin grant (LATTICE §3).
     """
 
     def __init__(self):
@@ -81,14 +73,12 @@ def oracle(verifier):
 def _declare(who: str, principal_type: str) -> None:
     """Stand in for the request boundary: this test acts as ``who``.
 
-    The oracle requires ``requester_id`` to equal the AUTHENTICATED acting principal
-    — that binding is what stopped SELF being a skeleton key, since previously both
-    sides of the comparison were caller-supplied. A unit test has no router, so the
-    request builders below declare the identity they are asking under.
+    The oracle requires ``requester_id`` to equal the authenticated acting principal
+    — that binding is what keeps SELF issuance from being a skeleton key.
 
     This does not weaken anything these tests assert: the grant verifier still runs
-    on every arm, so declaring an identity buys a CHECK, not a key — and MALLORY
-    below declares her identity honestly and is still refused, which is the point.
+    on every arm, so declaring an identity buys a check, not a key — MALLORY below
+    declares her identity honestly and is still refused.
     """
     from mantle.services.acting_principal import ActingPrincipal, set_acting_principal
     set_acting_principal(
@@ -98,12 +88,6 @@ def _declare(who: str, principal_type: str) -> None:
 
 def _grant(who, action="update"):
     """A third-party GRANT request.
-
-    ⚠ Defaults to ``update`` because a read no longer CREATES a master key (the
-    mint-ahead fix), so a test that acquires a principal's key for the first time
-    must ask as a write. That rule has its own dedicated coverage in
-    ``test_key_custody_bypasses.py``; these tests are about grant coupling, and the
-    action is incidental to what they assert.
     """
     _declare(who, "user")
     return KeyRequest(requester_id=who, purpose=KeyPurpose.GRANT, action=action)
@@ -151,7 +135,7 @@ class TestNoGrantNoKey:
         """A denied request must not create or persist a key as a side effect.
 
         Otherwise an unauthorized caller could still cause a principal's key to be
-        GENERATED -- which, on a principal whose real key merely failed to load,
+        generated -- which, on a principal whose real key merely failed to load,
         is the key-destruction path documented in the latticeMasterKeyStore.get.
         """
         with pytest.raises(GrantDenied):
@@ -169,7 +153,7 @@ class TestCacheIsNotABypass:
         """Caller A must not benefit from caller B's authorized fetch.
 
         This is the specific hazard of a process-lifetime cache keyed by principal
-        alone: if the cache were consulted BEFORE the grant check, Alice's
+        alone: if the cache were consulted before the grant check, Alice's
         legitimate request would warm the entry and Mallory's would then be served
         from it without ever being checked -- an authorization bypass with a
         process-lifetime TTL and no log line.
@@ -189,7 +173,7 @@ class TestCacheIsNotABypass:
                                                collection_id=COLLECTION) == alice_key
 
     def test_every_call_is_checked_even_when_cached(self, oracle, verifier):
-        """The verifier is consulted on EVERY call, not only on a cache miss.
+        """The verifier is consulted on every call, not only on a cache miss.
 
         A check that runs once per principal per process is not a check; it is a
         one-time initialization that a later revocation cannot affect.
@@ -199,10 +183,21 @@ class TestCacheIsNotABypass:
         oracle.get_or_create_master_key(PRINCIPAL, _grant(ALICE), collection_id=COLLECTION)
         assert len(verifier.calls) == n + 1, "cached path skipped the grant check"
 
-    def test_revocation_takes_effect_despite_a_warm_cache(self, oracle, verifier):
-        """Revoking the grant denies the next request even though the key is cached."""
+    def test_a_verdict_change_reaches_a_caller_whose_key_is_already_cached(self, oracle, verifier):
+        """The MASTER-KEY cache does not shortcut the verifier: a new verdict lands at once.
+
+        Named for what it proves. The verifier here is a memo-free double, so flipping its
+        answer IS the new verdict — which makes this a statement about `oracle._cache`
+        (the key cache), not about revocation propagating through the real verifier's
+        memoized light-cone decision. That memo is the thing a revocation actually has to
+        get past, and stubbing the component holding it is precisely how a test can pass
+        while the window it is named for stays open.
+
+        The revocation property lives in `tests/test_grant_cache_invalidation.py`, against
+        a real store and the production-default `LightConeGrantVerifier`.
+        """
         oracle.get_or_create_master_key(PRINCIPAL, _grant(ALICE), collection_id=COLLECTION)
-        verifier.authorized = lambda **kw: False          # revoke
+        verifier.authorized = lambda **kw: False
         with pytest.raises(GrantDenied):
             oracle.get_or_create_master_key(PRINCIPAL, _grant(ALICE),
                                             collection_id=COLLECTION)
@@ -222,7 +217,7 @@ class TestSelfIssuance:
         assert len(oracle.get_or_create_master_key(PRINCIPAL, _self(PRINCIPAL))) == 32
 
     def test_self_and_grant_paths_agree_on_the_key(self, oracle):
-        """Ingest (SELF) and query (GRANT) must derive the SAME key.
+        """Ingest (SELF) and query (GRANT) must derive the same key.
 
         If they diverged, cells written at index time would be undecryptable at
         query time -- the silent 'search returns nothing' failure mode.
@@ -238,7 +233,8 @@ class TestSelfIssuance:
 
 class TestFailsClosed:
     def test_oracle_without_a_verifier_refuses_to_issue(self):
-        """"We could not check, so we allowed it" is the shape being removed."""
+        """An oracle configured without a verifier must refuse to issue keys, not fall back to
+        "we could not check, so we allowed it"."""
         bare = OracleService(FernetMasterKeyStore(Fernet(Fernet.generate_key())))
         with pytest.raises(GrantDenied):
             bare.get_or_create_master_key(PRINCIPAL, _grant(ALICE))
@@ -246,9 +242,8 @@ class TestFailsClosed:
     def test_a_request_is_required_not_optional(self, oracle):
         """Omitting the requester must be a hard error.
 
-        An OPTIONAL requester would silently default to the old insecure behaviour
-        at every call site that simply didn't pass one -- which is exactly how the
-        original defect stayed invisible.
+        An optional requester would let a call site silently issue a key without one,
+        defeating the coupling between key issuance and the grant check.
         """
         with pytest.raises(TypeError):
             oracle.get_or_create_master_key(PRINCIPAL)          # type: ignore[call-arg]
@@ -313,7 +308,7 @@ class TestEndToEnd:
     def test_unauthorized_query_cannot_decrypt_the_cells(self, oracle):
         """Mallory can name the context, and still gets no plaintext.
 
-        The context list is an INPUT here -- Mallory supplies the very
+        The context list is an input here -- Mallory supplies the very
         (principal, collection) pair the data lives in, simulating a caller who
         bypassed or forged the light-cone resolution upstream. The custody
         boundary must hold on its own, without relying on the caller having built
@@ -342,10 +337,10 @@ class TestEndToEnd:
 
 class TestLightConeGrantVerifier:
     def test_authorizes_only_contexts_the_light_cone_returns(self, monkeypatch):
-        import mantle.search.mantle.sse.router_accessor as ra
+        import mantle.search.mantle.lightcone as lc
 
         monkeypatch.setattr(
-            ra, "resolve_authorized_contexts",
+            lc, "resolve_authorized_contexts",
             lambda db, who, *, lightcone, action, principal_type="user": (
                 [(PRINCIPAL, COLLECTION)] if who == ALICE else []
             ),
@@ -360,9 +355,9 @@ class TestLightConeGrantVerifier:
                                 action="read")
 
     def test_a_principal_with_no_grants_is_denied_everything(self, monkeypatch):
-        import mantle.search.mantle.sse.router_accessor as ra
+        import mantle.search.mantle.lightcone as lc
 
-        monkeypatch.setattr(ra, "resolve_authorized_contexts",
+        monkeypatch.setattr(lc, "resolve_authorized_contexts",
                             lambda db, who, *, lightcone, action, principal_type="user": [])
         v = LightConeGrantVerifier(object(), resolver=object())
         assert not v.authorized(requester_id=MALLORY, requester_type="user",
@@ -374,7 +369,7 @@ class TestLightConeGrantVerifier:
 
     def test_memoization_does_not_outlive_its_ttl(self, monkeypatch):
         """The authorization cache must expire; key material may be cached longer."""
-        import mantle.search.mantle.sse.router_accessor as ra
+        import mantle.search.mantle.lightcone as lc
 
         calls = []
 
@@ -382,7 +377,7 @@ class TestLightConeGrantVerifier:
             calls.append(who)
             return [(PRINCIPAL, COLLECTION)]
 
-        monkeypatch.setattr(ra, "resolve_authorized_contexts", _resolve)
+        monkeypatch.setattr(lc, "resolve_authorized_contexts", _resolve)
         v = LightConeGrantVerifier(object(), resolver=object(), ttl_s=0)
         for _ in range(3):
             v.authorized(requester_id=ALICE, requester_type="user",

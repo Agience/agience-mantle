@@ -1,32 +1,26 @@
-"""Authorization record access for Mantle — SOVEREIGN.
+"""Authorization record access for Mantle — sovereign.
 
-Mantle is the authority for its own data plane: grants + API keys live in Mantle's
-OWN STORE — the SQLite lattice, reached through ``db.backend`` — and Mantle enforces
-authorization (the light-cone + grant checks in ``services.dependencies``) with NO call
-to Origin. Origin is identity-only.
+Mantle is the authority for its own data plane: grants live in Mantle's own store —
+the SQLite lattice, reached through ``db.backend`` — and Mantle enforces authorization
+(the light-cone + grant checks in ``services.dependencies``) with no call to Origin.
+Origin is identity-only.
 
-Historically this module was pluggable (`local` vs `origin` backend) so a
-deployment could centralise authorization in Origin. That mode has been removed —
-the platform is sovereign-only. The `get_*_backend()` accessors remain so existing
-call sites don't churn; they always return the local (the lattice) backend.
+Bearer credentials are grants too (``grantee_type="grant_key"``), so they need no
+separate backend here; :mod:`services.grant_key_service` owns that path.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
-from mantle.entities.api_key import APIKey as APIKeyEntity
 from mantle.entities.grant import Grant as GrantEntity, grant_is_allow, grant_is_deny
 
 logger = logging.getLogger(__name__)
 
-# action → grant boolean flag (mirrors services.dependencies)
-_ACTION_FLAGS = {
-    "create": "can_create", "read": "can_read", "update": "can_update",
-    "delete": "can_delete", "evict": "can_evict", "invoke": "can_invoke",
-    "add": "can_add", "share": "can_share", "admin": "can_admin",
-}
+# action → grant boolean flag. Owned by the entity; aliased here so this module and
+# `services.dependencies` cannot come to disagree about which flag gates which action.
+_ACTION_FLAGS = GrantEntity.ACTION_FLAGS
 
 
 def _grant_dict(g: GrantEntity) -> dict:
@@ -39,18 +33,7 @@ def _grant_dict(g: GrantEntity) -> dict:
 
 
 class LocalBackend:
-    """Grants + API keys from Mantle's own lattice. No Origin dependency."""
-
-    def verify_api_key(self, db, token) -> Optional[Tuple[APIKeyEntity, List[GrantEntity]]]:
-        if db is None:
-            return None
-        from mantle.db import backend as dba
-        from mantle.services.auth_service import hash_api_key
-        key = dba.get_api_key_by_hash(db, hash_api_key(token))  # filters is_active + expiry
-        if key is None:
-            return None
-        grants = dba.get_active_grants_for_grantee(db, grantee_id=str(key.id), grantee_type="api_key")
-        return key, grants
+    """Grants from Mantle's own lattice. No Origin dependency."""
 
     def check_grant(self, db, *, principal_id, resource_id, action) -> Optional[dict]:
         from mantle.db import backend as dba
@@ -91,11 +74,6 @@ class LocalBackend:
 _LOCAL = LocalBackend()
 
 
-def get_apikey_backend() -> LocalBackend:
-    """API-key verification backend (sovereign: always Mantle's the lattice)."""
-    return _LOCAL
-
-
 def get_grant_backend() -> LocalBackend:
-    """Grant read/write backend (sovereign: always Mantle's the lattice)."""
+    """Grant read/write backend (sovereign: always Mantle's own lattice)."""
     return _LOCAL

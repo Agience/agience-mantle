@@ -4,37 +4,39 @@ import logging
 import re
 from typing import Any, Dict, List
 
-from origin import config
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# ⛔ TIKTOKEN IS DELETED. [John, 2026-07-22: the no-models rule is UNIVERSAL]
 #
-# This module sized chunks with `tiktoken.get_encoding("cl100k_base")` — OpenAI's
-# BPE merge table, downloaded from OpenAI's CDN on first use. A tokenizer's merge
-# ranks are TRAINED artifacts (learned from a corpus, shipped as a rank file), so
-# they fall under the same law as the remote providers removed from
-# `embeddings.py`: a downloaded vocabulary is still trained weights — it is
-# simply someone else's frequency statistics. It also made first-call chunking
-# depend on an outbound fetch to openai.com.
+# Chunks are sized in whitespace-delimited words, computed with stdlib only —
+# not with a tokenizer's BPE merge table. A tokenizer's merge ranks are trained
+# artifacts (learned from a corpus, shipped as a rank file), so a downloaded
+# vocabulary falls under the same no-models rule as `search/embeddings.py`: it is
+# someone else's frequency statistics, and using one would make first-call
+# chunking depend on an outbound fetch.
 #
-# Chunks are now sized in whitespace-delimited WORDS, computed with stdlib only.
-# Chunk texts are exact substrings of the input (as the encode/decode round trip
-# was), so downstream cache keys and index records keep the same shape.
+# Chunk texts are exact substrings of the input, so downstream cache keys and
+# index records keep the same shape.
 # ---------------------------------------------------------------------------
 
 # Word-boundary scanner: a "word" is any maximal run of non-whitespace. Spans
-# index into the ORIGINAL string so chunk texts are exact substrings.
+# index into the original string so chunk texts are exact substrings.
 _WORD_RE = re.compile(r"\S+")
 
-# Config (`SEARCH_CHUNK_SIZE` / `SEARCH_CHUNK_OVERLAP`) is denominated in
-# cl100k_base TOKENS (defaults 1000 / 200). Derivation of the word equivalents:
-# cl100k_base averages ~4 characters/token on English prose (OpenAI's published
-# rule of thumb), and English prose averages ~5.3 characters/word including the
-# separating space — so 1 word ≈ 5.3/4 ≈ 4/3 tokens, i.e. words ≈ tokens × 3/4.
-# 1000-token chunks → 750 words; 200-token overlap → 150 words. Same effective
-# chunk mass, no downloaded vocabulary.
+# Chunk geometry is a free parameter of this module, defaulted at the call
+# signatures below rather than read from settings: it is a property of the index,
+# and changing it without a reindex only makes the stored chunks disagree with the
+# new ones. A caller that wants different geometry passes it.
+#
+# The two numbers are denominated in cl100k_base TOKENS (1000 / 200). Derivation
+# of the word equivalents: cl100k_base averages ~4 characters/token on English
+# prose (OpenAI's published rule of thumb), and English prose averages ~5.3
+# characters/word including the separating space — so 1 word ≈ 5.3/4 ≈ 4/3 tokens,
+# i.e. words ≈ tokens × 3/4. 1000-token chunks → 750 words; 200-token overlap →
+# 150 words. Same effective chunk mass, no downloaded vocabulary.
+DEFAULT_CHUNK_SIZE = 1000
+DEFAULT_CHUNK_OVERLAP = 200
+
 _WORDS_PER_TOKEN_NUM = 3
 _WORDS_PER_TOKEN_DEN = 4
 
@@ -51,15 +53,14 @@ def count_words(text: str) -> int:
 
 def chunk_text(
     text: str,
-    chunk_size: int | None = None,
-    overlap: int | None = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
 ) -> List[Dict[str, Any]]:
     """
     Chunk text into overlapping segments by word count.
 
-    ``chunk_size`` / ``overlap`` are in cl100k-token units (the config
-    denomination, kept for setting compatibility) and are converted to words
-    via the 3/4 derivation above.
+    ``chunk_size`` / ``overlap`` are in cl100k-token units and are converted to
+    words via the 3/4 derivation above.
 
     Returns list of chunks with:
     - chunk_id: sequential identifier
@@ -67,11 +68,6 @@ def chunk_text(
     - start_word: index of the chunk's first word in the original text
     - end_word: index one past the chunk's last word
     """
-    if chunk_size is None:
-        chunk_size = config.SEARCH_CHUNK_SIZE
-    if overlap is None:
-        overlap = config.SEARCH_CHUNK_OVERLAP
-
     if not text or not text.strip():
         return []
 
@@ -93,9 +89,8 @@ def chunk_text(
             }
         ]
 
-    # Overlap >= size would loop forever (a pre-existing hazard of the token
-    # version too, with operator-settable config). Degenerate config steps a
-    # full chunk — adjacent, no overlap — rather than hanging.
+    # Overlap >= size would loop forever. Degenerate arguments step a full
+    # chunk — adjacent, no overlap — rather than hanging.
     step = size_words - overlap_words
     if step <= 0:
         step = size_words
@@ -127,14 +122,17 @@ def chunk_text(
     return chunks
 
 
-def should_chunk_content(content: str) -> bool:
-    """Determine if content should be chunked based on word count."""
+def should_chunk_content(content: str, chunk_size: int = DEFAULT_CHUNK_SIZE) -> bool:
+    """Determine if content should be chunked based on word count.
+
+    ``chunk_size`` defaults to the same value as :func:`chunk_text` so the two
+    answer the same question; a caller passing one must pass both."""
     if not content or not content.strip():
         return False
 
     # Same unit conversion as chunk_text — content chunks iff it exceeds one
     # chunk's word budget.
-    return count_words(content) > max(1, _tokens_to_words(config.SEARCH_CHUNK_SIZE))
+    return count_words(content) > max(1, _tokens_to_words(chunk_size))
 
 
 def extract_text_from_context(context_str: str) -> Dict[str, str]:
@@ -143,33 +141,18 @@ def extract_text_from_context(context_str: str) -> Dict[str, str]:
 
     Returns dict with:
     - title: artifact title
-    - description: artifact description (PRIMARY search field)
+    - description: artifact description (primary search field)
     - tags_raw: comma-separated tags
     """
     import json
 
     result = {"title": "", "description": "", "tags_raw": ""}
 
-    # ⛔ `.strip()` ASSUMED A STRING AND `context` IS OFTEN A DICT — 57 of 500 live vertices carry
-    # one (measured 2026-07-31). This raised `AttributeError: 'dict' object has no attribute
-    # 'strip'` on EVERY such artifact, straight through the parse below that was written to handle
-    # dicts: the guard rejected the input before the code that understood it ever ran. Latent until
-    # mantle was pointed at the real store and reindexed 1.3M chunks, at which point it fired
-    # continuously. Emptiness is asked of the value AS IT IS, not of an assumed type.
     if context_str is None or (isinstance(context_str, str) and not context_str.strip()):
         return result
     if not context_str:                      # empty dict / empty list -- nothing to extract
         return result
 
-    # ⛔ A CONTEXT THAT IS NOT JSON IS NOT A FAILURE — IT IS THE DESCRIPTION.
-    # [John, 2026-07-31: "Do not add words in, do not take words out. prime directive. but more
-    #  importantly - conservation of information. You cannot create or destroy information."]
-    # MEASURED on the live shard (500 vertices): 395 carry no context, 57 carry a dict, and 48 carry
-    # PLAIN PROSE — e.g. 'adds two numbers'. That prose is exactly the human-written description this
-    # function exists to index. `json.loads` raised on every one of them, the except below logged a
-    # warning, and the text was DISCARDED — thousands of warnings a minute on the running node, and
-    # an index built without the descriptions it was supposed to carry. The information arrived and
-    # did not leave. So a bare string is taken as what it plainly is.
     if isinstance(context_str, str):
         try:
             context = json.loads(context_str)
@@ -189,7 +172,7 @@ def extract_text_from_context(context_str: str) -> Dict[str, str]:
         # Extract title
         result["title"] = context.get("title", "")
 
-        # Extract description (PRIMARY search field)
+        # Extract description (primary search field)
         # Description is human-curated or AI-enhanced for optimal findability
         result["description"] = context.get("description", "")
 

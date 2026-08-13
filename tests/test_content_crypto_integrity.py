@@ -1,20 +1,19 @@
 """Artifact content crypto must never silently corrupt or silently downgrade.
 
-Three defects that compose into permanent, invisible data loss on a LIVE system:
+Three invariants are pinned:
 
-1. **Failed decryption returned ciphertext with HTTP 200.** `content` was left
-   holding base64 ciphertext and handed to the caller as if it were plaintext.
-2. **`Artifact` did not model `content_encrypted`.** The flag was dropped on the
-   storage round trip.
-3. **Failed encryption stored plaintext silently.** A blob without the `MEC1`
-   magic reads back as "legacy plaintext", so the degradation was invisible
-   forever after.
+1. A failed decryption raises rather than returning ciphertext as plaintext.
+2. `Artifact` models `content_encrypted`, so the flag survives the storage
+   round trip.
+3. A failed encryption raises rather than storing plaintext silently: a blob
+   without the `MEC1` magic reads back as legacy plaintext, so silent
+   degradation would otherwise be unrecoverable.
 
-(1) + (2) chain into destruction: read fails to decrypt -> ciphertext in
-`content` -> flag dropped -> caller saves -> `_encrypt_artifact_content` sees
-content with no flag and encrypts the CIPHERTEXT again -> the original plaintext
-is unrecoverable. `test_failed_decrypt_then_save_does_not_double_encrypt` is that
-chain, run end to end.
+(1) and (2) together prevent a destruction chain: if a read failed to decrypt
+and the flag were dropped, a subsequent save would encrypt the ciphertext a
+second time, making the original plaintext unrecoverable.
+`test_failed_decrypt_then_save_does_not_double_encrypt` exercises that chain
+end to end.
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ from mantle.entities.artifact import Artifact
 
 
 def test_artifact_models_content_encrypted():
-    """THE LOAD-BEARING GUARD: without this the destruction chain reconnects."""
+    """The content_encrypted flag survives to_dict/from_dict round trips."""
     art = Artifact(id="a1", content="ciphertext", created_by="owner", content_encrypted=True)
 
     assert art.content_encrypted is True
@@ -45,7 +44,7 @@ def test_artifact_models_content_encrypted():
 
 
 def test_plain_artifact_does_not_carry_the_flag():
-    """POSITIVE CONTROL: ordinary artifacts stay clean."""
+    """Ordinary (unencrypted) artifacts do not carry the content_encrypted flag."""
     art = Artifact(id="a1", content="hello", created_by="owner")
 
     assert art.content_encrypted is False
@@ -80,7 +79,7 @@ def test_non_strict_decrypt_drops_content_and_keeps_the_flag():
 
 
 def test_successful_decrypt_clears_the_flag_positive_control():
-    """POSITIVE CONTROL: the happy path still decrypts and clears the flag."""
+    """The happy path decrypts successfully and clears the flag."""
     raw = {"_key": "a1", "content": "Y2lwaGVydGV4dA==", "content_encrypted": True, "created_by": "o"}
 
     with patch("mantle.services.content_crypto.decrypt_content", return_value=b"plaintext"):
@@ -135,11 +134,8 @@ def test_encrypt_is_idempotent():
 
 
 def test_failed_decrypt_then_save_does_not_double_encrypt():
-    """THE DESTRUCTION CHAIN. This is the test that matters.
-
-    Read a doc whose decryption fails, build the entity, save it back, and assert
-    the ciphertext is not encrypted a second time. Before the fix each step was
-    individually 'reasonable' and together they destroyed the artifact.
+    """Read a doc whose decryption fails, build the entity, save it back, and
+    assert the ciphertext is not encrypted a second time.
     """
     stored_ciphertext = "Y2lwaGVydGV4dA=="
     raw = {
@@ -163,8 +159,72 @@ def test_failed_decrypt_then_save_does_not_double_encrypt():
     with patch("mantle.services.content_crypto.encrypt_content") as enc:
         doc = db_store.to_lattice_doc(entity)
 
-    enc.assert_not_called(), (
-        "content was encrypted a SECOND time — the original plaintext is now "
-        "unrecoverable, which is exactly the irreversible corruption this guards"
+    # `assert not enc.called, "..."` — `enc.assert_not_called(), "..."` is a tuple expression, so
+    # the message below was dead code rather than the failure explanation it looks like.
+    assert not enc.called, (
+        "content was encrypted a second time, which would make the original "
+        "plaintext unrecoverable"
     )
     assert doc.get("content_encrypted") is True
+
+
+# ---------------------------------------------------------------------------
+# 4. A flagged doc whose blob is NOT encrypted is a hard error
+#
+# `content_crypto.decrypt_content` returns a blob without the MEC1 magic unchanged.
+# That is a legitimate compatibility path for `content_service.get_bytes_decrypted` —
+# S3 objects predating envelope encryption genuinely carry neither flag nor magic. It
+# is a BYPASS on the artifact path, which only calls in when `content_encrypted` is
+# already set: without `require_encrypted=True`, an attacker with store-write access
+# could replace authenticated ciphertext with chosen plaintext and have it served as
+# artifact content, with no tag left to fail.
+#
+# Nothing is mocked below: the real `content_crypto` runs, and the magic-check fires
+# before any key lookup, which is exactly why the substitution would have been free.
+# ---------------------------------------------------------------------------
+
+
+def _b64(data: bytes) -> str:
+    import base64
+    return base64.b64encode(data).decode("ascii")
+
+
+CHOSEN = b"attacker-chosen plaintext"
+
+
+def test_flagged_doc_with_an_unencrypted_blob_raises_rather_than_returning_it():
+    raw = {"_key": "a1", "content": _b64(CHOSEN), "content_encrypted": True,
+           "created_by": "o", "collection_id": "col-1"}
+
+    with pytest.raises(doc_boundary.ContentDecryptionError):
+        doc_boundary.decrypt_artifact_content(raw)
+
+    assert raw["content"] != CHOSEN.decode(), (
+        "unauthenticated bytes were surfaced as artifact content"
+    )
+    assert raw["content_encrypted"] is True, "the flag must survive a failed decrypt"
+
+
+def test_flagged_doc_with_an_unencrypted_blob_is_dropped_on_the_non_strict_path():
+    """List/stream paths must not fail the page — nor serve the substituted bytes."""
+    raw = {"_key": "a1", "content": _b64(CHOSEN), "content_encrypted": True,
+           "created_by": "o", "collection_id": "col-1"}
+
+    doc_boundary.decrypt_artifact_content(raw, strict=False)
+
+    assert raw["content"] is None
+    assert raw["content_encrypted"] is True
+
+
+def test_the_passthrough_itself_is_still_available_to_callers_that_need_it():
+    """The control: `require_encrypted` is what closed it, not a blanket prohibition.
+
+    Same bytes, same function — the flag on the CALL is the only difference. This is the
+    behaviour `content_service.get_bytes_decrypted` still depends on for pre-envelope S3
+    objects, so it must keep working while the artifact path refuses it.
+    """
+    from mantle.services import content_crypto
+
+    assert content_crypto.decrypt_content("o", CHOSEN) == CHOSEN
+    with pytest.raises(ValueError):
+        content_crypto.decrypt_content("o", CHOSEN, require_encrypted=True)

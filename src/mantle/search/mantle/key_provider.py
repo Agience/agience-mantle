@@ -1,14 +1,14 @@
 """Pluggable KEK (key-encryption-key) custody for MANTLE master keys.
 
 The master-key store (:class:`search.mantle.oracle.LatticeMasterKeyStore`) persists
-per-principal DEKs WRAPPED by the platform KEK. A ``KeyProvider`` abstracts HOW the
+per-principal DEKs wrapped by the platform KEK. A ``KeyProvider`` abstracts how the
 wrap/unwrap happens, so the KEK's custody can climb the maturity ladder — local
-file → secrets manager → cloud KMS → HSM — WITHOUT changing the search/crypto path.
+file → secrets manager → cloud KMS → HSM — without changing the search/crypto path.
 
 Two custody models, one interface:
   - **Exportable KEK** (local file, Vault KV, Secrets Manager): the KEK material is
     loaded into this process; wrap/unwrap is local symmetric crypto (Fernet).
-  - **Non-exportable KEK** (cloud KMS, HSM, Vault Transit): the KEK NEVER leaves the
+  - **Non-exportable KEK** (cloud KMS, HSM, Vault Transit): the KEK never leaves the
     service; the provider calls its Encrypt/Decrypt API. Only the 32-byte DEK
     plaintext transits the wire — never the KEK.
 
@@ -17,8 +17,8 @@ well under every KMS's ~4 KB direct-encrypt limit — so no extra data-key layer
 needed.
 
 Selected by ``MANTLE_KEK_PROVIDER`` (default ``local``). Scoped to MANTLE master-key
-custody today; promote to ``platform`` for platform-wide KEK use (secrets_service,
-etc.) when that's wanted.
+custody today; promote to ``platform`` for platform-wide KEK use
+(``services/platform_settings_service.py``, etc.) when that's wanted.
 """
 
 from __future__ import annotations
@@ -60,12 +60,12 @@ class LocalKeyProvider:
 
 
 class AwsKmsKeyProvider:
-    """KEK = a NON-exportable AWS KMS key (managed SaaS).
+    """KEK = a non-exportable AWS KMS key (managed SaaS).
 
     The DEK plaintext is sent to KMS to be encrypted/decrypted; the KEK never
     enters this process, is IAM-gated, and every use is logged in CloudTrail.
 
-    SKELETON — wired but UNTESTED here (needs ``boto3`` + AWS creds + a KMS key).
+    Skeleton — wired but untested here (needs ``boto3`` + AWS creds + a KMS key).
     Enable with ``MANTLE_KEK_PROVIDER=kms`` and ``MANTLE_KMS_KEY_ID=<arn|key-id>``.
     """
 
@@ -93,7 +93,7 @@ class AwsKmsKeyProvider:
 class VaultTransitKeyProvider:
     """KEK = a HashiCorp Vault Transit key (non-exportable; Vault does the crypto).
 
-    SKELETON — wired but UNTESTED here (needs a reachable Vault + token + a transit
+    Skeleton — wired but untested here (needs a reachable Vault + token + a transit
     key). Enable with ``MANTLE_KEK_PROVIDER=vault`` and ``VAULT_ADDR`` /
     ``VAULT_TOKEN`` / ``MANTLE_VAULT_TRANSIT_KEY``.
     """

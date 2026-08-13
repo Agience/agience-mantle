@@ -8,7 +8,7 @@ from mantle.services.dependencies import get_auth
 def _iter_api_routes(container, _seen=None):
     """Yield every mounted APIRoute, descending included routers.
 
-    FastAPI >= 0.139 includes routers LAZILY: ``app.routes`` holds ``_IncludedRouter``
+    FastAPI >= 0.139 includes routers lazily: ``app.routes`` holds ``_IncludedRouter``
     marker objects, not the flattened routes, so a plain ``isinstance(r, APIRoute)``
     scan of ``app.routes`` misses everything mounted via ``include_router``. We descend
     the markers (their source router's routes already carry full, prefixed paths).
@@ -39,15 +39,15 @@ def _route_dependency_calls(route: APIRoute):
 @pytest.mark.parametrize(
     "method,path",
     [
-        # Unified artifact endpoints (Mantle). Grant endpoints moved to Origin
-        # in 1.1d — their auth-dependency check belongs in `origin/tests/`.
+        # Unified artifact endpoints (Mantle). Grant endpoints live in Origin;
+        # their auth-dependency check belongs in `origin/tests/`.
         ("POST", "/artifacts"),
         ("GET", "/artifacts/{artifact_id}"),
         ("PATCH", "/artifacts/{artifact_id}"),
         ("DELETE", "/artifacts/{artifact_id}"),
-        # POST /artifacts/{id}/op/{op_name} (operation dispatch) moved to the gateway
-        # (crystal) in Phase 2b — its auth check lives in the gateway's tests now.
-        ("POST", "/artifacts/search"),
+        # POST /artifacts/{id}/op/{op_name} (operation dispatch) lives in the gateway
+        # (crystal) — its auth check lives in the gateway's tests.
+        ("POST", "/artifacts/recall"),
     ],
 )
 def test_all_critical_routes_use_get_auth(method, path):

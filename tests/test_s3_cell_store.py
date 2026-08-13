@@ -1,4 +1,4 @@
-"""Tests for the S3-backed CellStore adapter (MANTLE Step 2.5).
+"""Tests for the S3-backed CellStore adapter.
 
 Covers key construction, get/put/delete/list semantics, paginated listing,
 and graceful handling of S3 ``NoSuchKey`` on read/delete.

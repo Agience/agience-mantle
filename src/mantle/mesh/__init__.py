@@ -12,7 +12,7 @@ is in `prism.mass`; both really do have two consumers.
 from .anchor_routing import (
     cell_region, parse_cell_key, route_query_regions, route_write_region,
 )
-from .directory import ProviderInfo, RegionDirectory, coherence_of, pull_regions
+from .directory import ProviderInfo, RegionDirectory, attribution_of, pull_regions
 from .manifest import (
     ShardItem, ShardManifest, build_manifest, content_root, item_hash, sign_manifest,
     verify_manifest,
@@ -23,5 +23,5 @@ __all__ = [
     "ShardManifest", "ShardItem", "build_manifest", "content_root", "item_hash",
     "sign_manifest", "verify_manifest", "MeshNode", "ShardVerifyError",
     "cell_region", "parse_cell_key", "route_query_regions", "route_write_region",
-    "RegionDirectory", "ProviderInfo", "coherence_of", "pull_regions",
+    "RegionDirectory", "ProviderInfo", "attribution_of", "pull_regions",
 ]

@@ -1,7 +1,39 @@
+# What must NOT enter the build context.
+#
+# ⚠ A BARE PATTERN IS ROOT-ONLY. Docker matches each line against the whole path from the context
+# root, and `*` does not cross `/` — so `.pytest_cache` excludes exactly `./.pytest_cache` and says
+# nothing about `src/mantle/.pytest_cache/`. That one is not academic: `build/Dockerfile` does
+# `COPY src/mantle/ ./mantle/`, so a pytest cache under `src/mantle/` is copied INTO THE RUNTIME
+# IMAGE. Anything meant to apply at any depth carries `**/`; the entries below that do not are
+# root-only on purpose (`.git`, `src/*.egg-info`).
+
 .git
 .gitignore
 **/__pycache__
 **/*.pyc
-.pytest_cache
-paper/figures/*.png
-paper/figures/*.svg
+**/.pytest_cache
+src/*.egg-info
+.coverage
+
+# ⭐ THE DEV KEYSET LIVES HERE, SO THIS LINE IS ABOUT SECRETS, NOT SIZE. `docker-compose.yml`
+# tells an operator to run `dev_init_keys.py --keys-dir ./.data/keys` before `up --build`, which
+# puts `encryption.key` and `mantle.private.pem` directly in the context of the very next build.
+# Nothing in the Dockerfile copies them — but a build context is uploaded to the daemon whole, and
+# private key material should not be in it. `.data/` is a runtime volume root; none of it is input
+# to a build.
+.data/
+.data-*/
+
+# A real `.env` is a developer's own secrets. `.env.example` is the template and is documentation,
+# so it is deliberately not matched here.
+.env
+
+# The store, its sidecars, and the embeddings cache — runtime state at any depth, never build
+# input. `.data/mantle-lattice.db` is where the default puts one and `.data/mantle/mantle.db` is
+# where the compose flow does, but MANTLE_LATTICE_PATH can name any depth, so these are unanchored.
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.sqlite
+**/*.sqlite-shm
+**/*.sqlite-wal

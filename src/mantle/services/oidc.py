@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 from jose import jwt
 
-from origin import config
+from mantle import config
 
 logger = logging.getLogger(__name__)
 
@@ -126,10 +126,10 @@ class OidcVerifier:
 
     def _load_manifest_anchors(self) -> None:
         """Register the authority manifest's service anchors as issuers, so this one
-        verifier uniformly covers: platform-service JWTs (iss = origin/mantle/chorus/
-        crystal), Origin-signed user tokens + delegations (iss = AUTHORITY_ISSUER),
-        and external OIDC IdPs. Inline JWKS — no fetch. Explicitly-configured
-        external issuers win over manifest anchors (setdefault)."""
+        verifier uniformly covers: platform-service JWTs (iss = origin/mantle/crystal),
+        Origin-signed user tokens + delegations (iss = AUTHORITY_ISSUER), and external
+        OIDC IdPs. Inline JWKS — no fetch. Explicitly-configured external issuers win
+        over manifest anchors (setdefault)."""
         manifest = _read_authority_manifest()
         if not manifest:
             return

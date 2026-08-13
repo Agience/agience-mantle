@@ -1,9 +1,11 @@
 # entities/artifact.py
 # Unified Artifact entity — one table, one entity, three states.
-# See .dev/features/universal-artifact-model.md for design rationale
-# (it supersedes the archived unified-artifact-store + container-as-artifact docs).
+# See .dev/features/universal-artifact-model.md for design rationale.
 
 from typing import Optional, Dict, Any
+
+from mantle.db.constants import STATE_WHEN_ABSENT as _STATE_WHEN_ABSENT, state_of
+
 from .base import BaseEntity
 
 # Re-export container content-type constants so importers can get them here.
@@ -20,7 +22,7 @@ class Artifact(BaseEntity):
     `content_type`. A container IS an artifact — same table, same entity.
 
     Ordering is NOT stored on the artifact — it lives on the
-    `collection_artifacts` edge (see db/lattice.py).
+    `collection_artifacts` edge (see db.py).
     """
 
     PREFIX = "Artifact"
@@ -28,6 +30,16 @@ class Artifact(BaseEntity):
     STATE_COMMITTED = "committed"
     STATE_ARCHIVED = "archived"
     VALID_STATES = {STATE_DRAFT, STATE_COMMITTED, STATE_ARCHIVED}
+
+    #: What a STORED doc that carries no `state` is in. Re-exported from the store layer, which
+    #: is where the one definition lives (`db/constants.STATE_WHEN_ABSENT`) — the search index is
+    #: partitioned by state into separately-keyed encrypted trees, so a second answer here would
+    #: relocate an artifact between trees on a read-modify-write that changed nothing.
+    #:
+    #: Distinct from the `state=` default on `__init__` below, which is `draft` and stays `draft`:
+    #: constructing a NEW artifact asserts that an unpublished edit exists, which is exactly the
+    #: claim absence cannot make.
+    STATE_WHEN_ABSENT = _STATE_WHEN_ABSENT
 
     def __init__(
         self,
@@ -47,9 +59,9 @@ class Artifact(BaseEntity):
         content_type: Optional[str] = None,
         # True while `content` still holds ciphertext — i.e. the read path could
         # not decrypt it. Modeled here so the flag SURVIVES the storage round
-        # trip: without it, a failed decrypt handed ciphertext to the entity,
-        # the flag was dropped, and saving re-encrypted the ciphertext and
-        # destroyed the original irrecoverably.
+        # trip: without it, a failed decrypt would hand ciphertext to the entity,
+        # the flag would be dropped, and saving would re-encrypt the ciphertext
+        # and destroy the original irrecoverably.
         content_encrypted: bool = False,
         # The collection's IMMUTABLE ORIGIN ROOT — the key root for this artifact's
         # content, and the same principal MANTLE cells are keyed under.
@@ -75,7 +87,7 @@ class Artifact(BaseEntity):
         self.root_id = root_id or self.id
         self.collection_id = collection_id
         # A top-level artifact (no parent collection) IS its own origin root. A child
-        # is stamped from its parent at create time (`db.lattice.create_artifact`);
+        # is stamped from its parent at create time (`db.create_artifact`);
         # leaving it None here rather than guessing `self.id` means an unstamped
         # child is VISIBLE as unstamped instead of silently claiming to be a root —
         # which would give it its own key tree and orphan it from its collection.
@@ -129,7 +141,7 @@ class Artifact(BaseEntity):
             collection_id=data.get("collection_id", ""),
             context=data.get("context", ""),
             content=data.get("content", ""),
-            state=data.get("state", cls.STATE_DRAFT),
+            state=state_of(data),
             created_by=data.get("created_by"),
             created_time=data.get("created_time"),
             modified_by=data.get("modified_by"),

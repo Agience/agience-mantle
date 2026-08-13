@@ -1,23 +1,9 @@
-"""The KEYED arm, across backends — a word/symbol -> the artifacts that carry it.
+"""The keyed arm, across backends — a word/symbol -> the artifacts that carry it.
 
-A dictionary lookup is KEYED retrieval, not similarity, and its whole failure mode is
-DISTRACTOR DENSITY: `lemmas` is one namespace shared by every content type in the corpus, so
-on the live system `lookup_by_lemma('spaceship', 200)` returned 200 rows and ZERO synsets —
-6,063,979 `wiki-*` rows crowding out 117,659 `wn-*` ones. A caller that wants senses must be
-able to say so.
-
-⚠ BACKENDS DIFFER IN CAPABILITY AND THIS MODULE MAKES THAT EXPLICIT RATHER THAN GUESSING.
-`LatticeArtifactStore` discriminates INSIDE the seek — `(field, value, ct)` is the index key,
-so the LIMIT is spent entirely on rows of the requested type. A store without that parameter
-(the retired `ArcadeArtifactStore` was one; test doubles may be another) can only over-fetch
-and filter in Python.
-
-⚠ THOSE TWO ARE NOT EQUIVALENT, AND THE DIFFERENCE IS NOT COSMETIC. Post-filtering cannot
-recover what the LIMIT already spent: if the fetched page is entirely distractors, the filter
-yields `[]` and the caller reports "not found" for a word the store demonstrably holds. That
-was precisely the live `define` defect. Over-fetching widens the window but does not close the
-hole — at 6M:117k it cannot. So the degraded path is LABELLED, not silently equated: callers
-get `typed=False` back and can say what they actually did.
+A dictionary lookup is keyed retrieval, not similarity, and its failure mode is distractor
+density: `lemmas` is one namespace shared by every content type in the corpus, so
+`lookup_by_lemma('spaceship', 200)` can return 200 rows and zero synsets — 6,063,979 `wiki-*`
+rows crowding out 117,659 `wn-*` ones. A caller that wants senses must be able to say so.
 """
 from __future__ import annotations
 
@@ -45,23 +31,12 @@ def lookup_by_lemma(store: Any, word: str, *, limit: int = 12,
                     principal: Optional[str] = None) -> Tuple[List[Dict[str, Any]], bool]:
     """`(rows, typed)` — artifacts carrying `word` as a lemma, of `content_type` if given.
 
-    `typed` reports whether the type discrimination happened in the SEEK (True) or by
+    `typed` reports whether the type discrimination happened in the seek (True) or by
     post-filtering an over-fetched page (False). It is returned rather than logged because the
-    caller is the only party that knows whether a thin result is worth re-asking.
-
-    ⛔ `principal` SCOPES THE READ, AND OMITTING IT RETURNS PRIVATE ROWS.
-    `lemmas` is one namespace shared by every content type — and that includes the PRIVATE rows
-    `activation.learn()` and `genesis.remember()` write, which carry keyed lemmas by design. So an
-    unscoped lookup could return another person's private memory to any caller. Pass the delegate's
-    person; `None` preserves the legacy unscoped behaviour for internal callers that genuinely want
-    the whole index (ingest, audits), which is why it is not mandatory here — but every path that
-    serves a delegate must pass it.
-
-    ⚠ The filter is a POST-filter, so it cannot recover LIMIT already spent on invisible rows —
-    the same structural caveat as `typed=False`. The over-fetch below widens the window."""
-    from mantle.db.lattice.access import filter_visible
+    caller is the only party that knows whether a thin result is worth re-asking."""
+    from mantle.db.access import filter_visible
     # Over-fetch when scoping: a page consumed entirely by rows the caller may not see would
-    # filter to [] and read as "not found" — the same structural caveat as `typed=False`.
+    # filter to [] and read as "not found" — the same structural limit as `typed=False`.
     want = limit if principal is None else min(max(int(limit) * 4, 24), int(limit) + 200)
     rows, typed = lookup_by_list_field(store, "lemmas", word, limit=want,
                                        content_type=content_type)
@@ -70,21 +45,12 @@ def lookup_by_lemma(store: Any, word: str, *, limit: int = 12,
     return rows, typed
 
 
-# ⚠ `_rank_headword` RETIRED 2026-07-29 (Environment Builder) — it went with `lexical.py`.
-# It ordered DICTIONARY SENSES ("a word's own senses lead, then the sets it leads, then mere
-# synonyms") off `doc["word"]`/`doc["lemmas"]` — a LEXICAL judgement, i.e. exactly the "dictionary
-# is just a model" thing John retired. Measured before removing: after `lexical.define` went, the
-# only caller left that passed `rank_for=` anywhere in the workspace was ONE TEST. A feature whose
-# sole consumer is its own test is the "coverage makes dead code look maintained" antipattern this
-# codebase already names. Recoverable from git history; if LUMEN ever renders senses and wants
-# dictionary order, that ordering belongs there, with the persona that speaks language.
-# The keyed lookup itself is UNCHANGED and stays ember: it is grounding, not a judgement.
 
 def lookup_by_list_field(store: Any, field: str, value: str, *, limit: int = 20,
                          content_type: Optional[str] = None) -> Tuple[List[Dict[str, Any]], bool]:
     """`(rows, typed)` — artifacts whose indexed list `field` contains `value`.
 
-    Raises whatever the backend raises. In particular `mantle.db.lattice.ListIndexUnbuilt`
+    Raises whatever the backend raises. In particular `mantle.db.ListIndexUnbuilt`
     propagates: a store whose keyed index has never been built must not answer `[]`, because
     `[]` from a keyed lookup asserts "this store does not contain that word"."""
     v = str(value).lower()
@@ -93,7 +59,7 @@ def lookup_by_list_field(store: Any, field: str, value: str, *, limit: int = 20,
     if _supports_typed(store, "lookup_by_list_field"):
         rows = store.lookup_by_list_field(field, v, limit=limit, content_type=content_type)
         return list(rows), True
-    # DEGRADED: discrimination after the fact. Over-fetch so the filter has room to work, then
+    # Degraded: discrimination after the fact. Over-fetch so the filter has room to work, then
     # keep only the requested type. Bounded deliberately — an unbounded over-fetch to "make sure"
     # is how a keyed lookup becomes a scan.
     over = min(int(limit) * 20, int(limit) + 400)

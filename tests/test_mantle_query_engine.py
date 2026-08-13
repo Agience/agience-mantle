@@ -249,14 +249,9 @@ class TestCellCache:
         """Evicting the cache makes the next search re-read the store.
 
         Corrupt the stored blob, evict, then search: the search must observe the
-        corruption, which it can only do by going back to the store.
-
-        The observable proof of reload changed with the systemic-key fix. It used
-        to be "returns []", but [] is no longer how a wholesale decrypt failure
-        presents itself: a corpus whose every readable cell fails GCM auth now
-        raises, because "no results" and "the key is wrong" must not look alike.
-        The test asserts the same underlying fact (cache dropped, store re-read);
-        it just reads the new, louder signal.
+        corruption, which it can only do by going back to the store. A corpus
+        whose every readable cell fails GCM auth raises, because "no results"
+        and "the key is wrong" must not look alike.
         """
         indexer, engine = stack
         indexer.index_artifact("o-1", "col-A", [_chunk("art-1", 0, vec_seed=1)], self_request("o-1", "update"))
@@ -303,14 +298,11 @@ class TestCellCache:
 
 class TestResilience:
     def test_one_tampered_cell_does_not_deny_the_rest_of_the_search(self, stack):
-        """A single bad cell degrades locally; it must NOT fail the whole query.
+        """A single bad cell degrades locally; it must not fail the whole query.
 
-        This is the DoS property the original silent-skip existed to protect, and
-        it is preserved. Strengthened from the original test, which corrupted the
-        ONLY cell and asserted `== []`: that assertion could not tell "one cell was
-        skipped" apart from "nothing was searched at all", so it would still have
-        passed if the engine had stopped searching entirely. Here a second, intact
-        context must still return its hit.
+        A corrupted cell must not deny results from other, intact contexts in the
+        same search. Asserting on a second, intact context distinguishes "one
+        cell was skipped" from "nothing was searched at all".
         """
         indexer, engine = stack
         indexer.index_artifact("o-1", "col-A", [_chunk("art-1", 0, vec_seed=1)], self_request("o-1", "update"))
@@ -325,11 +317,11 @@ class TestResilience:
         assert "art-1" not in ids, "the tampered cell must not yield hits"
 
     def test_all_cells_failing_auth_raises_instead_of_reporting_empty(self, stack):
-        """Total key loss must NOT be presented as an empty corpus.
+        """Total key loss must not be presented as an empty corpus.
 
-        The defect this replaces: every cell failing GCM auth was logged and
-        treated as a cache miss, so a wrong/rotated/destroyed master key returned
-        `[]` -- indistinguishable from a user who simply has no documents.
+        Every cell failing GCM auth indicates a wrong, rotated, or destroyed
+        master key, and must raise rather than return `[]` -- which would be
+        indistinguishable from a user who simply has no documents.
         """
         indexer, engine = stack
         indexer.index_artifact("o-1", "col-A", [_chunk("art-1", 0, vec_seed=1)], self_request("o-1", "update"))
@@ -343,10 +335,10 @@ class TestResilience:
             engine.search(_vec(1), [("o-1", "col-A"), ("o-1", "col-B")], req())
 
     def test_empty_corpus_still_returns_empty(self, stack):
-        """The other side of the same coin: absent cells are NOT a fault.
+        """The other side of the same coin: absent cells are not a fault.
 
-        Guards against over-correcting the fix into "any empty result raises",
-        which would break every new user who has no documents yet.
+        A context with no indexed data returns `[]` rather than raising; only a
+        corpus that fails to decrypt raises.
         """
         _, engine = stack
         assert engine.search(_vec(1), [("o-1", "col-A")], req()) == []

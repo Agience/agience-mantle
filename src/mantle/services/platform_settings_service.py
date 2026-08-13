@@ -11,12 +11,16 @@ Usage:
     from mantle.services.platform_settings_service import settings
 
     # After load_all() has been called at startup:
-    value = settings.get("mantle.search.chunk_size")
+    value = settings.get("platform.index_queue_max_workers")
     secret = settings.get_secret("auth.google.client_secret")
+
+This table is shared across services: `agience-origin` reads `branding.title`,
+`auth.password.*`, `auth.invite_only` and `platform.allow_local_mcp_servers` from the
+same rows. A key with no reader HERE may still have one there, so removing an entry is
+a cross-repo decision, not a local one.
 """
 
 import logging
-import os
 from typing import Optional
 
 from cryptography.fernet import Fernet
@@ -24,6 +28,7 @@ from mantle.db.store import Database
 
 from prism.trust.key_manager import get_encryption_key
 from mantle.db import identity_backend as identity_store
+from mantle import config as _config
 
 logger = logging.getLogger(__name__)
 
@@ -33,41 +38,63 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULTS: dict[str, str] = {
-    # db.postgres.* defaults REMOVED (2026-07-22): zero consumers anywhere in the
-    # workspace — Origin runs its own SQLite and mantle its lattice; no compose file
-    # has carried a `sql` container since the flip. Defaults for absent infrastructure
-    # are how a settings page grows knobs that configure nothing.
+    # No db.postgres.*, ai.*, or embeddings.* defaults: Origin runs its own SQLite and
+    # Mantle its lattice (opened in-process from MANTLE_LATTICE_PATH), and model/embedding
+    # capability is not configured here. Defaults are only defined for settings that
+    # configure something in this deployment.
 
-    # AI + embeddings defaults REMOVED (2026-07-22, no-models rule — universal):
-    # `ai.default_provider/default_model/quick_model/ollama_base_url` and
-    # `embeddings.provider/dim` configured model capability that no longer exists
-    # anywhere in the platform (see mantle/embeddings.py for the tombstone).
+    # No search tuning either. A default is a promise that something reads the key, and
+    # nothing reads a refresh interval, a BM25 window, or kNN candidate counts: Mantle's
+    # search runs over encrypted MANTLE/SSE blobs in the content store, so there is no
+    # OpenSearch-shaped engine for those numbers to reach. Chunk geometry is likewise
+    # absent — it is a free parameter of `search/ingest/chunking.py`, defaulted at its
+    # function signatures, and changing it without a full reindex only makes the stored
+    # chunks disagree with the new ones. A knob that changes nothing is worse than no
+    # knob: `get_all_by_category` surfaces every DEFAULTS key to the settings UI, so a
+    # dead default is an operator control that visibly accepts a value and does nothing.
 
-    # External-DB settings retired with the 2026-07-22 flip: the lattice is opened
-    # in-process from MANTLE_LATTICE_PATH; there is no DB server to configure.
-
-    # the legacy lexical index retired in Step 2.6.9 (2026-05-09); no legacy-lexical defaults.
-
-    # Search tuning
-    "mantle.search.refresh_interval": "750ms",
-    "mantle.search.chunk_size": "1000",
-    "mantle.search.chunk_overlap": "200",
-    "mantle.search.bm25_size": "200",
-    "mantle.search.knn_k": "400",
-    "mantle.search.knn_num_candidates": "1000",
+    # ── Keys `config._SETTING_MAP` rebinds: the default lives in `config.py` ──────────
+    #
+    # For these keys this table MIRRORS config rather than declaring a second default,
+    # and the mirror is the module attribute itself so the two cannot be written apart.
+    #
+    # `get()` falls back to DEFAULTS and therefore never returns None, so a literal
+    # written here is not a fallback the store may or may not supply — it is a value
+    # that OVERWRITES config's own default on every node whose env var is unset and
+    # whose store holds no row (`config.load_settings_from_db`). Two independently
+    # authored defaults for one variable cannot coexist under that rule: the one here
+    # always wins, and a config default that disagrees is silently unreachable. So
+    # there is exactly one default per variable, and it is config's.
+    #
+    # The layering that remains, unchanged and now the whole of it:
+    #   env var  >  stored row  >  config's Phase-1 default (reflected here).
+    #
+    # Reflecting the attribute also fixes the moment of resolution: an `os.getenv` call
+    # here would read the environment at THIS module's import, which need not be the
+    # same environment `config` read at its own.
 
     # Content storage (S3/MinIO)
-    "storage.content_uri": os.getenv("CONTENT_URI", "http://localhost:9000"),
-    "storage.content_bucket": os.getenv("CONTENT_BUCKET", "agience-content"),
-    "storage.content_download_url_expiry": "300",
-    "storage.content_upload_url_expiry": "900",
-    "storage.content_multipart_part_url_expiry": "300",
+    "storage.content_uri": _config.CONTENT_URI,
+    "storage.content_bucket": _config.CONTENT_BUCKET,
+    "storage.content_download_url_expiry": str(_config.CONTENT_DOWNLOAD_URL_EXPIRY),
+    "storage.content_upload_url_expiry": str(_config.CONTENT_UPLOAD_URL_EXPIRY),
+    "storage.content_multipart_part_url_expiry": str(_config.CONTENT_MULTIPART_PART_URL_EXPIRY),
 
-    # Branding
+    # Branding. No favicon: the browser clients take theirs from their own runtime
+    # config (`VITE_FAVICON`), never from this table.
+    "branding.facet_uri": _config.FACET_URI,
+    "branding.origin_uri": _config.ORIGIN_URI,
+
+    # Platform. `seed_collection_slugs` is the CSV form of config's list — the same
+    # value in the encoding `config._CSV_LIST_KEYS` decodes.
+    "platform.log_level": _config.BACKEND_LOG_LEVEL,
+    "platform.index_queue_max_workers": str(_config.INDEX_QUEUE_MAX_WORKERS),
+    "platform.seed_collection_slugs": ",".join(_config.SEED_COLLECTION_SLUGS),
+
+    # ── Keys this table alone owns ───────────────────────────────────────────────────
+    # Nothing in `config._SETTING_MAP` reads these, so the default below IS the default.
+
     "branding.title": "Agience",
-    "branding.favicon": "favicon.png",
-    "branding.facet_uri": os.getenv("FACET_URI", "http://localhost:5173"),
-    "branding.origin_uri": os.getenv("ORIGIN_URI", "http://localhost:8081"),
 
     # Auth
     "auth.password.enabled": "true",
@@ -76,10 +103,7 @@ DEFAULTS: dict[str, str] = {
     "auth.invite_only": "false",
 
     # Platform
-    "platform.log_level": "info",
-    "platform.index_queue_max_workers": "16",
     "platform.allow_local_mcp_servers": "false",
-    "platform.seed_collection_slugs": "agience-inbox-seeds",
     "platform.setup_complete": "false",
 
     # Email (not configured by default)

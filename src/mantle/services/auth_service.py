@@ -1,20 +1,18 @@
-"""Mantle auth service — verifier-only after 1.1e.
+"""Mantle auth service — verification only.
 
 Origin owns all token issuance, password hashing, and OAuth flows. Mantle
 retains:
 
-- `verify_token` — JWT verification against Origin's public key (switches
-  to JWKS-over-HTTP in 1.3).
-- `verify_api_key` — raw `agc_xxx` Bearer verification via Origin's
-  `/api-keys/verify` (HTTP).
+- `verify_token` — JWT verification against Origin's public key.
 - `verify_nonce` — stateless HMAC challenge-token validation.
-- `hash_api_key` / `generate_api_key` — used by `services/grant_service.py`
-  and the deprecated card-key rotation in `services/workspace_service.py`.
-- `OAuth2Error` constants — used by gate/api-key error paths.
+- `OAuth2Error` constants — used by gate error paths.
+
+Bearer-key minting and verification are NOT here: a grant key is a grant, so it
+lives with the rest of the grant machinery in `services/grant_key_service.py`.
 - `NONCE_TTL_SECONDS` / `JWT_ALGORITHM` / `ACCESS_TOKEN_EXPIRE_HOURS`.
 
-All issuance helpers (`create_jwt_token`, `hash_password`, `is_person_allowed`,
-etc.) moved to Origin alongside their last callers in 1.1e.
+Issuance helpers (`create_jwt_token`, `hash_password`, `is_person_allowed`,
+etc.) live in Origin.
 """
 
 from __future__ import annotations
@@ -28,11 +26,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from mantle.db.store import Database
-from jose import JWTError, jwt
 
-from origin import config
-from mantle.entities.api_key import APIKey as APIKeyEntity
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +45,7 @@ def verify_token(token: str, expected_audience: Optional[str] = None) -> Optiona
     — the database depends on no trust LIBRARY, only the manifest's inline JWKS that
     it reads itself. The verifier knows, uniformly:
     - the authority manifest's service anchors (platform-service JWTs:
-      `iss ∈ {origin, mantle, chorus, crystal}`),
+      `iss ∈ {origin, mantle, crystal}`),
     - the Origin issuer (user tokens + delegations: `iss == AUTHORITY_ISSUER`),
     - and any configured external OIDC IdP (Entra/Auth0/Okta/...).
 
@@ -67,22 +61,6 @@ def verify_token(token: str, expected_audience: Optional[str] = None) -> Optiona
     if exp and datetime.now(timezone.utc).timestamp() > exp:
         return None
     return payload
-
-
-def verify_api_key(db: Database, api_key: str) -> Optional[APIKeyEntity]:
-    """Verify a raw `agc_xxx` token via the pluggable authz backend.
-
-    `local` (default) verifies against Mantle's own api_keys in the lattice (`db`);
-    `origin` delegates to Origin. Returns the APIKey entity (grants dropped here;
-    callers that need grants use the backend's `verify_api_key` directly).
-    """
-    from mantle.services.grant_store import get_apikey_backend
-
-    result = get_apikey_backend().verify_api_key(db, api_key)
-    if result is None:
-        return None
-    api_key_entity, _grants = result
-    return api_key_entity
 
 
 def verify_nonce(
@@ -116,18 +94,7 @@ def verify_nonce(
 
 
 # ---------------------------------------------------------------------------
-# API key helpers — small, stateless, Mantle-owned
-# ---------------------------------------------------------------------------
-def generate_api_key() -> str:
-    return f"agc_{secrets.token_bytes(16).hex()}"
-
-
-def hash_api_key(api_key: str) -> str:
-    return hashlib.sha256(api_key.encode()).hexdigest()
-
-
-# ---------------------------------------------------------------------------
-# OAuth2 error constants — used by error responses in gate / api-key paths.
+# OAuth2 error constants — used by error responses in the gate paths.
 # ---------------------------------------------------------------------------
 class OAuth2Error:
     INVALID_REQUEST = "invalid_request"

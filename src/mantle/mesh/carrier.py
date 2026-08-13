@@ -1,4 +1,4 @@
-"""BROADCAST CARRIERS — the mesh over a medium that cannot be listed (John, 2026-07-23).
+"""Broadcast carriers — the mesh over a medium that cannot be listed.
 
 The mesh consumes from a plane it can `list`/`get` (S3, MinIO, a dict). A radio cannot be listed:
 you cannot ask the air what was said before you tuned in. So RF is not a plane — **it is a CARRIER
@@ -125,7 +125,6 @@ class Carrier:
     `emit(frames)`   — hand bytes to the medium (broadcast). Returns how many frames left.
     `receive()`      — yield whatever the medium delivered since last call. May be empty; never blocks
                        on a specific peer, never requests.
-
     A subclass implementing these over an SDR turns the mesh into an RF mesh with no change above."""
 
     def emit(self, frames: Iterable[Frame]) -> int:                      # pragma: no cover - contract

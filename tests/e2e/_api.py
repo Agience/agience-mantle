@@ -111,7 +111,7 @@ class Api:
         body: dict = {"query_text": query_text, "state": state, "size": size}
         if scope is not None:
             body["scope"] = scope
-        return self.post("/artifacts/search", json=body)
+        return self.post("/artifacts/recall", json=body)
 
 
 # --- well-known Origin auth flows (shapes confirmed against auth_router) -----

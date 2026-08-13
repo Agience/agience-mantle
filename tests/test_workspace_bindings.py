@@ -5,6 +5,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+from mantle.events import event_bus
 from mantle.entities.collection import Collection as CollectionEntity, WORKSPACE_CONTENT_TYPE
 from mantle.services import workspace_service as ws_svc
 
@@ -46,9 +47,14 @@ class TestSetBinding:
         ):
             result = ws_svc.set_binding(db, "user-1", "ws-1", "memory", artifact_id="col-abc")
         assert result == {"artifact_id": "col-abc"}
-        mock_bus.emit.assert_called_once()
-        call_args = mock_bus.emit.call_args
-        assert call_args[0][0] == "workspace.binding.set"
+        # Asserted against the real emitter by name. A `MagicMock` grows whatever attribute it is
+        # asked for, so patching the bus and asserting on an invented method name proves a call
+        # was made, not that anything on the other side could receive it.
+        assert hasattr(event_bus, "emit_artifact_event_sync")
+        mock_bus.emit_artifact_event_sync.assert_called_once()
+        args = mock_bus.emit_artifact_event_sync.call_args[0]
+        assert args[0] == "ws-1"                        # addressed to the workspace
+        assert args[1] == "workspace.binding.set"
 
     def test_set_multi_valued_binding(self):
         db = MagicMock()
@@ -99,8 +105,10 @@ class TestClearBinding:
             ws_svc.clear_binding(db, "user-1", "ws-1", "memory")
         # Should have written back without the memory binding
         mock_update.assert_called_once()
-        mock_bus.emit.assert_called_once()
-        assert mock_bus.emit.call_args[0][0] == "workspace.binding.cleared"
+        mock_bus.emit_artifact_event_sync.assert_called_once()
+        args = mock_bus.emit_artifact_event_sync.call_args[0]
+        assert args[0] == "ws-1"
+        assert args[1] == "workspace.binding.cleared"
 
     def test_clear_missing_binding_is_noop(self):
         db = MagicMock()
@@ -116,7 +124,7 @@ class TestClearBinding:
         # No bindings to clear — should not call update
         mock_update.assert_not_called()
         # Event still emitted (idempotent clear)
-        mock_bus.emit.assert_called_once()
+        mock_bus.emit_artifact_event_sync.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

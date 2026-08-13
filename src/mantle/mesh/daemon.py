@@ -1,14 +1,14 @@
-"""The Ember mesh daemon — a box manages its OWN peering: sync + role/idle policy.
+"""The Ember mesh daemon — a box manages its own peering: sync + role/idle policy.
 
 This replaces every hand-driven thing (Claude SSHing in, spawning tunnels, toggling ingest/compress).
 Ember reads its role and runs itself. Claude never has a back door: it authors this, deploys it once,
 and observes only via the reported stats.
 
-TRANSPORT IS S3 (John's decision): S3 is the authoritative store AND the exchange plane. There is no
-box-to-box connection at all — no SSH tunnels, no overlay, no VPS. Sync is ONE path: Merkle
+Transport is S3: S3 is the authoritative store and the exchange plane. There is no
+box-to-box connection at all — no SSH tunnels, no overlay, no VPS. Sync is one path: Merkle
 anti-entropy. Each box publishes its Merkle tree (per-node leaf objects) to S3 and pulls only the
-leaves that differ from each peer — vertices AND edges. Because every box reaches S3, NAT is
-irrelevant; because a leaf IS the authoritative state of its key-range, any box converges to FULL just
+leaves that differ from each peer — vertices and edges. Because every box reaches S3, NAT is
+irrelevant; because a leaf is the authoritative state of its key-range, any box converges to full just
 by pulling differing leaves, and a wiped/new box rebuilds by the same operation. Content is already
 S3-authoritative (cas/), so a box that has the graph can read any content on demand.
 
@@ -40,23 +40,12 @@ from prism import envelope as resource
 
 
 def invoke_loud(store, operator_id: str, args: dict, rec: dict) -> dict:
-    """Invoke an operator and REFUSE TO SWALLOW AN ERROR ENVELOPE.
+    """Invoke an operator without swallowing an error envelope.
 
-    ⛔ THE DEFECT THIS CLOSES, MEASURED. `genesis.invoke` does not raise when an operator cannot be
-    dispatched — it RETURNS `{"error": "operator 'x' is not invokable", ...}`. Every call in this
-    loop was `genesis.invoke(...)` with the result discarded, inside one `try/except` that only ever
-    sees a RAISE. So `op.pool.ensure_ingest` — an id that exists nowhere in the workspace and that
-    the "never idle" arm invoked on EVERY TICK — returned that envelope every 30 seconds, forever,
-    and the daemon printed a clean record saying the policy arm had run. The one guarantee this file
-    states in its own docstring ("at least one ingest runpod + the ingest laptop are always
-    ingesting — guaranteed because ingest-role boxes never stop") was false on every ingest box, and
-    nothing anywhere recorded it. `pool.run_task` learned this same lesson about the same envelope;
-    the daemon never did.
-
-    The failure envelope is `{"error": ...}` with NO `"operator"` key — the success envelope always
+    The failure envelope is `{"error": ...}` with no `"operator"` key — the success envelope always
     carries `"operator"`. Do not sniff nested results (a composition step may legitimately carry its
     own error), which is the discrimination `pool.run_task` already settled on."""
-    from mantle import runner_hooks   # the store ASKS the runner; it does not import one
+    from mantle.system import runner_hooks   # the store ASKS the runner; it does not import one
     res = runner_hooks.invoke(store, operator_id, args)
     if isinstance(res, dict) and res.get("error") and not res.get("operator"):
         detail = "%s -> %s" % (operator_id, str(res["error"])[:200])
@@ -66,13 +55,8 @@ def invoke_loud(store, operator_id: str, args: dict, rec: dict) -> dict:
 
 
 def _converged_to_full(store) -> bool:
-    """A compress box is 'full' when a Merkle round pulls NOTHING new and every peer's tree matches —
+    """A compress box is 'full' when a Merkle round pulls nothing new and every peer's tree matches —
     i.e. it is provably identical to the fleet, not merely that one probe read nothing.
-
-    ⛔ UNKNOWN IS NOT CONVERGED. Every way of FAILING to read the mesh must return False, never True:
-    no credentials -> `reason == no-s3`; an unlistable bucket -> `reconcile_via_s3` propagates
-    `MeshListingError`, caught here as False; no peers seen -> cannot claim convergence. Convergence
-    is the POSITIVE fact `leaves_fetched == 0 AND every peer diff empty`, which only holds when the
     roots actually matched — the same discipline `mesh_lag` uses (`converged = None` when blind)."""
     try:
         from . import sync as _sync
@@ -92,7 +76,7 @@ def run(store, *, interval: float = 30.0):
     """The mesh daemon loop — S3 sync + role/idle policy. One process per box.
 
     Every operator call goes through `invoke_loud`, never `genesis.invoke` directly: an
-    `{"error": ...}` envelope is a FAILURE and this loop must not print a clean record over one."""
+    `{"error": ...}` envelope is a failure and this loop must not print a clean record over one."""
     role = os.getenv("EMBER_ROLE", "ingest")
     purpose = os.getenv("EMBER_PURPOSE", "")
     print(json.dumps({"mesh_daemon": "up", "transport": "s3", "sync": "merkle", "role": role,
@@ -121,10 +105,6 @@ def run(store, *, interval: float = 30.0):
             rec["sync_err"] = str(e)[:120]
         # 2. ROLE / IDLE POLICY.
         #
-        # ⛔ THE "NEVER IDLE" ARM INVOKED `op.pool.ensure_ingest`, AN ID THAT EXISTS NOWHERE. Not in
-        # `runner_hooks.source_ingesters()`, not in `CONTROL_OPS`, not in `invoke`'s dispatch chain, not as
-        # a data-driven operator artifact, not in any sibling repo. The id was never real, so this
-        # arm has done NOTHING since it was written while reporting `policy: ingest-until-full`.
         #
         # `op.curriculum.advance` is what it meant and is the operator that does the job: "advances
         # the developmental curriculum by one bounded increment (ingest the next stage's records, or

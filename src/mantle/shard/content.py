@@ -3,7 +3,7 @@
 The proper content/context separation (the label-blind mesh model):
   • the artifact store (SQLite lattice) holds the CONTEXT + a REFERENCE (`content_ref` = the
     content's address). Queryable.
-  • the content store (local CAS cache / S3 mirror; formerly Garage) holds the CONTENT as
+  • the content store (local CAS cache / S3 mirror) holds the CONTENT as
     opaque ENCRYPTED bytes. No size limit, no truncation.
 
 Content-addressing: `content_ref = cas/<sha256(plaintext)>`. Identical content -> identical
@@ -31,6 +31,20 @@ class ContentKeyMissing(RuntimeError):
     can swallow "this one blob is unreadable" without also swallowing "this node has no key"."""
 
 
+class ContentIntegrityError(RuntimeError):
+    """The blob decrypted but does not hash to the ref it was fetched under.
+
+    Fernet authenticates the CIPHERTEXT under the node's content key; it does not — and with no
+    AAD parameter cannot — bind the blob to its content address. So a ciphertext moved between two
+    refs in the store, or served for the wrong ref by a mirror, decrypts cleanly and returns the
+    WRONG CONTENT under the right name. `cas/<sha256(plaintext)>` is the address, so re-hashing the
+    plaintext is the binding Fernet can't express, and it is checked rather than assumed — the same
+    verify-on-read contract `db/content_cache.py` already holds itself to.
+
+    Never an empty return: a caller that cannot use the content gets this exception, and
+    `resolve_text` degrades to the artifact's inline content rather than to wrong bytes."""
+
+
 _KEY_CACHE: dict = {}
 _KEY_TTL = 60.0
 
@@ -38,38 +52,26 @@ _KEY_TTL = 60.0
 def _content_key(keys_dir: Path, *, create: bool = False) -> MultiFernet:
     """The content/segment cipher. Returns a MultiFernet: `content.key` is primary (used for
     ENCRYPT), and any additional `content.key.*` files are decrypt-only fallbacks. This lets a
-    node decrypt peers' segments that were written under a DIFFERENT key (the mesh keys diverged
-    historically: t5/tu each have their own, 71+45 share one). Single-key nodes are unaffected —
+    node decrypt peers' segments written under a different key (the mesh keys diverge: t5/tu each
+    have their own, 71+45 share one). Single-key nodes are unaffected —
     encrypt still uses their one key, and MultiFernet with one key behaves exactly like Fernet.
 
-    ⛔⛔ THIS USED TO MINT A BRAND-NEW KEY WHENEVER `content.key` WAS ABSENT — ON THE READ PATH.
-    It is the one entry point for `put_content`, `get_content` AND `sync._fernet`, and it could not
-    tell "first-ever write, bootstrap me" from "the keys volume is not mounted yet". In the second
-    case it fabricated a key, wrote it as the new PRIMARY, and returned it. Then:
-      • the pending `decrypt` failed with `InvalidToken`, which `resolve_text` swallowed → `""`;
-      • every SUBSEQUENT write encrypted under a key **no peer holds**;
-      • published mesh segments became undecryptable fleet-wide, stalling every peer's cursor;
-      • and row counts, `keyed_coverage` and ρ all stayed perfectly healthy throughout.
-    The project's own `content-encryption` note names this exact failure — "a missing key is a
-    SILENT partition, fingerprint keys first" — and the code still implemented the partition.
-    It also `mkdir`'d the directory, which is precisely what made an unmounted volume look normal.
+    Key-bootstrap properties:
 
-    Three changes, each aimed at one half of the confusion:
-
-    1. `create` DEFAULTS TO FALSE. Only `put_content` opts in — a write on a provisioned node may
+    1. `create` defaults to False. Only `put_content` opts in — a write on a provisioned node may
        legitimately bootstrap the first key. Reads never mint (a read only happens when content
        already exists, so a missing key there is always a fault), and `sync._fernet` never mints:
        publishing under a fresh key is the worst outcome available, because it corrupts the mesh
        for every peer rather than just this node.
-    2. NO `mkdir`. An absent `keys_dir` means the volume is not mounted; that is a hard error, not
+    2. No `mkdir`. An absent `keys_dir` means the volume is not mounted; that is a hard error, not
        an invitation to create one. Bootstrapping requires the directory to already exist, which is
        what distinguishes "provisioned but empty" from "not mounted".
-    3. EXCLUSIVE CREATE (`"xb"`). The old check-then-write was racy: with a 64-worker pool two
-       threads could both see no key, mint different ones, and the loser's ciphertext became
-       permanently unreadable. On collision we re-read the winner's key instead of overwriting it.
+    3. Exclusive create (`"xb"`). Under concurrent writers, two threads could otherwise both see no
+       key, mint different ones, and the loser's ciphertext become permanently unreadable. On
+       collision we re-read the winner's key instead of overwriting it.
 
-    Cached per keys_dir for `_KEY_TTL` — this ran a stat, a read, a glob and N Fernet constructions
-    on EVERY put/get, and the re-entry is also what made the old create-branch self-perpetuating.
+    Cached per keys_dir for `_KEY_TTL`, so a stat, a read, a glob and N Fernet constructions run
+    at most once per TTL window rather than on every put/get.
     """
     kd = Path(keys_dir)
     ck = str(kd.resolve()) if kd.exists() else str(kd)
@@ -125,9 +127,35 @@ def put_content(content_store, keys_dir, data: bytes) -> Tuple[str, int]:
     return ref, len(data)
 
 
+_CAS_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _verify_ref(ref: str, plaintext: bytes) -> bytes:
+    """Return `plaintext` iff it hashes to `ref`. See :class:`ContentIntegrityError`.
+
+    Only a well-formed `cas/<64 hex>` ref carries a hash to check against. Anything else is an
+    addressing scheme this function was not given evidence for, and inventing a check for it
+    would be guessing — those pass through, exactly as before."""
+    if not ref.startswith(CAS_PREFIX) or not _CAS_HEX.match(ref[len(CAS_PREFIX):]):
+        return plaintext
+    got = hashlib.sha256(plaintext).hexdigest()
+    if got != ref[len(CAS_PREFIX):]:
+        raise ContentIntegrityError(
+            "content fetched as %s decrypted to bytes hashing to cas/%s — the ciphertext is "
+            "authentic under this node's content key but is NOT the content this ref names. "
+            "Refusing to return it." % (ref, got))
+    return plaintext
+
+
 def get_content(content_store, keys_dir, ref: str) -> bytes:
-    """Fetch + decrypt content by ref."""
-    return _content_key(keys_dir).decrypt(content_store.get(ref))
+    """Fetch + decrypt content by ref, then VERIFY it against that ref.
+
+    Fernet gives no AAD parameter, so the ciphertext cannot be cryptographically bound to its
+    address the way `cell.py` and `content_cache.py` bind theirs. The content address is the
+    binding available here, and re-hashing after decrypt is what enforces it — the check is a pure
+    addition, it changes no stored byte, and it is the difference between "authentic" and
+    "authentic AND the content this ref names"."""
+    return _verify_ref(ref, _content_key(keys_dir).decrypt(content_store.get(ref)))
 
 
 def resolve_text(store_bundle, artifact: dict) -> str:
@@ -157,12 +185,6 @@ def resolve_text(store_bundle, artifact: dict) -> str:
         try:
             return get_content(content, store_bundle.keys_dir, ref).decode("utf-8", "ignore")
         except ContentKeyMissing:
-            # ⛔ DELIBERATELY NOT SWALLOWED. Everything else here is a per-artifact problem (blob
-            # evicted, ref stale) where returning the inline fallback is right. A missing content
-            # key is a NODE-WIDE configuration fault: swallowing it makes every artifact resolve to
-            # "" and the whole corpus re-describe as empty, with no error at any layer. Note the
-            # inline fallback below is GUARANTEED absent for exactly these artifacts — `content` is
-            # popped once a `content_ref` is written — so "" here is never a real value.
             raise
         except Exception:
             pass
@@ -172,20 +194,13 @@ def resolve_text(store_bundle, artifact: dict) -> str:
 # One clean sentence of an article's own text — the `summary` the type template projects. NOT a
 # hardcoded layout: the type's `offer_template` decides how title + summary read; this only supplies
 # the summary value from the document itself, title-stripped so it is never repeated. Lives here (with
-# `resolve_text`, content projection) so BOTH the ember viewer (`ember.browse`) and the moved retrieval
+# `resolve_text`, content projection) so BOTH the ember viewer (`ember.browse`) and the retrieval
 # tekton (sage's `content_search._describe`) read one implementation — grounding stays Apache-side.
 _SENT_END = re.compile(r"[.!?](?:\s|$)")
 
 
 def _summary(content: str, title: str, *, budget: Optional[int] = None) -> str:
     """The document's own text, title-stripped — NOT cut to a chosen length.
-
-    ⛔ THIS USED TO TRUNCATE AT A CHOSEN 200 CHARACTERS and append "…", which silently amputated
-    definitions mid-clause — e.g. *"the part of calculus that deals with the variation of a function
-    with respect to changes in the independent variable (or variables) by means of the concepts of
-    derivative and…"*. A character budget is an ARBITRARY CAP ([[no-arbitrary-caps]]): a bound must be
-    DERIVED, and a definition's natural bound is THE DOCUMENT'S OWN STRUCTURE — it ends where its
-    author ended it, not where a constant here decided.
 
     So the text is returned WHOLE, ending at its first paragraph break when the document declares one
     (a unit the source itself supplies), and otherwise entire. `budget` survives only as a FLAGGED

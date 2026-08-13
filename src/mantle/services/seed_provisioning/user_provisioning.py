@@ -45,7 +45,7 @@ from mantle.db.backend import (
 from mantle.entities.artifact import Artifact as ArtifactEntity
 from mantle.entities.collection import Collection as CollectionEntity, COLLECTION_CONTENT_TYPE
 from mantle.entities.grant import Grant as GrantEntity
-from origin.config import AGIENCE_PLATFORM_USER_ID
+from mantle.config import AGIENCE_PLATFORM_USER_ID
 from mantle.services.bootstrap_types import (
     AUTHORITY_COLLECTION_SLUG,
     INBOX_MATERIALIZATION_SLUGS,
@@ -136,6 +136,11 @@ def provision_user(
     if email is None or name is None:
         try:
             from mantle.services import person_service
+            # No subject token: provisioning is a bootstrap path, run under no user's request —
+            # it is often what runs BEFORE that user has ever presented a token here. So this
+            # stays the unscoped call, and nothing is minted to make it look otherwise. It is
+            # already non-fatal: an Origin that refuses degrades to "no email", which the code
+            # below is written to survive.
             person = person_service.get_user_by_id(store_db, user_id)
             if person is not None:
                 email = email or getattr(person, "email", None)
@@ -144,6 +149,7 @@ def provision_user(
             logger.debug("provision_user (%s): could not resolve person email/name", user_id, exc_info=True)
 
     inbox_id = _ensure_inbox_workspace(store_db, user_id)
+    _ensure_observations_container(store_db, user_id)
     ctx = UserContext(id=user_id, email=email, name=name, inbox_id=inbox_id, tenant=tenant)
 
     # Declarative grant seeds are applied ONLY when the install package supplies a
@@ -159,20 +165,14 @@ def provision_user(
     # Identity linkage: give the user a Person artifact and attach any pre-signup
     # leads (contact form, newsletter) that share their email — so the lead's
     # history rolls up to the user. Both idempotent + non-fatal.
-    created_person = False
     try:
-        created_person = _ensure_person_artifact(store_db, ctx)
+        _ensure_person_artifact(store_db, ctx)
     except Exception:
         logger.warning("provision_user (%s): Person artifact creation failed", user_id, exc_info=True)
     try:
         _convert_leads_for_person(store_db, user_id, email)
     except Exception:
         logger.warning("provision_user (%s): lead conversion failed", user_id, exc_info=True)
-    if created_person:  # genuine first login → one-time welcome
-        try:
-            _send_welcome_email(store_db, ctx)
-        except Exception:
-            logger.warning("provision_user (%s): welcome email failed", user_id, exc_info=True)
 
 
 def _ensure_people_collection(store_db: Database) -> str:
@@ -256,27 +256,36 @@ def ensure_authority_collection(store_db: Database) -> str:
 
 
 def _ensure_person_owner_grant(store_db: Database, person_id: str, user_id: str) -> None:
-    """Grant the user read+update on their OWN Person card (idempotent).
+    """Grant the user read+update+delete on their OWN Person card (idempotent).
 
     People is a platform collection — members get only ``read`` on it, so the
     owner needs an explicit grant to EDIT their own profile. Authority roots to
     the person whose card it is (granted_by == the user). See
     ``feedback_authority_roots_to_person``.
+
+    ``can_delete`` is part of owning it. This card is the artifact that holds a
+    member's plaintext email and display name, and ``DELETE /artifacts/{id}``
+    resolves through the same grant flags as every other artifact — without the
+    flag the one person the data is about is the one principal who cannot remove
+    it. The idempotence check therefore tests for delete too, so a card issued
+    with the narrower pair is widened on the owner's next login rather than
+    staying undeletable for the life of the account.
     """
     existing = db_get_grants_for_principal_resource(store_db, user_id, person_id)
-    if any(getattr(g, "can_update", False) for g in existing):
+    if any(getattr(g, "can_update", False) and getattr(g, "can_delete", False)
+           for g in existing):
         return
     db_create_grant(store_db, GrantEntity(
         resource_id=person_id, grantee_type="user", grantee_id=user_id,
-        granted_by=user_id, can_read=True, can_update=True,
-        name="Own profile (read + edit)",
+        granted_by=user_id, can_read=True, can_update=True, can_delete=True,
+        name="Own profile (read + edit + delete)",
     ))
 
 
 def _migrate_person_home(
     store_db: Database, ctx: UserContext, person_id: str, people_id: Optional[str]
 ) -> None:
-    """One-time self-heal: move an existing Person card out of the legacy Inbox
+    """One-time self-heal: move an existing Person card out of the Inbox
     home into the People collection. No-op once migrated. Safe to run every login.
     """
     if not people_id:
@@ -344,39 +353,6 @@ def _ensure_person_artifact(store_db: Database, ctx: UserContext) -> bool:
     return True
 
 
-def _send_welcome_email(store_db: Database, ctx: UserContext) -> None:
-    """Send a one-time welcome email to a newly-provisioned user.
-
-    Sent AS the platform operator (who holds read on the platform email secrets,
-    so the authorizer resolves) via Mantle's chorus_client, which mints the
-    operator delegation. Recipient is the new user. Non-fatal.
-    """
-    if not ctx.email:
-        return
-    from mantle.services.platform_settings_service import settings
-    from mantle.services import chorus_client, server_registry
-
-    operator_id = settings.get("platform.operator_id")
-    iris_id = server_registry.resolve_name_to_id("iris")
-    if not operator_id or not iris_id:
-        return
-
-    greeting = ctx.name or "there"
-    body_html = (
-        f"<p>Hi {greeting},</p>"
-        "<p>Welcome to Agience — your account is ready. Provenance-first, "
-        "governable AI, built in from the start.</p>"
-        "<p>Jump in at <a href=\"https://my.agience.ai\">my.agience.ai</a>.</p>"
-        "<p>— The Agience team</p>"
-    )
-    chorus_client.call_tool(
-        iris_id, "send_email",
-        {"to": ctx.email, "subject": "Welcome to Agience", "body_html": body_html},
-        user_id=str(operator_id),
-    )
-    logger.info("Sent welcome email to %s", ctx.email)
-
-
 def _convert_leads_for_person(store_db: Database, user_id: str, email: Optional[str]) -> int:
     """Link unclaimed leads matching the user's email to their new Person.
 
@@ -431,6 +407,25 @@ def _apply_grant_set(
     report = seed_from_artifacts(store_db, root, user=ctx)
     for err in report.errors:
         logger.warning("provision_user (%s): %s", user_id, err)
+
+
+def _ensure_observations_container(store_db: Database, user_id: str) -> Optional[str]:
+    """Ensure the user owns the container their observation events are addressed to.
+
+    ⭐ PROVISIONED HERE BECAUSE THE READ PATH MUST NOT WRITE. `events/observation.py` records an
+    event for every MCP tool call and addresses it to this container — which is what keeps one
+    principal's queries out of the event feed of everyone holding a grant on whatever those
+    queries matched. That addressing needs the container to exist and to carry the owner grant
+    `create_container` issues; obtaining it lazily during a read would put a container create
+    inside a user-facing tool call, and announce it on the change feed as a side effect of looking.
+
+    Idempotent, and non-fatal: a user whose container is missing simply records no observations
+    until this runs again. The audit gap is the honest failure — a failed provisioning must not
+    fail a login.
+    """
+    from mantle.events import observation
+
+    return observation.ensure_observations_container(store_db, user_id)
 
 
 def _ensure_inbox_workspace(store_db: Database, user_id: str) -> Optional[str]:

@@ -1,4 +1,4 @@
-"""Storage protocols for MANTLE encrypted search (Step 2.2b.iii).
+"""Storage protocols for MANTLE encrypted search.
 
 One abstract store that the indexer + query engine talk to:
 
@@ -9,7 +9,7 @@ One abstract store that the indexer + query engine talk to:
   Tests use the in-memory implementation here.
 
 There is ONE path — every cell is anchor-routed; there is no flat / unpartitioned
-cell. The set of clusters grows with the manifold (``anchors.grow``).
+cell. The set of clusters is the seeded AnchorSet's, exactly.
 """
 
 from __future__ import annotations

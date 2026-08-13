@@ -4,7 +4,6 @@ Provides a lightweight in-process worker pool that accepts indexing callables an
 executes them concurrently on background threads. This keeps API handlers responsive
 while the index finishes writing, and exposes simple status metrics so the UI
 can surface pending work to users if needed.
-
 """
 
 from __future__ import annotations
@@ -31,20 +30,16 @@ class IndexTask:
     tenant_id: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-    #: The caller's context, captured at ENQUEUE time and re-entered in the worker
+    #: The caller's context, captured at enqueue time and re-entered in the worker
     #: thread — see :meth:`IndexQueue._execute_task`. Carries the acting principal
     #: (``services.acting_principal``), which indexing needs in order to obtain a
     #: cell key.
     #:
-    #: ⚠ REQUIRED BECAUSE ThreadPoolExecutor DOES NOT PROPAGATE CONTEXTVARS. Unlike
-    #: an asyncio task, a pool worker starts from an EMPTY context, so without this
-    #: the identity of whoever queued the work is silently lost and indexing fails
-    #: closed with ``NoActingPrincipal`` — correct, but useless.
     #:
     #: Capturing the enqueuer's context (rather than substituting a system identity)
     #: is also the more accurate answer: a queued index write really is done on
     #: behalf of the user whose write triggered it, so it should be checked against
-    #: THAT user's grants. Genuinely system-initiated work enqueues from inside
+    #: that user's grants. Genuinely system-initiated work enqueues from inside
     #: ``system_acting_context()`` and this carries the system principal instead.
     context: Optional[contextvars.Context] = None
 
@@ -54,25 +49,18 @@ class IndexQueue:
 
     def __init__(self, max_workers: int = 4) -> None:
         #: ``None`` is the shutdown sentinel. The coordinator blocks in an untimed
-        #: ``get()``, so ``stop()`` must PUT something to wake it — see ``stop()``.
+        #: ``get()``, so ``stop()`` must put something to wake it — see ``stop()``.
         self._queue: "queue.Queue[Optional[IndexTask]]" = queue.Queue()
         self._executor: Optional[ThreadPoolExecutor] = None
         self._coordinator: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-        # ⛔ RLock, NOT Lock — `get_status()` DEADLOCKS ON ITSELF WITH A PLAIN LOCK.
-        # It acquires this lock and then calls `is_running()`, which acquires it again. With a
-        # non-reentrant Lock the calling thread blocks forever **while still holding it**, so
-        # every subsequent `enqueue()` blocks too and indexing dies process-wide from a single
-        # status read. Demonstrated: `get_status()` never returned after 5s on a fresh queue.
-        # Currently latent only because nothing in-repo calls the exported `get_status` yet —
-        # i.e. it is live ammunition in the public API rather than an active outage.
         self._lock = threading.RLock()
         #: Signalled when ``_inflight`` reaches zero. `flush()` waits on this instead of
-        #: re-asking; a Condition over the SAME lock that already guards the counters, so
+        #: re-asking; a Condition over the same lock that already guards the counters, so
         #: there is no second lock to order against (RLock is re-entrant, as above).
         self._idle = threading.Condition(self._lock)
         #: Tasks accepted but not yet finished — enqueued, minus completed/failed/dropped.
-        #: This is what `flush()` actually means. `self._queue.empty()` is NOT: the queue
+        #: This is what `flush()` actually means. `self._queue.empty()` is not: the queue
         #: goes empty the moment the coordinator hands work to the executor, while that
         #: work is still running.
         self._inflight = 0
@@ -152,15 +140,7 @@ class IndexQueue:
             return status
 
     def flush(self, timeout: float = 5.0) -> None:
-        """Block until all accepted work has FINISHED, or the timeout elapses.
-
-        ⛔ THIS USED TO POLL `self._queue.empty()` EVERY 50 ms, AND IT ANSWERED THE WRONG
-        QUESTION. The queue drains the instant the coordinator hands a task to the
-        executor, so `empty()` went True while the task was still executing: `flush()`
-        returned "done" over work in flight, and `stop(drain=True)` relied on that. The
-        counter it should have been reading — tasks accepted minus tasks finished — is
-        `_inflight`, and a Condition over it is both the correct question and a real
-        blocking primitive, so the 50 ms poll disappears rather than being retuned.
+        """Block until all accepted work has finished, or the timeout elapses.
         """
         with self._idle:
             if not self._idle.wait_for(lambda: self._inflight == 0, timeout=timeout):
@@ -177,21 +157,10 @@ class IndexQueue:
     def _coordinator_loop(self) -> None:
         """Coordinator thread that dispatches tasks to the worker pool.
 
-        Blocks in `Queue.get()` until there IS work, drains everything already queued
+        Blocks in `Queue.get()` until there is work, drains everything already queued
         behind it, and submits the batch. Idle costs nothing: no timeout, no wakeup, no
         loop iteration until something is enqueued.
 
-        ⛔ THE `get(timeout=0.2)` THIS REPLACED WAS NOT A LATENCY KNOB. `get()` returns
-        the moment an item lands either way; the timeout existed ONLY so the loop could
-        re-check `_stop_event`, which cost ~5 wakeups/second forever to notice an event
-        that fires at most once. `stop()` now PUTS a `None` sentinel, so the check happens
-        when there is something to check. Latency is unchanged (it was never the timeout
-        that delivered a task) and shutdown gets *faster*: no up-to-200 ms wait to notice.
-
-        The futures list this used to keep is gone. Nothing ever read it; it existed only
-        to be periodically pruned of the completed futures that it was itself the sole
-        reason to retain. Failures are already caught and counted in `_execute_task`, so a
-        dropped future discards nothing.
         """
         while not self._stop_event.is_set():
             # Blocks here — indefinitely — until work arrives or `stop()` pushes None.
@@ -274,7 +243,7 @@ def _get_queue() -> IndexQueue:
     """Lazy initialization of index queue with config."""
     global _index_queue
     if _index_queue is None:
-        from origin import config
+        from mantle import config
         _index_queue = IndexQueue(max_workers=config.INDEX_QUEUE_MAX_WORKERS)
     return _index_queue
 
@@ -291,7 +260,7 @@ def enqueue(action: Callable[[], bool], *, description: str = "", tenant_id: Opt
     queue = _get_queue()
     if not queue.is_running():
         raise RuntimeError(f"IndexQueue worker not running - cannot enqueue task: {description}")
-    # Capture the CALLER's context here, in the enqueuing thread — this is the only
+    # Capture the caller's context here, in the enqueuing thread — this is the only
     # moment the acting principal is still in scope. See `IndexTask.context`.
     task = IndexTask(
         action=action,

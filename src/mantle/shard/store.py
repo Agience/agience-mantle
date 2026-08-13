@@ -1,9 +1,9 @@
 """Persistence — a cache that forgets on restart is not a cache.
 
-`cache_dir` was configured from the start and nothing wrote to it, so every shard died with the
-process. That makes disconnected operation a fiction on the *second* boot: the first run answers
-locally, the next one has nothing and must reach the network to say anything at all — which is
-exactly the moment a leaf is supposed to be useful.
+If `cache_dir` were configured but nothing wrote to it, every shard would die with the process,
+making disconnected operation a fiction on the *second* boot: the first run answers locally, the
+next one has nothing and must reach the network to say anything at all — which is exactly the
+moment a leaf is supposed to be useful.
 
 WHAT IS AND IS NOT PERSISTED
 ----------------------------
@@ -38,7 +38,7 @@ import tempfile
 from pathlib import Path
 from typing import Dict, Iterator, Optional, Tuple
 
-from mantle.search.anchors.anchorset import AnchorSet
+from mantle.search.anchors.anchorset import AnchorSet, AnchorSetCorrupt
 from mantle.mesh.node import MeshNode, ShardVerifyError
 from mantle.mesh.manifest import ShardManifest
 
@@ -179,11 +179,20 @@ class ShardStore:
         anchors.save(self.root / "anchors.json")
 
     def load_anchors(self) -> Optional[AnchorSet]:
+        """The cached canonical set, or ``None`` when this shard has none.
+
+        A CORRUPT set is not the same answer as an absent one and is not swallowed into it:
+        `AnchorSetCorrupt` means the file states anchor ids its own contents do not produce, so a
+        leaf that loaded it would route into regions no peer computes. Absent is a state an
+        unprovisioned leaf is legitimately in; corrupt is a file to replace.
+        """
         p = self.root / "anchors.json"
         if not p.is_file():
             return None
         try:
             return AnchorSet.load(p)
+        except AnchorSetCorrupt:
+            raise
         except (json.JSONDecodeError, KeyError, ValueError):
             return None
 
@@ -205,7 +214,7 @@ class ShardStore:
 
     def load_views(self) -> dict:
         """The head map + per-item root/vector sidecar, or an empty scaffold if absent (a first
-        boot, or a cache written before views existed — both fine, just nothing to restore)."""
+        boot, or nothing to restore yet — both fine)."""
         p = self.root / "views.json"
         if not p.is_file():
             return {"heads": {}, "items": {}}

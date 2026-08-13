@@ -25,7 +25,7 @@ class Commit(BaseEntity):
         host_id: Optional[str] = None,
         server_id: Optional[str] = None,
         agent_id: Optional[str] = None,
-        api_key_id: Optional[str] = None,
+        grant_key_id: Optional[str] = None,
         confirmation: str = "human_affirmed",
         changeset_type: str = "manual",
         item_ids: Optional[List[str]] = None,
@@ -44,14 +44,14 @@ class Commit(BaseEntity):
         self.host_id = host_id
         self.server_id = server_id
         self.agent_id = agent_id
-        self.api_key_id = api_key_id
+        self.grant_key_id = grant_key_id
         self.confirmation = confirmation
         self.changeset_type = changeset_type
         self.item_ids = item_ids or []
 
     def to_dict(self) -> Dict[str, Any]:
         """
-        Shape expected by db/lattice writers and schema.
+        Shape expected by db writers and schema.
         Note: the lattice schema uses `timestamp`, not `created_time`.
         """
         base = self.to_dict_base()
@@ -66,7 +66,7 @@ class Commit(BaseEntity):
             "host_id": self.host_id,
             "server_id": self.server_id,
             "agent_id": self.agent_id,
-            "api_key_id": self.api_key_id,
+            "grant_key_id": self.grant_key_id,
             "confirmation": self.confirmation,
             "changeset_type": self.changeset_type,
             "item_ids": list(self.item_ids),
@@ -88,7 +88,7 @@ class Commit(BaseEntity):
             host_id=data.get("host_id"),
             server_id=data.get("server_id"),
             agent_id=data.get("agent_id"),
-            api_key_id=data.get("api_key_id"),
+            grant_key_id=data.get("grant_key_id"),
             confirmation=data.get("confirmation", "human_affirmed"),
             changeset_type=data.get("changeset_type", "manual"),
             item_ids=list(data.get("item_ids", [])),

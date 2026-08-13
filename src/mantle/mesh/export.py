@@ -98,7 +98,7 @@ def import_shard(
                 "content_type": "text/plain",
                 "state": "committed",
                 # offer is not carried in the manifest leaf; a fuller manifest would
-                # include it. For now content-first import; describe re-runs on demand.
+                # include it. Import is content-first; describe re-runs on demand.
                 "context": text.split("\n", 1)[0][:200],
                 "content": text,
                 "created_by": manifest.authority,

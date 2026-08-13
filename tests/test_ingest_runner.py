@@ -54,8 +54,8 @@ class TestIngestRunnerService:
         result = describe_content_processing("audio/mpeg", upload_complete=True)
 
         assert result["strategy"] == "handler"
-        # Extraction handlers were unified: absent a type-local capability contract,
-        # every non-text MIME resolves to the single "extract-content" handler.
+        # Absent a type-local capability contract, every non-text MIME resolves to
+        # the single "extract-content" handler.
         assert result["handler"] == "extract-content"
         assert result["content_status"] == "pending_handler"
         assert result["index_status"] == "pending_handler"
@@ -122,11 +122,7 @@ class TestIngestRunnerService:
         assert result is None
 
     def test_extract_text_from_artifact_uses_content_type_field(self):
-        """Regression: context uses 'content_type' for the content type field.
-
-        Previously the code read ctx.get("mime") which missed artifacts that set
-        content_type (the standard field name). Now only content_type is read.
-        """
+        """context uses 'content_type' for the content type field."""
         from mantle.services.ingest_runner_service import extract_text_from_artifact
         artifact = FakeArtifact(
             content="",
@@ -138,7 +134,7 @@ class TestIngestRunnerService:
             mock.assert_called_once_with("tenant/xyz.content", "text/markdown", filename=None)
 
     def test_extract_text_from_artifact_ignores_legacy_mime_field(self):
-        """After the mime→content_type migration, only content_type is read."""
+        """Only content_type is read; the legacy mime field is not."""
         from mantle.services.ingest_runner_service import extract_text_from_artifact
         artifact = FakeArtifact(
             content="",

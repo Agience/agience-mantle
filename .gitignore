@@ -8,18 +8,28 @@ secrets/
 compose/secrets/
 
 # --- Runtime data / volumes ---
+# The store is one SQLite file plus its WAL sidecars. `.data/` is where every default puts them,
+# but an explicit MANTLE_LATTICE_PATH can name anywhere, so the file patterns stand on their own.
 .data/
 .data-*/
+*.db
+*.db-shm
+*.db-wal
 *.sqlite
+*.sqlite-shm
+*.sqlite-wal
 *.sqlite3
 
 # --- Python ---
+# `build/Dockerfile` is tracked, so `build/` itself is NOT ignored here — only the
+# setuptools staging output `python -m build` writes into that same directory.
+build/lib/
+build/bdist.*/
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-build/
 dist/
 downloads/
 eggs/
@@ -48,6 +58,9 @@ node_modules/
 .docusaurus/
 .cache/
 *.tsbuildinfo
+
+# --- Claude Code
+.claude/
 
 # --- IDE / OS ---
 .vscode/

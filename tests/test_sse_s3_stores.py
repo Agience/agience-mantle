@@ -1,4 +1,4 @@
-﻿"""Tests for the S3-backed SSE PostingStore + StatsStore adapters
+﻿"""Tests for the S3-backed SSE PostingStore adapter
 (MANTLE-SSE Step 2.6.9 production wiring).
 
 Reuses the fake S3 client pattern from :file:`test_s3_cell_store.py` to
@@ -10,8 +10,6 @@ Coverage:
   key returns None, delete missing is no-op, list_tokens_for_owner
   parses keys correctly with paginator and without, key construction
   (prefix + owner + namespace).
-- S3StatsStore: get/put/delete round-trip, missing key handling,
-  per-owner key isolation.
 - Round-trip with the SSE crypto: indexer-shape end-to-end
   (encrypt → S3 → decrypt) verifies the adapters preserve the wire
   format byte-for-byte.
@@ -29,9 +27,8 @@ from mantle.search.mantle.oracle import FernetMasterKeyStore, OracleService
 from mantle.search.mantle.sse import (
     blind_tokens as bt,
     posting,
-    stats as stats_mod,
 )
-from mantle.search.mantle.sse.s3_stores import S3PostingStore, S3StatsStore
+from mantle.search.mantle.sse.s3_stores import S3PostingStore
 from .helpers import SelfContextVerifier, self_request
 
 
@@ -113,11 +110,6 @@ def posting_store(s3: _FakeS3Client) -> S3PostingStore:
 
 
 @pytest.fixture
-def stats_store(s3: _FakeS3Client) -> S3StatsStore:
-    return S3StatsStore(s3, bucket="agience", prefix="mantle-sse")
-
-
-@pytest.fixture
 def oracle() -> OracleService:
     fernet = Fernet(Fernet.generate_key())
     return OracleService(FernetMasterKeyStore(fernet), grant_verifier=SelfContextVerifier())
@@ -137,10 +129,6 @@ class TestConstructorValidation:
     def test_posting_store_requires_bucket(self):
         with pytest.raises(ValueError, match="bucket"):
             S3PostingStore(_FakeS3Client(), bucket="")
-
-    def test_stats_store_requires_bucket(self):
-        with pytest.raises(ValueError, match="bucket"):
-            S3StatsStore(_FakeS3Client(), bucket="")
 
 
 # ---------------------------------------------------------------------------
@@ -240,43 +228,6 @@ class TestS3PostingStoreManifests:
 
 
 # ---------------------------------------------------------------------------
-# S3StatsStore
-# ---------------------------------------------------------------------------
-
-
-class TestS3StatsStore:
-    def test_get_missing_returns_none(self, stats_store):
-        assert stats_store.get("owner-A") is None
-
-    def test_round_trip(self, stats_store):
-        stats_store.put("owner-A", b"blob")
-        assert stats_store.get("owner-A") == b"blob"
-
-    def test_overwrite(self, stats_store):
-        stats_store.put("owner-A", b"v1")
-        stats_store.put("owner-A", b"v2")
-        assert stats_store.get("owner-A") == b"v2"
-
-    def test_delete(self, stats_store):
-        stats_store.put("owner-A", b"x")
-        stats_store.delete("owner-A")
-        assert stats_store.get("owner-A") is None
-
-    def test_delete_missing_is_noop(self, stats_store):
-        stats_store.delete("owner-A")  # no error
-
-    def test_owner_isolation(self, stats_store):
-        stats_store.put("owner-A", b"A")
-        stats_store.put("owner-B", b"B")
-        assert stats_store.get("owner-A") == b"A"
-        assert stats_store.get("owner-B") == b"B"
-
-    def test_stats_key_layout(self, s3, stats_store):
-        stats_store.put("owner-A", b"x")
-        assert ("agience", "mantle-sse/owner-A/sse/stats.enc") in s3.objects
-
-
-# ---------------------------------------------------------------------------
 # End-to-end with crypto (encrypted blob round-trip through S3)
 # ---------------------------------------------------------------------------
 
@@ -305,29 +256,9 @@ class TestEndToEnd:
             bt.blind_token(owner_key, bt.FIELD_TITLE, "alpha"),
             bt.blind_token(owner_key, bt.FIELD_TITLE, "beta"),
         ]
-        blob = posting.pack_manifest(
-            tokens, manifest_key, field_dls={"title": 2},
-        )
+        blob = posting.pack_manifest(tokens, manifest_key)
         posting_store.put_manifest("owner-A", "art-1", blob)
 
         recovered_blob = posting_store.get_manifest("owner-A", "art-1")
         assert recovered_blob == blob
-        rec_tokens, rec_dls = posting.unpack_manifest(recovered_blob, manifest_key)
-        assert sorted(tokens) == rec_tokens
-        assert rec_dls == {"title": 2}
-
-    def test_stats_through_s3(self, stats_store, owner_key):
-        skey = stats_mod.derive_stats_key(owner_key)
-        s = stats_mod.Stats(
-            doc_count=3,
-            field_doc_count={"title": 3},
-            field_total_dl={"title": 19},
-            df={"a" * 64: 2},
-        )
-        blob = stats_mod.pack_stats(s, skey)
-        stats_store.put("owner-A", blob)
-
-        recovered_blob = stats_store.get("owner-A")
-        assert recovered_blob == blob
-        recovered = stats_mod.unpack_stats(recovered_blob, skey)
-        assert recovered == s
+        assert posting.unpack_manifest(recovered_blob, manifest_key) == sorted(tokens)

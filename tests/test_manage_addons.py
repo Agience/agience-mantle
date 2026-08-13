@@ -2,7 +2,7 @@
 card discovery). The DB-applying `register` path is covered by the seed loader
 tests; here we test the pure pre-apply helpers."""
 
-from mantle import manage_addons as ma   # qualified: a bare top-level name is a collision waiting
+from mantle.system import manage_addons as ma   # qualified: a bare top-level name is a collision waiting
 
 
 def test_collect_vars_parses_pairs():

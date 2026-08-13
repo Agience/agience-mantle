@@ -1,7 +1,8 @@
 """Auth & tokens — the identity floor every other test stands on.
 
-bootstrap → operator; register + login; API keys; and the negative cases that
-prove Mantle actually verifies (bad/absent tokens → 401).
+bootstrap → operator; register + login; grant keys and grant bundles; and the
+negative cases that prove Mantle actually verifies (bad/absent tokens → 401, and a
+retired `agc_` API key naming its own retirement rather than reading as malformed).
 """
 from __future__ import annotations
 
@@ -49,22 +50,78 @@ def test_mantle_rejects_garbage_token():
     assert r.status_code == 401
 
 
-def _create_api_key(user) -> str:
-    # Sovereign: API keys are created on MANTLE (its own lattice store), not Origin.
-    r = user["api"].post("/api-keys", json={"name": "e2e-key"})
+def _a_collection(user) -> str:
+    """A committed top-level collection the user owns (see test_03_collections)."""
+    return user["api"].create_collection(f"key-{uuid.uuid4().hex[:6]}")["id"]
+
+
+def _create_grant_key(user, **body) -> tuple[str, str]:
+    """Mint a grant key on Mantle. Returns `(key_id, raw_token)`."""
+    payload = {"name": "e2e-key"}
+    payload.update(body)
+    r = user["api"].post("/grants/keys", json=payload)
     assert r.status_code in (200, 201), r.text
-    raw = r.json().get("key")
-    assert raw and raw.startswith("agc_"), r.json()
-    return raw
+    data = r.json()
+    raw = data.get("key")
+    assert raw and raw.startswith("agk_"), data
+    # The stored token hash must never come back out over the API.
+    assert "grantee_id" not in data, "the grant key's token hash was serialized"
+    return data["id"], raw
 
 
-def test_api_key_created_on_mantle(user):
-    """Mantle issues a raw `agc_` personal key exactly once."""
-    _create_api_key(user)
+def test_grant_key_created_on_mantle(user):
+    """Mantle issues a raw `agk_` key exactly once, and never echoes its hash."""
+    _create_grant_key(user)
 
 
-def test_api_key_usable_on_mantle(user):
-    """The raw `agc_` key authenticates against Mantle end-to-end (same store)."""
-    key_api = Api(_create_api_key(user))
-    r = key_api.get("/artifacts/visible", params={"action": "read"})
+def test_grant_key_usable_on_mantle(user):
+    """The raw `agk_` token authenticates end-to-end and reaches what it carries."""
+    _, raw = _create_grant_key(user, resource_id=_a_collection(user), can_read=True)
+
+    r = Api(raw).get("/artifacts/visible", params={"action": "read"})
     assert r.status_code == 200, r.text
+
+
+def test_a_retired_api_key_says_so(user):
+    """An `agc_` token names its own retirement instead of reading as malformed."""
+    r = Api("agc_" + "0" * 32).get("/artifacts/visible", params={"action": "read"})
+    assert r.status_code == 401, r.text
+    assert "retired" in r.text.lower(), r.text
+
+
+def test_api_keys_endpoint_is_gone(user):
+    """The decommissioned surface must not still answer."""
+    r = user["api"].post("/api-keys", json={"name": "e2e-key"})
+    assert r.status_code == 404, r.text
+
+
+def test_grant_bundle_carries_several_resources_at_once(user):
+    """A bundle is a key whose members are grants — one token, many resources.
+
+    Minted with no `resource_id`, so the root reaches nothing by itself and all of
+    the key's authority comes from the member added below.
+    """
+    key_id, raw = _create_grant_key(user, name="e2e-bundle")
+
+    r = user["api"].post(
+        f"/grants/keys/{key_id}/members",
+        json={"resource_id": _a_collection(user), "can_read": True},
+    )
+    assert r.status_code in (200, 201), r.text
+
+    detail = user["api"].get(f"/grants/keys/{key_id}")
+    assert detail.status_code == 200, detail.text
+    assert len(detail.json()["members"]) == 1
+
+    r = Api(raw).get("/artifacts/visible", params={"action": "read"})
+    assert r.status_code == 200, r.text
+
+
+def test_revoking_a_grant_key_stops_it_working(user):
+    key_id, raw = _create_grant_key(user, resource_id=_a_collection(user), can_read=True)
+    assert Api(raw).get("/artifacts/visible", params={"action": "read"}).status_code == 200
+
+    assert user["api"].delete(f"/grants/keys/{key_id}").status_code == 200
+
+    r = Api(raw).get("/artifacts/visible", params={"action": "read"})
+    assert r.status_code == 401, r.text

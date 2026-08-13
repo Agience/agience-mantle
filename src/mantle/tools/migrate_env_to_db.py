@@ -17,10 +17,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 # Mapping: env var name -> (setting key, category, is_secret)
-# 2026-07-22 hardening: the legacy-store block is GONE (the lattice reads MANTLE_LATTICE_PATH from
-# env directly — a store location is not a platform setting), and the AI/embeddings block is
-# GONE with the no-models rule (there are no provider keys to migrate; see mantle/embeddings.py
-# for the tombstone). What remains to migrate is auth, storage, search, branding, platform.
+# Store location is not a platform setting — the lattice reads MANTLE_LATTICE_PATH from env
+# directly, so there is no legacy-store block here. There are no AI/embeddings provider keys to
+# migrate either (see mantle/search/embeddings.py). What remains to migrate is auth, storage, branding,
+# platform.
+#
+# A legacy variable is carried here only while a setting still reads it. `SEARCH_CHUNK_SIZE` /
+# `SEARCH_CHUNK_OVERLAP` are not: chunk geometry is a free parameter of
+# `search/ingest/chunking.py`, so migrating them would write rows nothing consults — an operator
+# would see their old value preserved and conclude it still takes effect.
 ENV_TO_SETTING = {
     # Google OAuth
     "GOOGLE_OAUTH_CLIENT_ID": ("auth.google.client_id", "auth", False),
@@ -55,11 +60,7 @@ ENV_TO_SETTING = {
     "CONTENT_URI": ("storage.content_uri", "storage", False),
     "CONTENT_BUCKET": ("storage.content_bucket", "storage", False),
 
-    # the legacy lexical index retired in Step 2.6.9 — no env vars to migrate.
-
-    # Search tuning
-    "SEARCH_CHUNK_SIZE": ("mantle.search.chunk_size", "search", False),
-    "SEARCH_CHUNK_OVERLAP": ("mantle.search.chunk_overlap", "search", False),
+    # the lexical index has no env vars to migrate.
 
     # Branding
     "FACET_URI": ("branding.facet_uri", "branding", False),
@@ -127,10 +128,10 @@ def main():
     from prism.trust.key_manager import init_encryption_key
     init_encryption_key()
 
-    from origin.config import load_bootstrap_settings
+    from mantle.config import load_bootstrap_settings
     load_bootstrap_settings()
 
-    # THE FLIP (2026-07-22): the lattice handle is the one store.
+    # The lattice handle is the one store.
     from mantle.db import backend
     store_db = backend.store_handle()
 

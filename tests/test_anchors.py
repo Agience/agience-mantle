@@ -1,14 +1,14 @@
-"""AnchorSet + Reconciler — the native-language geometry layer.
+"""AnchorSet — the seeded coordinate system, and what routes against it.
 
-Validates the load-bearing claim of the canonical plan (§4): the anchor-relative
-code is **model-unbiased** — a gauge change (rotation = "a different embedding
-model") leaves the native code unchanged.
+The set arrives whole, from a client, and Mantle stores it and compares vectors to it. Nothing
+here derives, grows, reconciles or maps a coordinate system, and the last two tests in this file
+are the guard that keeps it that way.
 """
 
 import numpy as np
 import pytest
 
-from mantle.search.anchors import AnchorSet, Reconciler
+from mantle.search.anchors import AnchorSet
 from mantle.search.anchors import store as _store
 from mantle.search.anchors.anchorset import l2norm
 from mantle.search.anchors.repo import InMemoryAnchorRepo
@@ -41,13 +41,12 @@ def _clusters(rng, n_clusters=4, per=40, d=D, spread=0.12):
 
 
 def _provision(items, k, model_id="hf:test@1.0", d=D):
-    """A PROVISIONED AnchorSet: the first real item of each of the first ``k`` clusters, admitted
-    explicitly. No fitting — anchors are not derived here or anywhere else (the k-means bootstrap
-    was removed 2026-07-31 because locally-derived anchors mint region ids no peer computes). In
-    production the canonical set arrives as an artifact; in this test the test IS that outside
-    authority, which is exactly the point: someone else decides, and every node admits the same set.
-    Anchors stay REAL items (fully-disclosed artifacts, §3), which is what the routing assertions
-    below actually depend on."""
+    """A provisioned AnchorSet: the first real item of each of the first ``k`` clusters, admitted
+    explicitly. No fitting — anchors are not derived here or anywhere else, because locally-derived
+    anchors would mint region ids no peer computes. In production the canonical set arrives as an
+    artifact; in this test the test is that outside authority, which is exactly the point: someone
+    else decides, and every node admits the same set. Anchors stay real items (fully-disclosed
+    artifacts, §3), which is what the routing assertions below actually depend on."""
     aset = AnchorSet(model_id=model_id, dim=d)
     seen = []
     for lab, vec in items:
@@ -64,83 +63,8 @@ def test_anchors_are_real_items():
     aset = _provision(items, 4)
     assert len(aset) == 4
     labelset = {lab for lab, _ in items}
-    # anchors are REAL items (fully-disclosed artifacts), not synthetic centers
+    # anchors are real items (fully-disclosed artifacts), not synthetic centers
     assert all(a.label in labelset for a in aset.anchors)
-
-
-def test_routing_lands_in_own_cluster():
-    rng = np.random.default_rng(7)
-    items, truth = _clusters(rng)
-    aset = _provision(items, 4)
-    rec = Reconciler(aset, top_m=4)
-    label_by_id = {a.anchor_id: a.label for a in aset.anchors}
-    correct = 0
-    for (_, vec), c in zip(items, truth):
-        code = rec.to_native(vec)
-        top_cluster = label_by_id[code.top_anchor_id].split("_")[0]
-        correct += int(top_cluster == f"c{c}")
-    assert correct / len(items) > 0.9
-
-
-def test_same_cluster_more_similar_than_cross():
-    rng = np.random.default_rng(3)
-    items, truth = _clusters(rng)
-    aset = _provision(items, 4)
-    rec = Reconciler(aset, top_m=4)
-    codes = [rec.to_native(v) for _, v in items]
-    same = [i for i, c in enumerate(truth) if c == truth[0]]
-    diff = [i for i, c in enumerate(truth) if c != truth[0]]
-    s = codes[same[0]].dot(codes[same[1]])
-    d = codes[same[0]].dot(codes[diff[0]])
-    assert s > d
-
-
-def test_native_code_is_model_invariant_under_gauge_change():
-    """The core option-B claim: rotate the space (a different 'model'), provision anchors from the
-    same items in the rotated frame, and the native code is unchanged."""
-    rng = np.random.default_rng(11)
-    items, _ = _clusters(rng, n_clusters=4, per=30)
-    labels = [lab for lab, _ in items]
-    X = l2norm(np.vstack([v for _, v in items]))
-
-    R, _ = np.linalg.qr(rng.standard_normal((D, D)))   # random orthogonal gauge
-    Xr = (X @ R).astype(np.float32)
-
-    A = _provision(list(zip(labels, X)), 4, model_id="hf:m1@1.0")
-    B = _provision(list(zip(labels, Xr)), 4, model_id="hf:m2@1.0")
-    recA, recB = Reconciler(A, top_m=4), Reconciler(B, top_m=4)
-
-    for i in range(0, len(items), 7):
-        ca = recA.to_native(X[i], model_id="hf:m1@1.0")
-        cb = recB.to_native(Xr[i], model_id="hf:m2@1.0")
-        la = sorted((A.anchors[int(p)].label, round(float(w), 4)) for p, w in zip(ca.indices, ca.weights))
-        lb = sorted((B.anchors[int(p)].label, round(float(w), 4)) for p, w in zip(cb.indices, cb.weights))
-        assert la == lb
-
-
-def test_cross_model_without_crosswalk_fails_loudly():
-    aset = AnchorSet("hf:m1@1.0", D)
-    aset.add_text("a", l2norm(np.ones(D, dtype=np.float32)))
-    rec = Reconciler(aset)
-    try:
-        rec.to_native(np.ones(D, dtype=np.float32), model_id="hf:other@1.0")
-        assert False, "expected cross-walk error"
-    except ValueError as exc:
-        assert "cross-walk" in str(exc)
-
-
-def test_sparsecode_dict_roundtrip():
-    from mantle.search.anchors.reconciler import SparseCode
-
-    rng = np.random.default_rng(1)
-    items, _ = _clusters(rng, n_clusters=3, per=20)
-    aset = _provision(items, 3)
-    code = Reconciler(aset, top_m=3).to_native(items[0][1])
-    back = SparseCode.from_dict(code.to_dict())
-    assert list(back.indices) == list(code.indices)
-    assert back.anchor_ids == code.anchor_ids
-    assert back.dim == code.dim
-    assert abs(back.dot(code) - 1.0) < 1e-5  # unit-norm code, self-cosine ~ 1
 
 
 def test_store_roundtrip(anchor_repo):
@@ -156,20 +80,18 @@ def test_store_roundtrip(anchor_repo):
     assert len(loaded) == len(aset)
     assert loaded.model_id == aset.model_id
     assert loaded.dim == aset.dim
-    # a loaded anchor reconciles identically to the original
-    a = Reconciler(aset, top_m=4).to_native(items[0][1])
-    b = Reconciler(loaded, top_m=4).to_native(items[0][1])
-    assert abs(a.dot(b) - 1.0) < 1e-5
+    # The round-trip has to preserve the geometry, not merely the count: the ids ARE the cluster
+    # ids, so a set that came back with the same anchors in a different arrangement would still
+    # route every vector somewhere else.
+    for lab, vec in items[:8]:
+        before = aset.nearest(vec, k=4)
+        after = loaded.nearest(vec, k=4)
+        assert [a.anchor_id for a, _ in before] == [a.anchor_id for a, _ in after], lab
+        assert all(abs(s - t) < 1e-6 for (_, s), (_, t) in zip(before, after)), lab
 
 
 def test_require_live_anchorset_raises_when_not_provisioned(anchor_repo):
     """One path, and it cannot manufacture its own start.
-
-    This used to assert the opposite — that the first call "light-trains the set from the seed
-    corpus" — and it only passed because it monkeypatched a `bootstrap_anchorset` with a fake that
-    returned anchors. With the k-means gone there is nothing to fake: an AnchorSet that is not
-    provisioned is a provisioning failure, and the routed path must say so rather than invent cells
-    no peer shares.
     """
     from mantle.search.anchors import AnchorSetNotProvisioned
     from mantle.search.anchors import store
@@ -193,19 +115,10 @@ def test_require_live_anchorset_returns_the_provisioned_set(anchor_repo):
 
 
 def test_model_id_is_commons_format():
-    from mantle.embeddings import model_id
+    from mantle.search.embeddings import model_id
 
     mid = model_id()
     assert mid.count("@") == 1 and ":" in mid  # <ns>:<path>@<ver>
-
-
-def test_bootstrap_corpus_finds_platform_seeds():
-    from mantle import manage_anchors
-
-    corpus = manage_anchors.gather_seed_corpus()
-    # the platform seed tree has 40+ artifacts (agents, servers, tools, docs)
-    assert len(corpus) >= 20
-    assert all(text for _, text in corpus)
 
 
 # --------------------------------------------------------------------------
@@ -334,189 +247,32 @@ def test_anchor_routing_end_to_end(anchor_repo):
     assert indexer.chunks_in_cell(principal, coll, a0.anchor_id, self_request(principal, "update")) == []
 
 
-# --------------------------------------------------------------------------
-# P3 — density-zoom
-# (Manifold-structure analysis lives in the Beacon add-on, not in core.)
-# --------------------------------------------------------------------------
+# ── the anchor set is seeded, and that is enforced ──────────────────────────────────────────────
+# These guard against a lifecycle being reinstated: a clusterer added back on a fresh deployment
+# would let region ids diverge between nodes that fit different anchors from different data, and a
+# projection between spaces would let a node answer in a basis its cells were never written in.
+def test_no_module_owns_the_coordinate_system_s_lifecycle():
+    """Not "raises" — gone. A function that exists only to raise is an invitation with a docstring.
 
-
-def test_density_layer_common_vs_novel():
-    from mantle.search.anchors.anchorset import l2norm
-    from mantle.search.anchors.density import DensityZoom
-
-    rng = np.random.default_rng(2)
-    d = 16
-    base = l2norm(rng.standard_normal(d))
-    aset = AnchorSet("hf:t@1.0", d)
-    for i in range(8):
-        aset.add_text(f"a{i}", l2norm(base + 0.03 * rng.standard_normal(d)))
-    dz = DensityZoom(aset)
-
-    common = dz.layer(l2norm(base + 0.01 * rng.standard_normal(d)))   # at the cluster
-    orth = rng.standard_normal(d)
-    orth = l2norm(orth - (orth @ base) * base)                        # orthogonal → far
-    novel = dz.layer(orth)
-
-    assert common[0] == "L2"
-    assert novel[0] == "L0"
-    assert common[1] > novel[1]
-
-
-def test_density_layer_frame_invariant():
-    from mantle.search.anchors.anchorset import l2norm
-    from mantle.search.anchors.density import DensityZoom
-
-    rng = np.random.default_rng(4)
-    d = 16
-    pts = l2norm(rng.standard_normal((10, d)))
-    a = AnchorSet("hf:m1@1.0", d)
-    for i, p in enumerate(pts):
-        a.add_text(f"a{i}", p)
-    R, _ = np.linalg.qr(rng.standard_normal((d, d)))
-    b = AnchorSet("hf:m2@1.0", d)
-    for i, p in enumerate(pts):
-        b.add_text(f"a{i}", l2norm(p @ R))
-
-    q = l2norm(rng.standard_normal(d))
-    la, da = DensityZoom(a).layer(q)
-    lb, db = DensityZoom(b).layer(q @ R)
-    assert la == lb and abs(da - db) < 1e-4
-
-
-# --------------------------------------------------------------------------
-# P4 — cross-walk / AlignmentRegistry
-# --------------------------------------------------------------------------
-
-def test_crosswalk_enables_cross_model_reconcile():
-    from mantle.search.anchors.crosswalk import CrosswalkRegistry, fit_crosswalk
-
-    rng = np.random.default_rng(7)
-    d = 16
-    items = l2norm(rng.standard_normal((30, d)))        # concepts in TARGET space
-    R, _ = np.linalg.qr(rng.standard_normal((d, d)))    # SOURCE = TARGET gauge-rotated
-    items_src = l2norm(items @ R)
-
-    aset = AnchorSet("hf:target@1.0", d)
-    for i in range(6):
-        aset.add_text(f"a{i}", items[i])
-
-    reg = CrosswalkRegistry()
-    cw = reg.register(fit_crosswalk(
-        items_src, items,
-        source_model_id="hf:source@1.0", target_model_id="hf:target@1.0",
-        method="procrustes",
-    ))
-    assert cw.method == "procrustes" and cw.error_bound < 1e-3
-
-    rec_x = Reconciler(aset, top_m=4, crosswalks=reg)
-    rec_t = Reconciler(aset, top_m=4)
-    q = 10
-    code_src = rec_x.to_native(items_src[q], model_id="hf:source@1.0")
-    code_tgt = rec_t.to_native(items[q])
-    assert code_src.dot(code_tgt) > 0.99          # cross-walked code ≈ native code
-
-    # without a registry, a foreign model still fails loudly
-    try:
-        Reconciler(aset, top_m=4).to_native(items_src[q], model_id="hf:source@1.0")
-        assert False, "expected cross-walk error"
-    except ValueError as exc:
-        assert "cross-walk" in str(exc)
-
-
-def test_crosswalk_linear_cross_dimension():
-    from mantle.search.anchors.crosswalk import fit_crosswalk
-
-    rng = np.random.default_rng(2)
-    n, d_in, d_out = 60, 12, 20
-    src = l2norm(rng.standard_normal((n, d_in)))
-    M = rng.standard_normal((d_in, d_out))
-    tgt = l2norm(src @ M)
-
-    cw = fit_crosswalk(src, tgt, source_model_id="a@1", target_model_id="b@1")
-    assert cw.method == "linear" and (cw.dim_in, cw.dim_out) == (d_in, d_out)
-    assert cw.error_bound < 0.05
-
-    x = l2norm(rng.standard_normal(d_in))
-    assert float(cw.apply(x) @ l2norm(x @ M)) > 0.95
-
-
-# --------------------------------------------------------------------------
-# Anchor growth (RG-flow) — the AnchorSet grows as the manifold grows
-# --------------------------------------------------------------------------
-
-def test_propose_anchor_admits_novel_rejects_covered(anchor_repo):
-    from mantle.search.anchors import store
-    from mantle.search.anchors.anchorset import CANDIDATE
-    from mantle.search.anchors.grow import propose_anchor
-
-    d = 8
-    base = l2norm(np.eye(d)[0])
-    aset = AnchorSet("hf:t@1.0", d)
-    for i in range(5):
-        aset.add_text(f"a{i}", l2norm(base + 0.02 * np.random.default_rng(i).standard_normal(d)))
-    store.save_live_anchorset(aset)
-    before = len(store.get_live_anchorset())
-
-    # a novel (orthogonal) signal in an uncovered region → admitted as CANDIDATE
-    grown = propose_anchor("novel-concept", l2norm(np.eye(d)[4]))
-    assert grown is not None and grown.tier == CANDIDATE
-    assert len(store.get_live_anchorset()) == before + 1
-
-    # a near-duplicate of the existing cluster → already covered → rejected
-    assert propose_anchor("dup", l2norm(base + 0.001 * np.ones(d, dtype=np.float32))) is None
-    assert len(store.get_live_anchorset()) == before + 1
-
-
-def test_propose_anchor_no_anchorset_is_noop(anchor_repo):
-    from mantle.search.anchors.grow import propose_anchor
-
-    # Empty repo → no live AnchorSet → propose is a no-op.
-    assert propose_anchor("x", [0.1] * 8) is None
-
-
-# ── the anchor set is PROVISIONED, and that is enforced ─────────────────────────────────────────
-# These fail if someone reinstates a local derivation. FAILURE MODE FIRST: without them, "we removed
-# k-means" is a claim about one commit, and the next person who needs anchors on a fresh deployment
-# rebuilds the clusterer — which is precisely how the region ids diverge silently again.
-def test_the_derivation_entry_point_is_gone_entirely():
-    """Not "raises" — GONE. A function that exists only to raise is an invitation with a docstring.
-
-    The `bootstrap` module is renamed to `seed_corpus` (it gathers the corpus that gets indexed and
-    nothing more), and the module that remains must expose no way to manufacture an AnchorSet.
+    A client seeds the set; Mantle loads it and routes against it. Every name below is a way of
+    deriving, growing, reconciling or crosswalking one, and none of them resolves.
     """
+    import importlib
+
     import mantle.search.anchors as anchors_pkg
-    from mantle.search.anchors import seed_corpus
 
     assert not hasattr(anchors_pkg, "bootstrap_anchorset")
-    assert not hasattr(seed_corpus, "bootstrap_anchorset")
-    assert not hasattr(seed_corpus, "DEFAULT_K")     # the anchor count is not a knob anywhere
-    with pytest.raises(ImportError):
-        from mantle.search.anchors import bootstrap  # noqa: F401 — must not resolve
+    for gone in ("bootstrap", "seed_corpus", "grow", "reconciler", "density", "activate",
+                 "crosswalk", "crosswalk_artifact"):
+        with pytest.raises(ImportError):
+            importlib.import_module(f"mantle.search.anchors.{gone}")
+        assert not hasattr(anchors_pkg, gone), f"anchors.{gone} is re-exported"
 
 
 def test_no_clustering_remains_in_the_anchor_layer():
-    """⛔ THIS USED TO ASSERT `"KMeans" not in src` AND `"sklearn" not in src`, NEITHER OF WHICH THE
-    REMOVED CODE EVER CONTAINED.
-
-    The clusterer was a hand-rolled `def _kmeans_cosine(X, k, *, iters=25, seed=0)` built on numpy
-    alone — `git show e3a9430^:.../anchorset.py` has zero occurrences of `sklearn` or `KMeans`. So
-    both assertions were checks that could not fail against the removal they were written to guard,
-    and an earlier "proof" that this test had teeth only worked because the revert used to test it
-    seeded an `import sklearn` line that was never in the original.
-
-    It also scoped `_kmeans_cosine` to ONE of the three modules, so restoring the clusterer in
-    `seed_corpus.py` — the natural home, since that file IS the old `bootstrap.py` — passed cleanly.
-
-    Now: walk the WHOLE anchors package with the AST for any clustering-shaped definition or import.
-
-    ⚠ **Stated limit.** This matches on NAMES — definitions and imports whose identifier contains a
-    clustering word. It is a naming guard, not a structural one: `def _lloyd_fit(X, k)` containing
-    the identical iteration, or the same loop written inline inside another function, is NOT caught.
-    An earlier version of this docstring claimed it catches clustering "whatever it is built on",
-    which was an overclaim. Detecting a Lloyd iteration structurally is not something this test does;
-    what it does is make the obvious reinstatement loud, and make the package boundary explicit so a
-    new module cannot arrive outside the scan.
-    """
+    """Walks the whole anchors package with the AST for any clustering-shaped definition or
+    import, rather than checking a single module: a clusterer introduced in any file, not only
+    one expected module, would defeat a narrower guard."""
     import ast
     import importlib
     import inspect
@@ -527,18 +283,10 @@ def test_no_clustering_remains_in_the_anchor_layer():
     # AnchorSet must not regrow a fitting constructor.
     assert not hasattr(AnchorSet, "bootstrap")
 
-    # ⛔ THIS SCANNED THREE MODULES (`anchorset`, `seed_corpus`, `store`) OUT OF TEN. `grow.py` is the
-    # natural home for a reinstated derivation — it already holds `propose_anchor`, the anchor
-    # admission entry point — and it was not scanned. Walk the whole package instead, discovered
-    # rather than listed, so a NEW module cannot arrive outside the guard.
-    # ⛔ `iter_modules` SKIPS `__init__.py` AND DOES NOT RECURSE, so one file inside the boundary was
-    # outside the scan — and `__init__.py` is a perfectly ordinary place to land a helper. Include the
-    # package module itself and walk subpackages too, so "the WHOLE package" is true rather than
-    # nearly true.
     mods = [anchors_pkg]
     for m in pkgutil.walk_packages(anchors_pkg.__path__, prefix=anchors_pkg.__name__ + "."):
         mods.append(importlib.import_module(m.name))
-    assert len(mods) >= 9, f"anchor package discovery found only {[m.__name__ for m in mods]}"
+    assert len(mods) >= 5, f"anchor package discovery found only {[m.__name__ for m in mods]}"
     assert anchors_pkg in mods, "the package __init__ itself must be scanned"
 
     SHAPES = ("kmeans", "k_means", "cluster", "centroid", "medoid")
@@ -547,8 +295,8 @@ def test_no_clustering_remains_in_the_anchor_layer():
     for mod in mods:
         src = inspect.getsource(mod)
         tree = ast.parse(src)
-        # Guard the guard, at the SCAN level not per module: a re-export `__init__.py` legitimately
-        # has no definitions of its own, so requiring some in EVERY module fails on a correct file.
+        # Guard the guard, at the scan level not per module: a re-export `__init__.py` legitimately
+        # has no definitions of its own, so requiring some in every module fails on a correct file.
         # What must hold is that the scan as a whole saw real code.
         defs_seen += sum(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
                          for n in ast.walk(tree))
@@ -566,11 +314,11 @@ def test_no_clustering_remains_in_the_anchor_layer():
                 if "sklearn" in m or any(s in (m + " " + " ".join(names)).lower() for s in SHAPES):
                     offenders.append(f"{mod.__name__}: from {m} import {names}")
 
-    assert defs_seen >= 20, (
+    assert defs_seen >= 40, (
         f"the scan parsed only {defs_seen} definitions across {len(mods)} modules — too few to "
         f"believe it read the package")
     assert not offenders, (
         "clustering re-entered the anchor layer: "
         + "; ".join(offenders)
-        + " -- Anchors are PROVISIONED. A locally-derived set mints region ids no peer computes."
+        + " -- Anchors are SEEDED. A locally-derived set mints region ids no peer computes."
     )

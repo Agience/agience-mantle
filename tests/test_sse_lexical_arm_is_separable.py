@@ -1,28 +1,25 @@
-"""THE ENCRYPTED LEXICAL ARM MUST IMPORT WITHOUT THE VECTOR ARM OR KEY CUSTODY. Enforced.
+"""The encrypted lexical arm must import without pulling in the vector arm or key custody.
 
-EREA §5 (2026-07-28) is blocked on shipping `sse/` — blind tokens, encrypted posting lists, BM25 —
-as the retrieval story for an embedded store. Their alternative, `db/lattice/fts.py`, is FTS5
-*contentless* but still holds PLAINTEXT term postings, which discloses the vocabulary of every
-collection and confirms whether any given term appears. Not acceptable for customer data, and there
-is no acceptable interim: a temporary plaintext index leaks exactly what the migration prevents.
+`sse/` — blind tokens, encrypted posting lists, blind-token narrowing — is the retrieval story for an embedded
+store. It is blind: the index holds HMAC'd tokens and encrypted postings, never plaintext terms, so
+the server cannot read the vocabulary of a collection or confirm whether any given term appears in
+it — which is what makes it acceptable for customer data.
 
-Ten of the eleven `sse/` modules were already stdlib + `cryptography`. What pinned the arm
-service-side was NOT the lexical code — it was two `__init__.py` files importing eagerly:
+Most `sse/` modules depend on nothing beyond stdlib + `cryptography`. Importing the
+lexical core must not import:
 
-  * `search/mantle/__init__.py` imported `.engine`/`.indexer`/`.lightcone`/`.oracle`, so `import
-    …sse.tokenizer` executed it first and dragged in numpy, embeddings and `services`;
-  * `sse/__init__.py` imported `.router_accessor` and `.unified` — the vector-arm and custody
-    integration EREA explicitly does not want.
+  * `search/mantle/__init__.py`'s `.engine`/`.indexer`/`.lightcone`/`.oracle` — importing
+    `…sse.tokenizer` would otherwise execute it first and drag in numpy, embeddings and `services`;
+  * `sse/__init__.py`'s `.router_accessor` and `.unified` — the vector-arm and custody integration
+    a lexical-only consumer does not want.
 
-Plus one real interface leak: `indexer`/`query` typed against `OracleService` (703 lines of grant
-verifier + lattice master-key store + CRUDEASIO mint policy) for ONE method call. That is now
-`sse.keys.SseKeyProvider`.
-
-⚠ THIS RUNS IN A SUBPROCESS, AND THAT IS THE WHOLE POINT.
-In-process, `sys.modules` is already polluted by every other test in the session — `oracle` is
-certainly loaded by the time this runs. An in-process assertion would either fail spuriously or,
-worse, be written as a `sys.modules` delta that passes vacuously because the module was imported
-before the snapshot. A check that cannot fail proves nothing, so this pays for a clean interpreter.
+`indexer`/`narrowing` depend on `sse.keys.SseKeyProvider` for their one method call rather than the
+full `OracleService` (grant verifier + lattice master-key store + CRUDEASIO mint policy).
+`narrowing` additionally names one custody class — the refusal it catches, which an `except` matches
+by class object rather than by name — and it takes that class from `..custody`, a module holding
+those two names and nothing else. So the statement here is unconditional: every module in
+`LEXICAL_CORE` reaches stdlib, `cryptography`, and other `mantle` modules only. There is no
+per-module exemption list, because there is no module needing one.
 """
 from __future__ import annotations
 
@@ -34,17 +31,14 @@ import textwrap
 
 import pytest
 
-# ⚠ DEPTH FIXED 2026-07-31: the suite moved from `src/mantle/tests/` to `<repo>/tests/`, so the
-# package is reached from the repo root now, not from a parent. Both of these failed with a
-# FileNotFoundError naming the wrong path — loud, which is the right way for a path bug to fail.
 SRC = str(pathlib.Path(__file__).resolve().parents[1] / "src")   # …/agience-mantle/src
 
 # The modules an embedding consumer takes. `router_accessor` and `unified` are deliberately absent —
-# they ARE the vector-arm/custody integration, and EREA does not want them ("a data store does no
-# reasoning").
+# they ARE the vector-arm/custody integration, and a lexical-only consumer does not want them ("a
+# data store does no reasoning").
 LEXICAL_CORE = [
-    "keys", "tokenizer", "blind_tokens", "posting", "scorer", "stats", "s3_stores",
-    "indexer", "query",
+    "keys", "tokenizer", "blind_tokens", "posting", "s3_stores", "file_stores",
+    "indexer", "narrowing",
 ]
 
 # cryptography drags its own C extension in; that is the one declared dependency.
@@ -52,7 +46,7 @@ ALLOWED_ROOTS = {"cryptography", "_cffi_backend", "_openssl", "cffi", "pycparser
 
 
 def _run(body: str, *, service_path: bool = False) -> subprocess.CompletedProcess:
-    """Execute `body` in a CLEAN interpreter with only <mantle>/src importable.
+    """Execute `body` in a clean interpreter with only <mantle>/src importable.
 
     `service_path=True` additionally puts `<mantle>/src/mantle` on the path — required to import
     `oracle`, which does `from services.acting_principal import …`. That absolute intra-package
@@ -70,12 +64,9 @@ def _run(body: str, *, service_path: bool = False) -> subprocess.CompletedProces
 
 
 def test_lexical_core_imports_without_oracle_engine_or_embeddings():
-    # ⚠ DEDENT THE TEMPLATE BEFORE SUBSTITUTING. The interpolated import block is multi-line and
-    # lands at column 0, so a post-substitution `dedent` finds no common prefix and strips nothing —
-    # the surviving indentation is then an IndentationError in the child.
     template = textwrap.dedent("""
         import sys
-        # BASELINE FIRST. Measuring all of sys.modules would count interpreter-startup noise —
+        # Baseline first: measuring all of sys.modules would count interpreter-startup noise —
         # editable-install .pth finders, _distutils_hack, pywin32 — which this code never imports.
         _base = set(sys.modules)
         %s
@@ -98,17 +89,40 @@ def test_lexical_core_imports_without_oracle_engine_or_embeddings():
     assert "ROOTS=[]" in r.stdout, (
         "the lexical arm gained a third-party dependency beyond cryptography:\n" + r.stdout)
 
+    # Each module measured ALONE as well as together: importing the set at once lets one clean
+    # module's dependency-free reading be produced by another having already loaded what it
+    # needed. Per-module is the reading that would catch a single new edge.
+    for module in LEXICAL_CORE:
+        r = _run(template % ("import mantle.search.mantle.sse.%s" % module, ALLOWED_ROOTS))
+        assert r.returncode == 0, (
+            "sse/%s.py does not import on a bare <mantle>/src path:\n" % module + r.stderr)
+        assert "FORBIDDEN=[]" in r.stdout, (
+            "sse/%s.py reaches a custody or vector-arm module:\n%s" % (module, r.stdout))
+        assert "ROOTS=[]" in r.stdout, (
+            "sse/%s.py gained a third-party dependency beyond cryptography:\n" % module
+            + r.stdout)
 
-def test_the_key_contract_file_is_stdlib_only():
-    """`sse/keys.py` decides whether the arm can travel, so it takes nothing — not `cryptography`,
-    not a sibling package.
 
-    ⚠ CHECKED BY AST, NOT BY IMPORTING IT. Importing `…sse.keys` runs `sse/__init__.py`, which
-    eagerly imports the other lexical modules — and those legitimately use `cryptography`. A runtime
-    `sys.modules` check would therefore measure the PACKAGE, not this file, and report a dependency
-    `keys.py` does not have. The file's own import list is the thing under test."""
+#: The two files that exist to BE a seam, and so may not carry one themselves. `sse/keys.py` is
+#: the key contract; `search/mantle/custody.py` is the refusal vocabulary the custodian raises and
+#: the arm catches. A dependency in either is a dependency in everything on both sides of it.
+_SEAM_FILES = (
+    ("mantle", "search", "mantle", "sse", "keys.py"),
+    ("mantle", "search", "mantle", "custody.py"),
+)
+
+
+@pytest.mark.parametrize("parts", _SEAM_FILES, ids=lambda p: p[-1])
+def test_the_seam_files_are_stdlib_only(parts):
+    """A seam file decides whether the arm can travel, so it takes nothing — not `cryptography`,
+    not a sibling package. The file's own import list is the thing under test.
+
+    `custody.py` is held to this because it is what makes the arm's one custody name free: the
+    whole point of moving the refusals out of `oracle` is that catching them costs no dependency,
+    and an import added here would silently reintroduce exactly the coupling it removed.
+    """
     import ast
-    src = pathlib.Path(SRC) / "mantle" / "search" / "mantle" / "sse" / "keys.py"
+    src = pathlib.Path(SRC).joinpath(*parts)
     tree = ast.parse(src.read_text(encoding="utf-8"), filename=str(src))
     roots = set()
     for node in ast.walk(tree):
@@ -116,38 +130,70 @@ def test_the_key_contract_file_is_stdlib_only():
             roots |= {a.name.split(".")[0] for a in node.names}
         elif isinstance(node, ast.ImportFrom) and not node.level:
             roots.add((node.module or "").split(".")[0])
+        elif isinstance(node, ast.ImportFrom) and node.level:
+            roots.add("<relative:%s>" % (node.module or ""))
     external = sorted(roots - set(sys.stdlib_module_names) - {""})
     assert external == [], (
-        "sse/keys.py must stay stdlib-only — it is the file that decides whether the lexical arm "
-        "can be extracted. Found: %s" % external)
+        "%s must stay stdlib-only — it is a file that decides whether the lexical arm can be "
+        "extracted. Found: %s" % ("/".join(parts), external))
 
 
 def test_master_key_exceptions_are_one_class_not_two():
-    """`oracle` RE-EXPORTS the contract's exceptions; it must never redefine them.
+    """`custody` defines the refusals once; every consumer catches that same class OBJECT.
 
-    `pipeline_unified.py` and `test_key_custody_bypasses.py` both `except MasterKeyMissing` off the
-    oracle path while `query.py` raises through the contract path. Two same-named classes would stop
-    matching each other — silently, and only on the failure path, which is the worst place to find
-    out."""
+    `pipeline_unified.py` and `test_key_custody_bypasses.py` both `except MasterKeyMissing`, and
+    `sse/narrowing.py` catches it around the provider call that raises it. Two same-named classes would
+    stop matching each other — silently, and only on the failure path, which is the worst place to
+    find out. Identity is therefore the assertion, and a sweep of every loaded module is what
+    turns "one definition" into a measurement rather than a claim.
+
+    The definitions live in `search/mantle/custody.py`, which imports nothing, rather than in
+    `oracle` beside the raises. Both give one class object per name; only the first lets the
+    lexical arm name the class without importing the custodian, which is why `HOME` is asserted
+    and not merely `SAME` — `oracle` re-exports these, so identity alone would still hold if they
+    moved back."""
     r = _run("""
-        from mantle.search.mantle.oracle import MasterKeyMissing as O, MasterKeyUnavailable as OU
-        from mantle.search.mantle.sse.keys import MasterKeyMissing as K, MasterKeyUnavailable as KU
-        from mantle.search.mantle.sse.query import MasterKeyMissing as Q
-        print("SAME=%s" % ((O is K) and (OU is KU) and (Q is K)))
-        print("HIER=%s" % (issubclass(K, KU) and issubclass(KU, RuntimeError)))
+        import sys
+        import mantle.search.mantle.custody as C
+        import mantle.search.mantle.oracle as O
+        import mantle.search.mantle.sse.narrowing as N
+        print("SAME=%s" % (N.MasterKeyMissing is O.MasterKeyMissing is C.MasterKeyMissing))
+        print("HOME=%s" % (C.MasterKeyMissing.__module__,))
+        print("HIER=%s" % (issubclass(O.MasterKeyMissing, O.MasterKeyUnavailable)
+                           and issubclass(O.MasterKeyUnavailable, RuntimeError)))
+        # Any module holding a DIFFERENT object under either name is a second definition.
+        dupes = sorted(
+            name for name, mod in list(sys.modules.items())
+            if mod is not None and any(
+                getattr(mod, attr, klass) is not klass
+                for attr, klass in (("MasterKeyMissing", O.MasterKeyMissing),
+                                    ("MasterKeyUnavailable", O.MasterKeyUnavailable))
+            )
+        )
+        print("DUPES=%s" % dupes)
     """, service_path=True)
     assert r.returncode == 0, r.stderr
-    assert "SAME=True" in r.stdout, "MasterKeyMissing was redefined, not re-exported:\n" + r.stdout
+    assert "SAME=True" in r.stdout, "MasterKeyMissing was redefined, not imported:\n" + r.stdout
+    assert "HOME=mantle.search.mantle.custody" in r.stdout, (
+        "the refusals moved back into a module that carries other things; the lexical arm has to "
+        "import whatever that module imports in order to catch them:\n" + r.stdout)
     assert "HIER=True" in r.stdout, "the exception hierarchy changed:\n" + r.stdout
+    assert "DUPES=[]" in r.stdout, (
+        "a second class object is live under one of these names:\n" + r.stdout)
+
+    # The ingest catcher, in this interpreter: it must catch what the oracle raises.
+    from mantle.search.ingest import pipeline_unified
+    from mantle.search.mantle import oracle
+
+    assert pipeline_unified.MasterKeyMissing is oracle.MasterKeyMissing
 
 
 def test_the_lazy_init_still_exports_the_entangled_names():
-    """Making `router_accessor`/`unified` lazy must not remove them from the public API — several
-    call sites do `from search.mantle.sse import MantleUnifiedAccessor`."""
+    """Making `router_accessor` lazy must not remove it from the public API — several call sites
+    do `from search.mantle.sse import MantleSseSearchAccessor`."""
     r = _run("""
         import mantle.search.mantle.sse as sse
-        names = ["MantleSseSearchAccessor", "MantleUnifiedAccessor", "HitSource", "UnifiedHit",
-                 "SseIndexer", "SseQueryEngine"]
+        names = ["MantleSseSearchAccessor", "SseIndexer", "TokenNarrower", "Coverage"]
         print("MISSING=%s" % [n for n in names if not hasattr(sse, n)])
         import mantle.search.mantle as sm
         top = ["OracleService", "KeyRequest", "KeyPurpose", "GrantDenied", "GrantVerifier",

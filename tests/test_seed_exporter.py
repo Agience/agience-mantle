@@ -196,18 +196,3 @@ async def test_dispatch_export_raises_without_collection_id():
         await exporter.dispatch_export({}, {}, ctx)
 
 
-# ⛔ `test_export_operation_resolves_via_native_target` DELETED 2026-07-29 (Contract Builder).
-# It imported `mantle.services.handler_registry.get_native_target`, and that module is **absent from the
-# tree** (verified: the file does not exist, and the only remaining mentions are this repo's CLAUDE.md,
-# two quarantine lists, and the already-ignored `test_search_as_artifact_smoke.py`). It could not run —
-# the same shape as `test_edge_upsert.py`, deleted for testing `db.arcade` after that module ceased to
-# exist. It surfaced during the §13.21 triage: with the seeds/types tree wired up it was 1 of 15
-# failures, and the only one that was simply dead rather than drifted.
-#
-# ⚠ WHAT IT PROVED, RECORDED RATHER THAN QUIETLY DROPPED (the `RETIRED-lexical-e2e` precedent): *"The
-# collection type's `export` op must point at a target the native handler can resolve — proving the
-# type.json wiring is live, not just the code."* That was a real end-to-end claim about the type
-# definition matching the implementation, and **nothing asserts it now.** It cannot be rewritten here
-# because the resolution mechanism it went through no longer exists; re-establishing it needs whatever
-# replaced `handler_registry` (op-dispatch moved to the gateway in Phase 2b — see the note in
-# `conftest.py`), so it belongs with that owner. Its assertion was deliberately NOT guessed.

@@ -140,7 +140,7 @@ class TestAuthGuards:
 class TestCreateArtifact:
     @pytest.mark.asyncio
     async def test_create_top_level_artifact(self, client: AsyncClient):
-        # No container_id -> top-level artifact (subsumes the old /containers path).
+        # No container_id -> top-level artifact.
         ws = CollectionEntity(
             id="ws-1", name="My WS", created_by="user-123",
             content_type=WORKSPACE_CONTENT_TYPE, context="",
@@ -383,6 +383,49 @@ class TestUpdateArtifact:
         assert r.json()["name"] == "Renamed"
 
     @pytest.mark.asyncio
+    async def test_update_top_level_artifact_forwards_content(self, client: AsyncClient):
+        """A top-level artifact's new BODY reaches the service, rather than being dropped.
+
+        The branch above it routes anything with no `collection_id` to `update_workspace`, and
+        it used to forward only name/description/context/vector. Every artifact created without
+        a `container_id` is top-level AND content-bearing (`create_container` takes `content`),
+        so `PATCH {"content": ...}` on a note, a transcript or a captured file returned 200 and
+        changed nothing at all -- no error to notice, the old body still indexed and still what
+        `recall` answered with.
+
+        Asserting the forwarded ARGUMENT is the point. The sibling test above patches the same
+        function and asserts only that it was called, which a router dropping the one field
+        under test passes just as happily.
+        """
+        store = MagicMock()
+        _patch_db_collection(store, container_doc=_coll_doc(WORKSPACE_CONTENT_TYPE))
+        from mantle.services.dependencies import get_store_db
+
+        app.dependency_overrides[get_store_db] = lambda: store
+        updated = CollectionEntity(
+            id="container-1",
+            name="Container",
+            created_by="user-123",
+            content_type=WORKSPACE_CONTENT_TYPE,
+            context="",
+            content="rewritten body",
+        )
+        try:
+            with patch(
+                "mantle.services.workspace_service.update_workspace", return_value=updated
+            ) as upd:
+                r = await client.patch(
+                    "/artifacts/container-1",
+                    json={"content": "rewritten body"},
+                )
+        finally:
+            app.dependency_overrides.pop(get_store_db, None)
+        assert r.status_code == 200
+        upd.assert_called_once()
+        assert upd.call_args.kwargs["content"] == "rewritten body"
+        assert r.json()["content"] == "rewritten body"
+
+    @pytest.mark.asyncio
     async def test_update_artifact_routes_to_workspace_service(
         self, client: AsyncClient
     ):
@@ -420,8 +463,8 @@ class TestUpdateArtifact:
     ):
         """Artifacts created via the type picker have a top-level content_type
         (e.g. text/markdown). PATCH must still route to the artifact update
-        path, not the container update path. Regression test for the bug where
-        _is_collection returned True for any non-None content_type."""
+        path, not the container update path — `_is_collection` must not treat
+        any non-None content_type as a container."""
         store = MagicMock()
 
         # Artifact with a content_type that is NOT a container type.
@@ -506,6 +549,25 @@ class TestDeleteArtifact:
         assert r.status_code == 200
         assert r.json() == {"id": "art-1", "deleted": True}
         deleted.assert_called_once()
+        assert deleted.call_args.kwargs["cascade"] is False, (
+            "cascade must default to False when the query param is omitted"
+        )
+
+    @pytest.mark.asyncio
+    async def test_delete_forwards_cascade_true_from_the_query_string(self, client: AsyncClient):
+        store = MagicMock()
+        _patch_db_collection(store, artifact_doc=_artifact_doc())
+        from mantle.services.dependencies import get_store_db
+
+        app.dependency_overrides[get_store_db] = lambda: store
+        try:
+            with patch("mantle.services.workspace_service.delete_artifact") as deleted:
+                r = await client.delete("/artifacts/art-1?cascade=true")
+        finally:
+            app.dependency_overrides.pop(get_store_db, None)
+
+        assert r.status_code == 200
+        assert deleted.call_args.kwargs["cascade"] is True
 
     @pytest.mark.asyncio
     async def test_delete_404_when_missing(self, client: AsyncClient):
@@ -519,6 +581,82 @@ class TestDeleteArtifact:
         finally:
             app.dependency_overrides.pop(get_store_db, None)
         assert r.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_a_top_level_artifact_deletes_and_then_reads_404(self, client: AsyncClient):
+        """Omitting `container_id` on create is the documented way to make a top-level
+        artifact, and such an artifact carries no `collection_id`. Deleting one takes the
+        container primitive — `delete_workspace`, which cleans up members, edges and index
+        docs — rather than `delete_artifact`, which refuses a blank containing collection.
+
+        The read afterwards is the half that matters: a 200 that left the row in place
+        would be a delete that reports success and erases nothing.
+        """
+        from mantle.services.dependencies import get_store_db
+
+        top_level = {
+            "_key": "top-1",
+            "id": "top-1",
+            "root_id": "top-1",
+            "collection_id": "",
+            "context": "{}",
+            "content": "",
+            "state": "draft",
+            "created_by": "user-123",
+        }
+        docs = {"top-1": top_level}
+        store = MagicMock()
+        store.artifacts.get_artifact.side_effect = lambda key: docs.get(key)
+        store.artifacts.versions_of.side_effect = lambda root: [
+            d for d in docs.values() if d.get("root_id") == root
+        ]
+        store.graph.edges_of.side_effect = lambda node, **kw: []
+
+        app.dependency_overrides[get_store_db] = lambda: store
+        try:
+            with patch("mantle.services.workspace_service.delete_workspace") as dropped:
+                dropped.side_effect = lambda db, user_id, workspace_id, **_kw: docs.pop(
+                    workspace_id, None)
+                r = await client.delete("/artifacts/top-1")
+                assert r.status_code == 200, r.text
+                assert r.json() == {"id": "top-1", "deleted": True}
+                dropped.assert_called_once()
+                # The container primitive, not the one that needs a parent collection id.
+                assert dropped.call_args.args[2] == "top-1"
+
+            after = await client.get("/artifacts/top-1")
+        finally:
+            app.dependency_overrides.pop(get_store_db, None)
+
+        assert after.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_delete_does_not_pass_a_blank_collection_id_to_the_service(
+        self, client: AsyncClient
+    ):
+        """`workspace_service.delete_artifact` is keyed on the containing collection for both
+        its S3 arm and its index arm and raises without one, so the top-level branch must not
+        reach it at all."""
+        from mantle.services.dependencies import get_store_db
+
+        store = MagicMock()
+        _patch_db_collection(store, artifact_doc={
+            "_key": "top-2", "id": "top-2", "root_id": "top-2",
+            "collection_id": "", "context": "{}", "content": "", "state": "draft",
+        })
+
+        app.dependency_overrides[get_store_db] = lambda: store
+        try:
+            with (
+                patch("mantle.services.workspace_service.delete_workspace"),
+                patch("mantle.services.workspace_service.delete_artifact") as per_member,
+            ):
+                r = await client.delete("/artifacts/top-2")
+        finally:
+            app.dependency_overrides.pop(get_store_db, None)
+
+        assert r.status_code == 200
+        per_member.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -660,19 +798,11 @@ class TestBatchFetch:
         assert len(out) == 1
         assert out[0]["id"] == "ws-1"
         assert out[0]["root_id"] == "ws-1"
-        # Content defaults to "" for containers (normalization no longer
-        # synthesizes content from description).
+        # Content defaults to "" for containers (normalization does not
+        # synthesize content from description).
         assert out[0]["content"] == ""
         # Context defaults to "" when not set (no type-specific synthesis).
         assert out[0]["context"] == ""
-
-
-# ---------------------------------------------------------------------------
-# POST /artifacts/{container_id}/op/commit + /op/commit_preview
-# Commit and preview are now dispatched via the operation dispatcher
-# through type.json operations blocks on the workspace type.
-# ---------------------------------------------------------------------------
-
 
 
 # ---------------------------------------------------------------------------
@@ -698,7 +828,7 @@ class TestReorder:
 
     @pytest.mark.asyncio
     async def test_works_on_any_container(self, client: AsyncClient):
-        # P2 — any artifact with edges can be reordered, not just workspaces.
+        # Any artifact with edges can be reordered, not just workspaces.
         store = MagicMock()
         _patch_db_collection(store, container_doc=_coll_doc("application/json"))
         from mantle.services.dependencies import get_store_db
@@ -751,9 +881,8 @@ class TestContentUrl:
 
     @pytest.mark.asyncio
     async def test_happy_path_returns_proxied_content_url(self, client: AsyncClient):
-        # content-url no longer hands out a presigned S3 URL (storage is invisible to
-        # callers + holds only ciphertext). It points at Mantle's proxied content
-        # endpoint, which decrypts on the byte path.
+        # content-url points at Mantle's proxied content endpoint, which decrypts on
+        # the byte path — storage is invisible to callers and holds only ciphertext.
         store = MagicMock()
         _patch_db_collection(
             store,
@@ -868,21 +997,15 @@ class TestListCommits:
 # ---------------------------------------------------------------------------
 # Revert / Move / Upload-status / Multipart-part-url
 #
-# Regression cluster: these four endpoints all share the same "find the
-# artifact, look up its container" pattern. Pre-fix they checked
-# `source != "workspace"` against a tuple where source is always "artifacts",
-# so every call returned 404 — and even if that passed, they read
-# `workspace_id` instead of the unified-store `collection_id` field.
-# These tests lock down the post-fix behavior so the regression cannot
-# return.
+# These four endpoints all share the same "find the artifact, look up its
+# container" pattern, and read the unified-store `collection_id` field to do
+# it.
 # ---------------------------------------------------------------------------
 
 
 class TestRevertArtifact:
-    """Phase D.1: revert is a dedicated `POST /artifacts/{id}/revert` route.
-
-    The legacy `op/revert` dispatch still works for any caller that hasn't
-    migrated, but the dedicated route is the canonical path going forward.
+    """Revert is a dedicated `POST /artifacts/{id}/revert` route, the canonical
+    path; the `op/revert` dispatch route also still works.
     """
 
     @pytest.mark.asyncio
@@ -1051,19 +1174,18 @@ class TestMultipartPartUrl:
 class TestSearchArtifacts:
     @pytest.mark.asyncio
     async def test_400_on_empty_query(self, client: AsyncClient):
-        r = await client.post("/artifacts/search", json={"query_text": "   "})
+        r = await client.post("/artifacts/recall", json={"query_text": "   "})
         assert r.status_code == 400
 
     @pytest.mark.asyncio
     async def test_unauthenticated_search_returns_401(self, anon_client: AsyncClient):
-        r = await anon_client.post("/artifacts/search", json={"query_text": "x"})
+        r = await anon_client.post("/artifacts/recall", json={"query_text": "x"})
         assert r.status_code == 401
 
     @pytest.mark.asyncio
     async def test_happy_path_returns_hits(self, client: AsyncClient):
-        """Search endpoint goes through MantleSseSearchAccessor after
-        the lexical-backend retirement (Step 2.6.9). Patch the wiring builder to
-        return a stub accessor with a canned result."""
+        """Search endpoint goes through MantleSseSearchAccessor. Patch the wiring
+        builder to return a stub accessor with a canned result."""
         accessor_result = SimpleNamespace(
             hits=[
                 SimpleNamespace(
@@ -1082,8 +1204,9 @@ class TestSearchArtifacts:
             ],
             total=1,
             parsed_query="x",
+            applied_filters=[],
             corrections=[],
-            used_hybrid=True,
+            ordering="semantic",
         )
         fake_accessor = SimpleNamespace(search=lambda query: accessor_result)
         with patch(
@@ -1091,41 +1214,147 @@ class TestSearchArtifacts:
             return_value=fake_accessor,
         ):
             r = await client.post(
-                "/artifacts/search",
+                "/artifacts/recall",
                 json={"query_text": "x", "size": 10},
             )
         assert r.status_code == 200
         body = r.json()
         assert body["total"] == 1
         assert body["hits"][0]["id"] == "a-1"
-        assert body["used_hybrid"] is True
+        assert body["ordering"] == "semantic"
+        assert body["hits"][0]["score"] == 1.5
         assert body["from"] == 0
 
     @pytest.mark.asyncio
     async def test_503_when_sse_prereqs_missing(self, client: AsyncClient):
         """When SSE prerequisites aren't met (no S3, no Oracle), the search
-        endpoint returns 503 — there's no plaintext fallback after
-        the lexical-backend retirement."""
+        endpoint returns 503 — there's no plaintext fallback."""
         with patch(
             "mantle.search.mantle.wiring.build_sse_search_accessor",
             return_value=None,
         ):
             r = await client.post(
-                "/artifacts/search",
+                "/artifacts/recall",
                 json={"query_text": "x", "size": 10},
             )
         assert r.status_code == 503
 
     @pytest.mark.asyncio
     async def test_caller_supplied_embedding_is_rejected(self, client: AsyncClient):
-        """FAILURE MODE: before 2026-07-30 this returned 200 and threaded the caller's
-        raw vector to the accessor as `query.query_embedding` — lighting the vector arm
-        with no provider configured. A caller-supplied vector is trained-model output,
-        i.e. BYOK, which the no-models rule bans universally. Posting one must now be
-        an ordinary missing-query_text 400, and `embedding` must be an unknown field."""
+        """`embedding` is not the ingress and never was — `vector` + `space_id` is.
+
+        A bare list of floats under a name nothing reads is a request with nothing to
+        rank on, so it is an ordinary 400. The distinction is not decorative: the arm
+        needs the space name to know what the numbers are comparable to, and a field
+        that carried numbers without one would be exactly the unusable vector
+        `api/vectors.py` refuses.
+        """
         r = await client.post(
-            "/artifacts/search",
+            "/artifacts/recall",
             json={"embedding": [0.1, 0.2, 0.3], "size": 5},
+        )
+        assert r.status_code == 400
+
+    @pytest.fixture()
+    def seeded_space(self):
+        """A node that HAS an AnchorSet, in `space-a`, three-dimensional.
+
+        The two tests below are about the vector reaching the arm, and a vector only reaches
+        the arm on a node that ranks in some space: `api/vectors.project_to_anchor_space`
+        refuses a query vector when no AnchorSet is seeded, because there is nowhere to place
+        it and the alternative is a recency-ordered dump the caller cannot tell from a ranking.
+        Seeding here keeps these tests about their own subject.
+        `tests/test_recall_vector_without_anchorset.py` covers the unseeded node.
+        """
+        import numpy as np
+        from mantle.search.anchors import store as _anchor_store
+        from mantle.search.anchors.anchorset import Anchor
+        from mantle.search.anchors.repo import InMemoryAnchorRepo
+
+        repo = InMemoryAnchorRepo()
+        rng = np.random.default_rng(11)
+        repo.bulk_add([
+            Anchor.make(f"a{i}", rng.standard_normal(3).astype("float32"), "space-a")
+            for i in range(3)
+        ])
+        _anchor_store.set_anchor_repo(repo)
+        try:
+            yield repo
+        finally:
+            _anchor_store.set_anchor_repo(None)
+
+    @pytest.mark.asyncio
+    async def test_a_query_vector_reaches_the_accessor(self, client: AsyncClient, seeded_space):
+        """The reader's vector arrives at the vector arm — the whole point of the field."""
+        captured = {}
+
+        def _search(query):
+            captured["embedding"] = query.query_embedding
+            return SimpleNamespace(hits=[], total=0, parsed_query="", applied_filters=[],
+                                   corrections=[], ordering="recency")
+
+        with patch(
+            "mantle.search.mantle.wiring.build_sse_search_accessor",
+            return_value=SimpleNamespace(search=_search),
+        ):
+            r = await client.post(
+                "/artifacts/recall",
+                json={"query_text": "x", "vector": [0.1, 0.2, 0.3],
+                      "space_id": "space-a", "size": 5},
+            )
+        assert r.status_code == 200
+        assert captured["embedding"] == [0.1, 0.2, 0.3]
+
+    @pytest.mark.asyncio
+    async def test_a_vector_alone_is_a_complete_query(self, client: AsyncClient, seeded_space):
+        """kNN with no text is a real request, not a missing-query_text 400."""
+        captured = {}
+
+        def _search(query):
+            captured["embedding"] = query.query_embedding
+            captured["text"] = query.query_text
+            return SimpleNamespace(hits=[], total=0, parsed_query="", applied_filters=[],
+                                   corrections=[], ordering="recency")
+
+        with patch(
+            "mantle.search.mantle.wiring.build_sse_search_accessor",
+            return_value=SimpleNamespace(search=_search),
+        ):
+            r = await client.post(
+                "/artifacts/recall",
+                json={"vector": [0.1, 0.2, 0.3], "space_id": "space-a", "size": 5},
+            )
+        assert r.status_code == 200
+        assert captured["embedding"] == [0.1, 0.2, 0.3]
+        assert captured["text"] == ""
+
+    @pytest.mark.asyncio
+    async def test_a_query_vector_without_a_space_id_is_a_400(self, client: AsyncClient):
+        """Same rule as the write: numbers with no space name are not comparable to anything."""
+        r = await client.post(
+            "/artifacts/recall",
+            json={"query_text": "x", "vector": [0.1, 0.2, 0.3], "size": 5},
+        )
+        assert r.status_code == 400
+        assert "space_id" in r.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_a_space_id_without_a_vector_is_a_400(self, client: AsyncClient):
+        r = await client.post(
+            "/artifacts/recall",
+            json={"query_text": "x", "space_id": "space-a", "size": 5},
+        )
+        assert r.status_code == 400
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", [[], [0.0, 0.0]])
+    async def test_a_malformed_query_vector_fails_the_writer_s_way(
+        self, client: AsyncClient, bad,
+    ):
+        """No components and no direction are the writer's two shape refusals, verbatim."""
+        r = await client.post(
+            "/artifacts/recall",
+            json={"query_text": "x", "vector": bad, "space_id": "space-a", "size": 5},
         )
         assert r.status_code == 400
 
@@ -1136,14 +1365,15 @@ class TestSearchArtifacts:
 
         def _search(query):
             captured["embedding"] = query.query_embedding
-            return SimpleNamespace(hits=[], total=0, parsed_query="", corrections=[], used_hybrid=True)
+            return SimpleNamespace(hits=[], total=0, parsed_query="", applied_filters=[],
+                                   corrections=[], ordering="semantic")
 
         with patch(
             "mantle.search.mantle.wiring.build_sse_search_accessor",
             return_value=SimpleNamespace(search=_search),
         ):
             r = await client.post(
-                "/artifacts/search",
+                "/artifacts/recall",
                 json={"query_text": "x", "embedding": [0.1, 0.2], "size": 5},
             )
         assert r.status_code == 200
@@ -1151,7 +1381,7 @@ class TestSearchArtifacts:
 
     @pytest.mark.asyncio
     async def test_400_when_neither_query_text_nor_embedding(self, client: AsyncClient):
-        r = await client.post("/artifacts/search", json={"size": 5})
+        r = await client.post("/artifacts/recall", json={"size": 5})
         assert r.status_code == 400
 
 
@@ -1188,11 +1418,8 @@ class TestListVisibleActionFilter:
     async def test_action_create_filters_to_addable_collections(self, client: AsyncClient):
         _FakeResolver.seen_actions = []
         with patch("mantle.search.mantle.lightcone.LightConeResolver", _FakeResolver), patch(
-            "mantle.routers.artifacts_router._find_artifact",
-            side_effect=lambda db, aid: {"_key": aid, "id": aid},
-        ), patch(
-            "mantle.routers.artifacts_router._normalize_artifact_doc",
-            side_effect=lambda d: {"id": d["id"]},
+            "mantle.routers.artifacts_router._hydrate_batch",
+            side_effect=lambda db, ids: {aid: {"id": aid} for aid in ids},
         ):
             r = await client.get("/artifacts/visible?action=create")
         assert r.status_code == 200
@@ -1208,11 +1435,8 @@ class TestListVisibleActionFilter:
     async def test_default_action_is_read(self, client: AsyncClient):
         _FakeResolver.seen_actions = []
         with patch("mantle.search.mantle.lightcone.LightConeResolver", _FakeResolver), patch(
-            "mantle.routers.artifacts_router._find_artifact",
-            side_effect=lambda db, aid: {"_key": aid, "id": aid},
-        ), patch(
-            "mantle.routers.artifacts_router._normalize_artifact_doc",
-            side_effect=lambda d: {"id": d["id"]},
+            "mantle.routers.artifacts_router._hydrate_batch",
+            side_effect=lambda db, ids: {aid: {"id": aid} for aid in ids},
         ):
             r = await client.get("/artifacts/visible")
         assert r.status_code == 200
@@ -1229,13 +1453,13 @@ class TestListVisibleActionFilter:
 
 
 class TestEmbeddingEndpoint:
-    """Both endpoints were REMOVED 2026-07-30 under the no-models rule.
+    """Neither endpoint exists, under the no-models rule.
 
-    FAILURE MODE: before removal, `GET /artifacts/{id}/embedding` served stored bge-m3
-    vectors ("raw vectors out, no text") and `POST /artifacts/activate` accepted a
-    caller-supplied carrier vector and echoed it back. Both are embed/score-as-a-service,
-    which the standing ruling on `/coherence` and `/embed` says to remove entirely rather
-    than 501 — "an observer does not offer 'embed this' or 'score this' as a service."
+    `GET /artifacts/{id}/embedding` would serve stored bge-m3 vectors ("raw vectors out, no text")
+    and `POST /artifacts/activate` would accept a caller-supplied carrier vector and echo it back.
+    Both are embed/score-as-a-service, which the standing ruling on `/coherence` and `/embed` says
+    to remove entirely rather than answer 501 — "an observer does not offer 'embed this' or 'score
+    this' as a service."
     """
 
     @pytest.mark.asyncio

@@ -122,7 +122,7 @@ def second_issuer(operator_api) -> SelfSignedIssuer:
         "namespace": iss.namespace,
         "role": "external",
     }
-    r = operator_api.post("/issuers", on="mantle", json=body)
+    r = operator_api.post("/system/issuers", on="mantle", json=body)
     if r.status_code not in (200, 201):
-        pytest.skip(f"could not register second issuer (POST /issuers -> {r.status_code}: {r.text[:200]})")
+        pytest.skip(f"could not register second issuer (POST /system/issuers -> {r.status_code}: {r.text[:200]})")
     return iss

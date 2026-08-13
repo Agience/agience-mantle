@@ -99,22 +99,26 @@ class TestQueryParser:
         phrase_terms = [t for t in result.terms if t.is_phrase]
         assert len(phrase_terms) >= 1
     
-    def test_hybrid_auto_detection(self):
-        """Test automatic hybrid search detection."""
-        parser = QueryParser()
-        
-        # BM25 only by default
-        result_plain = parser.parse("simple query")
-        assert not result_plain.should_use_hybrid()
-        
-        # Hybrid with semantic modifier
-        result_semantic = parser.parse("~semantic query")
-        assert result_semantic.should_use_hybrid()
-        
-        # Hybrid with explicit control
-        result_control = parser.parse("query @hybrid:on")
-        assert result_control.should_use_hybrid()
-    
+    def test_there_is_no_query_side_hybrid_predicate(self):
+        """Gone, not returning False. A predicate that exists is one a caller can believe.
+
+        Nothing in a query string decides whether the semantic arm runs: the arm needs a query
+        vector on the request and a provisioned AnchorSet on the node. A `should_use_hybrid`
+        that answered from `@hybrid:` or `~` would be reporting an opinion no retrieval step
+        consults, and `@hybrid:on` read as a working switch for exactly that reason.
+
+        `@hybrid:` still PARSES, like any `@name:value` — `test_parse_control_params` covers
+        that, and lifting it out of the term stream is why it does not become a search term.
+        Parsing it is not the same as acting on it, and only the second was ever claimed here.
+        """
+        from mantle.search.query_parser import ParsedQuery
+
+        assert not hasattr(ParsedQuery, "should_use_hybrid")
+        parsed = QueryParser().parse("query @hybrid:on")
+        assert parsed.controls.get("hybrid") == "on"      # parsed, and inert
+        assert [t.text for t in parsed.terms] == ["query"]
+
+
     def test_empty_query(self):
         """Test empty query parsing."""
         parser = QueryParser()
@@ -152,8 +156,9 @@ class TestSearchEndpoints:
             hits=[hit],
             total=1,
             parsed_query="parsed",
+            applied_filters=[],
             corrections=[],
-            used_hybrid=True,
+            ordering="semantic",
         )
 
     @pytest.mark.asyncio
@@ -163,7 +168,7 @@ class TestSearchEndpoints:
         MockAccessor.return_value.search.return_value = self._fake_result(collection_id="col-9")
 
         resp = await client.post(
-            "/artifacts/search",
+            "/artifacts/recall",
             headers={"Authorization": "Bearer fake-token"},
             json={"query_text": "docs", "scope": ["col-9"]},
         )
@@ -177,7 +182,7 @@ class TestSearchEndpoints:
         MockAccessor.return_value.search.return_value = self._fake_result(collection_id="col-1")
 
         resp = await client.post(
-            "/artifacts/search",
+            "/artifacts/recall",
             headers={"Authorization": "Bearer fake-token"},
             json={"query_text": "docs"},
         )
@@ -189,7 +194,7 @@ class TestSearchEndpoints:
     async def test_search_rejects_empty_query(self, client: AsyncClient):
         """Empty query_text is rejected."""
         resp = await client.post(
-            "/artifacts/search",
+            "/artifacts/recall",
             headers={"Authorization": "Bearer fake-token"},
             json={"query_text": ""},
         )
@@ -202,7 +207,7 @@ class TestSearchEndpoints:
         MockAccessor.return_value.search.return_value = self._fake_result(collection_id="col-1")
 
         resp = await client.post(
-            "/artifacts/search",
+            "/artifacts/recall",
             headers={"Authorization": "Bearer fake-token"},
             json={"query_text": "docs"},
         )

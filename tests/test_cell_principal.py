@@ -41,10 +41,8 @@ def test_get_origin_root_cycle_guarded():
 
 
 def test_get_origin_root_walks_past_the_old_depth_cap():
-    """FAILURE MODE: this test previously asserted that a chain longer than max_depth=32
-    "returns the deepest id reached, not an error" — and that id is the stable principal used
-    for CELL-KEY DERIVATION, so a truncated walk meant a WRONG ENCRYPTION KEY, silently.
-    A 100-deep chain must now resolve to its real root."""
+    """The walk has no depth limit — only a cycle guard (`visited`) — so a legitimate chain of any
+    length resolves to its actual root rather than being cut off early."""
     chain = {str(n): str(n + 1) for n in range(100)}
 
     def parent(db, rid):
@@ -81,19 +79,12 @@ def test_resolve_empty_collection_is_empty():
 
 
 def test_resolve_raises_rather_than_substituting_a_different_principal():
-    """A failed lookup must RAISE, not fall back to ``collection_id``.
+    """A failed lookup must raise, not fall back to ``collection_id``.
 
-    This test previously asserted the opposite (``== "col-9"``) and so encoded the
-    defect as the contract. The fallback is not a graceful degradation: for any
-    collection that is not its own origin root it is a DIFFERENT, well-formed
-    principal, hence a different HKDF master key, and nothing downstream can tell
-    it apart from the real answer.
-
-    Because the substitution is TRANSIENT (it happens only while the lookup is
-    failing), index time and query time can disagree: cells get written under one
-    key and sought under another. The corpus is intact, the search finds nothing,
-    and every metric reads healthy. That is the shape of the production defect
-    where a delete reported success while removing nothing.
+    A fallback would only engage while the lookup is failing, so index time and query time could
+    disagree: cells get written under one key and sought under another. The corpus stays intact,
+    the search finds nothing, and every metric reads healthy — indistinguishable from a delete
+    that reports success while removing nothing.
     """
     with patch.object(db_store, "get_origin_root", side_effect=RuntimeError("boom")):
         with pytest.raises(CellPrincipalUnresolved):
@@ -103,9 +94,9 @@ def test_resolve_raises_rather_than_substituting_a_different_principal():
 def test_resolve_self_rooted_collection_is_not_an_error():
     """The other side: no ancestors is a real answer, not a failure.
 
-    ``get_origin_root`` returning falsy means the collection IS its own origin
-    root. That must keep resolving to the collection id -- the fix must not turn
-    every top-level collection into an exception.
+    ``get_origin_root`` returning falsy means the collection is its own origin
+    root. This must keep resolving to the collection id — a top-level collection
+    must not become an exception.
     """
     with patch.object(db_store, "get_origin_root", return_value=None):
         assert resolve_cell_principal(None, "col-top") == "col-top"

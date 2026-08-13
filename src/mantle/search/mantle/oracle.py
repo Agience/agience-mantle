@@ -1,8 +1,8 @@
 """OracleService — in-process key custodian for MANTLE encrypted search.
 
-Step 2.2a implementation. Holds per-principal 256-bit master keys in memory,
-loaded lazily from Fernet-wrapped storage on first access. Derives per-cell
-AES-256-GCM keys via HKDF on demand — cell keys are never persisted.
+Holds per-principal 256-bit master keys in memory, loaded lazily from
+Fernet-wrapped storage on first access. Derives per-cell AES-256-GCM keys via
+HKDF on demand — cell keys are never persisted.
 
 The **principal** is the collection's immutable origin root (see
 ``search.mantle.principal``), NOT an "owner" / ``created_by``. Agience has no
@@ -36,6 +36,7 @@ import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, Optional, Protocol
 
 from cryptography.fernet import Fernet
@@ -46,17 +47,11 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 # __init__ and this module imports nothing back, so there is no cycle.
 from mantle.services.acting_principal import KeyCustodyDenied, require_acting_principal
 
-# ⛔ RE-EXPORT, NOT REDEFINITION. `MasterKeyUnavailable`/`MasterKeyMissing` moved to `sse/keys.py` so
-# the encrypted lexical arm can ship without this 703-line custody module (EREA §5). They are
-# re-exported here because `pipeline_unified.py` and `test_key_custody_bypasses.py` catch them off
-# THIS import path — and because a second class of the same name would silently stop matching
-# `except MasterKeyMissing` wherever the two paths met. There is exactly ONE class object.
-#
-# The dependency points implementation → interface, never the reverse: `sse/keys.py` is stdlib-only
-# and knows nothing of grants, the lattice, or Fernet. `SseKeyProvider` is the Protocol this module's
-# `OracleService` satisfies.
-from .sse.keys import (MasterKeyMissing, MasterKeyUnavailable,  # noqa: F401
-                       SseKeyProvider)
+# The refusals this module RAISES, defined next door rather than here. One class object per
+# name either way; the difference is that `sse/narrowing.py` can catch them without importing the
+# custody implementation. See `custody.py` for why that direction matters. Re-exported below,
+# so `from ..oracle import MasterKeyMissing` keeps resolving to the same object it always did.
+from .custody import MasterKeyMissing, MasterKeyUnavailable
 
 if TYPE_CHECKING:  # pragma: no cover
     from mantle.db.store import Database
@@ -138,26 +133,12 @@ class FernetMasterKeyStore:
         return dict(self._persist)
 
 
-# `MasterKeyUnavailable` was defined here; it now lives in `sse/keys.py` and is imported at the top
-# of this module. It means: a master key EXISTS (or may exist) but could not be read or unwrapped —
-# deliberately distinct from "no key yet", because a caller must never treat it as first use. The
-# recovery for first use is to generate and persist a new key, which overwrites the only copy of the
-# old one. Failing a request is recoverable; that is not.
-
-
 class LatticeMasterKeyStore:
-    """The durable master key store over the standalone lattice (THE production backend).
+    """The durable master key store over the standalone lattice — the production backend.
 
-    Envelope contract: only WRAPPED DEKs touch storage — KEK custody stays with the KeyProvider
+    Envelope contract: only wrapped DEKs touch storage — KEK custody stays with the KeyProvider
     (local file | KMS | Vault) — persisted as a typed plane in the one store, ids namespaced so
     a principal id can never collide with an artifact id.
-
-    ⛔ `get` IS FAIL-CLOSED, AND THE DISTINCTION IS LOAD-BEARING: absence returns None (genuine
-    first use — safe to generate); a READ OR UNWRAP FAILURE RAISES `MasterKeyUnavailable`. The
-    lattice-era predecessor once returned None for all three conditions, and
-    `get_or_create_master_key` reads None as "first use" and OVERWRITES the stored wrapped DEK —
-    so a transient read error or a rotated KEK destroyed the only copy of the key and, with it,
-    every cell and content blob encrypted under it, silently, presented as "no results".
     Refusing to serve is recoverable; overwriting the only copy of the key is not."""
 
     CONTENT_TYPE = "application/vnd.agience.master-key+json"
@@ -206,54 +187,31 @@ class LatticeMasterKeyStore:
 # Authorization — key issuance is coupled to the grant check
 # ---------------------------------------------------------------------------
 #
-# Canonical plan §5.3 ("Now (single node)"): *couple key/anchor-position issuance
-# to the grant check immediately so the trust boundary matches the target.*
+# Canonical plan §5.3 ("Now (single node)"): key/anchor-position issuance is coupled
+# to the grant check so the trust boundary matches the target. Every key-issuing call
+# is verified inside issuance, where no call site can route around it — access is a
+# property of key custody, not a permission check somewhere up the call stack.
 #
-# Before this, `get_or_create_master_key(principal_id)` minted or unwrapped ANY
-# principal's key for ANY caller: the identity came from the OBJECT BEING READ,
-# never from the REQUESTER. Access was therefore a permission CHECK somewhere up
-# the call stack — bypassable by reaching the oracle directly — rather than a
-# property of key custody. The required property is "if you don't have a grant,
-# you simply cannot", and that can only hold if the grant is verified INSIDE
-# issuance, where no call site can route around it.
+# The property rests on two legs, and it holds only while both stand:
 #
-# ⚠ THAT PARAGRAPH WAS TRUE ABOUT THE INTENT AND FALSE ABOUT THE RESULT, AND THE
-# GAP WENT UNNOTICED BECAUSE IT WAS WRITTEN AS THOUGH ALREADY ACHIEVED. Verifying
-# "inside issuance" is necessary but NOT sufficient: the verifier can only be as
-# trustworthy as the requester identity handed to it, and that identity was a
-# caller-supplied string. Coupling the check to issuance while leaving the
-# requester assertable moved the bypass, it did not close it — `KeyPurpose.SELF`
-# let any caller name any principal and skip the verifier entirely.
-#
-# The property now rests on TWO legs, and it holds only while both stand:
-#
-#   1. WHO is asking is authenticated, not asserted — `requester_id` must equal the
+#   1. Who is asking is authenticated, not asserted — `requester_id` must equal the
 #      acting principal resolved at the request boundary (`services.acting_principal`).
-#   2. WHETHER they may is decided by the grant ledger, inside issuance, on EVERY
-#      arm and EVERY call, cached or not.
+#   2. Whether they may is decided by the grant ledger, inside issuance, on every
+#      arm and every call, cached or not.
 #
-# Leg 1 is the one that was missing. If a future change reintroduces a path where
-# `requester_id` comes from data rather than from the caller — a document field, a
-# collection's lineage root, a queue payload — leg 1 is gone and the check silently
-# becomes an identity comparison again, whatever leg 2 does.
+# Leg 1 is load-bearing: if `requester_id` ever comes from data rather than from the
+# caller — a document field, a collection's lineage root, a queue payload — the check
+# silently becomes an identity comparison again, whatever leg 2 does.
 
 
 #: Actions that may bring a principal's master key into existence. Drawn from
 #: CRUDEASIO (see ``entities.grant``); everything else — notably ``read`` — may only
-#: USE a key that already exists.
+#: use a key that already exists.
 #:
 #: An allow-list, not a deny-list: an action nobody thought about must fail to create
 #: rather than silently qualify. A new verb that genuinely needs to mint has to be
 #: added here deliberately.
 _WRITE_ACTIONS = frozenset({"create", "update", "delete", "add", "share", "invoke", "admin"})
-
-
-# `MasterKeyMissing` was defined here; it now lives in `sse/keys.py` and is imported at the top of
-# this module (same class object, so every `except MasterKeyMissing` in the tree still matches).
-# It means: no master key EXISTS for this principal, and this request may not create one. It
-# subclasses `MasterKeyUnavailable` so existing handling — which already treats "the key is not
-# usable" as a hard stop rather than an empty result — applies unchanged. The distinction is *why*:
-# absent rather than unreadable.
 
 
 class GrantDenied(KeyCustodyDenied):
@@ -268,31 +226,20 @@ class GrantDenied(KeyCustodyDenied):
 class KeyPurpose(str, enum.Enum):
     """Why a key is being requested. Narrows the check — it can never skip one.
 
-    ⚠ HISTORY, BECAUSE THE OLD DOCSTRING HERE WAS FALSE. It claimed *"SELF is not a
-    bypass: the oracle checks requester_id == principal_id"*. That check compared two
-    values the CALLER supplied, so it was an identity, not a check — and the SELF arm
-    returned before the grant verifier was consulted at all. A verifier hard-wired to
-    ``return False`` was defeated and four principals' master keys were harvested with
-    the verifier recording zero calls.
-
-    Two things changed. ``requester_id`` is now bound to the authenticated acting
-    principal (:mod:`services.acting_principal`), so a caller can no longer name a
-    requester it is not; and **both arms now run the grant verifier**. ``SELF`` is
-    therefore strictly NARROWER than ``GRANT``, never wider — selecting it can only
-    add a constraint, so it is no longer a purpose worth choosing to gain anything.
+    ``requester_id`` is bound to the authenticated acting principal
+    (:mod:`services.acting_principal`), so a caller cannot name a requester it is
+    not, and both arms run the grant verifier. ``SELF`` is therefore strictly
+    narrower than ``GRANT``, never wider — selecting it can only add a constraint.
     """
 
     #: The requester is a third party and must hold a grant reaching the context.
     #: Verified against the grant ledger via the light cone. This is the query path.
     GRANT = "grant"
 
-    #: The requester additionally asserts it IS the context principal. Verified by
-    #: identity equality AGAINST THE AUTHENTICATED CALLER, *and* by the same grant
+    #: The requester additionally asserts it is the context principal. Verified by
+    #: identity equality against the authenticated caller, *and* by the same grant
     #: check ``GRANT`` runs.
     #:
-    #: ⚠ RETAINED FOR COMPATIBILITY; production paths use ``GRANT``. Because it now
-    #: adds a constraint rather than replacing one, it grants nothing extra — which
-    #: is the whole point. Do not reintroduce an early return here.
     SELF = "self"
 
 
@@ -300,16 +247,39 @@ class KeyPurpose(str, enum.Enum):
 class KeyRequest:
     """Who is asking for a key, and under what authority.
 
-    Required — there is no default and no "anonymous" construction. An OPTIONAL
-    requester would default to the previous insecure behaviour at every call site
-    that simply didn't pass one, and nobody would notice; a required argument makes
-    an unauthenticated key request a ``TypeError`` at the call site instead.
+    Required — there is no default and no "anonymous" construction. An optional
+    requester would let a call site that simply didn't pass one silently go
+    unauthenticated, and nobody would notice; a required argument makes an
+    unauthenticated key request a ``TypeError`` at the call site instead.
     """
 
     requester_id: str
     purpose: KeyPurpose
     requester_type: str = "user"
     action: str = "read"
+    #: The `created_by` of the document whose key is being minted — set only by the encrypt path.
+    #:
+    #: The creator holds the key of the thing it is creating. A self-rooted (top-level) artifact
+    #: keys to its own id, and at the instant it is written no grant can yet reach that id — the id
+    #: was minted microseconds earlier. Rooting such artifacts at `created_by` instead would let the
+    #: first write succeed while leaving the artifact permanently unshareable: a grantee's grant
+    #: resolves to `(artifact_id, artifact_id)` while the key asks about the creator, so
+    #: `/grants/my-access` would say allowed while the read still 404'd.
+    #:
+    #: Honoured on the minting path only. On a read this would let anyone who can name themselves
+    #: as the creator obtain a key; `may_create` is what confines it to the moment of creation.
+    creator_id: Optional[str] = None
+    #: May this request bring a key into being that does not exist yet?
+    #:
+    #: Separate from `action`, because they answer different questions. `action` says which right
+    #: the requester must hold; this says whether the call is entitled to mint. They coincide for
+    #: every write, but the encrypt path demands `read` — holding a content key is the ability to
+    #: read it, and demanding `update` would reject a legitimate *create* — so it needs `may_create`
+    #: to be able to create the very key it is about to encrypt with.
+    #:
+    #: Defaults to False so the read protection below is what a caller gets by not thinking about
+    #: it — the same allow-list reasoning `_WRITE_ACTIONS` states.
+    may_create: bool = False
 
     def __post_init__(self) -> None:
         if not self.requester_id:
@@ -338,6 +308,25 @@ class GrantVerifier(Protocol):
         """True iff the requester holds a grant reaching ``(principal_id, collection_id)``."""
 
 
+def _seconds_until(expires_at: Optional[str], now: datetime) -> Optional[float]:
+    """Seconds from *now* until an ISO-8601 ``expires_at``, or ``None`` if there isn't one.
+
+    Tolerates a trailing ``Z`` and a naive timestamp (read as UTC, which is what every
+    writer in this codebase produces). An unparseable value returns ``0.0`` — a grant
+    whose expiry cannot be read must not be memoized on the strength of it.
+    """
+    if not expires_at:
+        return None
+    raw = str(expires_at).strip()
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (parsed - now).total_seconds()
+
+
 class LightConeGrantVerifier:
     """Grant verification via the existing :class:`LightConeResolver`.
 
@@ -347,37 +336,50 @@ class LightConeGrantVerifier:
     issues and the contexts the search may touch are decided by one piece of code.
     Two implementations would be two chances to disagree, and the disagreement
     would be silent.
-
-    ``requester_type`` REACHES THE LOOKUP. It was previously accepted, used as a
-    cache-key component, and then dropped, so every resolution ran as the ledger's
-    default grantee kind regardless of who asked. The two vocabularies differ; the
-    mapping is in ``lightcone.ledger_grantee_type`` — read that comment before
-    changing this line.
+    ``requester_type`` reaches the lookup.
 
     Results are memoized per ``(requester, type, action)`` for ``ttl_s`` seconds.
     Without it a single query re-walks the whole light cone once per cell. The TTL
     is short and bounds post-revocation validity in the same way the target
-    design's signed key TTL will; it is a cache of an AUTHORIZATION DECISION, so it
+    design's signed key TTL will; it is a cache of an authorization decision, so it
     is deliberately much shorter-lived than the master-key cache.
+
+    Two properties of the memo are load-bearing and neither is optional:
+
+    * ``ttl_s <= 0`` means **no memo at all** — nothing is stored and every call
+      re-reads the ledger. That is the honest configuration for a deployment where
+      :meth:`invalidate` cannot reach every process holding one (see
+      ``wiring._verifier_ttl_s``), not a degenerate case to be rounded up to a
+      small positive number.
+    * An entry may not outlive the grants it was derived from. The store filters
+      expired grants at read; the memo would not, so its deadline is clamped to the
+      earliest ``expires_at`` among the requester's grants (:meth:`_memo_ttl`).
+      Expiry is revocation that arrives on a clock, and a cache that ignores it is
+      stale in the direction that grants access.
+
+    ``clock`` is the monotonic time source, injectable so a test can advance a TTL
+    without sleeping through it — the production arithmetic still runs for real.
     """
 
-    def __init__(self, db, *, resolver=None, ttl_s: float = 30.0) -> None:
+    def __init__(self, db, *, resolver=None, ttl_s: float = 30.0,
+                 clock: Callable[[], float] = time.monotonic) -> None:
         self._db = db
         self._resolver = resolver
         self._ttl_s = float(ttl_s)
+        self._clock = clock
         self._lock = threading.RLock()
         self._cache: dict[tuple[str, str, str], tuple[float, frozenset]] = {}
 
     def _contexts(self, requester_id: str, requester_type: str, action: str) -> frozenset:
         ck = (requester_id, requester_type, action)
-        now = time.monotonic()
-        with self._lock:
-            hit = self._cache.get(ck)
-            if hit is not None and hit[0] > now:
-                return hit[1]
+        now = self._clock()
+        if self._ttl_s > 0:
+            with self._lock:
+                hit = self._cache.get(ck)
+                if hit is not None and hit[0] > now:
+                    return hit[1]
 
-        from .lightcone import LightConeResolver
-        from .sse.router_accessor import resolve_authorized_contexts
+        from .lightcone import LightConeResolver, resolve_authorized_contexts
 
         resolver = self._resolver or LightConeResolver(self._db)
         pairs = frozenset(
@@ -386,9 +388,49 @@ class LightConeGrantVerifier:
                 principal_type=requester_type,
             )
         )
-        with self._lock:
-            self._cache[ck] = (now + self._ttl_s, pairs)
+        ttl = self._memo_ttl(resolver, requester_id, requester_type)
+        if ttl > 0:
+            with self._lock:
+                self._cache[ck] = (now + ttl, pairs)
         return pairs
+
+    def _memo_ttl(self, resolver, requester_id: str, requester_type: str) -> float:
+        """How long this entry may be held: ``ttl_s``, capped by the next grant expiry.
+
+        The cap is what stops an entry warmed one second before a grant's ``expires_at``
+        from answering with reach the ledger has already withdrawn. It reads the
+        requester's SEED grants — the same set step 1 of the light cone starts from, for
+        the same principal kind, via the resolver that just ran — rather than restating
+        the "which grants does this principal hold" rule, which for a grant key means
+        walking a bundle and would be a second copy free to disagree with the first.
+
+        Costs one grant lookup, on the memo MISS only, on a path that has just walked the
+        whole light cone. Grants without an ``expires_at`` — the common case — cap
+        nothing, so the common case pays only that lookup.
+
+        Falls back to the full TTL when the seed set cannot be read: the TTL is still a
+        bound, and shortening it on a failed read would turn a store hiccup into an
+        un-memoized authorization hot path.
+        """
+        ttl = self._ttl_s
+        if ttl <= 0:
+            return ttl
+
+        # A resolver that does not expose its seed grants is a test double or a future
+        # implementation; the plain TTL still bounds it.
+        seed_grants = getattr(resolver, "_grants_for", None)
+        if seed_grants is None:
+            return ttl
+        try:
+            now = datetime.now(timezone.utc)
+            for grant in seed_grants(requester_id, requester_type) or ():
+                remaining = _seconds_until(getattr(grant, "expires_at", None), now)
+                if remaining is not None and remaining < ttl:
+                    ttl = max(remaining, 0.0)
+        except Exception:  # noqa: BLE001 — store reads can raise broadly
+            logger.debug("grant-expiry clamp: seed grant read failed", exc_info=True)
+            return self._ttl_s
+        return ttl
 
     def authorized(
         self,
@@ -402,14 +444,35 @@ class LightConeGrantVerifier:
         pairs = self._contexts(requester_id, requester_type, action)
         if collection_id:
             return (principal_id, collection_id) in pairs
+
+        # BASE CASE: a principal has custody of its own key. The light cone below resolves pairs
+        # whose principal is a collection's origin root — and a user's first collections are
+        # themselves self-rooted, so no pair ever carries the user as principal. Without this base
+        # case, a principal could never obtain the key that encrypts its own content: a brand-new
+        # principal could not write a first top-level artifact on any store, because the check would
+        # be asking someone to be granted access to themselves.
+        #
+        # This is not a bypass. `_authorize` has already bound `requester_id` to the authenticated
+        # acting principal and rejects any request naming someone else ("a caller may only request
+        # keys as itself"), so reaching this line means the caller IS `principal_id`. It therefore
+        # widens nothing: it cannot yield another principal's key, and the collection-scoped branch
+        # above is untouched. What it removes is a circularity, not a check.
+        if requester_id == principal_id:
+            return True
+
         # Principal-scoped key (e.g. the SSE key, which spans a principal's whole
-        # corpus): authorized iff the requester reaches AT LEAST ONE collection
+        # corpus): authorized iff the requester reaches at least one collection
         # under that principal. Scoping below the principal is not possible for a
         # key that is derived per-principal by construction.
         return any(p == principal_id for p, _ in pairs)
 
     def invalidate(self, requester_id: Optional[str] = None) -> None:
-        """Drop memoized authorization decisions (grant change / revocation)."""
+        """Drop memoized authorization decisions (grant change / revocation).
+
+        Clears THIS verifier's memo, which is this process's. A deployment with more
+        than one worker holds one memo per worker and this call reaches exactly one of
+        them; ``wiring._verifier_ttl_s`` is where that fact is accounted for.
+        """
         with self._lock:
             if requester_id is None:
                 self._cache.clear()
@@ -425,7 +488,7 @@ class LightConeGrantVerifier:
 class OracleService:
     """Single-node, in-process key custodian. MVP implementation.
 
-    Every key-issuing method takes a REQUIRED :class:`KeyRequest` and verifies it
+    Every key-issuing method takes a required :class:`KeyRequest` and verifies it
     before any key material is read, derived or returned. See the module's
     "Authorization" section for why the check lives here and not at the call site.
     """
@@ -442,18 +505,6 @@ class OracleService:
         # Cache unwrapped master keys for the process lifetime. Trade-off:
         # crypto round-trip cost vs. RAM. 32 bytes per principal is cheap.
         #
-        # ⚠ THIS CACHE IS KEYED BY PRINCIPAL ONLY, AND THAT IS DELIBERATE — BUT IT
-        # IS ONLY SAFE BECAUSE THE GRANT CHECK RUNS *BEFORE* THE CACHE IS READ.
-        # Keyed by principal alone and consulted first, caller A would ride in on
-        # caller B's authorized fetch: B's grant populates the entry, then A's
-        # unauthorized request finds it warm and is served without ever being
-        # checked — the cache would silently become an authorization bypass with a
-        # process-lifetime TTL. Keying it by (requester, principal) instead would
-        # look safer and be worse: it caches the same 32 bytes once per requester
-        # and still never re-checks a revoked grant. So: the cache stores KEY
-        # MATERIAL (whose value genuinely does not depend on who asks) and the
-        # authorization decision is made on EVERY call, cached or not, by
-        # `_authorize` at the top of `get_or_create_master_key`.
         self._cache: dict[str, bytes] = {}
 
     # ------------------------------------------------------------------
@@ -475,15 +526,13 @@ class OracleService:
                 "coupled to the grant check and there is no unauthenticated path"
             )
 
-        # ⚠ STEP 1 — THE REQUESTER MUST BE AUTHENTICATED, NOT ASSERTED.
         #
-        # This is the load-bearing line, and its absence was the root defect. Before
-        # it, `requester_id` was just a string the caller chose, so `requester_id ==
-        # principal_id` compared two caller-supplied values — an identity dressed as
-        # a check. Binding it to the acting principal means a caller can only ever
-        # ask as ITSELF; naming someone else is now a denial rather than a
-        # promotion. `require_acting_principal` raises when nothing is in scope, so
-        # an unauthenticated path gets no key instead of an unchecked one.
+        # This is the load-bearing line: binding `requester_id` to the acting principal means a
+        # caller can only ever ask as itself; naming someone else is a denial. Comparing
+        # `requester_id == principal_id` on its own would compare two caller-supplied values — an
+        # identity dressed as a check — so the comparison only means something once `requester_id`
+        # is bound to an authenticated identity here. `require_acting_principal` raises when nothing
+        # is in scope, so an unauthenticated path gets no key instead of an unchecked one.
         actor = require_acting_principal()
         if request.requester_id != actor.principal_id:
             raise GrantDenied(
@@ -492,8 +541,8 @@ class OracleService:
                 f"keys as itself"
             )
 
-        # STEP 2 — SELF NARROWS, IT DOES NOT SKIP. Falls through to the grant check
-        # below rather than returning, so this arm is strictly stronger than GRANT.
+        # SELF narrows; it does not skip. Falls through to the grant check
+        # below rather than returning, so this arm is strictly stronger than a plain grant check.
         if request.purpose is KeyPurpose.SELF and request.requester_id != principal_id:
             raise GrantDenied(
                 f"self-issuance requires requester == principal, but "
@@ -501,13 +550,37 @@ class OracleService:
             )
 
         if self._verifier is None:
-            # Fail CLOSED. An oracle with no way to check grants cannot establish
+            # Fail closed. An oracle with no way to check grants cannot establish
             # that the requester has one, and "we could not check, so we allowed
-            # it" is precisely the fail-open shape this change exists to remove.
+            # it" is the fail-open shape this guards against.
             raise GrantDenied(
                 f"no grant verifier is wired into this oracle; refusing to issue a "
                 f"key for principal {principal_id!r} to {request.requester_id!r}"
             )
+
+        # The create base case — the creator of an artifact holds that artifact's key at the
+        # moment it creates it. Three conditions, and every one is load-bearing:
+        #
+        #   · `may_create`         — minting only. A read never takes this branch.
+        #   · requester == creator — `requester_id` was bound to the authenticated acting principal
+        #                            above ("a caller may only request keys as itself"), and
+        #                            `creator_id` comes off the stored doc, never off the request
+        #                            body. So this compares two server-side facts.
+        #   · principal == collection — confines it to a self-rooted artifact keying to itself. A
+        #                            collection's key has principal != collection and cannot be
+        #                            obtained this way.
+        #
+        # It widens nothing that a grant would not: one statement later the creator receives an
+        # owner grant on this same artifact; this authorizes the instant between, which is the only
+        # instant in which no grant can exist yet.
+        if (
+            request.may_create
+            and request.creator_id
+            and request.requester_id == request.creator_id
+            and collection_id
+            and collection_id == principal_id
+        ):
+            return
 
         if not self._verifier.authorized(
             requester_id=request.requester_id,
@@ -524,9 +597,9 @@ class OracleService:
     def authorize(
         self, principal_id: str, collection_id: Optional[str], request: KeyRequest
     ) -> None:
-        """Run the authorization check WITHOUT deriving or returning key material.
+        """Run the authorization check without deriving or returning key material.
 
-        For callers that hold a plaintext CACHE and must decide whether to serve it.
+        For callers that hold a plaintext cache and must decide whether to serve it.
         A cache of decrypted data is a key-equivalent: serving from it without a
         check grants exactly what handing over the key would, so it needs the same
         gate — but calling a key-deriving method just to re-authorize would pay for
@@ -554,7 +627,7 @@ class OracleService:
     ) -> bytes:
         """Return the principal's master key, generating + persisting on first call.
 
-        ``request`` is REQUIRED and is verified before any key material is touched;
+        ``request`` is required and is verified before any key material is touched;
         see :meth:`_authorize`. ``collection_id`` narrows the grant check to one
         context when the caller has one (cell keys do; the per-principal SSE key
         does not).
@@ -564,19 +637,18 @@ class OracleService:
         not entitled to create one. Thread-safe: concurrent first-access calls won't
         generate duplicate keys for the same principal.
 
-        ⚠ ONLY A WRITE CREATES A KEY — see :data:`_WRITE_ACTIONS`. A read that finds
-        no key now FAILS instead of minting one, for two independent reasons:
+        Minting is refused on a read for two reasons:
 
-        1. *Mint-ahead.* ``get_or_create`` let a caller name a principal that does
-           not exist yet, cause a key to be generated and persisted, and keep the
-           bytes — so every artifact later written under that principal was readable
-           by whoever pre-seeded it. Authenticating the requester (see
+        1. *Mint-ahead.* Allowing any caller to name a principal that does not exist
+           yet, cause a key to be generated and persisted, and keep the bytes would
+           make every artifact later written under that principal readable by
+           whoever pre-seeded it. Authenticating the requester (see
            :meth:`_authorize`) already makes this hard, since no grant can reach a
            principal that does not exist; refusing to create on a read closes it
            outright rather than relying on that.
-        2. *A read that mints is a silent data-loss detector that stays silent.* If a
+        2. *A read that mints would be a silent data-loss detector.* If a
            principal's key is missing because the store lost it, minting a fresh one
-           on read returns a VALID key that decrypts nothing — surfacing as "no
+           on read would return a valid key that decrypts nothing — surfacing as "no
            results" rather than "the key is gone". That is the same failure
            :class:`MasterKeyUnavailable` exists to prevent, arriving by a different
            door.
@@ -584,8 +656,6 @@ class OracleService:
         if not principal_id:
             raise ValueError("principal_id is required")
 
-        # ⚠ ORDERING IS LOAD-BEARING: authorize FIRST, unconditionally, before the
-        # cache read below. See the `_cache` comment in __init__.
         self._authorize(principal_id, collection_id, request)
 
         # Fast path: already cached.
@@ -609,8 +679,11 @@ class OracleService:
                 self._cache[principal_id] = existing
                 return existing
 
-            # No key exists. Only a WRITE may bring one into being.
-            if request.action not in _WRITE_ACTIONS:
+            # No key exists. Only a write — or a caller that explicitly says it is entitled to
+            # create one — may bring it into being. `may_create` exists because the encrypt path
+            # demands `read` for sound authorization reasons yet must still mint on first write;
+            # see the field's own note on KeyRequest.
+            if request.action not in _WRITE_ACTIONS and not request.may_create:
                 raise MasterKeyMissing(
                     f"no master key exists for principal {principal_id!r} and "
                     f"action {request.action!r} does not create one; refusing to mint "
@@ -618,7 +691,7 @@ class OracleService:
                     f"'no results' instead of surfacing a missing key)"
                 )
 
-            # First WRITE by this principal — generate.
+            # First write by this principal — generate.
             master_key = os.urandom(_MASTER_KEY_BYTES)
             self._store.put(principal_id, master_key)
             self._cache[principal_id] = master_key
@@ -634,12 +707,12 @@ class OracleService:
     ) -> bytes:
         """HKDF(master_key, info=collection_id ‖ 0x00 ‖ cluster_id) → 256-bit AES key.
 
-        ``request`` is REQUIRED; the grant check runs against the specific
+        ``request`` is required; the grant check runs against the specific
         ``(principal_id, collection_id)`` context and raises :class:`GrantDenied`
         when the requester cannot reach it.
 
         ``cluster_id`` is the routing anchor of the cell (canonical plan §5.1:
-        the AnchorSet IS the partition; one cell per ``(principal, collection,
+        the AnchorSet is the partition; one cell per ``(principal, collection,
         anchor)``) and is required — routing has no flat fallback, so there is no
         anchor-less key. Deterministic; cell keys are never persisted — callers
         re-derive on demand.
@@ -653,13 +726,13 @@ class OracleService:
         return self._derive(master_key, collection_id, cluster_id)
 
     # ------------------------------------------------------------------
-    # SSE key derivation (MANTLE-SSE encrypted lexical, Step 2.6)
+    # SSE key derivation (MANTLE-SSE encrypted lexical)
     # ------------------------------------------------------------------
 
     def derive_sse_key(self, principal_id: str, request: KeyRequest) -> bytes:
         """HKDF(master_key, info='sse') → 256-bit principal SSE key.
 
-        ``request`` is REQUIRED. The SSE key is per-principal, so the grant check
+        ``request`` is required. The SSE key is per-principal, so the grant check
         is principal-scoped: the requester must reach at least one collection under
         ``principal_id``. Raises :class:`GrantDenied` otherwise.
 

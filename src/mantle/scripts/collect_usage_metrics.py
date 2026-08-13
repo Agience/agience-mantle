@@ -1,9 +1,8 @@
-"""Collect local deployment usage metrics from THE store (the standalone lattice).
+"""Collect local deployment usage metrics from the store (the standalone lattice).
 
-The metric KEY SET is stable — downstream usage snapshots/licensing read these names — but the
-values now come from the lattice: maintained counters where published (`count`, `count_edges`),
-typed-plane streams for the small per-type tallies. Ported from the lattice collection counts
-with the 2026-07-22 flip.
+The metric key set is stable — downstream usage snapshots/licensing read these names — while the
+values are read from the lattice: maintained counters where published (`count`, `count_edges`),
+typed-plane streams for the small per-type tallies.
 """
 from __future__ import annotations
 

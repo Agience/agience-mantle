@@ -1,7 +1,7 @@
 """Platform-admin management (multi-admin) — Mantle owns it (sovereign).
 
 An existing admin grants another user platform admin (an admin grant on the
-authority collection); that user can then perform admin ops. `GET /platform/users`
+authority collection); that user can then perform admin ops. `GET /system/users`
 is admin-gated, so it doubles as the "am I admin?" probe. The operator is
 self-healed into a real grant on the first grant-admin so it never locks itself out.
 """
@@ -12,12 +12,12 @@ import uuid
 
 def _admin_probe(api) -> int:
     """200 if the caller is a platform admin, 403 otherwise."""
-    return api.get("/platform/users").status_code
+    return api.get("/system/users").status_code
 
 
 def test_non_admin_cannot_list_or_grant(user):
-    assert user["api"].get("/platform/users").status_code == 403
-    r = user["api"].post(f"/platform/users/{uuid.uuid4()}/grant-admin")
+    assert user["api"].get("/system/users").status_code == 403
+    r = user["api"].post(f"/system/users/{uuid.uuid4()}/grant-admin")
     assert r.status_code == 403
 
 
@@ -26,12 +26,12 @@ def test_operator_grants_second_admin_and_keeps_own(operator_api, user_factory):
     # Not admin yet.
     assert _admin_probe(b["api"]) == 403
 
-    r = operator_api.post(f"/platform/users/{b['person_id']}/grant-admin")
+    r = operator_api.post(f"/system/users/{b['person_id']}/grant-admin")
     assert r.status_code == 200, r.text
 
     # B is now a platform admin — can do admin ops (register an issuer).
     assert _admin_probe(b["api"]) == 200
-    iss = b["api"].post("/issuers", json={
+    iss = b["api"].post("/system/issuers", json={
         "issuer": f"https://b-idp-{uuid.uuid4().hex[:6]}.test/",
         "jwks": {"keys": []}, "role": "external",
     })
@@ -45,23 +45,23 @@ def test_operator_grants_second_admin_and_keeps_own(operator_api, user_factory):
 
 def test_revoke_admin_removes_access(operator_api, user_factory):
     b = user_factory("admin3")
-    assert operator_api.post(f"/platform/users/{b['person_id']}/grant-admin").status_code == 200
+    assert operator_api.post(f"/system/users/{b['person_id']}/grant-admin").status_code == 200
     assert _admin_probe(b["api"]) == 200
 
-    r = operator_api.delete(f"/platform/users/{b['person_id']}/revoke-admin")
+    r = operator_api.delete(f"/system/users/{b['person_id']}/revoke-admin")
     assert r.status_code == 200, r.text
     assert _admin_probe(b["api"]) == 403
 
 
 def test_cannot_revoke_operator(operator_api, operator):
-    r = operator_api.delete(f"/platform/users/{operator['person_id']}/revoke-admin")
+    r = operator_api.delete(f"/system/users/{operator['person_id']}/revoke-admin")
     assert r.status_code == 400, r.text
 
 
 def test_list_users_reports_admin_status(operator_api, operator):
     # Ensure the operator is provisioned into Mantle's people (fires on visible).
     operator_api.get("/artifacts/visible", params={"action": "read"})
-    r = operator_api.get("/platform/users")
+    r = operator_api.get("/system/users")
     assert r.status_code == 200, r.text
     users = r.json().get("users", [])
     # The operator appears and is flagged admin.

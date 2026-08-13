@@ -14,7 +14,7 @@ from mantle.db.store import Database
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
-from mantle.services.dependencies import get_store_db, get_auth, AuthContext
+from mantle.services.dependencies import get_store_db, get_auth, AuthContext, offload_sync
 from mantle.db.backend import (
     create_grant,
     get_grant_by_id,
@@ -69,12 +69,57 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+#: Grantee types whose `grantee_id` is a hashed SECRET rather than a principal id
+#: (a bearer token for `grant_key`, a claim token for `invite`). Serializing one would
+#: publish the stored form of a live credential to anyone who can list grants.
+_SECRET_GRANTEE_TYPES = {GrantEntity.GRANTEE_GRANT_KEY, GrantEntity.GRANTEE_INVITE}
+
+
 def _grant_response(grant: GrantEntity) -> dict:
-    return grant.to_dict()
+    """Serialize a grant for the API, with credential material redacted."""
+    data = grant.to_dict()
+    if data.get("grantee_type") in _SECRET_GRANTEE_TYPES:
+        data.pop("grantee_id", None)
+    return data
+
+
+# The handlers below are `async def` and the grant store is synchronous, so anything that
+# issues more than one query runs through `offload_sync` — a whole call per hop, never a
+# fragment of a transaction (`db/seq.py`). `get_grant_by_id` stays on the loop: it is
+# one indexed seek, and the hop would cost more than the read.
+
+
+def _invalidate_cache_for(store_db: Database, grant: GrantEntity) -> None:
+    """Drop the oracle's memoized light-cone decisions for whoever *grant* affects.
+
+    Every path in this file that changes what a grant authorizes — create, claim, accept,
+    revoke — ends here, because the memo is read by every key derivation and every cell
+    decryption. Revocation is the direction that matters: the ledger already says
+    `revoked` while a memo entry keeps issuing content keys until its TTL lapses.
+
+    Which principal to name is `grant_key_service.principal_ids_for`'s job and not this
+    file's: for a bearer key it is the root grant's id, not `grantee_id` (which holds the
+    token hash), and for a bundle member it is the root at the top of the chain. Naming
+    the wrong id fails silently — the call is made, the entry stays.
+
+    Best-effort: a stale cache is a delay for the create path, and the TTL still bounds
+    it for the revoke path. Logged at warning for revocations by the caller when it is
+    the security-relevant direction.
+    """
+    try:
+        from mantle.services import grant_key_service
+        grant_key_service.invalidate_for(store_db, grant)
+    except Exception:
+        logger.warning("grant-cache invalidation failed for grant %s", grant.id, exc_info=True)
 
 
 def _require_admin(auth: AuthContext, resource_id: str, store_db: Database) -> None:
-    """Raise 403 unless the caller can manage grants on the resource (creator OR can_admin)."""
+    """Raise 403 unless the caller can manage grants on the resource (creator OR can_admin).
+
+    Stays synchronous so it can be handed to `offload_sync` whole — it resolves the resource's
+    creator and then walks the light cone, which is several queries, and an `HTTPException`
+    raised in the worker still becomes its response.
+    """
     from mantle.services import grant_service
     if not auth.user_id:
         raise HTTPException(status_code=401, detail="User identification required")
@@ -108,7 +153,7 @@ async def get_invite_context_endpoint(
 ):
     """Non-PII invite metadata. Safe to call pre-auth."""
     from mantle.services import grant_service
-    ctx = grant_service.get_invite_context(store_db, token)
+    ctx = await offload_sync(grant_service.get_invite_context, store_db, token)
     if not ctx:
         raise HTTPException(status_code=404, detail="Invite not found or expired")
     return ctx
@@ -124,7 +169,7 @@ async def get_invite_details_endpoint(
     if not auth.user_id:
         raise HTTPException(status_code=401, detail="User identification required")
     from mantle.services import grant_service
-    details = grant_service.get_invite_details(store_db, token, auth.user_id)
+    details = await offload_sync(grant_service.get_invite_details, store_db, token, auth.user_id)
     if not details:
         raise HTTPException(status_code=404, detail="Invite not found or expired")
     return details
@@ -140,7 +185,10 @@ async def list_invites_sent_endpoint(
     if not auth.user_id:
         raise HTTPException(status_code=401, detail="User identification required")
     from mantle.services import grant_service
-    grants = grant_service.list_invites_sent(store_db, auth.user_id, include_revoked=include_revoked)
+    grants = await offload_sync(
+        grant_service.list_invites_sent, store_db, auth.user_id,
+        include_revoked=include_revoked,
+    )
     return [_grant_response(g) for g in grants]
 
 
@@ -156,13 +204,24 @@ async def claim_invite_endpoint(
     from mantle.services import grant_service
     from mantle.services.grant_service import InviteNotFound, InviteExhausted, InviteIdentityMismatch
     try:
-        created = grant_service.claim_invite(store_db, auth.user_id, body.token)
+        # The address is passed only if the issuer vouched for it. Unverified, it is a string the
+        # user chose, and matching an invite on it would let anyone claim an invite addressed to
+        # anyone else. Withheld, the claim falls back to asking Origin — the full-platform path.
+        _claimant_email = auth.email if getattr(auth, "email_verified", False) else ""
+        created = await offload_sync(
+            grant_service.claim_invite, store_db, auth.user_id, body.token, _claimant_email
+        )
     except InviteIdentityMismatch as exc:
         raise HTTPException(status_code=403, detail=str(exc))
     except InviteExhausted as exc:
         raise HTTPException(status_code=410, detail=str(exc))
     except InviteNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+
+    # The claimant now holds a grant they did not hold a moment ago, and a memo entry warmed
+    # by their own pre-claim request would keep refusing them for the rest of the TTL — the
+    # claim → open-the-resource sequence is one click, well inside it.
+    _invalidate_cache_for(store_db, created)
     return _grant_response(created)
 
 
@@ -175,9 +234,9 @@ async def list_grants_endpoint(
     """List all grants on a resource. Only the creator (or can_admin) may list."""
     if not auth.user_id:
         raise HTTPException(status_code=401, detail="User identification required")
-    _require_admin(auth, resource_id, store_db)
+    await offload_sync(_require_admin, auth, resource_id, store_db)
     from mantle.db.backend import get_grants_for_collection
-    grants = get_grants_for_collection(store_db, resource_id)
+    grants = await offload_sync(get_grants_for_collection, store_db, resource_id)
     return [_grant_response(g) for g in grants]
 
 
@@ -190,16 +249,16 @@ async def my_access_endpoint(
 ):
     """The caller's effective verdict for ONE action on ONE resource — server-derived.
 
-    Added 2026-07-22 for crystal's op-level `requires_grant` gate: the gateway needs to ask
-    "may the CALLER do X here" and nothing in the API answered it (grant listing is
-    admin-only, and effective access is a light-cone computation that must never be
-    re-derived client-side). This delegates to `check_access` — the SAME audited chokepoint
-    every enforcing route uses, so the verdict here can never drift from the verdict at the
-    data path, and each probe is witnessed in the access audit like any other decision.
-    Denial and nonexistence both return allowed=false — no existence oracle."""
+    Serves crystal's op-level `requires_grant` gate: the gateway needs to ask "may the CALLER do X
+    here", and grant listing alone can't answer it (it's admin-only, and effective access is a
+    light-cone computation that must never be re-derived client-side). This delegates to
+    `check_access` — the SAME audited chokepoint every enforcing route uses, so the verdict here can
+    never drift from the verdict at the data path, and each probe is witnessed in the access audit
+    like any other decision. Denial and nonexistence both return allowed=false — no existence
+    oracle."""
     from mantle.services.dependencies import check_access
     try:
-        check_access(auth, resource_id, action, store_db)
+        await offload_sync(check_access, auth, resource_id, action, store_db)
         allowed = True
     except HTTPException:
         allowed = False
@@ -221,7 +280,7 @@ async def create_grant_endpoint(
         raise HTTPException(status_code=401, detail="User identification required")
 
     if body.grantee_type == GrantEntity.GRANTEE_INVITE:
-        _require_share_or_admin(auth, body.resource_id, store_db)
+        await offload_sync(_require_share_or_admin, auth, body.resource_id, store_db)
         from mantle.services import grant_service
 
         target_email = None
@@ -230,7 +289,8 @@ async def create_grant_endpoint(
 
         role = body.role or _role_from_bits(body) or "viewer"
         try:
-            created, raw_token = grant_service.create_invite(
+            created, raw_token = await offload_sync(
+                grant_service.create_invite,
                 store_db,
                 user_id=auth.user_id,
                 resource_id=body.resource_id,
@@ -251,7 +311,7 @@ async def create_grant_endpoint(
         return response
 
     # Direct user->user grant: requires can_admin on the resource.
-    _require_admin(auth, body.resource_id, store_db)
+    await offload_sync(_require_admin, auth, body.resource_id, store_db)
 
     now = _now_iso()
     grant = GrantEntity(
@@ -280,7 +340,17 @@ async def create_grant_endpoint(
         created_time=now,
         modified_time=now,
     )
-    created = create_grant(store_db, grant)
+    created = await offload_sync(create_grant, store_db, grant)
+
+    # A grant nobody can see yet is a grant that does not work yet. `LightConeGrantVerifier`
+    # memoizes (requester, type, action) → authorized-contexts for its TTL, so a person refused
+    # the resource within that window stays refused after being granted it unless this cache
+    # entry is dropped. Every grant mutation in this file ends this way, including this one.
+    #
+    # Scoped to the affected principals rather than global: `principal_ids_for` names them, and
+    # clearing every entry would throw away the memoization the cache exists for.
+    _invalidate_cache_for(store_db, created)
+
     return _grant_response(created)
 
 
@@ -299,6 +369,240 @@ def _role_from_bits(body: CreateGrantRequest) -> Optional[str]:
     return None
 
 
+# =============================================================================
+# Grant keys and grant bundles
+# =============================================================================
+#
+# These are registered BEFORE `/{grant_id}` — FastAPI matches in declaration order,
+# and a path parameter would otherwise swallow `/keys` as a grant id.
+#
+# A grant key is a bearer credential that IS a grant (see services/grant_key_service).
+# A bundle is one with members, so a single key can carry several resources at
+# different permission levels; the bundle's own bits are the ceiling over all of them.
+
+
+class CreateGrantKeyRequest(BaseModel):
+    name: str
+    #: Omit for a bundle — a bundle root reaches nothing itself and exists to carry
+    #: members. Provide one for a plain single-resource key.
+    resource_id: Optional[str] = None
+    role: Optional[str] = None              # role preset; mutually exclusive with the bits
+    can_create: Optional[bool] = None
+    can_read: Optional[bool] = None
+    can_update: Optional[bool] = None
+    can_delete: Optional[bool] = None
+    can_evict: Optional[bool] = None
+    can_invoke: Optional[bool] = None
+    can_add: Optional[bool] = None
+    can_share: Optional[bool] = None
+    can_admin: Optional[bool] = None
+    expires_at: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class AddBundleMemberRequest(BaseModel):
+    resource_id: str
+    role: Optional[str] = None
+    can_create: bool = False
+    can_read: bool = True
+    can_update: bool = False
+    can_delete: bool = False
+    can_evict: bool = False
+    can_invoke: bool = False
+    can_add: bool = False
+    can_share: bool = False
+    can_admin: bool = False
+    name: Optional[str] = None
+    expires_at: Optional[str] = None
+
+
+def _explicit_bits(body: BaseModel) -> Optional[dict]:
+    """The CRUDEASIO flags the caller actually set, or None if they set none."""
+    bits = {
+        flag: getattr(body, flag)
+        for flag in GrantEntity.PERMISSION_FLAGS
+        if getattr(body, flag, None) is not None
+    }
+    return bits or None
+
+
+def _require_key_owner(grant: GrantEntity, auth: AuthContext) -> None:
+    """Only the issuer manages a key. 404 rather than 403 — someone who does not hold
+    the key has no business learning that this id names one."""
+    if grant.grantee_type != GrantEntity.GRANTEE_GRANT_KEY or grant.granted_by != auth.user_id:
+        raise HTTPException(status_code=404, detail="Grant key not found")
+
+
+@router.post("/keys", status_code=status.HTTP_201_CREATED)
+async def create_grant_key_endpoint(
+    body: CreateGrantKeyRequest,
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    """Mint a grant key. The raw token is returned EXACTLY once.
+
+    With `resource_id`, the key carries that one resource at the given permissions —
+    which requires can_admin on it. Without, it is an empty bundle; add resources with
+    `POST /grants/keys/{id}/members`, each of which is admin-checked in its own right.
+    """
+    if not auth.user_id:
+        raise HTTPException(status_code=401, detail="User identification required")
+    if auth.principal_type == "grant_key":
+        # A key that could mint keys would let a leaked credential outlive its own
+        # revocation by issuing a fresh one.
+        raise HTTPException(status_code=403, detail="Grant keys cannot mint grant keys")
+
+    if body.resource_id:
+        await offload_sync(_require_admin, auth, body.resource_id, store_db)
+
+    from mantle.services import grant_key_service
+    try:
+        grant, raw_token = await offload_sync(
+            grant_key_service.mint,
+            store_db,
+            user_id=auth.user_id,
+            name=body.name,
+            resource_id=body.resource_id,
+            flags=_explicit_bits(body),
+            role=body.role,
+            expires_at=body.expires_at,
+            notes=body.notes,
+        )
+    except ValueError as exc:                 # unknown role preset
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    response = _grant_response(grant)
+    response["key"] = raw_token
+    response["members"] = []
+    return response
+
+
+@router.get("/keys")
+async def list_grant_keys_endpoint(
+    include_revoked: bool = Query(False, description="Include revoked keys."),
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    """List the grant keys the caller has minted (token hashes never exposed)."""
+    if not auth.user_id:
+        raise HTTPException(status_code=401, detail="User identification required")
+    from mantle.services import grant_key_service
+    keys = await offload_sync(
+        grant_key_service.list_keys_issued_by,
+        store_db, auth.user_id, include_revoked=include_revoked,
+    )
+    return [_grant_response(k) for k in keys]
+
+
+@router.get("/keys/{key_id}")
+async def read_grant_key_endpoint(
+    key_id: str,
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    """Read one key and its direct members."""
+    if not auth.user_id:
+        raise HTTPException(status_code=401, detail="User identification required")
+    grant = get_grant_by_id(store_db, key_id)
+    if not grant:
+        raise HTTPException(status_code=404, detail="Grant key not found")
+    _require_key_owner(grant, auth)
+
+    from mantle.services import grant_key_service
+    response = _grant_response(grant)
+    members = await offload_sync(grant_key_service.list_members, store_db, key_id)
+    response["members"] = [_grant_response(m) for m in members]
+    return response
+
+
+@router.delete("/keys/{key_id}")
+async def revoke_grant_key_endpoint(
+    key_id: str,
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    """Revoke a key. Members are left in place — with the bundle carrying them revoked,
+    they resolve to nothing, and the key can be reconstructed if it was revoked in error."""
+    if not auth.user_id:
+        raise HTTPException(status_code=401, detail="User identification required")
+    grant = get_grant_by_id(store_db, key_id)
+    if not grant:
+        raise HTTPException(status_code=404, detail="Grant key not found")
+    _require_key_owner(grant, auth)
+
+    from mantle.services import grant_key_service
+    if not await offload_sync(grant_key_service.revoke, store_db, grant, auth.user_id):
+        raise HTTPException(status_code=500, detail="Failed to revoke grant key")
+    return {"id": key_id, "state": "revoked"}
+
+
+@router.post("/keys/{key_id}/members", status_code=status.HTTP_201_CREATED)
+async def add_bundle_member_endpoint(
+    key_id: str,
+    body: AddBundleMemberRequest,
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    """Attach a resource to the bundle with its own permissions.
+
+    Requires can_admin on the resource being added — the bundle's own bits never widen
+    anything, they only cap what its members already carry.
+    """
+    if not auth.user_id:
+        raise HTTPException(status_code=401, detail="User identification required")
+    bundle = get_grant_by_id(store_db, key_id)
+    if not bundle:
+        raise HTTPException(status_code=404, detail="Grant key not found")
+    _require_key_owner(bundle, auth)
+    await offload_sync(_require_admin, auth, body.resource_id, store_db)
+
+    from mantle.services import grant_key_service
+    try:
+        member = await offload_sync(
+            grant_key_service.add_member,
+            store_db,
+            bundle_id=key_id,
+            resource_id=body.resource_id,
+            granted_by=auth.user_id,
+            flags={flag: getattr(body, flag) for flag in GrantEntity.PERMISSION_FLAGS},
+            role=body.role,
+            name=body.name,
+            expires_at=body.expires_at,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return _grant_response(member)
+
+
+@router.delete("/keys/{key_id}/members/{member_id}")
+async def remove_bundle_member_endpoint(
+    key_id: str,
+    member_id: str,
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    """Detach a resource from the bundle."""
+    if not auth.user_id:
+        raise HTTPException(status_code=401, detail="User identification required")
+    bundle = get_grant_by_id(store_db, key_id)
+    if not bundle:
+        raise HTTPException(status_code=404, detail="Grant key not found")
+    _require_key_owner(bundle, auth)
+
+    member = get_grant_by_id(store_db, member_id)
+    # Verify the member actually hangs off THIS bundle, or one bundle's owner could
+    # revoke a member of another's by id.
+    if (not member
+            or member.grantee_type != GrantEntity.GRANTEE_GRANT
+            or member.grantee_id != key_id):
+        raise HTTPException(status_code=404, detail="Bundle member not found")
+
+    from mantle.services import grant_key_service
+    if not await offload_sync(grant_key_service.revoke, store_db, member, auth.user_id):
+        raise HTTPException(status_code=500, detail="Failed to remove bundle member")
+    return {"id": member_id, "state": "revoked"}
+
+
 @router.get("/{grant_id}")
 async def read_grant(
     grant_id: str,
@@ -313,7 +617,7 @@ async def read_grant(
         raise HTTPException(status_code=404, detail="Grant not found")
     if grant.grantee_id != auth.user_id and grant.granted_by != auth.user_id:
         try:
-            _require_admin(auth, grant.resource_id, store_db)
+            await offload_sync(_require_admin, auth, grant.resource_id, store_db)
         except HTTPException:
             raise HTTPException(status_code=404, detail="Grant not found")
     return _grant_response(grant)
@@ -338,7 +642,7 @@ async def revoke_grant(
         and grant.grantee_type == GrantEntity.GRANTEE_INVITE
     )
     if not is_revocable_invite:
-        _require_admin(auth, grant.resource_id, store_db)
+        await offload_sync(_require_admin, auth, grant.resource_id, store_db)
 
     now = _now_iso()
     grant.state = GrantEntity.STATE_REVOKED
@@ -347,6 +651,13 @@ async def revoke_grant(
     grant.modified_time = now
     if not update_grant(store_db, grant):
         raise HTTPException(status_code=500, detail="Failed to revoke grant")
+
+    # Revocation is the direction that matters — see `_invalidate_cache_for`. This path reaches
+    # a grant KEY (`DELETE /grants/{id}` matches a key's own id) and a bundle MEMBER as readily
+    # as a user grant, which is exactly where `grantee_id` is the token hash or an inner bundle
+    # rather than the memo's key; the offload is because the bundle walk is several seeks.
+    await offload_sync(_invalidate_cache_for, store_db, grant)
+
     return {"id": grant_id, "state": "revoked"}
 
 
@@ -374,4 +685,9 @@ async def accept_grant(
     grant.modified_time = now
     if not update_grant(store_db, grant):
         raise HTTPException(status_code=500, detail="Failed to accept grant")
+
+    # `pending_accept` → `active` is a reachability change like any other: the store filters
+    # non-active grants at read, so a memo warmed while this grant was pending answers without
+    # it for the rest of the TTL, and the grantee who just accepted stays refused.
+    _invalidate_cache_for(store_db, grant)
     return _grant_response(grant)

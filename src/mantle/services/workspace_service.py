@@ -11,40 +11,26 @@
 # is the collection_id. `db` and `store_db` / `workspace_db` / `collection_db`
 # parameters are all the same the lattice handle.
 
-import hashlib
-import hmac
 import json
 import logging
-import os
-import time
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from mantle.db.store import Database
 from fastapi import HTTPException, status
 
-from mantle.api.workspaces.commit import (
-    ArtifactCommitChange,
-    CommitActorSummary,
-    CollectionChangeSummary,
-    CollectionCommitSummary,
-    WorkspaceCommitPlanSummary,
-    WorkspaceCommitResponse,
-)
-from mantle.entities.grant import grant_is_allow, grant_is_deny
+from mantle.entities.grant import Grant as GrantEntity, grant_is_allow, grant_is_deny
 from mantle.entities.artifact import Artifact as ArtifactEntity
 from mantle.entities.collection import (
     Collection as CollectionEntity,
     WORKSPACE_CONTENT_TYPE,
     COLLECTION_CONTENT_TYPE,
 )
-from mantle.entities.api_key import APIKey as APIKeyEntity
 
 import mantle.db.backend as store
 from mantle.db.backend import after_key, mid_key
-import mantle.event_bus as event_bus
+import mantle.events.event_bus as event_bus
 
 logger = logging.getLogger(__name__)
 
@@ -52,76 +38,12 @@ logger = logging.getLogger(__name__)
 # Workspaces are collections with this content type.
 WORKSPACE_MIME = WORKSPACE_CONTENT_TYPE
 
-# ---------------------------------------------------------------------------
-# Commit-preview token (HMAC-SHA256, process-scoped secret)
-# ---------------------------------------------------------------------------
-_COMMIT_TOKEN_SECRET = os.urandom(32)
-_COMMIT_TOKEN_TTL_SECONDS = 1800  # 30 minutes
-
-
-def _commit_token_payload(workspace_id: str, user_id: str, artifact_ids: Optional[List[str]]) -> str:
-    ids = ",".join(sorted(artifact_ids)) if artifact_ids else ""
-    return f"{workspace_id}|{user_id}|{ids}"
-
-
-def generate_commit_token(workspace_id: str, user_id: str, artifact_ids: Optional[List[str]] = None) -> str:
-    ts = str(int(time.time()))
-    payload = f"{ts}|{_commit_token_payload(workspace_id, user_id, artifact_ids)}"
-    sig = hmac.new(_COMMIT_TOKEN_SECRET, payload.encode(), hashlib.sha256).hexdigest()
-    return f"{ts}.{sig}"
-
-
-def validate_commit_token(
-    token: Optional[str],
-    workspace_id: str,
-    user_id: str,
-    artifact_ids: Optional[List[str]] = None,
-) -> bool:
-    if not token or "." not in token:
-        return False
-    try:
-        ts_s, sig = token.split(".", 1)
-        ts = int(ts_s)
-    except Exception:
-        return False
-    if abs(time.time() - ts) > _COMMIT_TOKEN_TTL_SECONDS:
-        return False
-    payload = f"{ts_s}|{_commit_token_payload(workspace_id, user_id, artifact_ids)}"
-    expected = hmac.new(_COMMIT_TOKEN_SECRET, payload.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, sig)
-
-
-# ---------------------------------------------------------------------------
-# Commit actor (retained for response shape)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class CommitActor:
-    actor_type: str = "user"
-    actor_id: str = ""
-    subject_user_id: Optional[str] = None
-    presenter_type: Optional[str] = None
-    presenter_id: Optional[str] = None
-    client_id: Optional[str] = None
-    host_id: Optional[str] = None
-    server_id: Optional[str] = None
-    agent_id: Optional[str] = None
-    api_key_id: Optional[str] = None
-    commit_authorized_by_flag: bool = False
-
-    def to_summary(self) -> CommitActorSummary:
-        return CommitActorSummary(**self.__dict__)
-
-
-def _resolve_commit_actor(user_id: str, api_key: Optional[APIKeyEntity]) -> CommitActor:
-    if api_key is not None:
-        return CommitActor(
-            actor_type="api_key",
-            actor_id=str(getattr(api_key, "id", "")),
-            subject_user_id=user_id,
-            api_key_id=str(getattr(api_key, "id", "")),
-        )
-    return CommitActor(actor_type="user", actor_id=user_id, subject_user_id=user_id)
+#: Largest UTF-8 payload kept as a duplicate INLINE copy alongside the object-storage write.
+#: A storage/transfer bound on the row, not a judgement about the content: the authoritative copy
+#: is in object storage at every size, so no value here can lose anything or change an outcome.
+#: A different value would be right if the row-size budget it is really about were measured
+#: rather than assumed — the store's per-row page/overflow cost is the thing that should set it.
+_MAX_INLINE_BYTES = 128 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -147,37 +69,16 @@ def _safe_parse_context(context_json: Optional[str]) -> Dict[str, Any]:
 
 
 def _emit_event(collection_id: str, name: str, payload: dict, *, actor_id: Optional[str] = None) -> None:
-    # artifact.created / artifact.updated are now emitted at the db chokepoint
-    # (db.store), so every write — raw or service — is covered exactly once.
-    # This helper only forwards events the db path doesn't (deletes carry the
-    # container context the db delete path lacks).
+    # artifact.created / artifact.updated are emitted at the write chokepoint
+    # (`db.doc_boundary.emit_artifact_change`), so every write — raw or service —
+    # is covered exactly once. This helper only forwards events the db path
+    # doesn't (deletes carry the container context the db delete path lacks).
     if name in ("artifact.created", "artifact.updated"):
         return
     try:
         event_bus.emit_artifact_event_sync(collection_id, name, payload, actor_id=actor_id)
     except Exception:
         logger.debug("event bus emit failed", exc_info=True)
-
-
-def _dispatch_handlers(
-    db: Database,
-    user_id: str,
-    collection_id: str,
-    event_type: str,
-    artifact: Optional[ArtifactEntity],
-) -> None:
-    try:
-        from .event_dispatcher import dispatch_workspace_event
-        dispatch_workspace_event(
-            db,
-            user_id,
-            collection_id,
-            event_type=event_type,
-            source_artifact_id=getattr(artifact, "id", None),
-            source_artifact=artifact,
-        )
-    except Exception:
-        logger.debug("workspace event dispatch failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +93,8 @@ def create_container(
     context: str = "",
     content: str = "",
     description: Optional[str] = None,
+    vector=None,
+    artifact_id: Optional[str] = None,
 ) -> CollectionEntity:
     """Create a TOP-LEVEL container artifact (no parent) and grant the creator
     full CRUDEASIO.
@@ -202,8 +105,19 @@ def create_container(
     artifacts can be added to; ``content_type`` is the opaque label that an
     application uses to distinguish workspace / collection / domain containers.
     The gateway routes ``native`` container-create operations here (Phase 5).
+
+    ``vector`` is a validated :class:`api.vectors.SuppliedVector` when the writer sent
+    one — it rides this write into the semantic arm. ``None`` is the ordinary case and
+    changes nothing.
+
+    ``artifact_id`` pins the new artifact's id instead of minting a ``uuid4``. The only
+    supplier is the router's ``identity`` path (`services/artifact_identity`), which derives it
+    from the acting principal and a caller-chosen natural key — so it is already bound to this
+    caller and cannot name another principal's artifact. It is NOT a general "let the client
+    choose an id" seam: a raw client-chosen id would be exactly the collision the derivation
+    exists to make unconstructable.
     """
-    container_id = str(uuid.uuid4())
+    container_id = artifact_id or str(uuid.uuid4())
     entity = CollectionEntity(
         id=container_id,
         name=name,
@@ -219,10 +133,6 @@ def create_container(
     store.create_collection(db, entity)
 
     # Issue explicit full-CRUDEASIO grant to the creator.
-    # ⚠ BEFORE the descriptor index below, deliberately: indexing encrypts cells under the
-    # container's key principal, and the oracle only mints that key for a caller whose grants
-    # reach it. Indexing first meant the creator's very first index attempt was 'update'-DENIED
-    # (the grant didn't exist yet) and the container's DEK went unminted until the async retry.
     store.upsert_user_collection_grant(
         db,
         user_id=user_id,
@@ -249,10 +159,27 @@ def create_container(
 
     # Index AFTER grant + cache-invalidation so the descriptor's cell encryption can mint
     # the container's DEK on the first attempt (see the ordering note above).
-    from mantle.services.collection_service import ensure_collection_descriptor
-    ensure_collection_descriptor(db, entity)
+    _index_container(db, entity, vector=vector)
 
     return entity
+
+
+def _index_container(db: Database, entity: CollectionEntity, *, vector=None) -> None:
+    """Index a top-level container artifact, carrying a writer-supplied vector if there is one.
+
+    ``ensure_collection_descriptor`` is the ordinary path and stays the ordinary path. It
+    takes no vector, so a container written WITH one calls the same pipeline entry point
+    directly rather than through it — one extra argument, not a second indexing path.
+    """
+    if vector is None:
+        from mantle.services.collection_service import ensure_collection_descriptor
+        ensure_collection_descriptor(db, entity)
+        return
+    try:
+        from mantle.search.ingest.pipeline_unified import index_artifact
+        index_artifact(entity, entity.id, is_head=True, vector=vector)
+    except Exception:
+        logger.warning("Failed to index container artifact %s", entity.id, exc_info=True)
 
 
 def create_workspace(
@@ -265,14 +192,18 @@ def create_workspace(
     Thin convenience wrapper over :func:`create_container` — workspaces are
     regular container artifacts, each with a fresh UUID and no ID-pinning.
     """
-    from mantle.services.gate_service import enforce_create_quota
-    enforce_create_quota(db, user_id, kind="workspace")
     return create_container(
         db, user_id, content_type=WORKSPACE_CONTENT_TYPE, name=name,
     )
 
 
 def list_workspaces(db: Database, user_id: str) -> List[CollectionEntity]:
+    """Every workspace inside the user's read light-cone — the containers carrying the workspace
+    content type that any active grant reaches.
+
+    Reachability, not authorship: a workspace shared with the user appears here, and one they
+    created but no longer hold a grant on does not.
+    """
     return store.get_collections_by_owner_and_type(db, user_id, WORKSPACE_CONTENT_TYPE)
 
 
@@ -284,17 +215,9 @@ def get_workspace(
 ) -> CollectionEntity:
     """Load a workspace, authorizing the caller for *required* (a CRUDEASIO verb).
 
-    ⛔ THIS USED TO AUTHORIZE EVERYTHING ON `can_read`.
-    It is the ONLY authorization in front of `update_workspace`,
-    `delete_workspace`, `update_workspace_context`, binding and key-rotation —
-    so read-only access to a workspace conferred the right to rewrite or destroy
-    it. `required` now names the verb, and every call site declares its own.
+    Deny grants are honoured: an explicit deny on the required verb wins over any allow.
 
-    Deny grants are also honoured now; the old check was
-    `any(g.can_read for g in grants)`, which ignored `effect` entirely, so an
-    explicit deny did nothing here.
-
-    Still a 404 (never 403) on refusal — not leaking existence is deliberate.
+    Always a 404 (never 403) on refusal — not leaking existence is deliberate.
     """
     entity = store.get_collection_by_id(db, workspace_id)
     if not entity:
@@ -316,6 +239,11 @@ def get_workspace(
 
 
 def get_workspace_unsafe(db: Database, workspace_id: str) -> Optional[CollectionEntity]:
+    """The container entity for ``workspace_id`` with NO access check, or ``None`` if absent.
+
+    ``unsafe`` is the whole contract: nothing here consults grants, so this belongs only on
+    paths that have already authorized the caller. :func:`get_workspace` is the checked read.
+    """
     return store.get_collection_by_id(db, workspace_id)
 
 
@@ -326,8 +254,75 @@ def update_workspace(
     name: Optional[str],
     description: Optional[str],
     context: Optional[str] = None,
+    vector=None,
+    content: Optional[str] = None,
+    content_type: Optional[str] = None,
+    state: Optional[str] = None,
 ) -> CollectionEntity:
+    """Update a top-level artifact's name, description, context, content and/or content_type;
+    return the current entity.
+
+    ``None`` fields are left alone, and the store write plus reindex happen only if something
+    actually moved — except that supplying ``vector`` is itself a change, since the writer is
+    restating what the container means even when no scalar field differs.
+
+    ``context`` replaces the stored context wholesale (see :func:`update_workspace_context`), and
+    a string is parsed as JSON with an unparseable value read as ``{}``. Requires ``update``;
+    raises ``HTTPException(404)`` for a missing workspace or a caller without that verb.
+
+    ``content`` and ``content_type`` are here because a TOP-LEVEL ARTIFACT IS NOT ALWAYS A
+    CONTAINER. :func:`create_container` is the only create path that takes no parent, so every
+    artifact written without a ``container_id`` — a note, a transcript, a file a hook captured —
+    is created through it WITH content (see its ``content`` parameter), and lands here on the way
+    back out. Without these two, `PATCH /artifacts/{id}` on such an artifact accepted a new body,
+    returned 200, and silently discarded it: the router's top-level branch had nothing to pass
+    the content to. That made every rewrite a fresh artifact instead of a new version of one, so
+    the store accumulated duplicate copies of the same thing with no way to tell which was
+    current — the failure `tests/test_workspace_service.py::test_update_workspace_replaces_content`
+    now pins. Stored on the entity directly, exactly as ``create_container`` stores it, and
+    reindexed through the same ``_index_container`` call the other fields use.
+
+    ``state`` archives and unarchives, and is here for the same reason ``content`` is: without
+    it the router's top-level branch had nothing to pass the caller's ``state`` to, so
+    ``PATCH /artifacts/{id}`` with ``state: "archived"`` returned 200 and changed nothing. That
+    left the archive mechanism unreachable for every artifact created without a ``container_id``
+    — which is every note, transcript and captured file — so superseded copies could only be
+    deleted, never retired. Pinned by
+    ``tests/test_workspace_service.py::test_update_workspace_archives_a_top_level_artifact``.
+
+    **Unarchiving returns a top-level artifact to COMMITTED, not to draft**, which is where it
+    differs from :func:`update_artifact` deliberately. A collection member unarchives to draft
+    because there is a commit path waiting for it — that same function's ``state == committed``
+    branch. A top-level artifact has none: :func:`create_container` writes ``committed``
+    directly and no path here ever promotes a draft, so unarchiving one into draft would move it
+    into a segment the default recall does not search and nothing could ever move it out of.
+    """
     ws = get_workspace(db, user_id, workspace_id, required="update")
+
+    # State transitions settle the artifact's segment and return; they never combine with a
+    # content edit in one call, because the two answer different questions ("where does this
+    # live" vs. "what does it say") and the index move has to be the whole of the write.
+    if state == CollectionEntity.STATE_ARCHIVED and ws.state != CollectionEntity.STATE_ARCHIVED:
+        ws.state = CollectionEntity.STATE_ARCHIVED
+        ws.modified_by = user_id
+        ws.modified_time = _now_iso()
+        store.update_collection(db, ws)
+        _reindex_after_state_change(ws, user_id, vacate=["committed", "draft"])
+        return ws
+
+    if ws.state == CollectionEntity.STATE_ARCHIVED:
+        if state and state != CollectionEntity.STATE_ARCHIVED:
+            ws.state = CollectionEntity.STATE_COMMITTED
+            ws.modified_by = user_id
+            ws.modified_time = _now_iso()
+            store.update_collection(db, ws)
+            _reindex_after_state_change(ws, user_id, vacate=["archived"])
+            return ws
+        # Editing an archived artifact is refused rather than silently reviving it — the same
+        # 409 `update_artifact` raises, for the same reason: an archived artifact has been
+        # retired, and a write that quietly un-retired it would defeat the retirement.
+        raise HTTPException(status.HTTP_409_CONFLICT, "Cannot edit an archived artifact")
+
     changed = False
     if name is not None and name != ws.name:
         ws.name = name
@@ -335,12 +330,18 @@ def update_workspace(
     if description is not None and description != ws.description:
         ws.description = description
         changed = True
-    if changed:
+    if content is not None and content != ws.content:
+        ws.content = content
+        changed = True
+    if content_type is not None and content_type != ws.content_type:
+        ws.content_type = content_type
+        changed = True
+    # A re-supplied vector is itself a change worth reindexing for: the writer is saying
+    # the container's meaning moved, even when none of its scalar fields did.
+    if changed or vector is not None:
         ws.modified_time = _now_iso()
         store.update_collection(db, ws)
-
-        from mantle.services.collection_service import ensure_collection_descriptor
-        ensure_collection_descriptor(db, ws)
+        _index_container(db, ws, vector=vector)
 
     if context is not None:
         parsed = _safe_parse_context(context) if isinstance(context, str) else context
@@ -350,42 +351,98 @@ def update_workspace(
     return ws
 
 
-def delete_workspace(db: Database, user_id: str, workspace_id: str) -> None:
-    get_workspace(db, user_id, workspace_id, required="delete")
+def _delete_or_detach_members(
+    db: Database, container_id: str, user_id: str, rows: list, *, cascade: bool,
+) -> None:
+    """The shared body of "what happens to a container's members when the container goes."
 
-    # Drop all artifacts in the workspace + their edges + search index docs.
-    rows = store.list_collection_artifacts(db, workspace_id, include_archived=True)
+    ``cascade=False`` (the default everywhere this is called) DETACHES: each member is evicted
+    from ``container_id`` — its edge to this container is dropped — and is otherwise untouched,
+    exactly as :func:`remove_artifact_from_container` leaves it. Nothing is destroyed, so a
+    member that was reachable only through this container becomes unreachable through it but
+    still exists, findable by anyone still holding its id or a direct grant on it — recoverable,
+    the way `rmdir` refusing a non-empty directory is recoverable and `rm -r` is not.
+
+    ``cascade=True`` is the old unconditional behaviour, preserved verbatim: a member still
+    linked into another container is evicted from this one only (the destroy would reach past
+    what the caller has rights over); a member with nowhere else to be reached from is destroyed
+    outright — its search index and object-storage content dropped along with the row. This is
+    the only branch that can lose data, and only because the caller asked for exactly that.
+
+    One event per root either way, because a watcher of this container sees the same thing in
+    both cases: the artifact is no longer in it. Which of "evicted" and "destroyed" happened is
+    not this event's business — `tests/test_scoped_deletion_and_urls.py` is where that is
+    decided and proven, not announced.
+    """
     for row in rows:
         art_id = row.get("id")
         root_id = row.get("root_id") or art_id
-        if art_id:
+        if not art_id:
+            continue
+
+        if cascade:
             try:
                 from mantle.search.ingest.pipeline_unified import delete_artifact_from_index
-                delete_artifact_from_index(art_id, root_id, collection_id=workspace_id)
+                delete_artifact_from_index(art_id, root_id, collection_id=container_id)
             except Exception:
                 logger.debug("index delete failed", exc_info=True)
 
-            # ⛔ THIS USED TO DELETE BY ROOT UNCONDITIONALLY.
-            # `delete_artifacts_by_root` + `remove_all_edges_for_root` destroy the
-            # artifact EVERYWHERE, not just here. An artifact linked into several
-            # containers (which `_link_source_artifact` exists to do) would be
-            # destroyed for every other container too — including containers the
-            # caller has no rights over. Deleting your own workspace should never
-            # reach into someone else's.
             shared_elsewhere = store.count_other_containers_for_root(
-                db, root_id, workspace_id
+                db, root_id, container_id
             ) > 0
             if shared_elsewhere:
                 # Evict from THIS container only; the artifact survives elsewhere.
-                store.remove_artifact_from_collection(db, workspace_id, root_id)
+                store.remove_artifact_from_collection(db, container_id, root_id)
             else:
                 store.delete_artifacts_by_root(db, root_id)
                 store.remove_all_edges_for_root(db, root_id)
+        else:
+            store.remove_artifact_from_collection(db, container_id, root_id)
+
+        _emit_event(container_id, "artifact.deleted", {"artifact_id": root_id},
+                    actor_id=user_id)
+
+
+def delete_workspace(
+    db: Database, user_id: str, workspace_id: str, *, cascade: bool = False,
+) -> None:
+    """Delete a workspace. Its members are DETACHED, not destroyed, unless ``cascade=True``.
+
+    ``cascade=False`` (the default): each member is evicted from this workspace — its edge
+    dropped — and otherwise left exactly as it was; nothing under it is deleted. ``cascade=True``
+    recurses the old way: a member linked into no other container is destroyed outright (index,
+    content, row); one still reachable elsewhere is evicted from this container only. See
+    :func:`_delete_or_detach_members` for the shared logic either branch runs.
+
+    Announced per root and then once for the workspace itself. A single event for the container
+    would not be enough: a subscriber holds derived state keyed on artifact ids, and told only
+    that the container went it has no way to name the ids it must drop. Emitted here rather than
+    at the write boundary for the reason every delete is — by the time the db layer has an id the
+    doc naming the container is gone, and the container is what the event is addressed to.
+
+    Each emit follows the write it announces, so nothing is announced that did not happen, and
+    `_emit_event` swallows its own failures — a feed that cannot be written to must not leave a
+    workspace half-deleted."""
+    get_workspace(db, user_id, workspace_id, required="delete")
+
+    rows = store.list_collection_artifacts(db, workspace_id, include_archived=True)
+    _delete_or_detach_members(db, workspace_id, user_id, rows, cascade=cascade)
 
     store.delete_collection(db, workspace_id)
+    # The container itself. A subscriber watching it learns the subscription's subject is gone,
+    # rather than going quiet and looking merely idle.
+    _emit_event(workspace_id, "artifact.deleted", {"artifact_id": workspace_id},
+                actor_id=user_id)
 
 
 def get_workspace_context(db: Database, user_id: str, workspace_id: str) -> dict:
+    """The workspace's parsed context, always carrying a ``collections`` list (empty if unset).
+
+    A context that is absent or not valid JSON reads as ``{}`` rather than raising — context is
+    caller-authored and a malformed one must not make the workspace unreadable. Mutating the
+    result persists nothing; :func:`update_workspace_context` is what writes it back. Requires
+    ``read``; raises ``HTTPException(404)`` otherwise.
+    """
     ws = get_workspace(db, user_id, workspace_id, required="read")
     parsed = _safe_parse_context(ws.context) if isinstance(ws.context, str) else (ws.context or {})
     parsed.setdefault("collections", [])
@@ -395,6 +452,13 @@ def get_workspace_context(db: Database, user_id: str, workspace_id: str) -> dict
 def update_workspace_context(
     db: Database, user_id: str, workspace_id: str, context: dict
 ) -> dict:
+    """Replace the workspace's context with ``context`` and return what was stored.
+
+    Whole-document replacement, NOT a merge: any key absent from ``context`` is dropped, so a
+    caller doing a partial edit must read the current context first and pass it back complete.
+    A non-dict argument is coerced to ``{}``, and a ``collections`` list is always present in
+    what is stored. Requires ``update``; raises ``HTTPException(404)`` otherwise.
+    """
     ws = get_workspace(db, user_id, workspace_id, required="update")
     if not isinstance(context, dict):
         context = {}
@@ -408,6 +472,15 @@ def update_workspace_context(
 def apply_workspace_card_actions(
     db: Database, user_id: str, workspace_id: str, actions: List[dict]
 ) -> dict:
+    """Apply ``attach_collection`` actions to the workspace context and return the stored context.
+
+    Attaching a collection already listed updates its ``mode`` (``own`` / ``shared``) in place
+    rather than appending a duplicate, which makes the call idempotent. Entries that are not
+    dicts, carry an unrecognised ``type``, or omit ``collection_id`` are skipped in silence — a
+    single bad action does not reject the batch. An unrecognised ``mode`` falls back to ``own``.
+
+    Requires ``read`` and ``update``; raises ``HTTPException(404)`` otherwise.
+    """
     current = get_workspace_context(db, user_id, workspace_id)
     coll_by_id = {c.get("collection_id"): c for c in current.get("collections", []) if isinstance(c, dict)}
     for act in actions or []:
@@ -628,11 +701,12 @@ def set_binding(
     bindings[role] = value
     update_workspace_context(db, user_id, workspace_id, ctx)
 
-    event_bus.emit("workspace.binding.set", {
-        "workspace_id": workspace_id,
-        "role": role,
-        "binding": value,
-    })
+    event_bus.emit_artifact_event_sync(
+        workspace_id,
+        "workspace.binding.set",
+        {"workspace_id": workspace_id, "role": role, "binding": value},
+        actor_id=user_id,
+    )
     return value
 
 
@@ -649,10 +723,12 @@ def clear_binding(
         del bindings[role]
         update_workspace_context(db, user_id, workspace_id, ctx)
 
-    event_bus.emit("workspace.binding.cleared", {
-        "workspace_id": workspace_id,
-        "role": role,
-    })
+    event_bus.emit_artifact_event_sync(
+        workspace_id,
+        "workspace.binding.cleared",
+        {"workspace_id": workspace_id, "role": role},
+        actor_id=user_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -664,6 +740,12 @@ def list_workspace_artifacts(
     user_id: str,
     workspace_id: str,
 ) -> List[ArtifactEntity]:
+    """The workspace's current members, ordered by ``order_key``, archived ones omitted.
+
+    Edge-resolved: each membership edge contributes the current version of its root, which for a
+    root linked in from elsewhere is a version whose own ``collection_id`` is another container.
+    Requires ``read``; raises ``HTTPException(404)`` otherwise.
+    """
     get_workspace(db, user_id, workspace_id, required="read")
     rows = store.list_collection_artifacts(db, workspace_id)
     return [ArtifactEntity.from_dict(r) for r in rows]
@@ -675,6 +757,16 @@ def get_workspace_artifact(
     workspace_id: str,
     artifact_id: str,
 ) -> ArtifactEntity:
+    """One artifact VERSION by id, confirmed to be homed in this workspace.
+
+    ``artifact_id`` is a version id, not a root id, and the version's own ``collection_id`` must
+    equal ``workspace_id`` — a root merely linked into the workspace by a membership edge does
+    NOT resolve here, because this is the read the write paths authorize against.
+
+    Requires ``read``. Raises ``HTTPException(404)`` for a missing workspace, a caller without
+    read, a missing artifact, or one homed in a different container — all the same answer, so a
+    refusal does not disclose which.
+    """
     get_workspace(db, user_id, workspace_id, required="read")
     artifact = store.get_artifact(db, artifact_id)
     if not artifact or artifact.collection_id != workspace_id:
@@ -683,33 +775,61 @@ def get_workspace_artifact(
 
 
 def get_artifact_unsafe_by_id(db: Database, artifact_id: str) -> Optional[ArtifactEntity]:
+    """One artifact version by id with NO access check and no container check, or ``None``.
+
+    ``unsafe`` is the whole contract: use :func:`get_workspace_artifact` on any path a caller
+    can reach.
+    """
     return store.get_artifact(db, artifact_id)
 
 
-def get_workspace_artifacts_batch(
+def get_workspace_artifacts_by_ids(
     db: Database,
     user_id: str,
     workspace_id: str,
     artifact_ids: List[str],
 ) -> List[ArtifactEntity]:
+    """The named artifact VERSIONS that are homed in ``workspace_id``.
+
+    Ids naming a missing artifact, or one homed in another container, are skipped, so the result
+    may be shorter than the input. Repeated ids are read once and yielded once. Archived versions
+    ARE included — the filter is containment, not state.
+
+    Deliberately not named ``*_batch``: the store publishes no multi-get, so this is one point
+    read per distinct id and there is no shared work to collapse. A batch name would invite
+    callers to hand it ids by the thousand, which is the one thing this shape cannot absorb.
+    Access is checked once for the workspace, not per artifact — every id that survives the
+    containment filter is in the workspace the caller was just authorized for.
+
+    Requires ``read``; raises ``HTTPException(404)`` otherwise.
+    """
     get_workspace(db, user_id, workspace_id, required="read")
     out: List[ArtifactEntity] = []
-    for aid in artifact_ids:
+    for aid in dict.fromkeys(artifact_ids or []):
         a = store.get_artifact(db, aid)
         if a and a.collection_id == workspace_id:
             out.append(a)
     return out
 
 
-def get_workspace_artifacts_batch_global(
+def get_workspace_artifacts_by_ids_global(
     db: Database,
     user_id: str,
     artifact_ids: List[str],
 ) -> List[ArtifactEntity]:
-    """Fetch artifacts across any workspace the user owns."""
+    """The named artifact VERSIONS homed in ANY workspace the user's grants reach.
+
+    The reachable set is resolved once (see :func:`list_workspaces`) and each artifact's home is
+    matched against it in memory, so the cost is one point read per distinct id rather than one
+    per (id, workspace) pair. Ids naming a missing artifact, or one homed outside that set, are
+    skipped; repeated ids are read once and yielded once.
+
+    Not named ``*_batch`` for the same reason as :func:`get_workspace_artifacts_by_ids`: the
+    per-id read is the store's floor here and the name should not promise otherwise.
+    """
     workspaces = {w.id for w in list_workspaces(db, user_id)}
     out: List[ArtifactEntity] = []
-    for aid in artifact_ids:
+    for aid in dict.fromkeys(artifact_ids or []):
         a = store.get_artifact(db, aid)
         if a and a.collection_id in workspaces:
             out.append(a)
@@ -720,12 +840,6 @@ def _safe_content_key(ctx: dict, artifact_id: str, *, default_prefix: str = "art
     """The object-store key for `artifact_id`, refusing any caller-supplied key that names a
     DIFFERENT artifact.
 
-    ⛔⛔ `content_key` CAME STRAIGHT OUT OF CALLER-SUPPLIED `context` AND WAS USED VERBATIM
-    TO READ, OVERWRITE, AND DELETE OBJECTS. `context` is a caller-authored JSON blob (it is
-    persisted unchanged on create, and `update_upload_status(context_patch=...)` merges raw caller
-    keys into it), and nothing checked that the key belonged to this artifact or this tenant.
-    Three separate paths consumed it, and the destructive ones need no read access at all:
-
       • WRITE — create an artifact in YOUR OWN container with
         `context = {"content_key": "<victim>/<their-artifact>.content"}`; `_store_content_in_s3`
         then calls `put_text_direct` on the victim's key, overwriting their object with bytes
@@ -733,9 +847,6 @@ def _safe_content_key(ctx: dict, artifact_id: str, *, default_prefix: str = "art
       • DELETE — the same trick with a throwaway artifact: `delete_object(content_key)` removes
         the victim's object from BOTH the edge and durable buckets.
       • READ — a signed URL, or the content endpoint, minted for someone else's key.
-
-    Found independently by two naive audits on disjoint scopes (the router pass and the service
-    pass), which is why it is fixed rather than argued about.
 
     The binding: a legitimate key always ends `/{artifact_id}.content` — the server derives either
     `artifacts/{id}.content` (here) or `{tenant}/{id}.content` (`initiate_upload_and_create_artifact`).
@@ -787,8 +898,10 @@ def _store_content_in_s3(
         logger.warning("Failed to upload artifact content to S3 for %s — keeping inline", artifact_id, exc_info=True)
         return content_key, content  # degrade gracefully: keep inline
 
-    # Keep small text inline as a fallback; clear inline for large content.
-    if len(content.encode("utf-8")) <= 131_072:  # 128 KB
+    # Keep small text inline as a fallback; clear inline for large content. The content is ALREADY
+    # in object storage at this point either way — this only decides whether a duplicate copy also
+    # rides along in the row, so nothing is lost at any value and no measurement is being judged.
+    if len(content.encode("utf-8")) <= _MAX_INLINE_BYTES:
         return content_key, content
     return content_key, ""
 
@@ -814,11 +927,18 @@ def _link_to_target_collections(
                 )
                 continue
             store.add_artifact_to_collection(db, target_id, artifact.root_id)
-            event_bus.emit("workspace.target_collection.linked", {
-                "workspace_id": workspace_id,
-                "target_collection_id": target_id,
-                "artifact_id": artifact.id,
-            })
+            # Addressed to the target collection, not the workspace: a subscriber watching the
+            # collection the artifact just entered is the one that needs to hear about it.
+            event_bus.emit_artifact_event_sync(
+                target_id,
+                "workspace.target_collection.linked",
+                {
+                    "workspace_id": workspace_id,
+                    "target_collection_id": target_id,
+                    "artifact_id": artifact.id,
+                },
+                actor_id=user_id,
+            )
         except Exception:
             logger.info(
                 "Failed to link artifact %s to target_collection %s",
@@ -835,14 +955,18 @@ def create_workspace_artifact(
     root_id: Optional[str] = None,
     order_key: Optional[str] = None,
     enqueue_index: bool = True,
-    dispatch_handlers: bool = True,
     name: Optional[str] = None,
     content_type: Optional[str] = None,
     index: Optional[str] = None,
+    vector=None,
 ) -> ArtifactEntity:
+    """Create an artifact inside a container.
+
+    ``vector`` is a validated :class:`api.vectors.SuppliedVector` when the writer sent one;
+    it rides the same index job as the rest of the write. Mantle produces no vector of its
+    own, so ``None`` means the vector arm receives nothing for this artifact.
+    """
     get_workspace(db, user_id, workspace_id, required="create")
-    from mantle.services.gate_service import enforce_create_quota
-    enforce_create_quota(db, user_id, kind="artifact")
 
     now = _now_iso()
     artifact_id = str(uuid.uuid4())
@@ -905,13 +1029,12 @@ def create_workspace_artifact(
     if enqueue_index and not resolve_lazy(index):
         try:
             from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
-            enqueue_index_artifact(artifact, artifact.collection_id, tenant_id=user_id)
+            enqueue_index_artifact(
+                artifact, artifact.collection_id, tenant_id=user_id, vector=vector,
+            )
             store.mark_materialized(db, artifact.id)
         except Exception:
             logger.debug("index enqueue failed", exc_info=True)
-
-    if dispatch_handlers:
-        _dispatch_handlers(db, user_id, workspace_id, "artifact_created", artifact)
 
     _emit_event(workspace_id, "artifact.created", {"artifact": artifact.to_dict()}, actor_id=user_id)
     return artifact
@@ -976,8 +1099,18 @@ def create_workspace_artifacts_bulk(
     user_id: str,
     workspace_id: str,
     items: Sequence[Union[Tuple[str, str], Tuple[str, str, Optional[Sequence[str]]], Dict[str, Any]]],
-    dispatch_handlers: bool = True,
 ) -> List[ArtifactEntity]:
+    """Create several artifacts in one workspace, returned in input order.
+
+    Each item is a mapping with ``context``/``content`` keys or a sequence of the two; non-string
+    values are JSON-encoded first. Access is checked once up front, then every item goes through
+    :func:`create_workspace_artifact` — so this is a convenience loop over the ordinary create
+    path, not a bulk store write, and it is NOT atomic: a failure part-way leaves the artifacts
+    already created in place.
+
+    Raises ``ValueError`` for an item that is neither a mapping nor a sequence, and
+    ``HTTPException(404)`` if the caller lacks ``create`` on the workspace.
+    """
     get_workspace(db, user_id, workspace_id, required="create")
 
     out: List[ArtifactEntity] = []
@@ -1004,7 +1137,6 @@ def create_workspace_artifacts_bulk(
                 context=context_val,
                 content=content_val,
                 enqueue_index=True,
-                dispatch_handlers=dispatch_handlers,
             )
         )
     return out
@@ -1050,11 +1182,18 @@ def _reindex_after_state_change(
     The index is per-state (committed/draft/archived live in separate trees);
     ``index_artifact`` routes by ``artifact.state`` and the same enqueued job
     vacates exactly the old segment(s) — never a blanket purge, since a root may
-    legitimately keep a committed version while a draft is also indexed."""
+    legitimately keep a committed version while a draft is also indexed.
+
+    The container id is ``collection_id or id`` because **a top-level artifact is its own
+    container** — the same identity ``_index_container`` passes when it indexes one at create
+    time. Reading ``collection_id`` alone would hand the empty string to a segment move for
+    every artifact written without a ``container_id``, which is the whole top-level population:
+    the state on the row would change and the index would not follow it.
+    """
     try:
         from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
         enqueue_index_artifact(
-            artifact, artifact.collection_id, tenant_id=user_id, vacate=vacate,
+            artifact, artifact.collection_id or artifact.id, tenant_id=user_id, vacate=vacate,
         )
     except Exception:
         logger.debug("reindex after state change failed", exc_info=True)
@@ -1070,8 +1209,14 @@ def update_artifact(
     state: Optional[str] = None,
     content_type: Optional[str] = None,
     reindex: bool = True,
-    dispatch_handlers: bool = True,
+    vector=None,
 ) -> ArtifactEntity:
+    """Update an artifact in a container.
+
+    ``vector`` is a validated :class:`api.vectors.SuppliedVector`. Supplying one is itself a
+    change: the writer is restating what this artifact means, so the update proceeds and
+    reindexes even when no scalar field moved.
+    """
     get_workspace(db, user_id, workspace_id, required="update")
 
     target = store.get_artifact(db, artifact_id)
@@ -1125,8 +1270,6 @@ def update_artifact(
             # draft just became the committed version).
             if reindex:
                 _reindex_after_state_change(target, user_id, vacate=["draft"])
-            if dispatch_handlers:
-                _dispatch_handlers(db, user_id, workspace_id, "artifact_committed", target)
             _emit_event(workspace_id, "artifact.updated", {"artifact": target.to_dict()}, actor_id=user_id)
         return target  # already committed — no-op
 
@@ -1155,7 +1298,7 @@ def update_artifact(
         else:
             target.content = content
         dirty = True
-    if not dirty:
+    if not dirty and vector is None:
         return target
 
     target.modified_by = user_id
@@ -1167,23 +1310,47 @@ def update_artifact(
     if reindex:
         try:
             from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
-            enqueue_index_artifact(target, target.collection_id, tenant_id=user_id)
+            enqueue_index_artifact(
+                target, target.collection_id, tenant_id=user_id, vector=vector,
+            )
         except Exception:
             logger.debug("reindex failed", exc_info=True)
-
-    if dispatch_handlers:
-        _dispatch_handlers(db, user_id, workspace_id, "artifact_updated", target)
 
     _emit_event(workspace_id, "artifact.updated", {"artifact": target.to_dict()}, actor_id=user_id)
     return target
 
 
 def delete_artifact(
-    db: Database, user_id: str, workspace_id: str, artifact_id: str
+    db: Database, user_id: str, workspace_id: str, artifact_id: str, *, cascade: bool = False,
 ) -> None:
+    """Delete one artifact version plus the copies of it that live outside the vertex —
+    the object-storage content and the search index.
+
+    ``workspace_id`` is the containing collection and is REQUIRED, not optional. Both the
+    S3 arm and the index arm are keyed on it, so a blank one deletes the row and leaves the
+    plaintext chunks searchable — a delete that reports success and erases nothing that
+    matters. Refuse the call instead: a caller that cannot name the container has not
+    established which artifact it is deleting.
+
+    This artifact may itself be a container — a sub-collection filed inside another one, not a
+    top-level workspace — in which case it can have members of its own. Those are handled exactly
+    as :func:`delete_workspace` handles a top-level container's members: detached (evicted, not
+    destroyed) unless ``cascade=True``. Skipping this check left the previous version of this
+    function silently unlinking a sub-collection while leaving its own members' edges pointing at
+    a container id that no longer resolves to anything.
+    """
+    if not workspace_id:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "delete_artifact requires the containing collection id",
+        )
     artifact = get_workspace_artifact(db, user_id, workspace_id, artifact_id)
 
-    # S3 cleanup — read the content_key straight from context (spec § delete fix).
+    children = store.list_collection_artifacts(db, artifact_id, include_archived=True)
+    if children:
+        _delete_or_detach_members(db, artifact_id, user_id, children, cascade=cascade)
+
+    # S3 cleanup — read the content_key straight from context.
     try:
         ctx = _safe_parse_context(artifact.context)
         # Validated, not trusted: an unchecked key here deletes ANOTHER tenant's object from both
@@ -1214,7 +1381,6 @@ def delete_artifact(
     except Exception:
         logger.debug("search delete failed", exc_info=True)
 
-    _dispatch_handlers(db, user_id, workspace_id, "artifact_deleted", artifact)
     _emit_event(workspace_id, "artifact.deleted", {"artifact_id": artifact_id}, actor_id=user_id)
 
 
@@ -1227,7 +1393,7 @@ def remove_artifact_from_container(
     """Remove an artifact from a container by detaching its edge.
 
     P2 — works on any container, not just workspaces. Access is gated by the
-    caller's `check_access` (typically with the `evict` action). If a draft
+    caller's `check_access`, with the `evict` action. If a draft
     version of the artifact is owned by this container, the draft row is
     cleaned up as part of the removal so it does not linger.
     """
@@ -1292,7 +1458,6 @@ def revert_artifact(
     except Exception:
         logger.debug("reindex failed", exc_info=True)
 
-    _dispatch_handlers(workspace_db, user_id, workspace_id, "artifact_updated", committed)
     _emit_event(workspace_id, "artifact.updated", {"artifact": committed.to_dict()}, actor_id=user_id)
     return committed
 
@@ -1303,7 +1468,7 @@ def add_artifact_to_workspace(
     user_id: str,
     workspace_id: str,
     artifact_root_id: str,
-    api_key: Optional[APIKeyEntity] = None,
+    grant_key: Optional[GrantEntity] = None,
 ) -> Optional[ArtifactEntity]:
     """
     Link an existing artifact (by root_id) into another collection via an edge.
@@ -1357,6 +1522,18 @@ def move_workspace_artifact(
     after_id: Optional[str],
     expected_version: Optional[int] = None,
 ) -> int:
+    """Reposition an artifact within its workspace by rewriting its membership edge's order key.
+
+    ``before_id`` and ``after_id`` name the neighbours to land between; a fractional key between
+    their two order keys is assigned, so no other edge is touched and concurrent moves elsewhere
+    in the list do not collide. Either may be ``None`` for "at the start"/"at the end".
+
+    Always returns ``0``: ordering is not versioned, edges are authoritative, and
+    ``expected_version`` is accepted for call-site compatibility WITHOUT being enforced — this
+    call has no optimistic-concurrency check and a caller must not read one into it.
+
+    Requires ``update``; raises ``HTTPException(404)`` for a missing workspace or artifact.
+    """
     get_workspace(db, user_id, workspace_id, required="update")
     artifact = store.get_artifact(db, artifact_id)
     if not artifact:
@@ -1378,158 +1555,14 @@ def move_workspace_artifact(
 
 
 def get_artifacts_order_version(db: Database, user_id: str, workspace_id: str) -> int:
+    """Always ``0``. Membership edges carry ordering directly, so there is no order counter to
+    report; the call survives to give ordering clients a stable value to echo back, and the
+    access check it performs is the part that still has an effect.
+
+    Requires ``read``; raises ``HTTPException(404)`` otherwise.
+    """
     get_workspace(db, user_id, workspace_id, required="read")
-    return 0  # no longer tracked — edges are authoritative
-
-
-# ---------------------------------------------------------------------------
-# Commit — batch state flip
-# ---------------------------------------------------------------------------
-
-def commit_workspace_to_collections(
-    workspace_db: Database,
-    collection_db: Database,
-    user_id: str,
-    workspace_id: str,
-    *,
-    artifact_ids: Optional[List[str]] = None,
-    dry_run: bool = False,
-    api_key: Optional[APIKeyEntity] = None,
-    commit_token: Optional[str] = None,
-    **_unused: Any,
-) -> WorkspaceCommitResponse:
-    """
-    Commit = flip drafts to committed in-place. No cross-table copies, no
-    membership deltas. `artifact_ids` optionally narrows to a subset;
-    `dry_run` returns the planned changes without mutating state.
-    """
-    get_workspace(workspace_db, user_id, workspace_id, required="update")
-
-    # Collect candidate drafts.
-    drafts = store.list_draft_artifacts(workspace_db, workspace_id)
-    if artifact_ids:
-        wanted = set(artifact_ids)
-        # Accept either version id or root id.
-        drafts = [d for d in drafts if d.id in wanted or d.root_id in wanted]
-
-    # Build the plan.
-    changes: List[ArtifactCommitChange] = []
-    for d in drafts:
-        changes.append(
-            ArtifactCommitChange(
-                artifact_id=d.id,
-                root_id=d.root_id,
-                action="commit",
-                state_before=ArtifactEntity.STATE_DRAFT,
-                state_after=ArtifactEntity.STATE_COMMITTED,
-                target_collections=[workspace_id],
-                committed_collections=[workspace_id],
-            )
-        )
-
-    plan = WorkspaceCommitPlanSummary(
-        artifacts=changes,
-        collections=[
-            CollectionChangeSummary(
-                collection_id=workspace_id,
-                added_artifacts=[d.id for d in drafts],
-            )
-        ] if drafts else [],
-        warnings=[],
-        total_artifacts=len(drafts),
-        total_adds=len(drafts),
-        total_removes=0,
-    )
-
-    actor = _resolve_commit_actor(user_id, api_key).to_summary()
-
-    if dry_run or not drafts:
-        token = generate_commit_token(workspace_id, user_id, [d.id for d in drafts])
-        return WorkspaceCommitResponse(
-            workspace_id=workspace_id,
-            plan=plan,
-            actor=actor,
-            dry_run=dry_run,
-            commit_token=token,
-            updated_workspace_artifacts=[],
-            deleted_workspace_artifact_ids=[],
-            skipped_workspace_artifact_ids=[],
-            per_collection=[
-                CollectionCommitSummary(
-                    collection_id=workspace_id,
-                    adds=[d.id for d in drafts],
-                )
-            ] if drafts else [],
-        )
-
-    # Apply: single AQL UPDATE for the whole batch.
-    now = _now_iso()
-    committed_count = store.batch_commit_drafts(
-        workspace_db,
-        collection_id=workspace_id,
-        artifact_ids=[d.id for d in drafts],
-        committed_by=user_id,
-        committed_time=now,
-    )
-
-    # Provenance record.
-    try:
-        from mantle.entities.commit import Commit as CommitEntity, CommitItem
-        commit_entity = CommitEntity(
-            collection_id=workspace_id,
-            author_id=user_id,
-            message=f"commit {committed_count} drafts",
-            timestamp=now,
-            item_ids=[d.id for d in drafts],
-        )
-        store.create_commit(collection_db, commit_entity)
-        store.create_commit_items(
-            collection_db,
-            [
-                CommitItem(
-                    commit_id=commit_entity.id,
-                    collection_id=workspace_id,
-                    artifact_root_id=d.root_id,
-                    artifact_version_id=d.id,
-                )
-                for d in drafts
-            ],
-        )
-    except Exception:
-        logger.debug("provenance record failed", exc_info=True)
-
-    # Re-index each committed artifact into the committed segment, and vacate the
-    # draft segment (the draft just became the committed version).
-    try:
-        from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
-        for d in drafts:
-            d.state = ArtifactEntity.STATE_COMMITTED
-            enqueue_index_artifact(
-                d, d.collection_id, tenant_id=user_id, vacate=["draft"],
-            )
-    except Exception:
-        logger.debug("post-commit reindex failed", exc_info=True)
-
-    for d in drafts:
-        _emit_event(workspace_id, "artifact.updated", {"artifact": d.to_dict()}, actor_id=user_id)
-
-    updated_dicts = [d.to_dict() for d in drafts]
-    return WorkspaceCommitResponse(
-        workspace_id=workspace_id,
-        plan=plan,
-        actor=actor,
-        dry_run=False,
-        commit_token=None,
-        updated_workspace_artifacts=updated_dicts,
-        deleted_workspace_artifact_ids=[],
-        skipped_workspace_artifact_ids=[],
-        per_collection=[
-            CollectionCommitSummary(
-                collection_id=workspace_id,
-                adds=[d.id for d in drafts],
-            )
-        ],
-    )
+    return 0  # order is not versioned — edges are authoritative for ordering
 
 
 # ---------------------------------------------------------------------------
@@ -1551,6 +1584,20 @@ def initiate_upload_and_create_artifact(
     order_key: Optional[str] = None,
     context: Optional[dict] = None,
 ):
+    """Create a draft artifact to receive a file upload; return ``(descriptor, artifact)``.
+
+    The descriptor is ``{"upload_id", "mode", "url", "method", "key"}`` and always describes a
+    PROXIED upload — the client PUTs bytes to Mantle, which envelope-encrypts them before they
+    reach object storage. No presigned storage URL is ever handed out, so storage stays invisible
+    to callers and never receives plaintext.
+
+    ``size`` and ``content_type`` are the client's CLAIM, recorded in context so the UI has
+    something to show; the true values are read back from storage on completion. The artifact is
+    created unindexed because it has no content yet — :func:`update_upload_status` indexes it
+    once the bytes land.
+
+    Requires ``create`` on the workspace; raises ``HTTPException(404)`` otherwise.
+    """
     from mantle.services.content_service import presign_put_or_multipart, get_content_storage_mode
     from mantle.services.ingest_runner_service import describe_content_processing
 
@@ -1577,7 +1624,6 @@ def initiate_upload_and_create_artifact(
         content="",
         order_key=order_key,
         enqueue_index=False,
-        dispatch_handlers=False,
     )
 
     key = f"{tenant}/{artifact.id}.content"
@@ -1595,7 +1641,6 @@ def initiate_upload_and_create_artifact(
         db, user_id, workspace_id, artifact.id,
         context=_ensure_json_str(patched_ctx),
         reindex=False,
-        dispatch_handlers=False,
     )
 
     return (
@@ -1620,6 +1665,20 @@ def update_upload_status(
     parts: Optional[List[Dict]] = None,
     context_patch: Optional[Dict] = None,
 ):
+    """Advance an in-progress upload and return the updated artifact.
+
+    ``uploading`` and ``failed`` only record state in the artifact's context and return without
+    touching storage; ``failed`` additionally marks every processing stage failed. ``complete``
+    finalizes a multipart write if there is one, reads the object's TRUE size and content type
+    back from storage (the values recorded at initiation were the client's claim), mirrors the
+    object to durable storage, and drops the ``upload`` section — after which the artifact
+    indexes on the ordinary update path.
+
+    Raises ``HTTPException(400)`` for an unrecognised ``status_value``, for a ``complete`` whose
+    context carries no key or mode, for a multipart completion missing its id or parts, and when
+    the object is not in storage. Raises ``HTTPException(502)`` if the durable copy fails, which
+    leaves the upload unfinished rather than reporting a success only the edge bucket can serve.
+    """
     from mantle.services.content_service import (
         complete_multipart,
         head_object,
@@ -1653,7 +1712,6 @@ def update_upload_status(
             db, user_id, workspace_id, upload_id,
             context=_ensure_json_str(ctx),
             reindex=False,
-            dispatch_handlers=False,
         )
 
     if status_value == "complete":
@@ -1720,13 +1778,22 @@ def update_upload_status(
 
 
 # ---------------------------------------------------------------------------
-# Artifact-scoped API keys (inbound / stream)
+# Artifact-scoped grant keys (inbound / stream)
 # ---------------------------------------------------------------------------
+#
+# A card key is an ordinary grant key (services/grant_key_service) scoped to the one
+# workspace the card lives in, so what the key may do is legible in the same CRUDEASIO
+# bits as any other grant.
 
 _KEY_CONTEXT_MAP: Dict[str, Tuple[str, str, str]] = {
-    "stream":  ("stream",  "obs_api_key_id", "Stream Source"),
-    "inbound": ("inbound", "api_key_id",     "Inbound Source"),
+    "stream":  ("stream",  "obs_grant_key_id", "Stream Source"),
+    "inbound": ("inbound", "grant_key_id",     "Inbound Source"),
 }
+
+#: What a card key may do in its workspace: read the card and post messages back.
+#: Deliberately not `can_delete`/`can_admin` — an inbound webhook URL is the most
+#: exposed credential in the system and should not be able to destroy the workspace.
+_CARD_KEY_FLAGS = {"can_read": True, "can_create": True, "can_update": True, "can_add": True}
 
 
 def rotate_artifact_key(
@@ -1737,7 +1804,32 @@ def rotate_artifact_key(
     store_db: Database,
     key_context: str,
 ) -> Dict[str, str]:
-    from mantle.services import auth_service
+    """Issue a fresh card key for an artifact's ``stream`` or ``inbound`` endpoint, revoking the
+    one it replaces, and record the new key's id in the artifact's context.
+
+    Returns ``{"workspace_id", "artifact_id", "key_id", "key"}``. ``key`` is shaped
+    ``"<artifact_id>:<secret>"`` because :func:`resolve_card_key` authenticates the pair, and
+    this return is the ONLY time the secret is available — it is hashed at rest and cannot be
+    recovered afterwards, so a caller that drops it must rotate again.
+
+    The grant is scoped to the WORKSPACE, not to the artifact, carrying read/create/update/add
+    and deliberately not delete or admin: an inbound webhook URL is the most exposed credential
+    in the system and must not be able to destroy the workspace it posts into. Binding to the
+    issuing artifact is enforced separately, by the ``key_id`` written into context here.
+
+    The prior key is revoked rather than deleted so it stays visible in the grant ledger. A
+    revocation that fails is logged and rotation proceeds — the replaced key can therefore
+    outlive the rotation, and a caller rotating in response to a leak must confirm the old key
+    is revoked rather than assume it.
+
+    The only access this checks is ``read`` on the workspace, by way of the artifact lookup —
+    while the key it mints carries create/update/add. Callers that expose this must gate it on
+    the authority they intend to require; it does not gate itself.
+
+    Raises ``HTTPException(400)`` for a ``key_context`` outside ``{"stream", "inbound"}`` and
+    ``HTTPException(404)`` if the artifact is not readable in this workspace.
+    """
+    from mantle.services import grant_key_service
     binding = _KEY_CONTEXT_MAP.get(key_context)
     if not binding:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Unknown key_context: {key_context}")
@@ -1747,33 +1839,25 @@ def rotate_artifact_key(
     ctx = _safe_parse_context(artifact.context)
     section_cfg = dict(ctx.get(context_section) or {})
 
+    # Rotation must invalidate the old credential. Revoked rather than deleted so the
+    # replaced key stays visible in the grant ledger.
     old_key_id = section_cfg.get(key_id_field)
     if isinstance(old_key_id, str) and old_key_id.strip():
         try:
-            store.delete_api_key(store_db, old_key_id)
+            old = store.get_grant_by_id(store_db, old_key_id.strip())
+            if old is not None:
+                grant_key_service.revoke(store_db, old, user_id)
         except Exception:
-            pass
+            logger.warning("card-key rotation: revoking prior key failed", exc_info=True)
 
-    raw_key = auth_service.generate_api_key()
-    key_hash = auth_service.hash_api_key(raw_key)
-    now = _now_iso()
-    api_key = APIKeyEntity(
-        id=str(uuid.uuid4()),
+    created, raw_key = grant_key_service.mint(
+        store_db,
         user_id=user_id,
-        key_hash=key_hash,
         name=f"{key_label_prefix} - {artifact_id}",
-        scopes=[
-            f"resource:{WORKSPACE_CONTENT_TYPE}:read",
-            f"resource:{WORKSPACE_CONTENT_TYPE}:write",
-        ],
-        resource_filters={"collections": [workspace_id]},
-        created_time=now,
-        modified_time=now,
-        expires_at=None,
-        last_used_at=None,
-        is_active=True,
+        resource_id=workspace_id,
+        flags=_CARD_KEY_FLAGS,
+        notes=f"card:{key_context}:{artifact_id}",
     )
-    created = store.create_api_key(store_db, api_key)
 
     section_cfg[key_id_field] = created.id
     ctx[context_section] = section_cfg
@@ -1787,40 +1871,45 @@ def rotate_artifact_key(
     }
 
 
-def resolve_card_api_key(
+def resolve_card_key(
     db: Database,
     artifact_id: str,
     token: str,
     store_db: Database,
     key_context: Optional[str] = None,
 ) -> Tuple[ArtifactEntity, CollectionEntity, str]:
-    from mantle.services import auth_service
+    """Authenticate a card key and return the artifact, its workspace, and the owner.
+
+    Every failure is 404 regardless of cause, so a caller holding a wrong token cannot
+    use the response to learn which artifact ids exist.
+    """
+    from mantle.services import grant_key_service
 
     artifact = store.get_artifact(db, artifact_id)
     if not artifact:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
 
     workspace_id = artifact.collection_id
-    if not token.startswith("agc_"):
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
-
-    api_key = auth_service.verify_api_key(store_db, token)
-    if not api_key or not api_key.user_id:
+    root = grant_key_service.authenticate(store_db, token)
+    if root is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
 
     ws = store.get_collection_by_id(db, workspace_id)
     if not ws:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
 
-    grants = store.get_active_grants_for_principal_resource(
-        db, grantee_id=api_key.user_id, resource_id=workspace_id,
-    )
-    if not any(getattr(g, "can_read", False) for g in grants):
+    # The key must actually reach THIS workspace and be able to write to it. Resolving
+    # the bundle means a key that carries the workspace as a member works too, without
+    # this path needing to know whether it was a bundle.
+    effective = grant_key_service.resolve(store_db, root)
+    if not any(
+        g.resource_id == workspace_id and getattr(g, "can_create", False)
+        for g in effective
+    ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
 
-    if not api_key.can_access_resource("collections", workspace_id):
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
-
+    # Bind the key to the specific card that issued it: a stream key for one card must
+    # not post as another card in the same workspace.
     ctx = _safe_parse_context(artifact.context)
     binding = _KEY_CONTEXT_MAP.get(key_context) if key_context else None
     if binding:
@@ -1828,7 +1917,7 @@ def resolve_card_api_key(
         if isinstance(section_cfg, dict):
             expected = section_cfg.get(binding[1])
             if isinstance(expected, str) and expected.strip():
-                if str(getattr(api_key, "id", "") or "") != expected.strip():
+                if str(root.id or "") != expected.strip():
                     raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
 
     return artifact, ws, ws.created_by
@@ -1844,7 +1933,20 @@ def receive_card_inbound_message(
     metadata: Optional[dict] = None,
     store_db: Optional[Database] = None,
 ) -> Tuple[str, str]:
-    source_artifact, ws, owner_id = resolve_card_api_key(
+    """Record an inbound webhook message as a new artifact in the card's workspace.
+
+    Authenticates ``token`` as that card's ``inbound`` key, then creates the message artifact as
+    the WORKSPACE OWNER rather than as the credential: a webhook has no user behind it, and the
+    owner is the principal accountable for what lands in their workspace. The originating card is
+    kept in the new artifact's context as ``source_artifact_id``, so provenance survives even
+    though the writer is recorded as the owner.
+
+    Returns ``(message_artifact_id, workspace_id)``. Raises ``HTTPException(401)`` for a token
+    that does not authenticate and ``HTTPException(404)`` for every other failure — including a
+    valid token pointed at the wrong card — so a caller cannot use the response to probe which
+    artifact ids exist.
+    """
+    source_artifact, ws, owner_id = resolve_card_key(
         db, artifact_id, token, store_db or db, key_context="inbound"
     )
     card_ctx: Dict[str, Any] = {
@@ -1873,33 +1975,3 @@ async def dispatch_create_workspace(artifact: dict, body: dict, ctx: Any) -> dic
     name = (body or {}).get("name", "New Workspace")
     ws = create_workspace(ctx.store_db, ctx.user_id, name)
     return ws.to_dict()
-
-
-async def dispatch_commit(artifact: dict, body: dict, ctx: Any) -> dict:
-    """Commit workspace drafts via the ``commit`` operation."""
-    workspace_id = artifact.get("_key") or artifact.get("id")
-    artifact_ids = (body or {}).get("artifact_ids")
-    result = commit_workspace_to_collections(
-        workspace_db=ctx.store_db,
-        collection_db=ctx.store_db,
-        user_id=ctx.user_id,
-        workspace_id=workspace_id,
-        artifact_ids=artifact_ids,
-        dry_run=False,
-    )
-    return result.to_dict() if hasattr(result, "to_dict") else {"status": "committed"}
-
-
-async def dispatch_commit_preview(artifact: dict, body: dict, ctx: Any) -> dict:
-    """Dry-run commit preview via the ``commit_preview`` operation."""
-    workspace_id = artifact.get("_key") or artifact.get("id")
-    artifact_ids = (body or {}).get("artifact_ids")
-    result = commit_workspace_to_collections(
-        workspace_db=ctx.store_db,
-        collection_db=ctx.store_db,
-        user_id=ctx.user_id,
-        workspace_id=workspace_id,
-        artifact_ids=artifact_ids,
-        dry_run=True,
-    )
-    return result.to_dict() if hasattr(result, "to_dict") else {"status": "preview"}

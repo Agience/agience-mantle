@@ -17,7 +17,8 @@ from urllib.request import Request, urlopen
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from prism.mass import consensus_of, provenance_of
+from prism.attestation import SELF_ORIGIN
+from prism.mass import provenance_of
 
 from .node import MeshNode
 
@@ -36,26 +37,30 @@ def build_node_from_mantle(node_id: str, mantle_url: str, token: str,
                            version: int = 1) -> Tuple[MeshNode, List[dict]]:
     """Fetch a node's visible artifacts and pack them into signed shards by region.
 
-    Region = ``context`` for now (a real anchor-region id once routing is wired).
-    Each item's bytes = the artifact content; the entroptics consensus/coherence score
-    travels in the manifest so routing can prefer the densest/most-coherent source.
+    Region = ``context``. A real anchor-region id replaces it once routing is wired.
+    Each item's bytes = the artifact content; this authority's ATTESTATION of each item travels in
+    the manifest, so a peer can compute agreement rather than inherit a number.
+
+    What travels is what this bridge actually observed: it fetched these artifacts from this
+    Mantle, so this authority ORIGINATES them into the mesh, and the provenance label rides as the
+    CHANNEL — how they were obtained, not how much to believe them. A number every node would
+    derive identically from the same table (a weight rather than an observation) tells a peer
+    nothing it could not have computed itself, so none travels here.
     """
     artifacts = fetch_visible(mantle_url, token)
     regions: Dict[str, Dict[str, bytes]] = {}
-    consensus: Dict[str, Dict[str, float]] = {}
+    attest: Dict[str, Dict[str, dict]] = {}
     for a in artifacts:
         region = a.get("context") or "default"
         content = (a.get("content") or "").encode("utf-8")
         regions.setdefault(region, {})[a["id"]] = content
-        # MASS, not length. The old placeholder scored `1.0 if len(content) > 8` — it
-        # weighed VERBOSITY, a property every hallucination has in abundance, and handed
-        # a fabricated paragraph full marks. Weight now follows PROVENANCE: how the item
-        # was obtained (prism.mass). Artifacts written before provenance was recorded read
-        # as UNKNOWN — weak, but above the ghost floor, because unlabeled is not fabricated.
-        consensus.setdefault(region, {})[a["id"]] = consensus_of(provenance_of(a))
+        attest.setdefault(region, {})[a["id"]] = {
+            "origin": SELF_ORIGIN,
+            "channel": provenance_of(a).value,
+        }
 
     node = MeshNode(node_id)
     for region, items in regions.items():
         node.put_shard(region, items, version=version, authority=authority_id,
-                       priv=authority_priv, consensus=consensus.get(region))
+                       priv=authority_priv, attest=attest.get(region))
     return node, artifacts

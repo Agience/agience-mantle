@@ -1,4 +1,4 @@
-"""Unit tests for `search.mantle.LightConeResolver` (Step 2.1).
+"""Unit tests for `search.mantle.LightConeResolver`.
 
 CRUDEASIO lives in Mantle (the lattice grants collection). The resolver reads
 grants from `db_store.get_active_grants_for_grantee` — no Origin HTTP
@@ -10,15 +10,26 @@ calls. Tests cover:
 - direct grant + descendants → union
 - propagate mask blocks descendants → only direct included
 - unknown action → empty
+- deny-effect grant → not authorizing (audit S1)
+- the context lattice is seeded from what containment reached, held under a stated action
+  ceiling, CONFINED to the grant-derived set, and bounded (D16)
+
+The context lattice's own properties — nesting, multi-parent, cycles, that authority strictly
+attenuates along a context chain, and the swept invariant that a context edge never widens
+what grants authorize — are in `tests/test_context_lattice.py`. What is tested here is only
+what the RESOLVER decides: what it seeds the walk with, what two ceilings it holds it under,
+and that it does not run the walk at all for a principal with no grants.
 """
 
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+from mantle.attenuation import Mask
 from mantle.db import backend as db_store
 from mantle.entities.grant import Grant as GrantEntity
 from mantle.search.mantle import LightConeResolver
+from mantle.services import context_service
 
 def _grant(resource_id: str, **flags) -> GrantEntity:
     """Build a GrantEntity with CRUDEASIO flags defaulting to False."""
@@ -28,11 +39,13 @@ def _grant(resource_id: str, **flags) -> GrantEntity:
         "can_add": False, "can_share": False, "can_admin": False,
     }
     defaults.update(flags)
+    effect = defaults.pop("effect", "allow")
     return GrantEntity(
         resource_id=resource_id,
         grantee_type="user",
         grantee_id="user-1",
         granted_by="admin",
+        effect=effect,
         **defaults,
     )
 
@@ -49,6 +62,104 @@ def test_grant_lacking_action_flag_is_excluded():
                       return_value=[_grant("col-1", can_read=False, can_admin=True)]):
         resolver = LightConeResolver(db=MagicMock())
         assert resolver.resolve("user-1", "read") == set()
+
+
+# ---------------------------------------------------------------------------
+# effect — deny is the absorbing element (audit S1)
+# ---------------------------------------------------------------------------
+#
+# The resolver used to filter on the CRUDEASIO flag alone (`getattr(g, flag_attr, False)`),
+# which is only half the authorization question: a `deny`-effect grant carrying `can_read`
+# was read as AUTHORIZING. It feeds key issuance (`oracle.LightConeGrantVerifier`) and
+# search-result decryption (`sse/router_accessor`), so the failure would have handed out a
+# content key on the strength of a grant that says the opposite of what it means.
+#
+# Structurally this is now impossible — `mask_of(g).allows(action)` is the meet of the bit
+# and the effect, and deny is that operator's absorbing zero (`tests/
+# test_attenuation_algebra.py` proves it over the whole domain). These tests keep the
+# guarantee visible at the level it matters, because "unrepresentable" is a claim about the
+# operator and this is a claim about the resolver.
+
+
+def test_a_deny_grant_does_not_seed_the_light_cone():
+    """The regression. A deny grant with `can_read=True` reaches nothing."""
+    deny = _grant("col-1", can_read=True, effect="deny")
+    with (
+        patch.object(db_store, "get_active_grants_for_grantee", return_value=[deny]),
+        patch.object(db_store, "list_origin_descendants", return_value={"art-a"}),
+    ):
+        reached = LightConeResolver(db=MagicMock()).resolve("user-1", "read")
+
+    assert reached == set(), (
+        "a deny-effect grant seeded the light cone — it authorized decryption and key "
+        "issuance while saying the opposite"
+    )
+
+
+def test_a_deny_grant_does_not_drag_its_descendants_in_either():
+    """The BFS must not even be asked: pruning starts at the seed, so a deny grant must
+    contribute no root for the walk to expand."""
+    called = []
+
+    def fake_descendants(_db, root_ids, action):
+        called.append(list(root_ids))
+        return {"art-a"}
+
+    with (
+        patch.object(db_store, "get_active_grants_for_grantee",
+                     return_value=[_grant("col-1", can_read=True, effect="deny")]),
+        patch.object(db_store, "list_origin_descendants", side_effect=fake_descendants),
+    ):
+        reached = LightConeResolver(db=MagicMock()).resolve("user-1", "read")
+
+    assert reached == set()
+    assert called == [], f"the BFS was seeded from a deny grant: {called}"
+
+
+def test_an_unrecognized_effect_confers_nothing_here_too():
+    """`grant_is_allow` is positive matching, not `not grant_is_deny(...)` — an effect
+    nobody can read as an allow must fail closed rather than fall through."""
+    with (
+        patch.object(db_store, "get_active_grants_for_grantee",
+                     return_value=[_grant("col-1", can_read=True, effect="permit")]),
+        patch.object(db_store, "list_origin_descendants", return_value=set()),
+    ):
+        assert LightConeResolver(db=MagicMock()).resolve("user-1", "read") == set()
+
+
+def test_an_allow_grant_alongside_a_deny_one_still_reaches_its_own_resource():
+    """The positive control. Without it every assertion above would pass against a resolver
+    that reached nothing at all.
+
+    It also states the residual, deliberately: deny here is *absorbing*, not *subtractive* —
+    a deny on `col-1` does not revoke a separate allow on `col-2`. Per-resource deny
+    PRECEDENCE (a deny beating a co-located allow) lives in `services.dependencies.
+    check_access`, which is the gate in front of every artifact read.
+    """
+    grants = [
+        _grant("col-1", can_read=True, effect="deny"),
+        _grant("col-2", can_read=True),
+    ]
+    with (
+        patch.object(db_store, "get_active_grants_for_grantee", return_value=grants),
+        patch.object(db_store, "list_origin_descendants", return_value=set()),
+    ):
+        assert LightConeResolver(db=MagicMock()).resolve("user-1", "read") == {"col-2"}
+
+
+def test_the_deny_check_is_not_a_blanket_and_still_honours_the_action():
+    """Both halves of the meet must still be live: a deny grant is filtered on its effect,
+    an allow grant lacking the bit on its bit. Collapsing either into the other would pass
+    the regression above while breaking the other axis."""
+    with (
+        patch.object(db_store, "get_active_grants_for_grantee", return_value=[
+            _grant("col-1", can_read=True),                      # allow + bit  -> in
+            _grant("col-2", can_update=True),                    # allow, no bit -> out
+            _grant("col-3", can_read=True, effect="deny"),       # bit, no allow -> out
+        ]),
+        patch.object(db_store, "list_origin_descendants", return_value=set()),
+    ):
+        assert LightConeResolver(db=MagicMock()).resolve("user-1", "read") == {"col-1"}
 
 
 def test_unknown_action_returns_empty():
@@ -102,10 +213,6 @@ def test_two_grants_descendants_unioned():
     # The resolver passes both granted IDs to the BFS in one call.
     assert set(captured["root_ids"]) == {"col-1", "col-2"}
     assert captured["action"] == "read"
-    # FAILURE MODE: a `max_depth` used to be threaded through here and silently truncated the
-    # light-cone, so a grant more than 4 levels up produced a false deny. There is no depth
-    # parameter to pass any more — `seen` terminates the BFS.
-    assert "max_depth" not in captured
 
 
 def test_action_passes_through_to_descendant_lookup():
@@ -127,21 +234,159 @@ def test_action_passes_through_to_descendant_lookup():
 
 
 # ---------------------------------------------------------------------------
+# the context lattice (D16) — one walk, not a second pass
+# ---------------------------------------------------------------------------
+#
+# Context is an artifact with edges to its own context, so authorization and selection are the
+# same traversal rather than "compute the authorized set, then filter". These pin the three
+# decisions the RESOLVER makes about that walk; what the walk itself does is
+# `tests/test_context_lattice.py`.
+
+
+def test_the_context_walk_is_seeded_from_everything_containment_reached():
+    """Not from the grants alone. A context edge hanging off a descendant is as real as one
+    hanging off the granted resource, and seeding only the grants would make reach depend on
+    where in a collection someone happened to attach it."""
+    seen = {}
+
+    def fake_reach(_db, seeds, action, **kw):
+        seen["seeds"] = set(seeds)
+        seen["action"] = action
+        seen["authority"] = kw.get("authority")
+        seen["within"] = kw.get("within")
+        seen["bound"] = (kw.get("max_depth"), kw.get("max_nodes"))
+        seen["expander"] = kw.get("expand_containment")
+        return context_service.ContextReach(frozenset({"ctx-child"}), 1, False, None)
+
+    with (
+        patch.object(db_store, "get_active_grants_for_grantee",
+                     return_value=[_grant("col-1", can_read=True)]),
+        patch.object(db_store, "list_origin_descendants", return_value={"art-a"}),
+        patch.object(context_service, "reach", side_effect=fake_reach),
+    ):
+        reached = LightConeResolver(db=MagicMock()).resolve("user-1", "read")
+        # Asserted inside the patch: the expander the resolver hands over must be the LIVE
+        # containment BFS, so the two lattices alternate inside one walk rather than being
+        # unioned afterwards.
+        assert seen["expander"] is db_store.list_origin_descendants
+
+    assert seen["seeds"] == {"col-1", "art-a"}
+    assert seen["action"] == "read"
+    # `ctx-child` is outside what grants authorize, so it does not survive — even though the
+    # (here deliberately lying) walk returned it. The resolver intersects rather than trusts.
+    assert reached == {"col-1", "art-a"}
+
+
+def test_the_context_walk_may_not_leave_what_grants_authorize():
+    """The confinement, at the point the resolver states it.
+
+    `within` must be exactly the grant-derived set: the granted ids plus the origin
+    containment cone below them. A resolver that passed `UNCONFINED` and relied on filtering
+    the result afterwards would be one refactor away from the bug this replaced — a grant on
+    `org` returning `{"org", "project", "doc-1"}`, ids `check_access` would refuse to read
+    and `oracle.LightConeGrantVerifier` would issue a content key for.
+    """
+    seen = {}
+
+    with (
+        patch.object(db_store, "get_active_grants_for_grantee",
+                     return_value=[_grant("col-1", can_read=True)]),
+        patch.object(db_store, "list_origin_descendants", return_value={"art-a", "art-b"}),
+        patch.object(context_service, "reach",
+                     side_effect=lambda *a, **kw: seen.update(kw) or context_service.EMPTY_REACH),
+    ):
+        reached = LightConeResolver(db=MagicMock()).resolve("user-1", "read")
+
+    assert seen["within"] == {"col-1", "art-a", "art-b"}
+    assert seen["within"] is not context_service.UNCONFINED
+    assert reached == {"col-1", "art-a", "art-b"}
+
+
+def test_the_context_walk_is_held_under_a_ceiling_that_states_the_action():
+    """Every seed already passed `allows(action)`, and they came from grants with different
+    bits. `Mask.of((action,))` is exactly what is true of all of them — and because the first
+    hop meets with it, it is a real ceiling rather than a comment."""
+    seen = {}
+
+    with (
+        patch.object(db_store, "get_active_grants_for_grantee",
+                     return_value=[_grant("col-1", can_update=True)]),
+        patch.object(db_store, "list_origin_descendants", return_value=set()),
+        patch.object(context_service, "reach",
+                     side_effect=lambda *a, **kw: seen.update(kw) or context_service.EMPTY_REACH),
+    ):
+        LightConeResolver(db=MagicMock()).resolve("user-1", "update")
+
+    assert seen["authority"] == Mask.of(("update",))
+    assert seen["authority"].allows("update") and not seen["authority"].allows("read")
+
+
+def test_the_resolver_bounds_the_context_walk_and_the_bound_is_per_node():
+    """`resolve()` runs the containment BFS to exhaustion, which is tolerable on a shallow
+    engine-driven structure. The context lattice is deeper by construction, so its walk is
+    bounded — and by a value fixed at construction, because a per-request bound would be a
+    way to make any single query as expensive as the caller liked."""
+    import inspect
+
+    seen = {}
+    with (
+        patch.object(db_store, "get_active_grants_for_grantee",
+                     return_value=[_grant("col-1", can_read=True)]),
+        patch.object(db_store, "list_origin_descendants", return_value=set()),
+        patch.object(context_service, "reach",
+                     side_effect=lambda *a, **kw: seen.update(kw) or context_service.EMPTY_REACH),
+    ):
+        LightConeResolver(db=MagicMock()).resolve("user-1", "read")
+        assert seen["max_depth"] == context_service.DEFAULT_MAX_DEPTH
+        assert seen["max_nodes"] == context_service.DEFAULT_MAX_NODES
+
+        LightConeResolver(db=MagicMock(), max_depth=3, max_nodes=7).resolve("user-1", "read")
+        assert (seen["max_depth"], seen["max_nodes"]) == (3, 7)
+
+    resolve_params = inspect.signature(LightConeResolver.resolve).parameters
+    assert "max_depth" not in resolve_params and "max_nodes" not in resolve_params
+
+
+def test_a_principal_with_no_grants_does_not_enter_the_context_lattice():
+    """No seed, no walk. A context edge must not be an entry point for a principal the
+    containment cone already refused."""
+    calls = []
+    with (
+        patch.object(db_store, "get_active_grants_for_grantee", return_value=[]),
+        patch.object(context_service, "reach",
+                     side_effect=lambda *a, **kw: calls.append(a) or context_service.EMPTY_REACH),
+    ):
+        assert LightConeResolver(db=MagicMock()).resolve("user-1", "read") == set()
+    assert calls == []
+
+
+def test_a_deny_grant_does_not_enter_the_context_lattice_either():
+    """S1 again, one layer out: the new edges must not become a second way for a deny grant to
+    seed a cone."""
+    calls = []
+    with (
+        patch.object(db_store, "get_active_grants_for_grantee",
+                     return_value=[_grant("col-1", can_read=True, effect="deny")]),
+        patch.object(db_store, "list_origin_descendants", return_value=set()),
+        patch.object(context_service, "reach",
+                     side_effect=lambda *a, **kw: calls.append(a) or context_service.EMPTY_REACH),
+    ):
+        assert LightConeResolver(db=MagicMock()).resolve("user-1", "read") == set()
+    assert calls == []
+
+
+# ---------------------------------------------------------------------------
 # principal_type -> ledger grantee_type
 # ---------------------------------------------------------------------------
 #
-# THE FAILURE MODE THESE PIN, STATED FIRST — because the obvious "fix" is the bug:
+# The platform system principal acts with principal_type "service", but
+# `seed_provisioning/platform_email.py` issues its grants via
+# `upsert_user_collection_grant`, which stores grantee_type "user". The resolver
+# must map "service" to "user" when querying the ledger rather than passing it
+# through verbatim, or system-principal grants would not be found.
 #
-#   The oracle's grant verifier accepts a `requester_type` and, until 2026-07-31,
-#   dropped it. Threading it STRAIGHT THROUGH as the ledger's `grantee_type` looks
-#   like the correction and is a regression: the platform SYSTEM principal acts with
-#   principal_type "service", but `seed_provisioning/platform_email.py` issues its
-#   grants via `upsert_user_collection_grant`, which stores grantee_type "user".
-#   A verbatim pass-through queries for "service" grants, finds none, and every
-#   system-principal grant in every existing store becomes a silent false DENY.
-#
-# So both directions are asserted: the mapping must REACH the ledger (it is not
-# dropped) and must NOT be the identity function (it does not pass "service" on).
+# Both directions are asserted: the mapping must reach the ledger (it is not dropped) and must not
+# be the identity function (it does not pass "service" on).
 
 def test_service_principal_resolves_against_the_ledgers_principal_grant_kind():
     captured = {}
@@ -157,16 +402,15 @@ def test_service_principal_resolves_against_the_ledgers_principal_grant_kind():
         resolver = LightConeResolver(db=MagicMock())
         result = resolver.resolve("sys-1", "update", principal_type="service")
 
-    # NEGATIVE CONTROL: "service" is not a grantee_type this ledger ever writes.
-    # If this assertion ever reads "service", the system principal's real grants
-    # have just become invisible.
+    # "service" is not a grantee_type this ledger ever writes. If this assertion ever reads
+    # "service", the system principal's real grants become invisible.
     assert captured["grantee_type"] != "service"
     assert captured["grantee_type"] == "user"
     assert result == {"col-1"}
 
 
-def test_key_shaped_principals_keep_their_own_grantee_type():
-    """api_key / grant_key hold grants as a hashed credential, not as a principal id."""
+def test_non_key_principals_resolve_as_a_principal_id():
+    """Entity kinds with no credential of their own hold `user`-type grants."""
     seen = []
 
     def fake_grants(_db, *, grantee_id, grantee_type):
@@ -175,18 +419,49 @@ def test_key_shaped_principals_keep_their_own_grantee_type():
 
     with patch.object(db_store, "get_active_grants_for_grantee", side_effect=fake_grants):
         resolver = LightConeResolver(db=MagicMock())
-        resolver.resolve("k-1", "read", principal_type="api_key")
-        resolver.resolve("k-2", "read", principal_type="grant_key")
-        # Entity kinds with no credential of their own act as a principal id.
         resolver.resolve("s-1", "read", principal_type="server")
         resolver.resolve("d-1", "read", principal_type="delegation")
+        resolver.resolve("u-1", "read", principal_type="user")
 
-    assert seen == ["api_key", "grant_key", "user", "user"]
+    assert seen == ["user", "user", "user"]
+
+
+def test_a_grant_key_is_resolved_through_its_bundle_not_by_grantee_lookup():
+    """A key must NOT be looked up as a grantee of its own principal id.
+
+    Its `grantee_id` is the token hash, so that lookup returns nothing and the key
+    silently reaches zero resources. The resolver loads the root grant and expands the
+    bundle instead. `test_acting_principal_grant_key_subject.py` covers the resulting
+    reach; this pins that the grantee-lookup path is not taken at all.
+    """
+    root = GrantEntity(
+        id="k-1", resource_id="col-root", grantee_type="grant_key",
+        grantee_id="token-hash", granted_by="admin", can_read=True,
+    )
+    grantee_lookups = []
+
+    def fake_grants(_db, *, grantee_id, grantee_type):
+        grantee_lookups.append((grantee_id, grantee_type))
+        return []
+
+    with (
+        patch.object(db_store, "get_active_grants_for_grantee", side_effect=fake_grants),
+        patch.object(db_store, "get_grant_by_id", return_value=root),
+        patch.object(db_store, "list_origin_descendants", return_value=set()),
+    ):
+        reached = LightConeResolver(db=MagicMock()).resolve(
+            "k-1", "read", principal_type="grant_key")
+
+    assert reached == {"col-root"}
+    assert ("k-1", "grant_key") not in grantee_lookups, (
+        "the resolver looked the key up as a grantee of its own id — that matches "
+        "nothing, so the key would reach no resource at all"
+    )
 
 
 def test_verifier_does_not_drop_requester_type_before_the_lookup():
-    """The parameter must REACH the resolver — it used to die in the verifier."""
-    import mantle.search.mantle.sse.router_accessor as ra
+    """The parameter must reach the resolver rather than being dropped along the way."""
+    import mantle.search.mantle.lightcone as lc
     from mantle.search.mantle.oracle import LightConeGrantVerifier
 
     captured = {}
@@ -197,7 +472,7 @@ def test_verifier_does_not_drop_requester_type_before_the_lookup():
             return set()
 
     with patch.object(
-        ra, "_raw_artifact", return_value={"id": "col-1", "collection_id": "col-1"},
+        lc, "_raw_artifact", return_value={"id": "col-1", "collection_id": "col-1"},
     ):
         v = LightConeGrantVerifier(MagicMock(), resolver=_Recorder())
         v.authorized(
@@ -205,6 +480,6 @@ def test_verifier_does_not_drop_requester_type_before_the_lookup():
             principal_id="p-1", collection_id="col-1", action="update",
         )
 
-    # FAILURE MODE: before the fix this stayed at the "user" default no matter who
-    # asked, so the type was a parameter that read as enforced and was not.
+    # principal_type must be threaded through to the resolver rather than falling
+    # back to the default "user" value regardless of who asked.
     assert captured["principal_type"] == "service"
