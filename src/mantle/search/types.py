@@ -23,7 +23,7 @@ ORDER_SEMANTIC = "semantic"
 #: Nothing could rank them, so they are most-recently-updated first. See
 #: :attr:`SearchResult.ordering`.
 ORDER_RECENCY = "recency"
-#: HOW MUCH OF THE QUERY EACH HIT MATCHED ordered them — the count of distinct query stems the
+#: How much of the query each hit matched ordered them — the count of distinct query stems the
 #: narrowing found in each artifact, most first, ties broken by recency.
 #:
 #: Named for the measurement rather than for a quality. `"lexical"` would name an arm and imply
@@ -33,9 +33,23 @@ ORDER_RECENCY = "recency"
 #: the data — which is the distinction the removal of BM25 exists to hold.
 ORDER_COVERAGE = "coverage"
 
-#: What ordered a result. Three values, because there are three things that can: a cosine, the
-#: query's own coverage, or the clock. There is no value meaning "we would rather not say".
-Ordering = Literal["semantic", "coverage", "recency"]
+#: MEASURED REACH ordered them — how far each hit stands above what a candidate of its size would
+#: reach by nothing, through :mod:`mantle.search.ranking`. This one is only reachable on a node
+#: where a host has bound an ontology (`ranking.bind`); without one the same recall lands on
+#: :data:`ORDER_COVERAGE`, which is the base install's answer and not a degraded one.
+#:
+#: It is the only text ordering that is a METRIC ON THE DATA rather than a count on the query, and
+#: it is the only one that CUTS: the arm takes `ranking.relevance_cut` over its own spectrum before
+#: returning, the way the cosine arm takes the beacon cut over its. So `total` on a reach-ordered
+#: result counts what survived that cut, not every narrowed match — the same trade the semantic arm
+#: already makes, and the reason both are told apart from `coverage` here rather than blended into
+#: it.
+ORDER_REACH = "reach"
+
+#: What ordered a result. Four values, because there are four things that can: a cosine, measured
+#: reach, the query's own coverage, or the clock. There is no value meaning "we would rather not
+#: say".
+Ordering = Literal["semantic", "reach", "coverage", "recency"]
 
 
 @dataclass
@@ -104,12 +118,18 @@ class SearchHit:
 
     doc_id: str
 
-    #: WHAT PUT THIS HIT WHERE IT IS, as a number — and ``None`` when nothing did.
+    #: What put this hit where it is, as a number — and ``None`` when nothing did.
     #:
-    #: Three cases, told apart by :attr:`SearchResult.ordering` and never by the number itself:
+    #: Four cases, told apart by :attr:`SearchResult.ordering` and never by the number itself:
     #:
     #: - ``"semantic"`` — the cosine that ranked it. A float in ``[-1, 1]``.
-    #: - ``"coverage"`` — HOW MANY DISTINCT QUERY STEMS this artifact matched. An INTEGER count,
+    #: - ``"reach"`` — the STANDARDISED REACH that ranked it: how many spreads above what a
+    #:   candidate of its size would reach by nothing. Unbounded in both directions and negative
+    #:   for a hit that reached less than its own size predicts, which is a reading and not an
+    #:   absence. Like the coverage count it is comparable across the hits of ONE response and
+    #:   across nothing else — `mu` and `sigma` are measured from the positions THIS query
+    #:   reached, so the same number on two queries is two different statements.
+    #: - ``"coverage"`` — how many distinct query stems this artifact matched. An INTEGER count,
     #:   carried in a float-typed field because the field is one field. It is a count and not a
     #:   score: it is not normalised, not weighted by document frequency or term frequency, and
     #:   not comparable between two different queries — a 2 on a five-stem query and a 2 on a
@@ -151,13 +171,13 @@ class SearchResult:
     parsed_query: ParsedQuery
     corrections: List[str]
 
-    #: WHAT ORDERED THESE HITS. Not what was asked for — what happened.
+    #: What ordered these hits. Not what was asked for — what happened.
     #:
     #: `"semantic"` means a cosine did: a query vector reached the ranker, it ranked the
     #: narrowed set, and the beacon cut decided where that ranking stops. `SearchHit.score`
     #: carries the cosine.
     #:
-    #: `"coverage"` means the QUERY'S OWN COVERAGE did: no vector reached the ranker, so the
+    #: `"coverage"` means the query's own coverage did: no vector reached the ranker, so the
     #: hits are ordered by how much of the query each one matched — the count of distinct query
     #: stems the narrowing found in it, most first — with a quoted phrase's bigram count beneath
     #: that and recency beneath both. `SearchHit.score` carries the stem count as an integer.

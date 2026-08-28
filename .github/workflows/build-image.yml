@@ -11,8 +11,9 @@ name: build-image
 # code while every dashboard reports agreement. A digest cannot drift. mantle.agience.ai and
 # mantle.foresightreports.agience.ai are promoted the SAME digest or the promotion did not happen.
 #
-# ⚠ THE BUILD CONTEXT IS `prism`, AND ONLY `prism`. `agience-origin`'s workflow checks out
-# `agience-beam` as a `core` context; copying that shape here would be wrong twice — mantle's floor
+# ⚠ THE BUILD CONTEXT IS `prism`, AND ONLY `prism`. `agience-origin`'s workflow USED TO check out
+# `agience-beam` as a `core` context (corrected 2026-08-04; beam is now archived at
+# `_archive/agience-beam`); copying that shape here would be wrong twice — mantle's floor
 # is neither `beam` (which it may not import) nor `origin` (wrong licence direction: Apache image,
 # AGPL package). It is `agience-prism-py`.
 on:
@@ -79,13 +80,13 @@ jobs:
       # Bare `pytest` — the package is declared, so PYTHONPATH must NOT be set here.
       #
       # ⛔ ONE FILE IS IGNORED, AND NOT BECAUSE IT FAILS. `test_the_apache_store_is_a_product.py`
-      # measures that mantle keeps working with `ember`/`entroptics`/`beam` BLOCKED. On a runner
+      # measures that mantle keeps working with `ember`/`beam` BLOCKED. On a runner
       # none of the three is installed, so blocking them blocks nothing and all 15 tests are
       # vacuous — which the file's own positive control
       # (`test_the_blocked_packages_are_really_installed_here`) detects and reports as a failure,
       # correctly. Running it here would mean 14 meaningless passes guarded by one red.
       #
-      # The alternative — installing ember and entroptics on the runner — was rejected [John,
+      # The alternative — installing the copyleft half on the runner — was rejected [John,
       # 2026-08-13]: it drags AGPL packages into the CI of an Apache-licensed image purely to prove
       # mantle does not depend on them. The file keeps its full force on a developer box, which is
       # the only place its premise holds.

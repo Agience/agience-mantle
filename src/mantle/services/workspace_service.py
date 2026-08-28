@@ -38,12 +38,6 @@ logger = logging.getLogger(__name__)
 # Workspaces are collections with this content type.
 WORKSPACE_MIME = WORKSPACE_CONTENT_TYPE
 
-#: Largest UTF-8 payload kept as a duplicate INLINE copy alongside the object-storage write.
-#: A storage/transfer bound on the row, not a judgement about the content: the authoritative copy
-#: is in object storage at every size, so no value here can lose anything or change an outcome.
-#: A different value would be right if the row-size budget it is really about were measured
-#: rather than assumed — the store's per-row page/overflow cost is the thing that should set it.
-_MAX_INLINE_BYTES = 128 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +79,32 @@ def _emit_event(collection_id: str, name: str, payload: dict, *, actor_id: Optio
 # Workspace (= collection) CRUD
 # ---------------------------------------------------------------------------
 
+def _mint_container_context(db, container_id, content_type, content, context):
+    """Stamp the db-level mint context onto a container create. See `services/mint_context`.
+
+    A description must never fail a write, so every failure path returns the caller's context
+    unchanged — the coverage gate reports the miss, which is honest and distinguishable from a
+    mint that recorded an empty screen.
+    """
+    import json as _json
+    from mantle.services import mint_context as _mc
+    caller_ctx = {}
+    if context:
+        try:
+            parsed = _json.loads(context)
+            if isinstance(parsed, dict):
+                caller_ctx = parsed
+        except (ValueError, TypeError):
+            caller_ctx = {"_opaque": context}
+    try:
+        minted = _mc.mint(db, artifact_id=container_id, content_type=content_type,
+                          content=content, collection_id=None, caller=caller_ctx or None)
+        return _json.dumps(minted)
+    except Exception:  # noqa: BLE001
+        logger.warning("mint_context failed on a container create; caller context stands",
+                       exc_info=True)
+        return context
+
 def create_container(
     db: Database,
     user_id: str,
@@ -106,7 +126,7 @@ def create_container(
     application uses to distinguish workspace / collection / domain containers.
     The gateway routes ``native`` container-create operations here (Phase 5).
 
-    ``vector`` is a validated :class:`api.vectors.SuppliedVector` when the writer sent
+    ``vector`` is a validated:class:`api.vectors.SuppliedVector` when the writer sent
     one — it rides this write into the semantic arm. ``None`` is the ordinary case and
     changes nothing.
 
@@ -118,6 +138,34 @@ def create_container(
     exists to make unconstructable.
     """
     container_id = artifact_id or str(uuid.uuid4())
+
+    # A collection is an artifact, so its body is addressed like any other: it goes through
+    # `_store_content_in_s3` rather than being handed to the entity directly, which is what keeps
+    # a collection from being the one kind of artifact still carrying bytes in its row.
+    #
+    # A container is self-rooted, so its own id is the collection its content key scopes to.
+    cas_ref: Optional[str] = None
+    if content:
+        # `creator_id` is what authorizes the instant before this container's own owner grant
+        # exists — see `oracle._authorize`'s create base case. The principal stays the CREATOR,
+        # which is what `doc_boundary.decrypt_artifact_content` derives from on the way back out
+        # (`content_key_principal or created_by`); keying to the container instead makes the write
+        # succeed and the READ fail, which is how this was found.
+        _key, content, cas_ref = _store_content_in_s3(
+            container_id, content, context or "", owner_id=user_id,
+            collection_id=container_id, creator_id=user_id)
+        context = _record_content_address(context or "", _key, cas_ref)
+
+    # The primitive stamps context too, because the router is not the only door.
+    # `routers/artifacts_router` mints context for every external write, which is every writer
+    # reaching mantle as a service — hooks, astra, connectors. An in-process caller reaches this
+    # function directly and skips the router, which is how a corpus gets bulk-ingested straight
+    # into the lattice and measures 0% context afterwards.
+    #
+    # `mint` is idempotent on its own mark, so a write that already came through the router passes
+    # through here untouched rather than being re-stamped with a later timestamp.
+    context = _mint_container_context(db, container_id, content_type, content, context)
+
     entity = CollectionEntity(
         id=container_id,
         name=name,
@@ -127,6 +175,7 @@ def create_container(
         state=CollectionEntity.STATE_COMMITTED,
         context=context or "",
         content=content or "",
+        content_ref=cas_ref,
         created_time=_now_iso(),
         modified_time=_now_iso(),
     )
@@ -186,14 +235,22 @@ def create_workspace(
     db: Database,
     user_id: str,
     name: str,
+    artifact_id: Optional[str] = None,
 ) -> CollectionEntity:
     """Create a new workspace (a top-level container with content_type=workspace).
 
-    Thin convenience wrapper over :func:`create_container` — workspaces are
-    regular container artifacts, each with a fresh UUID and no ID-pinning.
+    Thin convenience wrapper over:func:`create_container`. A workspace is a regular
+    container artifact and gets a fresh UUID by default.
+
+    ``artifact_id`` pins the id, passing straight through to:func:`create_container` —
+    see that function for why this is not a client-chosen-id seam. ID-pinning is a property of
+    the primitive, which takes ``artifact_id``, and not a guarantee this wrapper withholds.
+    Reading it as a guarantee blocks the fix for a real race
+    (`_ensure_inbox_workspace`), so it is corrected rather than worked around.
     """
     return create_container(
         db, user_id, content_type=WORKSPACE_CONTENT_TYPE, name=name,
+        artifact_id=artifact_id,
     )
 
 
@@ -201,8 +258,8 @@ def list_workspaces(db: Database, user_id: str) -> List[CollectionEntity]:
     """Every workspace inside the user's read light-cone — the containers carrying the workspace
     content type that any active grant reaches.
 
-    Reachability, not authorship: a workspace shared with the user appears here, and one they
-    created but no longer hold a grant on does not.
+    Reachability rather than authorship: a workspace shared with the user appears here, and one
+    they created but hold no active grant on does not.
     """
     return store.get_collections_by_owner_and_type(db, user_id, WORKSPACE_CONTENT_TYPE)
 
@@ -242,7 +299,7 @@ def get_workspace_unsafe(db: Database, workspace_id: str) -> Optional[Collection
     """The container entity for ``workspace_id`` with NO access check, or ``None`` if absent.
 
     ``unsafe`` is the whole contract: nothing here consults grants, so this belongs only on
-    paths that have already authorized the caller. :func:`get_workspace` is the checked read.
+    paths that have already authorized the caller.:func:`get_workspace` is the checked read.
     """
     return store.get_collection_by_id(db, workspace_id)
 
@@ -266,34 +323,32 @@ def update_workspace(
     actually moved — except that supplying ``vector`` is itself a change, since the writer is
     restating what the container means even when no scalar field differs.
 
-    ``context`` replaces the stored context wholesale (see :func:`update_workspace_context`), and
+    ``context`` replaces the stored context wholesale (see:func:`update_workspace_context`), and
     a string is parsed as JSON with an unparseable value read as ``{}``. Requires ``update``;
     raises ``HTTPException(404)`` for a missing workspace or a caller without that verb.
 
-    ``content`` and ``content_type`` are here because a TOP-LEVEL ARTIFACT IS NOT ALWAYS A
-    CONTAINER. :func:`create_container` is the only create path that takes no parent, so every
+    ``content`` and ``content_type`` are here because a top-level artifact is not always a
+    container. :func:`create_container` is the only create path that takes no parent, so every
     artifact written without a ``container_id`` — a note, a transcript, a file a hook captured —
-    is created through it WITH content (see its ``content`` parameter), and lands here on the way
-    back out. Without these two, `PATCH /artifacts/{id}` on such an artifact accepted a new body,
-    returned 200, and silently discarded it: the router's top-level branch had nothing to pass
-    the content to. That made every rewrite a fresh artifact instead of a new version of one, so
-    the store accumulated duplicate copies of the same thing with no way to tell which was
-    current — the failure `tests/test_workspace_service.py::test_update_workspace_replaces_content`
-    now pins. Stored on the entity directly, exactly as ``create_container`` stores it, and
+    is created through it with content (see its ``content`` parameter), and lands here on the way
+    back out. Without these two, `PATCH /artifacts/{id}` on such an artifact would accept a new
+    body, return 200, and silently discard it: the router's top-level branch would have nothing to
+    pass the content to. That would make every rewrite a fresh artifact instead of a new version of
+    one, so the store would accumulate duplicate copies of the same thing with no way to tell which
+    is current — the failure `tests/test_workspace_service.py::test_update_workspace_replaces_content`
+    pins. Stored on the entity directly, exactly as ``create_container`` stores it, and
     reindexed through the same ``_index_container`` call the other fields use.
 
-    ``state`` archives and unarchives, and is here for the same reason ``content`` is: without
-    it the router's top-level branch had nothing to pass the caller's ``state`` to, so
-    ``PATCH /artifacts/{id}`` with ``state: "archived"`` returned 200 and changed nothing. That
-    left the archive mechanism unreachable for every artifact created without a ``container_id``
-    — which is every note, transcript and captured file — so superseded copies could only be
-    deleted, never retired. Pinned by
+    ``state`` archives and unarchives, and is here for the same reason ``content`` is: it is what
+    the router's top-level branch passes the caller's ``state`` to, which is what makes the archive
+    mechanism reachable for an artifact created without a ``container_id`` — every note, transcript
+    and captured file. Without it a superseded copy can only be deleted, never retired. Pinned by
     ``tests/test_workspace_service.py::test_update_workspace_archives_a_top_level_artifact``.
 
     **Unarchiving returns a top-level artifact to COMMITTED, not to draft**, which is where it
-    differs from :func:`update_artifact` deliberately. A collection member unarchives to draft
+    differs from:func:`update_artifact` deliberately. A collection member unarchives to draft
     because there is a commit path waiting for it — that same function's ``state == committed``
-    branch. A top-level artifact has none: :func:`create_container` writes ``committed``
+    branch. A top-level artifact has none::func:`create_container` writes ``committed``
     directly and no path here ever promotes a draft, so unarchiving one into draft would move it
     into a segment the default recall does not search and nothing could ever move it out of.
     """
@@ -331,7 +386,14 @@ def update_workspace(
         ws.description = description
         changed = True
     if content is not None and content != ws.content:
+        # Addressed on the way in, exactly as a create does — a top-level artifact updated with
+        # new content must not become the one row that carries its own bytes.
+        _key, content, cas_ref = _store_content_in_s3(
+            ws.id, content, ws.context or "", owner_id=ws.created_by or user_id,
+            collection_id=ws.collection_id or ws.id)
         ws.content = content
+        ws.content_ref = cas_ref
+        ws.context = _record_content_address(ws.context or "", _key, cas_ref)
         changed = True
     if content_type is not None and content_type != ws.content_type:
         ws.content_type = content_type
@@ -351,14 +413,47 @@ def update_workspace(
     return ws
 
 
+def _may_destroy_member(db: Database, container_id: str, root_id: str, auth: Any) -> bool:
+    """May this caller DESTROY *root_id* as part of cascading a delete of *container_id*?
+
+    Checks the member's own delete right only where this container is not its origin parent.
+
+    The origin edge decides it. `check_access` takes the direct grant first, then walks origin
+    edges upward checking propagated grants at each parent, and `get_origin_parent` returns a
+    parent only where `is_origin` is set. A member whose origin parent is this container already
+    inherits the caller's grant, so asking again is a read that can only say yes.
+
+    A member linked in with `origin=False` inherits nothing, and that is deliberate:
+    `_link_source_artifact` says an `origin=True` link *"would let the linking container be
+    returned as the source's origin parent and confer grants over the whole subtree."* **So a link
+    is prevented from conferring authority — and before this guard, a cascade destroyed through
+    that same link once the artifact had no other container.** Linking needs only `read` on the
+    source.
+
+    Fails closed, including when `auth` is absent: `_may_delete_draft` answers False on any
+    uncertainty, and what is being decided is whether to destroy someone's artifact.
+    """
+    try:
+        parent = store.get_origin_parent(db, root_id)
+    except Exception:
+        #: Not "assume yes". An unreadable origin edge is exactly the uncertainty this guard is
+        #: for, and the caller keeps the artifact rather than losing it to a failed lookup.
+        logger.warning("could not read the origin parent of %s; refusing to destroy it", root_id)
+        return False
+    if parent and parent[0] == container_id:
+        return True
+    return _may_delete_draft(db, auth, root_id)
+
+
 def _delete_or_detach_members(
     db: Database, container_id: str, user_id: str, rows: list, *, cascade: bool,
-) -> None:
+    auth: Any = None,
+) -> Dict[str, int]:
     """The shared body of "what happens to a container's members when the container goes."
 
     ``cascade=False`` (the default everywhere this is called) DETACHES: each member is evicted
     from ``container_id`` — its edge to this container is dropped — and is otherwise untouched,
-    exactly as :func:`remove_artifact_from_container` leaves it. Nothing is destroyed, so a
+    exactly as:func:`remove_artifact_from_container` leaves it. Nothing is destroyed, so a
     member that was reachable only through this container becomes unreachable through it but
     still exists, findable by anyone still holding its id or a direct grant on it — recoverable,
     the way `rmdir` refusing a non-empty directory is recoverable and `rm -r` is not.
@@ -374,6 +469,15 @@ def _delete_or_detach_members(
     not this event's business — `tests/test_scoped_deletion_and_urls.py` is where that is
     decided and proven, not announced.
     """
+    #: The counts are returned so the API can say what a delete did: a cascade over a 1.85M-member
+    #: collection and deleting a note are otherwise the same three-word body, and "detached" and
+    #: "destroyed" are the difference between recoverable and not.
+    #:
+    #: The annotation names the dict, because an annotation promising no value while the body
+    #: hands one back describes a function that does not exist, and misleads a reader
+    #: into writing code around a contract nothing honours. Three instances, all in this file,
+    #: all from that one change.
+    detached = destroyed = refused = 0
     for row in rows:
         art_id = row.get("id")
         root_id = row.get("root_id") or art_id
@@ -385,7 +489,13 @@ def _delete_or_detach_members(
                 from mantle.search.ingest.pipeline_unified import delete_artifact_from_index
                 delete_artifact_from_index(art_id, root_id, collection_id=container_id)
             except Exception:
-                logger.debug("index delete failed", exc_info=True)
+                # `warning`, not `debug`. A dropped index job is the kind nobody goes looking for, and
+                # `debug` is below the default level, so the record exists and is not seen. Logged and
+                # seen are different properties. The `mark_materialized` sibling
+                # was promoted for this reason; these four were missed by that pass.
+                logger.warning("index DELETE failed for %s — the artifact is gone but its index"
+                               " entry is not, so searches keep returning it", art_id,
+                               exc_info=True)
 
             shared_elsewhere = store.count_other_containers_for_root(
                 db, root_id, container_id
@@ -393,19 +503,37 @@ def _delete_or_detach_members(
             if shared_elsewhere:
                 # Evict from THIS container only; the artifact survives elsewhere.
                 store.remove_artifact_from_collection(db, container_id, root_id)
+                detached += 1
+            elif not _may_destroy_member(db, container_id, root_id, auth):
+                #: The caller asked to destroy and may not, so the member is evicted instead — what
+                #: already happens to a member the destroy would reach past the caller's rights
+                #: over. Counted separately and logged, because
+                #: silently downgrading a destroy to an evict is the caller not getting what it
+                #: asked for, which is the defect class this API keeps finding.
+                logger.warning(
+                    "cascade on %s refused to destroy %s: the caller has no delete right on it "
+                    "and this container is not its origin parent (audit D4)",
+                    container_id, root_id)
+                store.remove_artifact_from_collection(db, container_id, root_id)
+                refused += 1
             else:
                 store.delete_artifacts_by_root(db, root_id)
                 store.remove_all_edges_for_root(db, root_id)
+                destroyed += 1
         else:
             store.remove_artifact_from_collection(db, container_id, root_id)
+            detached += 1
 
         _emit_event(container_id, "artifact.deleted", {"artifact_id": root_id},
                     actor_id=user_id)
 
+    return {"detached": detached, "destroyed": destroyed, "refused": refused}
+
 
 def delete_workspace(
     db: Database, user_id: str, workspace_id: str, *, cascade: bool = False,
-) -> None:
+    auth: Any = None,
+) -> Dict[str, int]:
     """Delete a workspace. Its members are DETACHED, not destroyed, unless ``cascade=True``.
 
     ``cascade=False`` (the default): each member is evicted from this workspace — its edge
@@ -426,13 +554,15 @@ def delete_workspace(
     get_workspace(db, user_id, workspace_id, required="delete")
 
     rows = store.list_collection_artifacts(db, workspace_id, include_archived=True)
-    _delete_or_detach_members(db, workspace_id, user_id, rows, cascade=cascade)
+    counts = _delete_or_detach_members(db, workspace_id, user_id, rows, cascade=cascade,
+                                       auth=auth)
 
     store.delete_collection(db, workspace_id)
     # The container itself. A subscriber watching it learns the subscription's subject is gone,
     # rather than going quiet and looking merely idle.
     _emit_event(workspace_id, "artifact.deleted", {"artifact_id": workspace_id},
                 actor_id=user_id)
+    return counts
 
 
 def get_workspace_context(db: Database, user_id: str, workspace_id: str) -> dict:
@@ -440,7 +570,7 @@ def get_workspace_context(db: Database, user_id: str, workspace_id: str) -> dict
 
     A context that is absent or not valid JSON reads as ``{}`` rather than raising — context is
     caller-authored and a malformed one must not make the workspace unreadable. Mutating the
-    result persists nothing; :func:`update_workspace_context` is what writes it back. Requires
+    result persists nothing;:func:`update_workspace_context` is what writes it back. Requires
     ``read``; raises ``HTTPException(404)`` otherwise.
     """
     ws = get_workspace(db, user_id, workspace_id, required="read")
@@ -777,7 +907,7 @@ def get_workspace_artifact(
 def get_artifact_unsafe_by_id(db: Database, artifact_id: str) -> Optional[ArtifactEntity]:
     """One artifact version by id with NO access check and no container check, or ``None``.
 
-    ``unsafe`` is the whole contract: use :func:`get_workspace_artifact` on any path a caller
+    ``unsafe`` is the whole contract: use:func:`get_workspace_artifact` on any path a caller
     can reach.
     """
     return store.get_artifact(db, artifact_id)
@@ -819,12 +949,12 @@ def get_workspace_artifacts_by_ids_global(
 ) -> List[ArtifactEntity]:
     """The named artifact VERSIONS homed in ANY workspace the user's grants reach.
 
-    The reachable set is resolved once (see :func:`list_workspaces`) and each artifact's home is
+    The reachable set is resolved once (see:func:`list_workspaces`) and each artifact's home is
     matched against it in memory, so the cost is one point read per distinct id rather than one
     per (id, workspace) pair. Ids naming a missing artifact, or one homed outside that set, are
     skipped; repeated ids are read once and yielded once.
 
-    Not named ``*_batch`` for the same reason as :func:`get_workspace_artifacts_by_ids`: the
+    Not named ``*_batch`` for the same reason as:func:`get_workspace_artifacts_by_ids`: the
     per-id read is the store's floor here and the name should not promise otherwise.
     """
     workspaces = {w.id for w in list_workspaces(db, user_id)}
@@ -838,19 +968,19 @@ def get_workspace_artifacts_by_ids_global(
 
 def _safe_content_key(ctx: dict, artifact_id: str, *, default_prefix: str = "artifacts") -> str:
     """The object-store key for `artifact_id`, refusing any caller-supplied key that names a
-    DIFFERENT artifact.
+    different artifact.
 
-      • WRITE — create an artifact in YOUR OWN container with
+      • write — create an artifact in your own container with
         `context = {"content_key": "<victim>/<their-artifact>.content"}`; `_store_content_in_s3`
         then calls `put_text_direct` on the victim's key, overwriting their object with bytes
-        encrypted under YOUR master key. Their next read fails to decrypt. Unrecoverable.
-      • DELETE — the same trick with a throwaway artifact: `delete_object(content_key)` removes
-        the victim's object from BOTH the edge and durable buckets.
-      • READ — a signed URL, or the content endpoint, minted for someone else's key.
+        encrypted under your master key. Their next read fails to decrypt. Unrecoverable.
+      • delete — the same trick with a throwaway artifact: `delete_object(content_key)` removes
+        the victim's object from both the edge and durable buckets.
+      • read — a signed URL, or the content endpoint, minted for someone else's key.
 
     The binding: a legitimate key always ends `/{artifact_id}.content` — the server derives either
     `artifacts/{id}.content` (here) or `{tenant}/{id}.content` (`initiate_upload_and_create_artifact`).
-    Tying the key to ITS OWN artifact id therefore accepts every legitimately-derived key, including
+    Tying the key to its own artifact id therefore accepts every legitimately-derived key, including
     every one already stored, and rejects exactly the cross-artifact case. A stored key that fails
     the check is discarded in favour of the derived one rather than honoured."""
     derived = f"{default_prefix}/{artifact_id}.content"
@@ -866,45 +996,75 @@ def _safe_content_key(ctx: dict, artifact_id: str, *, default_prefix: str = "art
     return derived
 
 
+def _record_content_address(context_str: str, content_key: str,
+                            cas_ref: Optional[str]) -> str:
+    """Stamp `content_key` and `content_cas_ref` onto a context JSON string.
+
+    The ref goes in two places because two readers look in different ones:
+    `routers/artifacts_router` serves `GET /artifacts/{id}/content` from
+    `context["content_cas_ref"]` and `services/mirror_drain` reconciles against it, while
+    `db/vertex.py` reads the DOC's `content_ref` column to tell a re-describe from a new version.
+    Writing only one leaves the other blind, so they are set together, here, once.
+
+    An absent ref pops the old one. A ref left behind by a write that produced none points the next
+    read at bytes that are not this artifact's content — the same rule the upload route states
+    where it does this.
+    """
+    try:
+        ctx = json.loads(context_str) if context_str else {}
+        if not isinstance(ctx, dict):
+            ctx = {}
+    except (json.JSONDecodeError, TypeError):
+        ctx = {}
+    ctx["content_key"] = content_key
+    if cas_ref:
+        ctx["content_cas_ref"] = cas_ref
+    else:
+        ctx.pop("content_cas_ref", None)
+    return json.dumps(ctx)
+
+
 def _store_content_in_s3(
     artifact_id: str,
     content: str,
     context_str: str,
     owner_id: Optional[str] = None,
-) -> Tuple[str, str]:
-    """Upload inline content to S3 and return (content_key, inline_content).
+    collection_id: Optional[str] = None,
+    creator_id: Optional[str] = None,
+) -> Tuple[str, str, Optional[str]]:
+    """Put an artifact's bytes in the CAS and return ``(content_key, content, cas_ref)``.
 
-    For small text (< 128 KB), the content is also kept inline in the lattice as a
-    fallback so the artifact remains readable even if S3 is temporarily
-    unreachable.  Large content (>= 128 KB) is cleared from inline to keep the
-    document store lean.
+    One destination. Content lives at ``cas/<sha256 of the plaintext>``, envelope-encrypted for its
+    owner, deduped by address, and drained to S3 by `shard/content_tier.promote_local_content` on a
+    node that has a mirror. `put_bytes_encrypted(cas=True)` writes the local tier and mirrors in the
+    same call, so there is no second leg to choose between: the object store is where the ref gets
+    promoted to rather than an alternative place to put the bytes.
 
-    Derives the content_type from the artifact context if present.
-    Falls back to text/plain. Idempotent — safe to call on every create/update.
+    The ``content`` that comes back is what the caller keeps on its in-memory entity, for indexing
+    and for the API response. It does not reach storage: `db/doc_boundary.encrypt_artifact_content`
+    drops the body and `decrypt_artifact_content` hydrates it from the ref, so the document carries
+    the ADDRESS and the row never carries bytes.
+
+    An owner is required to seal the envelope: an unenveloped object in one globally
+    content-addressed space is reachable by anyone able to name its address.
     """
-    from mantle.services.content_service import put_text_direct
+    from mantle.services.content_service import put_bytes_encrypted
 
     try:
         ctx = json.loads(context_str) if context_str else {}
+        if not isinstance(ctx, dict):
+            ctx = {}
     except (json.JSONDecodeError, TypeError):
         ctx = {}
 
     content_type = ctx.get("content_type") or "text/plain"
     content_key = _safe_content_key(ctx, artifact_id)
 
-    try:
-        put_text_direct(content_key, content, content_type, owner_id=owner_id)
-    except Exception:
-        logger.warning("Failed to upload artifact content to S3 for %s — keeping inline", artifact_id, exc_info=True)
-        return content_key, content  # degrade gracefully: keep inline
-
-    # Keep small text inline as a fallback; clear inline for large content. The content is ALREADY
-    # in object storage at this point either way — this only decides whether a duplicate copy also
-    # rides along in the row, so nothing is lost at any value and no measurement is being judged.
-    if len(content.encode("utf-8")) <= _MAX_INLINE_BYTES:
-        return content_key, content
-    return content_key, ""
-
+    cas_ref = put_bytes_encrypted(
+        content_key, content.encode("utf-8"), content_type, owner_id,
+        collection_id=collection_id, creator_id=creator_id, cas=True,
+    )
+    return content_key, content, cas_ref
 
 def _link_to_target_collections(
     db: Database,
@@ -959,33 +1119,60 @@ def create_workspace_artifact(
     content_type: Optional[str] = None,
     index: Optional[str] = None,
     vector=None,
+    description: Optional[str] = None,
 ) -> ArtifactEntity:
     """Create an artifact inside a container.
 
-    ``vector`` is a validated :class:`api.vectors.SuppliedVector` when the writer sent one;
+    ``vector`` is a validated:class:`api.vectors.SuppliedVector` when the writer sent one;
     it rides the same index job as the rest of the write. Mantle produces no vector of its
     own, so ``None`` means the vector arm receives nothing for this artifact.
+
+    ``description`` is carried here because this is the path an ordinary `POST /artifacts` with a
+    `container_id` takes — the common create — and `description` is one of the three stated offer
+    fields the lexical arm indexes (`pipeline_unified._STATED_OFFER_FIELDS`). The MCP
+    `create_artifact` tool description recommends supplying it so the artifact can be found again,
+    so a create that dropped it would return 200 and leave the artifact unfindable by its offer.
     """
     get_workspace(db, user_id, workspace_id, required="create")
 
     now = _now_iso()
+    # ── the FIRST version of a named lineage IS its root ─────────────────────────────────────
+    # `Artifact` states the contract: "First version of an artifact: id == root_id. The root doc
+    # persists forever and is the stable target of `collection_artifacts` edges." Minting a fresh
+    # id here regardless left that root as a name nothing answered to, and `_place` then wrote the
+    # containment edge to it -- `vertex.py::_place`: "The member is the ROOT, not the version."
+    #
+    # Measured on a real store: a capture collection held 97 containment edges of which 0 pointed
+    # at an existing vertex, and 183 captures whose roots were all unmaterialised. Every hook
+    # capture -- session transcripts, file mirrors, commits -- was
+    # written, placed, and unreachable, because authorization walks edges and every edge ended
+    # nowhere. The count was still climbing during the audit that found it (95 -> 99).
+    #
+    # Only when nothing answers to that id yet: a LATER version of the same lineage must keep its
+    # own fresh id, or a rewrite would collide with the root it is a version of.
     artifact_id = str(uuid.uuid4())
-
-    # Store content in S3; update context with content_key.
-    resolved_content = content
-    if content:
-        content_key, resolved_content = _store_content_in_s3(artifact_id, content, context, owner_id=user_id)
-        # Inject content_key into context JSON if not already present.
+    if root_id:
         try:
-            ctx_obj = json.loads(context) if context else {}
-        except (json.JSONDecodeError, TypeError):
-            ctx_obj = {}
-        if "content_key" not in ctx_obj:
-            ctx_obj["content_key"] = content_key
-            context = json.dumps(ctx_obj)
+            # the RAW doc read: this asks only whether anything answers to that id, and must
+            # not depend on hydration, grants or entity shape to answer it.
+            existing = store.get_raw_artifact(db, root_id)
+        except Exception:  # noqa: BLE001 -- an unreadable store must not block the create
+            existing = None
+        if existing is None:
+            artifact_id = root_id
+
+    # Store content in the CAS; update context with content_key.
+    resolved_content = content
+    cas_ref: Optional[str] = None      # an artifact with no content has no bytes to address
+    if content:
+        content_key, resolved_content, cas_ref = _store_content_in_s3(
+            artifact_id, content, context, owner_id=user_id,
+            collection_id=workspace_id, creator_id=user_id)
+        context = _record_content_address(context, content_key, cas_ref)
 
     artifact = ArtifactEntity(
         id=artifact_id,
+        content_ref=cas_ref,
         root_id=root_id or artifact_id,
         collection_id=workspace_id,
         context=context,
@@ -996,6 +1183,7 @@ def create_workspace_artifact(
         created_time=now,
         modified_time=now,
         name=name,
+        description=description,
         content_type=content_type,
     )
     store.create_artifact(db, artifact)
@@ -1021,7 +1209,21 @@ def create_workspace_artifact(
             can_evict=True, can_invoke=True, can_add=True, can_share=True, can_admin=True,
         )
     except Exception:
-        logger.debug("owner grant on create failed", exc_info=True)
+        # `warning`, not `debug`: this failure produces a durably unreachable artifact. Most
+        # `logger.debug(... failed)` in this codebase are best-effort notifications — an event that
+        # did not emit, a websocket send, a probe. This is not one of them. Authorization is
+        # grant-based and `services/dependencies.py::check_access` walks grants — `created_by` is
+        # never consulted — so a create whose owner grant failed leaves a row that EXISTS and that
+        # no principal can read, update or contain anything in. Every API surface answers 404.
+        #
+        # An artifact in this state is one row of genuinely probed content answering 404 from
+        # `get_artifact`, indefinitely, because nothing says anything. The 404 cannot tell you
+        # which it is either: `check_access` returns the same code
+        # for "absent" and "present but you hold no grant", deliberately, so it is not an existence
+        # oracle. **This log line is the only place the difference would ever have been visible.**
+        logger.warning("owner grant on create FAILED for %s — the artifact will exist and be "
+                       "unreachable through every API surface", getattr(artifact, "id", "?"),
+                       exc_info=True)
 
     # WHERE index: eager (default) or deferred to first access (lazy). A latent
     # write skips indexing and carries no materialization marker (WHO+WHEN only).
@@ -1032,9 +1234,16 @@ def create_workspace_artifact(
             enqueue_index_artifact(
                 artifact, artifact.collection_id, tenant_id=user_id, vector=vector,
             )
-            store.mark_materialized(db, artifact.id)
         except Exception:
-            logger.debug("index enqueue failed", exc_info=True)
+            # `warning`, not `debug`: an artifact that is stored and never indexed is invisible to
+            # search with nothing to show for it. All three enqueue sites log, and one logging
+            # below the default level logs without being seen, which is the same as not logging.
+            #
+            # The distinction from the house pattern is the same as for the owner grant above:
+            # this is the write path rather than a best-effort notification. The failure is
+            # durable, silent, and observable later only as a search result that is not there.
+            logger.warning("index enqueue FAILED for %s — the artifact is stored but will not be "
+                           "searchable", getattr(artifact, "id", "?"), exc_info=True)
 
     _emit_event(workspace_id, "artifact.created", {"artifact": artifact.to_dict()}, actor_id=user_id)
     return artifact
@@ -1057,16 +1266,51 @@ def materialize_on_access(db, *, artifact_id, collection_id, tenant_id=None, art
             artifact = ArtifactEntity.from_dict(raw) if isinstance(raw, dict) else raw
         from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
         enqueue_index_artifact(artifact, collection_id, is_head=True, tenant_id=tenant_id)
-        store.mark_materialized(db, artifact_id)
     except Exception:
         logger.warning("materialize-on-access failed for %s", artifact_id, exc_info=True)
 
 
-def warm_collection(db, collection_id, *, tenant_id=None) -> int:
+#: How many members one warm sweep will examine. The same ceiling as the router's page bound.
+#:
+#: The sweep enqueues and does not index, so the cost this caps is one `is_materialized` store
+#: read plus one enqueue per member — cheap each, unbounded in total, and paid synchronously on a
+#: request thread while the caller waits. The container's size is chosen by whoever chooses the
+#: container, which is what makes "unbounded" a caller-controlled quantity rather than a scale
+#: question.
+WARM_SWEEP_LIMIT = 10_000
+
+
+def warm_collection(db, collection_id, *, tenant_id=None, limit: int = WARM_SWEEP_LIMIT) -> dict:
     """Warm-sweep guardrail: materialize every latent artifact in a collection so
     it is searchable up front (for corpora that must not wait for first access).
-    Returns the count newly materialized. Idempotent — safe to re-run."""
+    Idempotent — safe to re-run. (Whether re-running makes progress is a separate question; see
+    ``truncated`` below.)
+
+    Returns a dict rather than a count, because a count alone cannot separate the outcomes: `0`
+    is produced by nothing needing warming, by the sweep failing and being swallowed to a
+    `logger.warning`, and by stopping early, and a caller gets `200` for all three. That is the
+    same
+    confusion `_page`'s `total=None` exists to remove: **a reader must be able to tell "none" from
+    "not counted"**, and here they could not.
+
+    Keys:
+
+    * ``materialized`` — members newly enqueued by this call.
+    * ``examined`` — distinct members looked at, whether or not they needed warming.
+    * ``failed`` — members whose enqueue raised. Counted rather than swallowed silently.
+    * ``truncated`` — the sweep stopped at ``limit`` and more members remain. Re-running continues
+      it only once the enqueued work has been indexed: `is_materialized` becomes true when the
+      index job completes rather than when it is enqueued, so an immediate re-run walks the same
+      members in the same order and reaches no further.
+    * ``complete`` — the sweep ran to the end without the listing itself failing. `False` means
+      every other number here is partial. It is the field that separates "nothing to do" from
+      "could not tell", and it is the reason this returns a dict.
+    """
     n = 0
+    examined = 0
+    failed = 0
+    truncated = False
+    complete = False
     seen: set = set()
     try:
         from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
@@ -1080,18 +1324,26 @@ def warm_collection(db, collection_id, *, tenant_id=None) -> int:
             aid = getattr(art, "id", None)
             if not aid or aid in seen:
                 continue
+            if examined >= limit:
+                # Stop at the bound and record it: returning early without setting `truncated`
+                # would silently claim completeness.
+                truncated = True
+                break
             seen.add(aid)
+            examined += 1
             if store.is_materialized(db, aid):
                 continue
             try:
                 enqueue_index_artifact(art, collection_id, is_head=True, tenant_id=tenant_id)
-                store.mark_materialized(db, aid)
                 n += 1
             except Exception:
+                failed += 1
                 logger.warning("warm_collection: materialize %s failed", aid, exc_info=True)
+        complete = True
     except Exception:
         logger.warning("warm_collection(%s) failed", collection_id, exc_info=True)
-    return n
+    return {"materialized": n, "examined": examined, "failed": failed,
+            "truncated": truncated, "complete": complete}
 
 
 def create_workspace_artifacts_bulk(
@@ -1196,7 +1448,12 @@ def _reindex_after_state_change(
             artifact, artifact.collection_id or artifact.id, tenant_id=user_id, vacate=vacate,
         )
     except Exception:
-        logger.debug("reindex after state change failed", exc_info=True)
+        # `warning`, not `debug`. A dropped index job is the kind nobody goes looking for, and
+        # `debug` is below the default level, so the record exists and is not seen. Logged and
+        # seen are different properties. The `mark_materialized` sibling
+        # was promoted for this reason; these four were missed by that pass.
+        logger.warning("reindex after state change FAILED — the index entry still describes"
+                       " the artifact's previous state", exc_info=True)
 
 
 def update_artifact(
@@ -1210,12 +1467,23 @@ def update_artifact(
     content_type: Optional[str] = None,
     reindex: bool = True,
     vector=None,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
 ) -> ArtifactEntity:
     """Update an artifact in a container.
 
-    ``vector`` is a validated :class:`api.vectors.SuppliedVector`. Supplying one is itself a
+    ``vector`` is a validated:class:`api.vectors.SuppliedVector`. Supplying one is itself a
     change: the writer is restating what this artifact means, so the update proceeds and
     reindexes even when no scalar field moved.
+
+    ``name`` and ``description`` are taken here as well as by ``update_workspace``, the sibling
+    this function mirrors for a top-level artifact, so `PATCH /artifacts/{id}` changes the same
+    fields whether it names a collection member or a top-level artifact. The MCP `update_artifact`
+    tool promises "only the fields you supply change", and a member that ignored them would return
+    200 having changed less than that.
+
+    Both are indexed fields — `title` in the lexical arm is this `name` — so a renamed member is
+    findable under its new name.
     """
     get_workspace(db, user_id, workspace_id, required="update")
 
@@ -1234,8 +1502,11 @@ def update_artifact(
         target.state = ArtifactEntity.STATE_ARCHIVED
         target.modified_by = user_id
         target.modified_time = _now_iso()
-        if store.update_artifact(db, target) is None:
-            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to persist artifact update")
+        #: No guard: `store.update_artifact` has one `return entity` and no error path, so testing
+        #: its result for `None` can only ever be False. It would not cover the real failure
+        #: either — the failure that reaches a client is `put_artifact` raising, which propagates
+        #: past a guard regardless.
+        store.update_artifact(db, target)
         # Archive: index into the archived segment and vacate committed + draft
         # (an archived root has no live committed/draft entry).
         if reindex:
@@ -1247,8 +1518,8 @@ def update_artifact(
         target.state = ArtifactEntity.STATE_DRAFT
         target.modified_by = user_id
         target.modified_time = _now_iso()
-        if store.update_artifact(db, target) is None:
-            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to persist artifact update")
+        #: No guard, for the reason given above.
+        store.update_artifact(db, target)
         # Unarchive: index into draft and vacate the archived segment.
         if reindex:
             _reindex_after_state_change(target, user_id, vacate=["archived"])
@@ -1264,8 +1535,8 @@ def update_artifact(
             target.state = ArtifactEntity.STATE_COMMITTED
             target.modified_by = user_id
             target.modified_time = _now_iso()
-            if store.update_artifact(db, target) is None:
-                raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to persist artifact update")
+            #: No guard, for the reason given above.
+            store.update_artifact(db, target)
             # Index into the committed segment and vacate the draft segment (the
             # draft just became the committed version).
             if reindex:
@@ -1278,6 +1549,12 @@ def update_artifact(
         target = _ensure_draft(db, user_id, target)
 
     dirty = False
+    if name is not None and name != target.name:
+        target.name = name
+        dirty = True
+    if description is not None and description != target.description:
+        target.description = description
+        dirty = True
     if context is not None and context != target.context:
         target.context = context
         dirty = True
@@ -1287,13 +1564,11 @@ def update_artifact(
     if content is not None and content != target.content:
         # Store new content in S3; update target.context with content_key.
         if content:
-            content_key, stored_content = _store_content_in_s3(target.id, content, target.context, owner_id=target.created_by)
-            try:
-                ctx_obj = json.loads(target.context) if target.context else {}
-            except (json.JSONDecodeError, TypeError):
-                ctx_obj = {}
-            ctx_obj["content_key"] = content_key
-            target.context = json.dumps(ctx_obj)
+            content_key, stored_content, cas_ref = _store_content_in_s3(
+                target.id, content, target.context, owner_id=target.created_by,
+                collection_id=target.collection_id)
+            target.content_ref = cas_ref or target.content_ref
+            target.context = _record_content_address(target.context, content_key, cas_ref)
             target.content = stored_content
         else:
             target.content = content
@@ -1303,9 +1578,12 @@ def update_artifact(
 
     target.modified_by = user_id
     target.modified_time = _now_iso()
-    result = store.update_artifact(db, target)
-    if result is None:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to persist artifact update")
+    #: No guard: `store.update_artifact` has one `return entity` and no error path, so a branch
+    #: testing its result is unreachable and the `500` behind it can never be produced.
+    #:
+    #: A failed persist still reaches the caller: `put_artifact` raises and nothing here catches
+    #: it.
+    store.update_artifact(db, target)
 
     if reindex:
         try:
@@ -1314,15 +1592,143 @@ def update_artifact(
                 target, target.collection_id, tenant_id=user_id, vector=vector,
             )
         except Exception:
-            logger.debug("reindex failed", exc_info=True)
+            # `warning`, not `debug` — PUBLISHING §4.4. A dropped index job is exactly the kind nobody
+            # goes looking for, and `debug` is below the default level: the record existed and was
+            # INVISIBLE. Logs and IS SEEN are different properties. The `mark_materialized` sibling
+            # was promoted for this reason; these four were missed by that pass.
+            logger.warning("reindex after update FAILED — the artifact is written but its index"
+                           " entry is stale", exc_info=True)
 
     _emit_event(workspace_id, "artifact.updated", {"artifact": target.to_dict()}, actor_id=user_id)
     return target
 
 
+def upsert_identity_member(
+    db: Database,
+    user_id: str,
+    workspace_id: str,
+    root_id: str,
+    *,
+    context: Optional[str] = None,
+    content: Optional[str] = None,
+    content_type: Optional[str] = None,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    vector=None,
+    report: Optional[Dict[str, Any]] = None,
+) -> ArtifactEntity:
+    """Create-or-overwrite the committed member of ``workspace_id`` whose ROOT is ``root_id``.
+
+    ``report``, when given, receives ``{"created": True|False}`` — which of the two things this
+    upsert actually did. The return value cannot say: both branches return an ``ArtifactEntity``
+    and they are indistinguishable.: without it the route answered ``201 Created``
+    for an overwrite, and a caller that supplied ``identity`` precisely BECAUSE the write is an
+    upsert had no way to learn which half it got.
+
+    An identity-addressed artifact is a mirror rather than a document. The caller supplied an
+    `identity` — "this is the same thing I stored before", a file on disk, a session, a commit — so
+    there is one true version of it and the writer is restating it. The ordinary member lifecycle
+    breaks that in two ways:
+
+    - A member is born a DRAFT (`create_workspace_artifact`), and `recall` reads the COMMITTED
+      segment. The mirror would be invisible to the search it exists to feed.
+    - Editing a committed member promotes a new draft (`_ensure_draft`) and leaves the committed
+      row alone, so the next recall answers with the PREVIOUS content. For a mirror of a file
+      that just changed, serving the old bytes is precisely the drift this whole mechanism was
+      built to remove.
+
+    So this writes the committed version in place and never forks a draft. Ordinary members are
+    unaffected: they arrive as drafts through `create_workspace_artifact`, and `update_artifact`
+    promotes on edit-after-commit.
+
+    The root is the identity and the id is the version. A top-level artifact derives its `id` from
+    the identity because there `id == root_id`; a member derives its root, because that is what
+    edges, grants and both search arms are keyed on (`search/ingest/pipeline_unified` indexes by
+    `root_id`). Deriving the version id would make every rewrite a new thing.
+    """
+    get_workspace(db, user_id, workspace_id, required="create")
+
+    target = store.get_latest_committed_artifact(db, root_id, workspace_id)
+    if target is None:
+        # No committed version. A draft under the same root is the same THING, so adopt it and
+        # commit it rather than creating a second lineage beside it.
+        target = store.get_draft_artifact(db, root_id, workspace_id)
+
+    if target is None:
+        created = create_workspace_artifact(
+            db=db, user_id=user_id, workspace_id=workspace_id,
+            context=context or "", content=content or "",
+            root_id=root_id, name=name, content_type=content_type,
+            vector=vector, enqueue_index=False,
+        )
+        created.state = ArtifactEntity.STATE_COMMITTED
+        if description is not None:
+            created.description = description
+        created.modified_by = user_id
+        created.modified_time = _now_iso()
+        #: No guard, same as above.
+        store.update_artifact(db, created)
+        _index_identity_member(created, user_id, vector)
+        _emit_event(workspace_id, "artifact.created",
+                    {"artifact": created.to_dict()}, actor_id=user_id)
+        if report is not None:
+            report["created"] = True
+        return created
+
+    if content is not None and content != target.content:
+        if content:
+            content_key, stored_content, cas_ref = _store_content_in_s3(
+                target.id, content, target.context, owner_id=target.created_by,
+                collection_id=target.collection_id)
+            target.content_ref = cas_ref or target.content_ref
+            context = _record_content_address(context or target.context, content_key, cas_ref)
+            target.content = stored_content
+        else:
+            target.content = content
+    if context is not None:
+        target.context = context
+    if content_type is not None:
+        target.content_type = content_type
+    if name is not None:
+        target.name = name
+    if description is not None:
+        target.description = description
+    target.state = ArtifactEntity.STATE_COMMITTED
+    target.modified_by = user_id
+    target.modified_time = _now_iso()
+    #: No guard, same as above.
+    store.update_artifact(db, target)
+    _index_identity_member(target, user_id, vector)
+    _emit_event(workspace_id, "artifact.updated", {"artifact": target.to_dict()}, actor_id=user_id)
+    if report is not None:
+        report["created"] = False
+    return target
+
+
+def _index_identity_member(artifact: ArtifactEntity, user_id: str, vector) -> None:
+    """Index a mirror write.
+
+    A failure here logs at warning. The sibling reindex calls swallow failures at `debug` because a
+    missed reindex is recoverable; on this path the artifact is a mirror whose purpose is to be
+    found, so an index that did not happen is the feature failing behind a successful-looking
+    write, and it is reported at the level an operator reads.
+    """
+    try:
+        from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
+        enqueue_index_artifact(
+            artifact, artifact.collection_id, tenant_id=user_id, vector=vector,
+        )
+    except Exception:
+        logger.warning(
+            "identity member %s indexed with no vector arm — recall will not find it "
+            "semantically", artifact.id, exc_info=True,
+        )
+
+
 def delete_artifact(
     db: Database, user_id: str, workspace_id: str, artifact_id: str, *, cascade: bool = False,
-) -> None:
+    auth: Any = None,
+) -> Dict[str, int]:
     """Delete one artifact version plus the copies of it that live outside the vertex —
     the object-storage content and the search index.
 
@@ -1332,12 +1738,11 @@ def delete_artifact(
     matters. Refuse the call instead: a caller that cannot name the container has not
     established which artifact it is deleting.
 
-    This artifact may itself be a container — a sub-collection filed inside another one, not a
-    top-level workspace — in which case it can have members of its own. Those are handled exactly
-    as :func:`delete_workspace` handles a top-level container's members: detached (evicted, not
-    destroyed) unless ``cascade=True``. Skipping this check left the previous version of this
-    function silently unlinking a sub-collection while leaving its own members' edges pointing at
-    a container id that no longer resolves to anything.
+    This artifact may itself be a container — a sub-collection filed inside another one rather than
+    a top-level workspace — in which case it can have members of its own. Those are handled exactly
+    as:func:`delete_workspace` handles a top-level container's members: detached (evicted rather
+    than destroyed) unless ``cascade=True``. Without the check a sub-collection would be unlinked
+    while its own members' edges still pointed at a container id that resolves to nothing.
     """
     if not workspace_id:
         raise HTTPException(
@@ -1347,8 +1752,10 @@ def delete_artifact(
     artifact = get_workspace_artifact(db, user_id, workspace_id, artifact_id)
 
     children = store.list_collection_artifacts(db, artifact_id, include_archived=True)
+    counts = {"detached": 0, "destroyed": 0, "refused": 0}
     if children:
-        _delete_or_detach_members(db, artifact_id, user_id, children, cascade=cascade)
+        counts = _delete_or_detach_members(db, artifact_id, user_id, children, cascade=cascade,
+                                           auth=auth)
 
     # S3 cleanup — read the content_key straight from context.
     try:
@@ -1382,6 +1789,25 @@ def delete_artifact(
         logger.debug("search delete failed", exc_info=True)
 
     _emit_event(workspace_id, "artifact.deleted", {"artifact_id": artifact_id}, actor_id=user_id)
+    return counts
+
+
+def _may_delete_draft(db: Database, auth: Any, artifact_id: str) -> bool:
+    """May this caller delete `artifact_id` in its own right?
+
+    Fails CLOSED on every uncertainty — no `auth`, an unavailable check, an unexpected error.
+    The thing being decided is whether to destroy someone's draft; "could not tell" must never
+    resolve to "yes".
+    """
+    if auth is None:
+        return False
+    try:
+        from mantle.services.dependencies import check_access
+
+        check_access(auth, artifact_id, "delete", db)
+        return True
+    except Exception:
+        return False
 
 
 def remove_artifact_from_container(
@@ -1389,6 +1815,7 @@ def remove_artifact_from_container(
     user_id: str,
     container_id: str,
     artifact_id: str,
+    auth: Any = None,
 ) -> ArtifactEntity:
     """Remove an artifact from a container by detaching its edge.
 
@@ -1396,6 +1823,17 @@ def remove_artifact_from_container(
     caller's `check_access`, with the `evict` action. If a draft
     version of the artifact is owned by this container, the draft row is
     cleaned up as part of the removal so it does not linger.
+
+    The draft cleanup is a deletion, and it needs its own authorization: `evict` on the container
+    is not enough on its own, or a caller who could evict could destroy a draft version homed
+    there — another user's unfinished work, removed under a container permission, with the
+    artifact's own grants never consulted. Unlinking is fairly a property of the container;
+    deleting a version is not.
+
+    `auth` is the caller's context, needed to make that second check. It is optional only so the
+    unlink path stays callable without one; when it is absent the draft is left in place rather
+    than deleted. That is the safe direction: an orphaned draft is recoverable and visible, an
+    unauthorized deletion is neither.
     """
     # Resolve the root_id: the caller may pass a version id or a root_id.
     root_id = artifact_id
@@ -1407,13 +1845,34 @@ def remove_artifact_from_container(
     # is not in this container.
     edge = store.get_edge(db, container_id, root_id)
     if not edge:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Artifact not found")
+        # Naming which 404 this is: the artifact usually exists and simply is not in this
+        # container, so a message that only names a missing artifact would read as "gone" for
+        # the common case, when a caller could act on the more precise answer.
+        #
+        # Still a 404 and still safe: the caller already holds `evict` on the container, and
+        # "not a member of this container" says strictly less about the artifact's global
+        # existence than "not found" would appear to.
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "That artifact is not a member of this container — nothing was detached. It may "
+            "exist elsewhere, or not exist at all; this route cannot tell you which.")
 
     store.remove_artifact_from_collection(db, container_id, root_id)
 
-    # If a draft version is owned by this container, clean it up.
+    # If a draft version is owned by this container, clean it up — but only for a caller who may
+    # delete THAT ARTIFACT. See the docstring: `evict` on the container authorizes the unlink, not
+    # the destruction of a version.
     local = store.get_current_in_collection(db, container_id, root_id)
     if local and local.state == ArtifactEntity.STATE_DRAFT and local.collection_id == container_id:
+        if not _may_delete_draft(db, auth, local.id):
+            logger.info(
+                "remove_artifact_from_container(%s): draft %s left in place — the caller holds "
+                "`evict` on the container but not `delete` on the artifact",
+                container_id, local.id)
+            _emit_event(container_id, "artifact.removed", {"artifact_id": artifact_id},
+                        actor_id=user_id)
+            return artifact or store.get_artifact(db, root_id) or ArtifactEntity(
+                id=root_id, root_id=root_id)
         store.delete_artifact(db, local.id)
         try:
             from mantle.search.ingest.pipeline_unified import delete_artifact_from_index
@@ -1456,7 +1915,12 @@ def revert_artifact(
         from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
         enqueue_index_artifact(committed, committed.collection_id, tenant_id=user_id)
     except Exception:
-        logger.debug("reindex failed", exc_info=True)
+        # `warning`, not `debug` — PUBLISHING §4.4. A dropped index job is exactly the kind nobody
+        # goes looking for, and `debug` is below the default level: the record existed and was
+        # INVISIBLE. Logs and IS SEEN are different properties. The `mark_materialized` sibling
+        # was promoted for this reason; these four were missed by that pass.
+        logger.warning("reindex after revert FAILED — the draft was discarded but the index"
+                       " still describes it", exc_info=True)
 
     _emit_event(workspace_id, "artifact.updated", {"artifact": committed.to_dict()}, actor_id=user_id)
     return committed
@@ -1587,18 +2051,18 @@ def initiate_upload_and_create_artifact(
     """Create a draft artifact to receive a file upload; return ``(descriptor, artifact)``.
 
     The descriptor is ``{"upload_id", "mode", "url", "method", "key"}`` and always describes a
-    PROXIED upload — the client PUTs bytes to Mantle, which envelope-encrypts them before they
+    proxied upload — the client PUTs bytes to Mantle, which envelope-encrypts them before they
     reach object storage. No presigned storage URL is ever handed out, so storage stays invisible
     to callers and never receives plaintext.
 
-    ``size`` and ``content_type`` are the client's CLAIM, recorded in context so the UI has
+    ``size`` and ``content_type`` are the client's claim, recorded in context so the UI has
     something to show; the true values are read back from storage on completion. The artifact is
-    created unindexed because it has no content yet — :func:`update_upload_status` indexes it
+    created unindexed because it has no content yet —:func:`update_upload_status` indexes it
     once the bytes land.
 
     Requires ``create`` on the workspace; raises ``HTTPException(404)`` otherwise.
     """
-    from mantle.services.content_service import presign_put_or_multipart, get_content_storage_mode
+    from mantle.services.content_service import get_content_storage_mode
     from mantle.services.ingest_runner_service import describe_content_processing
 
     tenant = _tenant_prefix_for_workspace(db, user_id, workspace_id)
@@ -1655,12 +2119,18 @@ def initiate_upload_and_create_artifact(
     )
 
 
+#: The upload statuses `update_upload_status` acts on. `uploading` and `failed` only record state;
+#: `complete` finalises the write. This tuple is checked rather than implied, because any value
+#: outside it would otherwise fall through every branch and return 200 having done nothing.
+_UPLOAD_STATUSES = ("uploading", "failed", "complete")
+
+
 def update_upload_status(
     db: Database,
     user_id: str,
     workspace_id: str,
     upload_id: str,
-    status_value: str,
+    status_value: Optional[str] = None,
     progress: Optional[float] = None,
     parts: Optional[List[Dict]] = None,
     context_patch: Optional[Dict] = None,
@@ -1678,7 +2148,31 @@ def update_upload_status(
     context carries no key or mode, for a multipart completion missing its id or parts, and when
     the object is not in storage. Raises ``HTTPException(502)`` if the durable copy fails, which
     leaves the upload unfinished rather than reporting a success only the edge bucket can serve.
+
+    Every unrecognised ``status_value`` must be refused rather than silently accepted: without the
+    check, any string outside ``("uploading", "failed", "complete")`` would fall through every
+    branch, change nothing, and return the artifact with 200 — a client that wrote ``"Complete"``
+    or ``"completed"`` would be told it had succeeded while the upload never finalised: the object
+    unmirrored, the ``upload`` section never dropped, and nothing anywhere recording that a status
+    had been ignored.
+
+    Nothing that worked before behaves differently: an unrecognised value already did nothing,
+    so the only requests newly refused are ones that were silently no-ops.
     """
+    # FIRST, before any store read. The branches below are the definition of this set and this
+    # guard must keep naming exactly them. At the top deliberately: a request that cannot be acted
+    # on should not cost an artifact lookup before it is refused.
+    # `None` means 'leave the status alone'. It is not a synonym for `uploading`: sending
+    # `body.status or "uploading"` would make an empty `PATCH {}` write `uploading` — and on an
+    # upload that had already completed that would silently revert it, because the branch below
+    # assigns whatever it is given. A PATCH that names no field must change no field; that is what
+    # PATCH means.
+    if status_value is not None and status_value not in _UPLOAD_STATUSES:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Unknown upload status %r. Expected one of: %s."
+            % (status_value, ", ".join(_UPLOAD_STATUSES)))
+
     from mantle.services.content_service import (
         complete_multipart,
         head_object,
@@ -1699,6 +2193,15 @@ def update_upload_status(
 
     key = up.get("s3_key")
     mode = up.get("mode")
+
+    if status_value is None:
+        # Progress / parts / context only. The upload's own status is untouched.
+        ctx["upload"] = up
+        return update_artifact(
+            db, user_id, workspace_id, upload_id,
+            context=_ensure_json_str(ctx),
+            reindex=False,
+        )
 
     if status_value in ("uploading", "failed"):
         up["status"] = status_value
@@ -1808,7 +2311,7 @@ def rotate_artifact_key(
     one it replaces, and record the new key's id in the artifact's context.
 
     Returns ``{"workspace_id", "artifact_id", "key_id", "key"}``. ``key`` is shaped
-    ``"<artifact_id>:<secret>"`` because :func:`resolve_card_key` authenticates the pair, and
+    ``"<artifact_id>:<secret>"`` because:func:`resolve_card_key` authenticates the pair, and
     this return is the ONLY time the secret is available — it is hashed at rest and cannot be
     recovered afterwards, so a caller that drops it must rotate again.
 
@@ -1936,7 +2439,7 @@ def receive_card_inbound_message(
     """Record an inbound webhook message as a new artifact in the card's workspace.
 
     Authenticates ``token`` as that card's ``inbound`` key, then creates the message artifact as
-    the WORKSPACE OWNER rather than as the credential: a webhook has no user behind it, and the
+    the workspace owner rather than as the credential: a webhook has no user behind it, and the
     owner is the principal accountable for what lands in their workspace. The originating card is
     kept in the new artifact's context as ``source_artifact_id``, so provenance survives even
     though the writer is recorded as the owner.

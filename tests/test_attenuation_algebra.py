@@ -35,7 +35,7 @@ from mantle.attenuation import (
     NOTHING,
     TOP,
     Mask,
-    attenuate,
+    meet,
     compose,
     propagates,
 )
@@ -225,7 +225,7 @@ def test_every_unary_law_on_every_mask() -> None:
         assert TOP & a is a and a & TOP is a, f"TOP is not neutral for {a!r}"
         assert DENY & a is DENY and a & DENY is DENY, f"DENY is not absorbing for {a!r}"
         assert a <= TOP and DENY <= a, f"{a!r} escapes the bounds"
-        assert attenuate(a, a) is a and a.intersect(a) is a
+        assert meet(a, a) is a and a.intersect(a) is a
         # `actions` is the code, read out — which is what lets the pair sweep prove the
         # subset law once, in bit terms, and have it hold in action-name terms as well.
         assert a.actions == frozenset(

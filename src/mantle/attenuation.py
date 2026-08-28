@@ -52,7 +52,7 @@ __all__ = [
     "DENY",
     "TOP",
     "NOTHING",
-    "attenuate",
+    "meet",
     "compose",
     "propagates",
 ]
@@ -382,8 +382,16 @@ TOP: Mask = Mask(_ACTION_BITS | _ALLOW_BIT)
 NOTHING: Mask = Mask(_ALLOW_BIT)
 
 
-def attenuate(a: Mask, b: Mask) -> Mask:
-    """Function form of the meet, for call sites that pass it around as a value."""
+def meet(a: Mask, b: Mask) -> Mask:
+    """Function form of the meet, for call sites that pass it around as a value.
+
+    NAMED `meet`, NOT `attenuate`. `prism.law.attenuate(distance, length=xi)` is the screened
+    exponential propagator — a real-valued decay over a distance. This is the greatest lower
+    bound of two authority masks: integer AND, no distance, no decay, no continuum. They share
+    a verb and nothing else, and both were importable under the bare name `attenuate`, which is
+    exactly the shape a wrong import takes. `meet` is also what the algebra calls it, so the
+    name now says which of the two operations a reader is looking at.
+    """
     return a & b
 
 

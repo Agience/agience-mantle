@@ -12,7 +12,7 @@ install time:
     into subpackages. `src/mantle/system/` has its own `__init__.py`, so it is a package of its
     own, and `uvicorn_log_config.json` — which `system/logging_utils.py` loads as
     `Path(__file__).parent / "uvicorn_log_config.json"` — needs its own entry or it is simply
-    left out. A wheel built without it BUILDS, INSTALLS AND RUNS, with default log formatting
+    left out. A wheel built without it builds, installs and runs, with default log formatting
     and nothing to say why.
 
 No check that reads the source tree can see that, and no check that reads `pyproject.toml` can

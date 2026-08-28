@@ -35,7 +35,7 @@ def _repo_root() -> Path:
 
 
 # There is no builtin `package/types` root in this image — the type tree lives in
-# agience-bundle, not agience-mantle, and no deployment mounts one into Mantle. Filesystem
+# `agience-crystal/src/types`, not agience-mantle, and no deployment mounts one into Mantle. Filesystem
 # type resolution is opt-in via `AGIENCE_TYPES_PATHS`; nothing is read from a location no
 # deployment supplies. Servers self-register the types they own via `register_runtime_type`
 # (Mantle stays passive) — see `_default_server_ui_roots` below.

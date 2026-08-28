@@ -10,7 +10,7 @@ Three steps, and nothing else:
     2. the first user                person card + inbox workspace + owner grant
     3. the admin grant on (1)        which closes the bootstrap window
 
-!! THIS IS NOT REQUIRED TO STORE AND FIND THINGS. An ordinary write reaches a virgin store on its
+!! This is not required to store and find things. An ordinary write reaches a virgin store on its
 own: `POST /artifacts` (and the `create_artifact` MCP tool) roots the content key at the new doc's
 own `origin_root` and the write path issues the creator's owner grant in the same call, so
 `oracle.get_or_create_master_key` finds the `read` grant it requires and the artifact is created,
@@ -24,7 +24,7 @@ collection, and `grants_router._require_admin` checks `grant_service.can_admin(d
 resource_id)` — a grant on the resource, which the operator fast-path does not satisfy — so there
 is no API by which the first such grant can be created.
 
-!! IT DOES NOT INITIALIZE KEY MATERIAL, so what it writes is not searchable. `main.py`'s lifespan
+!! It does not initialize key material, so what it writes is not searchable. `main.py`'s lifespan
 calls `init_encryption_key()` at Phase 0; this script does not, so the key oracle has no KEK and
 every artifact below is logged `sse=skipped vector=skipped` and stays that way until a reindex.
 The exit code is 0 regardless.
@@ -34,8 +34,8 @@ The two admin paths disagree by design. `/system/*` honours the bootstrap window
 gap with a deliberate, one-time action rather than by widening an authorization path permanently.
 
 This is not seeding. `manage_seed.py` and `POST /system/seed` load the install package's corpus
-from `AGIENCE_SEEDS_ROOT` — which, in `agience-bundle`, is the Agience persona roster
-(`agent-aria`, `agent-astra`, `agent-sage`, `agent-seraph`, `agent-verso`) plus grants making every
+from `AGIENCE_SEEDS_ROOT` — which, in `agience-observe`, is the Agience persona roster
+(`agent-aria`, `agent-astra`, `agent-sage`, `agent-seraph`, `agent-lumen`) plus grants making every
 new user able to read and invoke it. An enterprise store wants none of that: installing it would
 seed someone else's tenant with Agience agents. Nothing here reads `AGIENCE_SEEDS_ROOT`.
 

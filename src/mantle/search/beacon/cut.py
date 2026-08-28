@@ -33,10 +33,10 @@ Public surface
 
 `coherent_basis`, `in_subspace_fraction`, `anomaly`, `anomaly_rank`, `most_anomalous`,
 `novelty_score`, and `subspace_coherence` were retired from this surface: zero production callers
-anywhere in mantle, and the naming-collision avoidance they required (`anomaly_rank` rather than
+anywhere in mantle, so the naming-collision avoidance they require (`anomaly_rank` rather than
 `rank`, which collides with `signal_rank`/`structure_rank`; `subspace_coherence` rather than
-`coherence`, which collides with `SpectralRead.coherence`) no longer applies to anything exported
-here. See SEARCH-ARCHITECTURE.md.
+`coherence`, which collides with `SpectralRead.coherence`) applies to nothing exported here.
+See SEARCH-ARCHITECTURE.md.
 
 ═══════════════════════════════════════════════════════════════════════════════════════════════
 No tuned constants — and what is still typed is named as a seam rather than defended
@@ -85,13 +85,15 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from .engine import _tw1_core, occupancy_fraction, signal_rank
+from .engine import BeaconEngineError, _tw1_core, occupancy_fraction, signal_rank
 
 __all__ = [
     # ── primitives ──
     "gap_split", "top_break",
     # ── the adaptive cut ──
     "derive_heads", "head_screen", "signal_power", "select",
+    # ── the frame the adaptive cut asks for ──
+    "screen_frame",
 ]
 # Deliberately not re-exported from `mantle.search.beacon`. The package `__all__` is a promise —
 # every name in it is something a third party may build on and therefore something that cannot
@@ -173,7 +175,7 @@ def _read_instrument():
 
     When prism *is* on the path, beacon registers itself as the process default the first time it
     is asked — not at import time, and not unconditionally, so a host that registered something
-    fuller first (a richer, entroptics-backed `Read`) keeps its slot; `set_default_read` is one
+    fuller first (a richer, instrument-backed `Read`) keeps its slot; `set_default_read` is one
     slot, last write wins, and this only writes when the slot is still empty. From then on,
     resolution goes through `prism.instrument.resolve_read`, which checks the explicit
     `instrument=` argument first (there is none here), then the process default, exactly as
@@ -238,8 +240,51 @@ def gap_split(scores) -> Tuple[np.ndarray, float]:
 
     `n <= 1` keeps everything and reports `1.0`. One item has no consecutive pair, so there is no
     gap to find — `1.0` is the no-break ratio, not a measured break.
+
+    NO DROP IS NOT A SMALL DROP (repaired 2026-08-22). When no consecutive ratio clears 1 by more
+    than the round-off of the arithmetic that produced the values, there is no break: this keeps
+    the whole set and reports `1.0`. Before the repair `argmax` ran over ratios that were all
+    exactly 1, landing on index 0, so a tied plateau was cut to a single arbitrary member while
+    reporting a gap of `1.000` — a cut, and in the same breath the news that nothing was found to
+    cut at. `[9,9,9,5,5,5,1,1]` kept one item of three; `[1]*9` kept one of nine.
+
+    The tolerance is derived, not picked. Every salience this is handed is a sum — a row's energy
+    over resolved modes, a row of per-head cosines — and a sum of at most `n` terms carries a
+    relative forward error bounded by `n * eps`, so a ratio of two such values carries twice that.
+    `eps` is read off the array's own dtype rather than asserted. It matters: identical candidate
+    rows give powers differing in the last bits, and a ratio of `1 + 4e-15` was cutting twenty
+    identical items down to one.
     """
     s = np.asarray(scores, dtype=np.float64).ravel()
+    n = s.size
+    if n <= 1:
+        return np.ones(n, dtype=bool), 1.0
+    return _gap_split(s, _tie_tol(s))
+
+
+def _tie_tol(s: np.ndarray) -> float:
+    """The relative width within which two values of `s` are the same computed number.
+
+    Computed on the WHOLE spectrum, never on a slice. `top_break` narrows to a region before
+    locking, and a tolerance recomputed on the narrowed region shrinks with it — backwards, since
+    the values in the region were produced by the same arithmetic as the ones outside it.
+
+    ACCUMULATION — every salience `gap_split` is handed is a sum of at most `n` non-negative
+    terms (a row's energy over resolved modes, a row of per-head cosines), so the relative forward
+    error is bounded by `n * eps`, and a RATIO of two such values carries twice that.
+
+    This may not call `prism.rounding`, which is where the law otherwise lives.
+    `test_the_cut_imports_and_works_with_beam_and_prism_all_blocked` blocks ALL of prism
+    for this module — stricter than `instrument.py`, which is allowed the one rounding import —
+    because the silhouette is what keeps mantle shippable on its own. So the
+    bound is restated here and the site is enumerated in
+    `test_rounding_law_is_single_sourced.ALLOWED` with this model, which is what that list is for.
+    `eps` is read off the array's own dtype rather than asserted."""
+    return 2.0 * max(1, s.size) * float(np.finfo(s.dtype).eps)
+
+
+def _gap_split(s: np.ndarray, tol: float) -> Tuple[np.ndarray, float]:
+    """`gap_split` on a validated spectrum with a tolerance supplied by the caller."""
     n = s.size
     if n <= 1:
         return np.ones(n, dtype=bool), 1.0
@@ -248,6 +293,9 @@ def gap_split(scores) -> Tuple[np.ndarray, float]:
     ratios = sd[:-1] / np.clip(sd[1:], _RATIO_FLOOR, None)   # consecutive top/next = relative gaps
     cut = int(np.argmax(ratios))                             # the single biggest multiplicative drop
     keep = np.zeros(n, dtype=bool)
+    if ratios[cut] <= 1.0 + tol:                             # no drop that clears the round-off
+        keep[:] = True
+        return keep, 1.0
     keep[order[: cut + 1]] = True
     return keep, float(ratios[cut])
 
@@ -265,10 +313,19 @@ def top_break(scores) -> Tuple[np.ndarray, float]:
     median is the coarsest data-derived way to keep the read inside the region that carries signal.
     It is a robustness step, not a threshold: it never decides how many are kept.
 
-    When the top region has at most one item, exactly one is kept and the reported gap is `1.0`.
-    That is the no-break report, and it is reachable on an all-equal spectrum (nothing is strictly
-    above the median) — including the all-zero spectrum, which is what a screen with nothing to
-    read produces. See `head_screen` for the one way that arises in practice.
+    The region carries one element below the floor (repaired 2026-08-22), and that matters more
+    than it sounds. The break that ends a top cluster sits BETWEEN the cluster and what follows —
+    which is exactly the boundary the median floor excludes. Restricted to strictly-above-median
+    values, `[9,8,8,1,1,1,1,1]` offers only the ratios 1.125 and 1.000 and cuts after the 9,
+    keeping one item of an obvious three; the real break, 8 -> 1 at a ratio of 8, was on the other
+    side of the floor. Including one boundary element makes it visible and the cut lands on 3. The
+    floor still does its job: the tail beyond that one element is never a candidate, and the
+    boundary element is used to FIND the break and never itself kept.
+
+    Nothing above the median is a flat spectrum: there is no top cluster, so everything is kept and
+    the gap is `1.0` — the read ran and found no break. Before the repair this kept exactly one
+    item, the last by `argsort`, which is a cut the data does not support wearing the same shape as
+    one it does. An all-zero spectrum — what a screen with nothing to read produces — lands here.
     """
     s = np.asarray(scores, dtype=np.float64).ravel()
     n = s.size
@@ -276,13 +333,20 @@ def top_break(scores) -> Tuple[np.ndarray, float]:
     if n <= 1:
         keep[:] = True
         return keep, 1.0
+    tol = _tie_tol(s)
     order = np.argsort(s)[::-1]
-    idx = order[s[order] > np.median(s)]                     # high-salience items, descending
-    if idx.size <= 1:
-        keep[order[:1]] = True
+    med = float(np.median(s))
+    # Above the median means MEASURABLY above it. A value sitting a few last bits over the median
+    # is the median, and admitting it opens a one- or two-element region whose only break is
+    # round-off.
+    n_above = int((s[order] > med * (1.0 + tol)).sum())
+    if n_above == 0:
+        keep[:] = True
         return keep, 1.0
-    keep_local, rel_gap = gap_split(s[idx])
-    keep[idx[keep_local]] = True
+    region = order[: min(n_above + 1, n)]                    # + one boundary element
+    keep_local, rel_gap = _gap_split(s[region], tol)         # the WHOLE spectrum's tolerance
+    n_keep = min(int(keep_local.sum()), n_above)             # the boundary element is never kept
+    keep[order[:n_keep]] = True
     return keep, rel_gap
 
 
@@ -414,3 +478,30 @@ def select(item_embs, query_emb, heads: Optional[int] = None) -> np.ndarray:
     power = signal_power(head_screen(E, query_emb, H))
     keep, _ = top_break(power)
     return np.where(keep)[0]
+
+
+def screen_frame(item_embs, query_emb) -> np.ndarray:
+    """The `(T, F)` frame `prism.adaptive_cut.cut` asks for, built from embeddings and a query.
+
+    `adaptive_cut` reads a frame and declines without one, because a score column is a line and the
+    number of spots on a line is a different question. Its own note — "a synthesised one would be a
+    reading nobody took" — is the right instinct, and this is the frame that is not synthesised:
+    `head_screen` is `W[item, head]`, each candidate's per-head cosine to the query, over the
+    coordinates the pipeline already holds. Every row is a measurement of that candidate against
+    that query, and the head count is derived from the candidate set's own effective rank.
+
+    `_cut_for` already builds a frame for the SYNSET candidates in a ranking, through the
+    projection seam. This is the other half: a ranking of documents has no synset names to place,
+    so it yields no frame today and the cut falls to `_knee` over the scores. Where embeddings for
+    the candidates and the query are in hand, this turns them into a frame the adaptive instrument
+    can read.
+
+    Wiring it to a live caller is a separate act and is not done here: it needs the embeddings
+    provider, which may be unconfigured, and costs a lookup per candidate. Making the capability
+    reachable is what this function is for; deciding it is worth its cost is a measurement on a
+    corpus.
+    """
+    E = np.asarray(item_embs, dtype=np.float64)
+    if E.ndim != 2 or len(E) < 1:
+        raise BeaconEngineError(f"item embeddings must be (n, d); got shape {E.shape}")
+    return head_screen(E, query_emb, derive_heads(E))

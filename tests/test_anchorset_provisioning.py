@@ -79,8 +79,8 @@ def test_embeddings_are_preserved_bit_for_bit_so_the_ids_stay_derivable(tmp_path
 
     `l2norm` is not bitwise idempotent in float32 — re-normalising an already-unit vector shifts
     roughly a third of them by an ulp — so a reader that normalises on the way in hands back
-    anchors whose bytes no longer produce the ids they arrived with. Then save→load→save emits a
-    file that its own verification rejects.
+    anchors whose bytes do not produce the ids they arrived with, and save→load→save emits a file
+    that its own verification rejects.
     """
     src = _canonical()
     p, q = tmp_path / "a.json", tmp_path / "b.json"
@@ -126,7 +126,7 @@ def test_a_refused_file_loads_nothing_at_all(tmp_path):
     path = tmp_path / "anchors.json"
     src.save(path)
     raw = json.loads(path.read_text(encoding="utf-8"))
-    raw["anchors"][0]["label"] = "relabelled"      # id no longer follows from the content
+    raw["anchors"][0]["label"] = "relabelled"      # the id no longer follows from the content
     path.write_text(json.dumps(raw), encoding="utf-8")
 
     repo = InMemoryAnchorRepo()

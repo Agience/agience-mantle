@@ -114,7 +114,11 @@ search = ["agience-mantle[lexical,semantic]"]
 # the module at the import system and proves the blocker actually fires before concluding anything —
 # a guard that silently does nothing would be indistinguishable from a passing test.
 #
-# `agience-prism` is the one declared cross-package edge. Mantle imports it in 19 modules
+# `agience-prism` is the one declared cross-package edge. ⛑ Re-measured 2026-08-26 by AST, not
+# by grep: **24 modules**, 36 import statements — 13 at module scope across 11 files (`mesh/` `search/`
+# `services/` `shard/`) and 23 deferred inside functions. ⭐ `import mantle` reaches NONE of them:
+# `mantle/__init__.py` imports only `os`, which is what keeps the base install honest at its single
+# declared dependency. The comment said 19 and `config.py` said ~28; both predate this count
 # (trust.key_manager, trust.service_identity, mass, canonical, envelope, grounding, law, vector);
 # prism is the designated floor, Apache-2.0, and imports nothing from this workspace, so it is the
 # right edge to depend on.
@@ -144,8 +148,11 @@ service = [
     "python-dotenv>=1.0",
     "httpx>=0.27",
     "authlib>=1.3",
-    "bcrypt",
-    "itsdangerous",
+    # ⚠ `bcrypt` and `itsdangerous` WERE BARE until 2026-08-25, alone among this extra's
+    # entries — every neighbour already carried a floor. A bare requirement is satisfied by
+    # whatever is installed, so two boxes with different versions both "satisfy" this file.
+    "bcrypt>=4.0",
+    "itsdangerous>=2.1",
     "pyyaml>=6.0",
 ]
 
@@ -207,6 +214,11 @@ all = ["agience-mantle[s3,smb,search,service,dev]"]
 mantle-serve = "mantle.scripts.serve:main"
 mantle-init-keys = "mantle.scripts.dev_init_keys:main"
 mantle-token = "mantle.scripts.dev_mint_token:main"
+# `mantle-wal-checkpoint` reclaims the write-ahead log without a restart. `main.py` truncates
+# on clean shutdown and `wal_autocheckpoint=2000` bounds growth, but neither reaches a node
+# that has been up for weeks and cannot be bounced — which is the state that produced a
+# 30.4 GiB WAL on node 71. It needs the readers quiet and exits non-zero when they were not.
+mantle-wal-checkpoint = "mantle.scripts.wal_checkpoint:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -260,6 +272,7 @@ asyncio_default_fixture_loop_scope = "function"
 # a different question than the root run does, which is what makes a green run evidence about the
 # command line rather than about the code.
 markers = [
+    "real_content_store: exercise the real artifact content write path instead of the addressed stub in conftest",
     "lazy: requires MANTLE_LAZY_INDEX=on (the first-observation regime)",
     "search: requires the search backend (the lattice + its content edge) to be up",
     "external_issuer: registers and uses a self-signed second issuer",

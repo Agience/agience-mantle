@@ -62,7 +62,7 @@ _EXPECTED_COLLECTIONS = [
     "agience-anchorset",
 ]
 
-_PERSONAS = ("aria", "astra", "sage", "iris", "ophan", "seraph", "verso")
+_PERSONAS = ("aria", "astra", "sage", "iris", "ophan", "seraph", "lumen")
 
 _EXPECTED_ARTIFACTS = [
     "agience-authority-current-instance", "agience-host-current-instance",
@@ -109,7 +109,7 @@ def test_platform_tree_containment_and_membership_edges(tmp_path, monkeypatch):
     assert (_id("agience-resources"), _id("agience-agent-aria")) in edges
     assert (_id("agience-seeds-agents"), _id("agience-agent-aria")) in edges
     # Server record in the all-servers collection.
-    assert (_id("agience-seeds-all-servers"), _id("agience-server-verso")) in edges
+    assert (_id("agience-seeds-all-servers"), _id("agience-server-lumen")) in edges
     # Authority + host artifacts also linked into platform-artifacts.
     assert (_id("agience-seeds-platform-artifacts"), _id("agience-authority-current-instance")) in edges
     assert (_id("agience-seeds-platform-artifacts"), _id("agience-host-current-instance")) in edges

@@ -38,6 +38,8 @@ See `.dev/features/mantle-mvp.md` and
 
 from __future__ import annotations
 
+import re
+
 import logging
 import time
 from typing import Optional
@@ -56,7 +58,6 @@ from mantle.search.ingest.chunking import (
 )
 from mantle.search.ingest.tags import (
     normalize_tags,
-    parse_tags_from_context,
 )
 from mantle.search.mantle.oracle import MasterKeyMissing
 from mantle.services.acting_principal import KeyCustodyDenied
@@ -107,7 +108,7 @@ def _segment_for_state(state: str) -> str:
 #:
 #: That is not a leak. Cells stay encrypted at rest, and every posting and every
 #: hydration is cut by the same light cone that guards the read path, so no principal
-#: learns anything it could not already fetch by id. It is a WIDER SURFACE, chosen
+#: learns anything it could not already fetch by id. It is a wider surface, chosen
 #: rather than inherited: recall answers a question nobody needs answered about a
 #: secret ("which of these contains this string?"), and a full-text index is a second
 #: representation of the plaintext, in a second store, with a second decrypt path and
@@ -184,6 +185,229 @@ except Exception as exc:  # pragma: no cover — queue optional during static an
 # ============================================================
 
 
+#: The offer as the artifact states it — what it announces about itself in its own words. Every one
+#: of these is bounded by the artifact: a title, a one-line description, a tag list.
+#:
+#: `_extract_artifact_fields` still returns `content` beside these. The body is not indexed as
+#: itself; what is indexed is what the body announces — see :func:`_body_offer`.
+#: A lexicon entry, whose `lemmas` are the names it goes by rather than terms taken from a body.
+#: See `_extract_fields` for why the distinction has to be made by type and not by the field.
+LEXICON_CONTENT_TYPE = "text/x-wordnet"
+
+#: Not a discriminator, and the reason this comment is long. `application/x-concept` has two
+#: writers on this store, measured 2026-08-24:
+#:
+#:     cn-*        1,165,110   ConceptNet 5.7 terms.  lemmas are the title, split:
+#:                             `12 hour clock` -> ['12', 'hour', 'clock']
+#:     concept-*       5,484   `ember.consolidate.colimit` merges.  lemmas are the union of the
+#:                             NAMES of the synsets merged: ['apparel','clothes','dress', ...]
+#:
+#: So a rule keyed on this type promotes 1.16M sets of word fragments into the tags of records that
+#: already carry those same words in their title. That is the one-field-two-meanings-two-writers
+#: shape the block in `_extract_artifact_fields` is about, and it caught this file out AGAIN — the
+#: first version of this constant read the type, exactly as that block advises, and the advice does
+#: not hold here because the type does not separate the writers.
+CONCEPT_CONTENT_TYPE = "application/x-concept"
+
+
+def _lemmas_are_names(artifact) -> bool:
+    """Does this record's ``lemmas`` hold the names it goes BY, rather than words taken from it?
+
+    Three writers put three different things in one field, so this asks about the record and not
+    about the field being present:
+
+    * a **synset** (`text/x-wordnet`) — its lemmas are the words that mean it, and that IS its
+      offer; the record exists to say these words mean this;
+    * a **colimit** — a merge of synsets, carrying the union of their names. Recognised by
+      ``colimit_of``, which names the members and is what makes it a merge. Not by content type:
+      ConceptNet shares that type and splits its title into the same field;
+    * everything else — on a wiki artifact `lemmas` is key terms `astra/doc_index` pulled out of
+      the body, and indexing those would be indexing the content, which this pipeline is built not
+      to do.
+    """
+    if getattr(artifact, "content_type", None) == LEXICON_CONTENT_TYPE:
+        return True
+    return bool(getattr(artifact, "colimit_of", None))
+
+_STATED_OFFER_FIELDS = ("title", "description", "tags")
+
+
+def _description_that_adds_something(title: str, description: str) -> str:
+    """The description, or ``""`` when it carries no stem the title does not already carry.
+
+    An artifact should not announce itself twice. Measured 2026-08-24 across 2,167,300 artifacts
+    on 71/home:
+
+        carry both a title and a description        1,175,579   (54%)
+          description CONTAINS the title verbatim   1,164,574   (99% of those)
+        carry a description and no title                    0
+        description saying anything the title does not 11,005   (0.5% of the corpus)
+
+    and the shape of the 1.16M is one template, repeated:
+
+        title        agience-build/AGENTS.md
+        description  Workspace document imported from agience-build/AGENTS.md
+
+    That is PROVENANCE wearing the offer's clothes, and this file already carries the argument
+    against it one function up -- "provenance lives in `citation` / `source_path` / `via` and is
+    never reachable by the matcher" -- with the measured consequence that promoting a provenance
+    string put all 6,480 canon documents on the same two nodes.
+
+    The test is per-artifact and needs no judgement about what a description is FOR: subtract the
+    title's stems, and what remains is what the second field contributed. Nothing remaining means
+    the artifact said one thing in two places, and the second copy is dropped. This subtracts
+    STEMS rather than testing containment, because `oxygen` / `oxygen: a nonmetallic bivalent
+    element` contains its title and is not a duplicate -- that is the 11,005.
+
+    NOT a ranking fix: `Coverage.stems` counts DISTINCT query stems, so a stem indexed under two
+    fields never counted twice. What this saves is one posting per (duplicated stem x field) over
+    1.16M records, and it stops the corpus teaching the index that a template is an offer.
+    """
+    if not description:
+        return ""
+    if not title:
+        return description
+    try:
+        from mantle.search.mantle.sse.tokenizer import tokenize
+    except Exception:                              # noqa: BLE001 -- no tokenizer, no opinion
+        return description
+    try:
+        title_stems = set(tokenize(title))
+        if not title_stems:
+            return description
+        if set(tokenize(description)) - title_stems:
+            return description
+    except Exception:                              # noqa: BLE001
+        return description
+    return ""
+
+
+def _fields_to_index(fields: dict[str, str]) -> dict[str, str]:
+    """Exactly what the lexical arm is given: the stated offer, plus what the body announces.
+
+    A free function so the decision is testable on its own. Inline in `_sse_index_artifact` it
+    needs a store, an oracle and an acting principal to reach, which leaves a test exercising the
+    indexer rather than the choice of what to hand it.
+
+    The raw body never appears in the result. `_body_offer` returns a projection, and `""` when
+    there is nothing to project, in which case the stated offer alone is indexed.
+
+    Both the offer and the projected body belong here. The offer is how a thing is found; the
+    content is what the finding is worth. Measured on 150 retrievals:
+
+        the retrieved entry NAMES the answer   (89 items)   +0.1420
+        it does not                            (61 items)   +0.0073
+
+    Twenty times the value, and it is carried by the material an offer does not contain. The
+    alignment that makes `description` the single offer field invites the next step — "context is
+    what we index, so index context" — and that step would delete the thing the value was measured
+    in. §84 already leaves ~70% of a canon body outside this index by design, and that 70% is also
+    70% of the material that could have held the answer. Both channels, doing different jobs.
+    """
+    if not fields:
+        return {}
+    body = _body_offer(fields.get("content") or "")
+    fields = dict(fields)
+    # One offer, not two. See `_description_that_adds_something`.
+    kept = _description_that_adds_something(fields.get("title") or "",
+                                            fields.get("description") or "")
+    if kept:
+        fields["description"] = kept
+    else:
+        fields.pop("description", None)
+    out = {k: v for k, v in fields.items() if k in _STATED_OFFER_FIELDS and v}
+    if body:
+        out["content"] = body
+    return out
+
+
+def _body_offer(content: str) -> str:
+    """What the body announces about itself: the spans that stand out from its own others.
+
+    Still the offer rather than the body: a title is what an artifact says about itself in a line,
+    and this is what a body says about itself when nobody supplied a line. What goes into the index
+    is a projection, never the text.
+
+    `beacon.density.dense_excerpt` is that projection, and it fits for the same reason it makes a
+    poor preview. Entropy is query-independent by construction, so one artifact yields the same span
+    to every question asked of it — measured on 71/dev, three unrelated questions each got the same
+    368 characters of this project's README. A preview should answer the question that was asked; at
+    index time there is no question to answer, and an offer must be the same offer whoever reads it.
+
+    It is bounded without a cap. `top_break` keeps whichever windows stand out, at whatever count
+    that turns out to be, so the extent is read off the document rather than chosen for it. That is
+    what keeps "a body contributes thousands of distinct stems" from making write cost a function of
+    the corpus; the entry layout in `sse/posting.py` covers the part of that cost which is O(entries
+    already in the slot).
+
+    Returns `""` for empty content, and for a body so short it is a single window the whole of it is
+    its own densest span (`dense_windows`' no-break convention) — which is correct: a two-line body
+    announces itself entirely.
+    """
+    if not content or not content.strip():
+        return ""
+    try:
+        from mantle.search.beacon.density import dense_excerpt
+    except Exception:                              # noqa: BLE001 — beacon is the permissive half
+        # Without beacon there is no cut, and no cut means no projection. Indexing the raw body
+        # instead would reinstate the write cost this whole design avoids, so the honest answer is
+        # to index the stated offer alone — which is exactly what happened before this existed.
+        logger.debug("beacon.density unavailable; the body announces nothing", exc_info=True)
+        return ""
+    return dense_excerpt(content)
+
+
+#: Separators inside a group id. `collection:agience-pharos/features` and `stage.0.lexicon` are
+#: both paths; the words in them are what a person would type.
+_GROUP_SPLIT = re.compile(r"[:/._\-]+")
+
+
+def _group_terms(artifact: Artifact) -> list[str]:
+    """The groups this artifact belongs to, as searchable words (§112).
+
+    A tag, a collection, a group and an attribute are the same thing: an edge to another artifact.
+    So there is no `tags` field to read — membership is the tag set, and `collection_id` /
+    `collections` are the field mirror of the `contains` edges that record it
+    (`mantle.shard.curate._memberships` reads both names, which is why both are read here).
+
+    A `tags` key in the context blob would be a second, parallel answer to a question the graph
+    already answers, and the two could
+    disagree with nothing to notice: an artifact moved between collections kept whatever tag
+    strings its context happened to carry.
+
+    The id is split into words rather than emitted whole, because a group id is a path and the
+    words in it are what a person types — `collection:agience-pharos/features` yields
+    `agience`, `pharos`, `features`. `normalize_tags` then dedupes and canonicalises, so a term
+    repeated across an artifact's groups costs nothing.
+    """
+    ids: list[str] = []
+    for value in (getattr(artifact, "collections", None) or []):
+        if value:
+            ids.append(str(value))
+    own = str(getattr(artifact, "collection_id", "") or "").strip()
+    if own:
+        ids.append(own)
+
+    terms: list[str] = []
+    seen: set[str] = set()
+    for gid in ids:
+        # ── the SCHEME is a type marker, not a name ──────────────────────────────────────────
+        # `collection:agience-pharos/features` splits to `collection, agience, pharos, features`,
+        # and `collection` is then a tag on every artifact that is in a collection — which is all
+        # of them. A term carried by every member of a corpus cannot distinguish between them:
+        # the same defect as `canon knowledge` in the offer (§111) and the cardinal numbers in
+        # the position set (§110), a third time and from a third direction. The part before the
+        # first `:` is a scheme by construction, so dropping it is structural rather than a
+        # judgement about which words are boring.
+        body = gid.split(":", 1)[1] if ":" in gid else gid
+        for word in _GROUP_SPLIT.split(body):
+            word = word.strip().lower()
+            if word and not word.isdigit() and word not in seen:
+                seen.add(word)
+                terms.append(word)
+    return terms
+
+
 def _extract_artifact_fields(artifact: Artifact) -> dict[str, str]:
     """Build the long-form per-field text dict the SSE indexer wants.
 
@@ -192,18 +416,75 @@ def _extract_artifact_fields(artifact: Artifact) -> dict[str, str]:
     the full analyzable text (artifact.content + extracted text fields)
     — the same corpus the MANTLE chunker walks for embedding.
     """
+    # ── the offer is TOP-LEVEL; `context` is a compatibility read ────────────────────────────
+    # Five names, four jobs. `title` is the name; `description` is the offer, the one thing a need
+    # is matched against; provenance lives in `citation` / `source_path` / `via` and is never
+    # reachable by the matcher; and a tag / collection / group / attribute is an edge to another
+    # artifact rather than a field.
+    #
+    # `context` is read after the explicit fields, so a non-JSON context string cannot be promoted
+    # whole to `description`. Two ingests write exactly such a string — "canon knowledge: <doc>
+    # §<section>" and "the concept <w>: a ConceptNet 5.7 English term node" — and promoting it makes
+    # provenance the stated offer: all 6,480 canon documents then position on `canon.n.01` and
+    # `cognition.n.01`, the same two nodes.
+    #
+    # Top-level first, context second and only when structured, so rows written before the
+    # alignment keep working and rows written after are not overridden by a stale carrier.
     text_fields = extract_text_from_context(artifact.context)
 
+    # Decided before the title, because the title falls back to the first of these — see the
+    # block below for why this is a decision about the TYPE and not about the field.
+    lemma_names: list[str] = []
+    if _lemmas_are_names(artifact):
+        lemma_names = [str(lemma) for lemma in (getattr(artifact, "lemmas", None) or []) if lemma]
+
     title = (
-        text_fields.get("title", "").strip()
+        (getattr(artifact, "title", "") or "").strip()
+        or text_fields.get("title", "").strip()
         or (getattr(artifact, "name", "") or "").strip()
+        # ── a record whose names ARE its lemmas titles itself with the first of them ─────────
+        # This is the synset rule below, applied rather than restated: "only the first of them
+        # becomes the title". A synset gets that title from its source; measured 2026-08-24,
+        # all 5,484 `application/x-concept` colimits carry `lemmas` and NONE of `title` / `name`
+        # / `description`, with `content` empty — so without this they extract to `{}`, "no
+        # analyzable fields", and the merge is unindexable while every member it consolidates
+        # stays findable. That is COMPACTIFICATION §5 inverted, and it is silent: the pipeline
+        # reports a skip, not a failure.
+        #
+        # Derived from `lemmas` rather than read from the `word` field the consolidator also
+        # writes, because `word` is that field's first lemma and a second carrier is a second
+        # thing to keep true. (It does not survive `Artifact.from_dict` either, which is the
+        # form this sees.)
+        or (lemma_names[0].strip() if lemma_names else "")
     )
     description = (
-        text_fields.get("description", "").strip()
-        or (getattr(artifact, "description", "") or "").strip()
+        (getattr(artifact, "description", "") or "").strip()
+        or text_fields.get("description", "").strip()
     )
 
-    raw_tags = parse_tags_from_context(artifact.context)
+    raw_tags = _group_terms(artifact)
+    # ── a lexicon entry's OTHER NAMES ────────────────────────────────────────────────────────
+    # A synset's `lemmas` are the words that mean it, and for a dictionary entry that IS the
+    # offer: the whole point of the record is to say that these words mean this. Only the first
+    # of them becomes the title, and the two lexicons order them differently, so:
+    #
+    #     wn-oewn-14672278-n   title 'O'        lemmas: o, atomic number 8, oxygen
+    #     wn-oxygen.n.01       title 'oxygen'   lemmas: oxygen, o, atomic number 8
+    #
+    # and the OEWN copy is the one in the SSE index. Its gloss ("a nonmetallic bivalent element
+    # that is normally a colorless odorless tasteless nonflammable diatomic gas") never says the
+    # word either. Measured, `recall("what is oxygen")` did not narrow to that artifact at all and
+    # answered `LOX / air / artificial blood` — every hyponym carries `oxygen` inside its own
+    # title, so the hyponyms were findable and the concept itself was not.
+    #
+    # Restricted to the lexicon content type deliberately. `lemmas` does not mean one thing across
+    # this corpus: on a wiki artifact it is key terms extracted FROM the body by `astra/doc_index`,
+    # and indexing those would be indexing the content, which this pipeline is built not to do
+    # ("we should be indexing (needs/offers) on context, not content"). On a synset they are names.
+    # One field, two meanings, two writers — the same shape as every other defect in this corpus,
+    # which is why this reads the type rather than the field's presence.
+    if lemma_names:
+        raw_tags = list(raw_tags or []) + lemma_names
     tags_canonical = normalize_tags(raw_tags)
     tags_text = " ".join(t for t in tags_canonical if t)
 
@@ -216,10 +497,17 @@ def _extract_artifact_fields(artifact: Artifact) -> dict[str, str]:
         fields["title"] = title
     if description:
         fields["description"] = description
-    if tags_text:
-        fields["tags"] = tags_text
     if content_text:
         fields["content"] = content_text
+    # ── membership DESCRIBES an artifact; it is not one ──────────────────────────────────────
+    # Every artifact belongs to a group, so tags alone are never empty, and emitting them for a
+    # row with no title, no offer and no content would make "an artifact with nothing to find is
+    # not indexed" false for every artifact in the store. It would also index that empty row under
+    # its group's words, where it would be returned for every query those words answer.
+    #
+    # So tags ride along with something to describe, and do not stand alone.
+    if tags_text and fields:
+        fields["tags"] = tags_text
     return fields
 
 
@@ -476,13 +764,65 @@ def _sse_index_artifact(
     fields: dict[str, str],
     *,
     segment: str = "committed",
+    indexer=None,
 ) -> str:
     """Write per-field text into the SSE blind-token posting lists.
 
     Returns one of :data:`ARM_WRITTEN` / :data:`ARM_SKIPPED` / :data:`ARM_FAILED`,
     which the caller reports. Exceptions stay swallowed here so the other arm and
     the commit survive; the return value is what carries the result out.
+
+    The lexical arm indexes the offer rather than the body. `db/vertex.py` states it —
+    "`doc['context']` is conceptually the offer" — and the `offer` column with `ix_v_offer` carries
+    it. What narrows a search is what an artifact announces itself as; the body is what the semantic
+    arm answers with, and it goes there (`_mantle_index_artifact` reads `fields["content"]`
+    untouched).
+
+    Indexing the raw body would make write cost a function of the corpus, which is the one thing
+    this system cannot have: the aperture is finite and the substrate is not. `sse/posting.py`
+    maintains
+    each blind token's posting list by READ-MODIFY-WRITE — `get_posting` → decrypt every entry →
+    `upsert_entry`'s linear scan → re-encrypt every entry → `put_posting` — so ONE term costs
+    O(artifacts already carrying that term). A body contributes thousands of distinct stems, and
+    `indexer.index_artifact` multiplies each by its prefixes and bigrams. Measured on 71/home
+    (2.9M vertices, 12.1M edges) before this changed:
+
+        raw SQLite insert into the 9.7 GB store   0.008s   <- the substrate was never the problem
+        POST, no content and no name              0.2s     <- nothing to index
+        POST, no content, ONE name               14.6s
+        POST, 4KB of real prose                  16.4s
+        POST, 4KB of `'x '` (one distinct term)   3.5s     <- cost is terms, not bytes
+
+    The same signature explains an earlier puzzle: an 800 KB transcript of `'x '` stored fine while
+    a 120 KB one of real prose blew every timeout in the chain. Every cap written to work around
+    that — `_MAX_CHARS`, `_MIN_GROWTH_CHARS`, the raised HTTP and hook budgets — was scar tissue
+    over this line, and none of them addressed it.
+
+    An artifact's offer is bounded by the artifact. Its body is bounded by nothing.
+
+    The body reaches the index as a projection, under the `content` field, via :func:`_body_offer`.
+    The rule above holds: the raw text never reaches a posting list. Two properties make that
+    affordable.
+
+    *The O(slot) term is gone.* `sse/posting.py` holds one sealed blob per `(artifact, collection)`
+    rather than one per term, so adding an artifact to a term does not decrypt, scan and re-encrypt
+    every entry already there. That is the term that made the numbers above grow with the corpus
+    rather than with the write.
+
+    *The remaining term is bounded by the cut rather than by a cap.* "A body contributes thousands
+    of distinct stems" is true of a body and would be unaffordable; it is not true of the
+    projection, because `beacon.density` keeps whichever windows stand out from the document's own
+    others, so the indexed extent is read off the document rather than decreed for it.
+
+    The corpus is heterogeneous in this. An artifact carries its full text under `content`, none of
+    it, or the projection, according to what the write path did at the time; the read path probes
+    `content` on every stem, so all three answer, with different amounts of the body behind them. A
+    reindex is what makes it uniform.
     """
+    if not fields:
+        return ARM_SKIPPED
+
+    fields = _fields_to_index(fields)
     if not fields:
         return ARM_SKIPPED
 
@@ -504,7 +844,14 @@ def _sse_index_artifact(
         logger.debug("SSE: lattice handle unavailable; skipping", exc_info=True)
         return ARM_SKIPPED
 
-    indexer = build_sse_indexer(store_db, segment=segment)
+    # A caller may supply the indexer. Building one per artifact is not merely wasteful — each
+    # `SqlitePostingStore` carries its own connection and its own thread-local transaction depth,
+    # so a fresh instance per artifact CANNOT join a transaction the caller has already opened.
+    # Sharing one is what lets a bulk pass commit a whole chunk once instead of once per artifact,
+    # and SQLite commit cost is fsync-dominated. `None` keeps the per-artifact path exactly as it
+    # was, so every existing caller is unchanged.
+    if indexer is None:
+        indexer = build_sse_indexer(store_db, segment=segment)
     if indexer is None:
         logger.debug("SSE indexer prerequisites missing; skipping")
         return ARM_SKIPPED
@@ -660,6 +1007,7 @@ def index_artifact(
     is_head: bool = True,
     fields: Optional[dict[str, str]] = None,
     vector=None,
+    sse_indexer=None,
 ) -> IndexOutcome:
     """Index one artifact into the index segment for its current state.
 
@@ -703,7 +1051,8 @@ def index_artifact(
                 sse=ARM_SKIPPED, vector=ARM_SKIPPED, reason="no analyzable fields",
             )
         outcome = IndexOutcome(
-            sse=_sse_index_artifact(artifact, collection_id, fields, segment=segment),
+            sse=_sse_index_artifact(artifact, collection_id, fields, segment=segment,
+                                    indexer=sse_indexer),
             vector=_mantle_index_artifact(
                 artifact, collection_id, fields, segment=segment, vector=vector,
             ),
@@ -915,6 +1264,36 @@ def delete_artifact_from_index(
 # ============================================================
 
 
+def _mark_indexed(artifact_id: str) -> None:
+    """Stamp the materialization marker after the indexing work, from inside the job.
+
+    Stamping at enqueue time instead would say "this was queued" while the only reader
+    (`workspace_service`, as a skip condition) reads it as "this is indexed" — with a queue
+    configured to return immediately, the job runs later on a worker thread, so a job that never
+    ran would leave an artifact stamped done, carrying no postings, and never re-enqueued: stored
+    and unfindable, with nothing reporting it.
+
+    Not hypothetical: `mantle` was stopped and restarted several times on `71/home` on
+    2026-08-25 — twice in an unplanned outage, once for the WAL maintenance window, once when the
+    supervisor moved under its scheduled task. Every index job queued at those moments was dropped.
+
+    Stamping here makes a dropped job self-healing: no marker, so the next access re-enqueues it.
+    The cost, which is real and worth stating: between the write and the job finishing,
+    `is_materialized` reads False, so a second write in that window enqueues a duplicate job.
+    Indexing overwrites, so that spends work rather than correctness — the opposite trade to
+    stamping at enqueue time, which spends correctness silently.
+    """
+    try:
+        from mantle.db.backend import mark_materialized, store_handle
+
+        mark_materialized(store_handle(), artifact_id)
+    except Exception:
+        # `mark_materialized` is best-effort by contract — a missing marker costs a re-index, not
+        # correctness. Logged rather than swallowed, because "the marker never wrote" and "the
+        # marker was never needed" must not look the same from outside.
+        logger.warning("could not mark %s materialized after indexing", artifact_id, exc_info=True)
+
+
 def enqueue_index_artifact(
     artifact: Artifact,
     collection_id: str,
@@ -939,7 +1318,11 @@ def enqueue_index_artifact(
         if vacate:
             move_artifact_segments(artifact, collection_id, remove_from=vacate)
         # bool(outcome) is False iff an arm failed — a skip is not a job failure.
-        return bool(outcome)
+        ok = bool(outcome)
+        if ok:
+            # Only on success: a failed arm must leave no marker, so the work is retried.
+            _mark_indexed(artifact.id)
+        return ok
 
     desc = f"index artifact {artifact.id} -> {collection_id}"
     if index_queue:
@@ -961,7 +1344,11 @@ def enqueue_index_artifacts_batch(
 ) -> None:
     """Enqueue a batch for async bulk indexing; falls back to sync."""
     def _act() -> bool:
-        return index_artifacts_batch(artifacts, collection_id, is_head=is_head)
+        ok = bool(index_artifacts_batch(artifacts, collection_id, is_head=is_head))
+        if ok:
+            for _a in artifacts:
+                _mark_indexed(_a.id)
+        return ok
 
     desc = f"batch index {len(artifacts)} artifacts -> {collection_id}"
     if index_queue:

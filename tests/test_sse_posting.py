@@ -321,7 +321,7 @@ class TestSerializeManifest:
         assert posting.deserialize_manifest(blob) == tokens
 
     def test_canonical_empty(self):
-        # Empty token list — canonical bytes are stable, and are now the whole wire shape.
+        # Empty token list — canonical bytes are stable, and are the whole wire shape.
         assert posting.serialize_manifest([]) == b'{"tokens":[]}'
 
     def test_a_legacy_manifest_carrying_field_dls_still_reads(self):
@@ -393,7 +393,7 @@ class TestUpsertEntry:
         posting.upsert_entry(entries, replacement)
         # Same length — replaced in place.
         assert len(entries) == 3
-        # The (art-1, col-1) entry now has tf=99.
+        # The (art-1, col-1) entry carries tf=99.
         match = [
             e for e in entries
             if e["artifact_id"] == "art-1" and e["collection_id"] == "col-1"
@@ -777,3 +777,43 @@ class TestSlotBinding:
         # Openable with no AAD and no fallback involved.
         assert posting.unpack_posting(blob, key, allow_unbound=False) == entries
         assert len(blob) == 12 + len(posting.serialize_entries(entries)) + 16
+
+
+def test_a_manifest_key_derives_for_an_id_with_a_diacritic():
+    """An artifact id is any non-empty string, so the derivation must accept one.
+
+    `.encode("ascii")` here refused every id carrying a diacritic and took the whole SSE arm down
+    with it — `cn-archaeological` spelled with the ligature, `cn-ardeche` with the grave, and
+    `stage.0.lexicon` is 1.84M ConceptNet entries. Measured on 71/home: 100% of a reindex pass
+    reported `sse=failed` for this reason.
+    """
+    from mantle.search.mantle.sse.posting import derive_manifest_key
+
+    key = bytes(range(32))
+    for artifact_id in ("cn-archæological", "cn-ardèche", "cn-über", "wn-中文"):
+        out = derive_manifest_key(key, artifact_id)
+        assert isinstance(out, bytes) and len(out) == 32
+    # Distinct ids must still derive distinct keys — the point of putting the id in `info`.
+    assert derive_manifest_key(key, "cn-ardèche") != derive_manifest_key(key, "cn-ardeche")
+
+
+def test_the_utf8_switch_cannot_invalidate_an_existing_ascii_key():
+    """Why this was a fix and not a migration.
+
+    UTF-8 and ASCII agree byte-for-byte on anything that encodes as ASCII, so every manifest key
+    already derived re-derives identically. A non-ASCII id raised instead of deriving anything, so
+    there is no stored manifest to orphan.
+    """
+    import hashlib
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    from mantle.search.mantle.sse import posting as p
+
+    key = bytes(range(32))
+    for artifact_id in ("wiki-en-1000", "a", "0123456789", "cn-plain_ascii_id"):
+        legacy = HKDF(algorithm=hashes.SHA256(), length=32, salt=p._HKDF_SALT_V1,
+                      info=p._INFO_PREFIX_MANIFEST + artifact_id.encode("ascii")).derive(key)
+        assert p.derive_manifest_key(key, artifact_id) == legacy, artifact_id
+    assert hashlib  # keep the import meaningful if the assert above is ever relaxed

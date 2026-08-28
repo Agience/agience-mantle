@@ -81,7 +81,11 @@ def ingest_image(content_store, keys_dir, image: Image, *, repository: str) -> I
 
     out: List[IngestedBlob] = []
     for blob in list(image.blobs[1:]) + [manifest_blob]:
-        out.append(_put(content_store, keys_dir, blob))
+        # The repository IS the collection [John, 2026-08-24] — the mapping `oci/__init__.py` has
+        # stated from the start ("repository == a collection"), now supplied rather than implied.
+        # Threaded from `ingest_image`'s own argument, so the blobs of an image land in the
+        # collection named by the same string the ImageRecord records.
+        out.append(_put(content_store, keys_dir, blob, collection=repository))
 
     # Reported in the layout's order — manifest first — so the record reads the way the image does.
     out = [out[-1]] + out[:-1]
@@ -89,7 +93,7 @@ def ingest_image(content_store, keys_dir, image: Image, *, repository: str) -> I
                        media_type=image.media_type, tag=image.ref_name, blobs=out)
 
 
-def _put(content_store, keys_dir, blob: Blob) -> IngestedBlob:
+def _put(content_store, keys_dir, blob: Blob, *, collection: str) -> IngestedBlob:
     ref = digest_to_ref(blob.digest)
     already = _has(content_store, ref)
     if already:
@@ -98,7 +102,7 @@ def _put(content_store, keys_dir, blob: Blob) -> IngestedBlob:
         # only tell those apart if this is reported.
         return IngestedBlob(blob.digest, ref, blob.size, blob.media_type, stored=False)
     body = b"".join(blob_bytes(blob))
-    got_ref, size = put_content(content_store, keys_dir, body)
+    got_ref, size = put_content(content_store, keys_dir, body, collection=collection)
     if got_ref != ref:
         # Cannot happen unless the two address spaces have diverged — which is exactly the failure
         # that would otherwise be invisible, so it is checked rather than assumed.
@@ -116,11 +120,17 @@ def _has(content_store, ref: str) -> bool:
         return False
 
 
-def read_blob(content_store, keys_dir, digest: str) -> bytes:
+def read_blob(content_store, keys_dir, digest: str, *, collection: str | None = None) -> bytes:
     """A blob by its OCI digest — the `/v2/<name>/blobs/<digest>` path.
 
     Keyed, O(1), no scan: the digest is the key. The alternative — an artifact per blob found by
     `json_extract(doc,'$.digest') = ?` — is unindexed and reads every record in the store regardless
     of LIMIT, which does not scale to a large corpus.
+
+    `collection` IS THE REPOSITORY, and on a scoping store it is required [2026-08-24]. That is
+    the same mapping the write side uses — `oci/__init__.py`'s "repository == a collection" — so a
+    blob is read back from exactly the scope it was written into. Optional here because the
+    caller-decrypts store shape neither needs nor accepts one; `get_content` refuses if the store
+    scopes and nothing was passed, rather than reading from a scope nobody named.
     """
-    return get_content(content_store, keys_dir, digest_to_ref(digest))
+    return get_content(content_store, keys_dir, digest_to_ref(digest), collection=collection)

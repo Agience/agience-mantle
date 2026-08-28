@@ -96,14 +96,41 @@ def test_count_words_is_whitespace_delimited():
 def test_malformed_context_returns_empty_fields_instead_of_raising(bad):
     """Ingest processes whatever is in the store. One malformed context must not abort the run."""
     out = extract_text_from_context(bad)
-    assert set(out) == {"title", "description", "tags_raw"}
+    assert set(out) == {"title", "description"}
     assert all(isinstance(v, str) for v in out.values())
 
 
-def test_tags_are_joined_from_either_a_list_or_a_string():
-    assert extract_text_from_context('{"tags": ["a", "b"]}')["tags_raw"] == "a, b"
-    assert extract_text_from_context('{"tags": "a, b"}')["tags_raw"] == "a, b"
-    assert extract_text_from_context('{"tags": ["a", null, "b"]}')["tags_raw"] == "a, b"
+def test_a_tag_is_an_edge_not_a_key_in_the_context():
+    """A tag, a collection, a group and an attribute are the same thing — an edge to another
+    artifact — so group membership is read from the graph. A `tags_raw` key extracted here would be
+    a second answer to a question the graph already answers, and nothing would consume it."""
+    out = extract_text_from_context('{"tags": ["a", "b"], "title": "t"}')
+    assert "tags_raw" not in out and "tags" not in out
+    assert out["title"] == "t"
+
+
+def test_a_bare_context_string_is_provenance_and_never_becomes_the_offer():
+    """`description` is the offer — the one thing a need is matched against.
+
+    A non-JSON `context` was promoted whole to `description`, and the only two ingests that write
+    such a string write where the row CAME FROM:
+
+        sage/canon.py       "canon knowledge: best-practices §intro"
+        stage0_sources.py   "the concept 0: a ConceptNet 5.7 English term node"
+
+    Measured on the live shard, that made the stated offer of all 6,480 canon documents their own
+    provenance, and every one of them then positioned on the same two nodes — `canon.n.01` and
+    `cognition.n.01`. A field that says the same thing about every member of a corpus cannot tell
+    them apart.
+    """
+    assert extract_text_from_context("canon knowledge: best-practices §intro") == {
+        "title": "", "description": ""}
+
+
+def test_a_structured_context_still_supplies_the_offer():
+    """The compatibility path for rows written before the offer moved top-level."""
+    out = extract_text_from_context('{"title": "dog", "description": "a canine"}')
+    assert out == {"title": "dog", "description": "a canine"}
 
 
 if __name__ == "__main__":

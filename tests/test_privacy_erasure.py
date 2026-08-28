@@ -51,9 +51,9 @@ PERSON = "user-erased"
 def client(monkeypatch):
     """The endpoint with the platform-admin gate satisfied and the primitive observable.
 
-    `require_platform_admin` is left REAL and its predicate stubbed, so the gate under test is
-    the one the other platform endpoints use. Stubbing the dependency itself would test a route
-    that no longer has a gate."""
+    `require_platform_admin` is left real and its predicate stubbed, so the gate under test is the
+    one the other platform endpoints use. Stubbing the dependency itself would test an ungated
+    route."""
     from mantle.services import dependencies
 
     monkeypatch.setattr(dependencies, "is_platform_admin", lambda *a, **k: True)
@@ -142,7 +142,7 @@ def test_a_dry_run_never_touches_the_identity_record(client, seen, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# The primitive now has callers — the finding was that it had none
+# The primitive has callers
 # ---------------------------------------------------------------------------
 
 def test_erasure_has_a_front_door():

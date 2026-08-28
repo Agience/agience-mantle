@@ -28,7 +28,7 @@ import os
 import shutil
 import tempfile
 import threading
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Iterable, Optional, Tuple
 
 _log = logging.getLogger(__name__)
 
@@ -150,7 +150,9 @@ class FileContentCache:
 
     def __init__(self, root: str, *, key: Optional[bytes] = None,
                  legacy_key_for_collection: Optional[Callable[[str], bytes]] = None,
-                 is_durable: Optional[Callable[[str], bool]] = None):
+                 is_durable: Optional[Callable[[str], bool]] = None,
+                 previous_keys: Optional[Iterable[bytes]] = None,
+                 rekey_previous: bool = False):
         """`key` is the at-rest key (32 bytes) — normally `shared_content_key(root_secret)`.
 
         Injected rather than derived here so this module never holds the root secret and never
@@ -162,6 +164,28 @@ class FileContentCache:
         in place (see `get`), so a corpus still holding objects under the older per-collection keying
         converges without a re-fetch and without downtime. Pass None once a store is known fully
         migrated.
+
+        `previous_keys` are at-rest keys from EARLIER KEY ERAS, tried in order after `key` and
+        after the per-collection legacy key. A key rotation does not rewrite the objects already on
+        disk, so after one the store holds two populations that are identical in every way except
+        which key opens them — and with a single key configured, the older population is
+        indistinguishable from corruption.
+
+        Measured 2026-08-25 on 71/home, which is why this exists: `keys/content.key` was replaced
+        on 2026-08-24 at 11:05 and 313,982 CAS-backed artifacts stopped being readable. 197 blobs
+        sampled across 12 random shards, tried under both keys:
+
+            under the previous key   138    mtime 08-24 10:14 .. 11:29
+            under the current key     59    mtime 08-24 13:39 .. 20:26
+            under neither              0
+
+        Nothing was corrupt and nothing was lost — but restoring the old key would have broken the
+        59, and keeping only the new one broke the 138. Both eras are live, so both must open.
+
+        `rekey_previous` decides whether an object opened by a previous key is re-encrypted under
+        `key` in place, the way the per-collection legacy path already converges. It defaults to
+        FALSE: the fallback is a read-side repair, and turning a read into a 1.47 GB rewrite is a
+        decision an operator makes deliberately, not a side effect of reading.
 
         `is_durable(ref) -> bool` proves an object exists in the durable tier. Required for the
         disk-floor eviction in `_ensure_free` to run at all — without it nothing is evicted, because
@@ -181,10 +205,16 @@ class FileContentCache:
         self.root = root
         self._key = key
         self._legacy_key_for = legacy_key_for_collection
+        self._previous_keys = [k for k in (previous_keys or ()) if k]
+        for _k in self._previous_keys:
+            if len(_k) != 32:
+                raise ValueError("every previous at-rest key must be 32 bytes, got %d" % len(_k))
+        self._rekey_previous = bool(rekey_previous)
         self._is_durable = is_durable
         self._lock = threading.Lock()
         self.stats: Dict[str, int] = {"hit": 0, "miss": 0, "corrupt": 0, "key_mismatch": 0,
-                                      "put": 0, "evicted": 0, "rekeyed": 0, "rekey_failed": 0}
+                                      "put": 0, "evicted": 0, "rekeyed": 0, "rekey_failed": 0,
+                                      "previous_key_reads": 0}
         self.tiers: Dict[str, int] = {}
         os.makedirs(self.root, exist_ok=True)
 
@@ -418,12 +448,25 @@ class FileContentCache:
                         blob[:_NONCE_BYTES], blob[_NONCE_BYTES:], aad), True
                 except InvalidTag:
                     pass
+        # ── previous key ERAS: the same object, written before a rotation ───────────────────────
+        # Tried last because the current key is the common case and this is the repair. A hit here
+        # is counted so the size of the un-migrated population is visible rather than inferred.
+        for _prev in self._previous_keys:
+            try:
+                plain = AESGCM(_prev).decrypt(blob[:_NONCE_BYTES], blob[_NONCE_BYTES:], aad)
+            except InvalidTag:
+                continue
+            with self._lock:
+                self.stats["previous_key_reads"] += 1
+            return plain, self._rekey_previous
         raise ContentKeyMismatch(
-            "AES-GCM tag mismatch for %s (collection %r) under the shared at-rest key%s — either a "
-            "wrong/rotated key or the object was altered on disk. THE TWO ARE INDISTINGUISHABLE "
+            "AES-GCM tag mismatch for %s (collection %r) under the shared at-rest key%s%s — either "
+            "a wrong/rotated key or the object was altered on disk. THE TWO ARE INDISTINGUISHABLE "
             "HERE, so the object is left in place: never returned as data, never destroyed on a "
             "guess." % (ref, collection,
-                        " or this collection's legacy key" if self._legacy_key_for else ""))
+                        " or this collection's legacy key" if self._legacy_key_for else "",
+                        " or %d previous key era(s)" % len(self._previous_keys)
+                        if self._previous_keys else ""))
 
     def _evict(self, path: str) -> None:
         try:

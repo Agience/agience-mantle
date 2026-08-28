@@ -102,8 +102,8 @@ class TestRouterUpsert:
             patch("mantle.services.workspace_service.update_workspace") as update,
         ):
             await ar._default_create_artifact(
-                {"identity": "file:/repo/README.md", "content": "first body",
-                 "content_type": "text/markdown"},
+                ar.CreateArtifactRequest(**{"identity": "file:/repo/README.md", "content": "first body",
+                 "content_type": "text/markdown"}),
                 auth, store_db,
             )
 
@@ -134,8 +134,8 @@ class TestRouterUpsert:
                   return_value=updated) as update,
         ):
             await ar._default_create_artifact(
-                {"identity": "file:/repo/README.md", "content": "second body",
-                 "content_type": "text/markdown"},
+                ar.CreateArtifactRequest(**{"identity": "file:/repo/README.md", "content": "second body",
+                 "content_type": "text/markdown"}),
                 auth, store_db,
             )
 
@@ -161,29 +161,73 @@ class TestRouterUpsert:
                   return_value=created) as create,
         ):
             await ar._default_create_artifact(
-                {"content": "body", "content_type": "text/markdown"}, auth, MagicMock(),
+                ar.CreateArtifactRequest(**{"content": "body", "content_type": "text/markdown"}), auth, MagicMock(),
             )
 
         assert create.call_args.kwargs["artifact_id"] is None
 
     @pytest.mark.asyncio
-    async def test_identity_with_container_id_is_refused_by_name(self):
-        """Refused rather than ignored.
+    async def test_identity_inside_a_container_upserts_on_the_ROOT(self):
+        """`identity` + `container_id` is supported, and it names the root rather than the version.
 
-        A collection member is born a draft and grows a second live version the first time it
-        is edited after commit, so "the artifact for this identity" stops being one row.
-        Accepting the parameter and dropping it would report idempotency that is not there.
+        A collection member is born a draft and grows a second live version on edit-after-commit,
+        so "the artifact for this identity" would not be one row. That is a property of the draft
+        lifecycle rather than of identity: an
+        identity names something outside the store (a file, a session, a commit) which has one
+        true version. Naming the root resolves it, and the root is what edges, grants and both
+        search arms are already keyed on.
+
+        It buys more than convenience. Without it every hook artifact is top-level, and a
+        top-level artifact is its own origin root, which is the SSE principal: 115 self-rooted
+        artifacts are 115 separately keyed owners for a recall to read.
         """
+        from mantle.routers import artifacts_router as ar
+        from mantle.services.artifact_identity import derived_id_for
+
+        auth = MagicMock(user_id="user-1")
+        member = MagicMock()
+        member.to_dict.return_value = {"id": "member-1"}
+
+        with (
+            patch("mantle.routers.artifacts_router.check_access"),
+            patch("mantle.routers.artifacts_router._artifact_exists", return_value=True),
+            patch("mantle.services.workspace_service.upsert_identity_member",
+                  return_value=member) as upsert,
+        ):
+            out = await ar._default_create_artifact(
+                ar.CreateArtifactRequest(**{"identity": "file:x", "container_id": "col-1", "content": "b"}),
+                auth, MagicMock(),
+            )
+
+        assert out == {"id": "member-1"}
+        args = upsert.call_args.args
+        assert args[2] == "col-1", "the member must be filed in the container it named"
+        assert args[3] == derived_id_for("user-1", "file:x"), (
+            "the root must be the DERIVED id — that is what makes the write idempotent"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_container_member_without_identity_is_untouched(self):
+        """The ordinary draft lifecycle must not have moved. Only identity writes are mirrors."""
         from mantle.routers import artifacts_router as ar
 
         auth = MagicMock(user_id="user-1")
-        with pytest.raises(HTTPException) as exc:
+        member = MagicMock()
+        member.to_dict.return_value = {"id": "member-2"}
+
+        with (
+            patch("mantle.routers.artifacts_router.check_access"),
+            patch("mantle.routers.artifacts_router._artifact_exists", return_value=True),
+            patch("mantle.services.workspace_service.create_workspace_artifact",
+                  return_value=member) as create,
+            patch("mantle.services.workspace_service.upsert_identity_member") as upsert,
+        ):
             await ar._default_create_artifact(
-                {"identity": "file:x", "container_id": "col-1", "content": "b"},
-                auth, MagicMock(),
+                ar.CreateArtifactRequest(**{"container_id": "col-1", "content": "b"}), auth, MagicMock(),
             )
-        assert exc.value.status_code == 400
-        assert "identity" in exc.value.detail
+
+        assert create.called, "a member with no identity still takes the ordinary create path"
+        assert not upsert.called, "no identity was supplied; nothing should be upserted"
 
     @pytest.mark.asyncio
     async def test_an_empty_identity_is_a_400_not_a_shared_id(self):
@@ -192,6 +236,103 @@ class TestRouterUpsert:
         auth = MagicMock(user_id="user-1")
         with pytest.raises(HTTPException) as exc:
             await ar._default_create_artifact(
-                {"identity": "   ", "content": "b"}, auth, MagicMock(),
+                ar.CreateArtifactRequest(**{"identity": "   ", "content": "b"}), auth, MagicMock(),
             )
         assert exc.value.status_code == 400
+
+
+class TestALexiconEntrysNamesSurviveTheRoundTrip:
+    """`lemmas` is modelled on the entity, so it must also come back out of it.
+
+    A synset's lemmas are the words that mean it, and only the first becomes the title. The OEWN
+    oxygen entry is titled `O`; `oxygen` and `atomic number 8` are the other two, and its gloss
+    never says any of them. `from_dict` dropped the field, so the indexing pipeline never saw the
+    names and `recall("what is oxygen")` could not narrow to the concept at all.
+
+    Reading a field that `to_dict` does not write would be WORSE than not modelling it: the first
+    save of a lexicon entry would delete the words that name it. That is the failure `content_ref`
+    and `origin_root` carry the same warning about, and this states it as a test rather than a
+    comment.
+    """
+
+    @staticmethod
+    def _doc(**over):
+        doc = {
+            "id": "wn-oewn-14672278-n",
+            "collection_id": "stage.0.lexicon",
+            "state": "committed",
+            "title": "O",
+            "content": "a nonmetallic bivalent element",
+            "content_type": "text/x-wordnet",
+            "lemmas": ["o", "atomic number 8", "oxygen"],
+        }
+        doc.update(over)
+        return doc
+
+    def test_lemmas_survive_dict_to_entity_to_dict(self):
+        from mantle.entities.artifact import Artifact
+
+        once = Artifact.from_dict(self._doc())
+        assert once.lemmas == ["o", "atomic number 8", "oxygen"]
+
+        stored = once.to_dict()
+        assert stored.get("lemmas") == ["o", "atomic number 8", "oxygen"], (
+            "a save must not drop the names — %r" % (stored,)
+        )
+        # The second hop is the one that matters: a field that survives one direction and not the
+        # other destroys data on the FIRST save, not on the read that follows it.
+        twice = Artifact.from_dict(stored)
+        assert twice.lemmas == once.lemmas
+
+    def test_an_artifact_with_no_lemmas_emits_no_key(self):
+        """Absent and empty are different claims, and only a lexicon entry has names here."""
+        from mantle.entities.artifact import Artifact
+
+        prose = Artifact.from_dict(self._doc(content_type="text/markdown", lemmas=None))
+        assert prose.lemmas is None
+        assert "lemmas" not in prose.to_dict()
+
+
+class TestAMergeSaysThatItIsOne:
+    """`colimit_of` names the synsets a merge absorbed, and it must survive the round trip.
+
+    Same contract as `lemmas` above and the same failure if it is dropped, one layer along:
+    `pipeline_unified._lemmas_are_names` reads this field to decide whether a record's `lemmas`
+    are names it goes by or words taken out of it. Measured 2026-08-24, that decision cannot be
+    made from `content_type` — `application/x-concept` carries 5,484 colimits AND 1,165,110
+    ConceptNet terms, and the two put opposite things in `lemmas`. A save that dropped
+    `colimit_of` would turn every merge into an ordinary term with no visible change.
+    """
+
+    @staticmethod
+    def _doc(**over):
+        doc = {
+            "id": "concept-be603d8ac3dd0185fcf653e18a8dc72d",
+            "collection_id": "collection:concepts-consolidated",
+            "content_type": "application/x-concept",
+            "state": "committed",
+            "lemmas": ["decade", "decennary", "decennium"],
+            "colimit_of": ["wn-decade.n.01", "wn-oewn-15174893-n"],
+        }
+        doc.update(over)
+        return doc
+
+    def test_colimit_of_survives_dict_to_entity_to_dict(self):
+        from mantle.entities.artifact import Artifact
+
+        once = Artifact.from_dict(self._doc())
+        assert once.colimit_of == ["wn-decade.n.01", "wn-oewn-15174893-n"]
+        stored = once.to_dict()
+        assert stored.get("colimit_of") == ["wn-decade.n.01", "wn-oewn-15174893-n"], (
+            "a merge that cannot say what it merged stops being recognisable as one — %r"
+            % (stored,)
+        )
+        assert Artifact.from_dict(stored).colimit_of == once.colimit_of
+
+    def test_an_ordinary_concept_emits_no_colimit_key(self):
+        """A ConceptNet term shares the content type and is not a merge."""
+        from mantle.entities.artifact import Artifact
+
+        term = Artifact.from_dict(self._doc(id="cn-decade", colimit_of=None))
+        assert term.colimit_of is None
+        assert "colimit_of" not in term.to_dict()

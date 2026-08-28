@@ -386,14 +386,14 @@ class TestUpdateArtifact:
     async def test_update_top_level_artifact_forwards_content(self, client: AsyncClient):
         """A top-level artifact's new BODY reaches the service, rather than being dropped.
 
-        The branch above it routes anything with no `collection_id` to `update_workspace`, and
-        it used to forward only name/description/context/vector. Every artifact created without
-        a `container_id` is top-level AND content-bearing (`create_container` takes `content`),
-        so `PATCH {"content": ...}` on a note, a transcript or a captured file returned 200 and
-        changed nothing at all -- no error to notice, the old body still indexed and still what
-        `recall` answered with.
+        The branch above it routes anything with no `collection_id` to `update_workspace`. Every
+        artifact created without a `container_id` is top-level and content-bearing
+        (`create_container` takes `content`), so a forward that carried only
+        name/description/context/vector would leave `PATCH {"content": ...}` on a note, a
+        transcript or a captured file returning 200 and changing nothing -- no error to notice, the
+        old body still indexed and still what `recall` answers with.
 
-        Asserting the forwarded ARGUMENT is the point. The sibling test above patches the same
+        Asserting the forwarded argument is the point. The sibling test above patches the same
         function and asserts only that it was called, which a router dropping the one field
         under test passes just as happily.
         """
@@ -547,7 +547,11 @@ class TestDeleteArtifact:
             app.dependency_overrides.pop(get_store_db, None)
 
         assert r.status_code == 200
-        assert r.json() == {"id": "art-1", "deleted": True}
+        # A delete reports what it did via `detached`/`destroyed`, because `{deleted: true}` alone
+        # is the same answer for a note and for a cascade over a 1.85M-member collection. `deleted`
+        # is unchanged, so this stays an exact-shape assertion.
+        assert r.json() == {"id": "art-1", "deleted": True, "detached": 0, "destroyed": 0,
+                            "refused": 0}
         deleted.assert_called_once()
         assert deleted.call_args.kwargs["cascade"] is False, (
             "cascade must default to False when the query param is omitted"
@@ -619,7 +623,11 @@ class TestDeleteArtifact:
                     workspace_id, None)
                 r = await client.delete("/artifacts/top-1")
                 assert r.status_code == 200, r.text
-                assert r.json() == {"id": "top-1", "deleted": True}
+                # This case is the guard: the mock above returns the popped artifact document, not
+                # counts. The response is built from named keys, so a callee returning something
+                # else — like a whole document — contributes nothing to it instead of leaking it.
+                assert r.json() == {"id": "top-1", "deleted": True,
+                                    "detached": 0, "destroyed": 0, "refused": 0}
                 dropped.assert_called_once()
                 # The container primitive, not the one that needs a parent collection id.
                 assert dropped.call_args.args[2] == "top-1"
@@ -664,9 +672,15 @@ class TestDeleteArtifact:
 # ---------------------------------------------------------------------------
 
 class TestRemoveArtifactFromWorkspace:
+    """DELETE /artifacts/{container_id}/children/{artifact_id} — remove from workspace (soft).
+
+    The container is a path segment, not a request-body field: DELETE with a request body has no
+    defined semantics in HTTP and intermediaries may drop it, so the field naming what to detach
+    from must not depend on a carrier that may not arrive.
+    """
     @pytest.mark.asyncio
     async def test_requires_auth(self, anon_client: AsyncClient):
-        r = await anon_client.post("/artifacts/art-1/remove", json={"container_id": "ws-1"})
+        r = await anon_client.delete("/artifacts/ws-1/children/art-1")
         assert r.status_code == 401
 
     @pytest.mark.asyncio
@@ -685,7 +699,7 @@ class TestRemoveArtifactFromWorkspace:
             "mantle.services.workspace_service.remove_artifact_from_container",
             return_value=removed,
         ) as svc:
-            r = await client.post("/artifacts/art-1/remove", json={"container_id": "ws-1"})
+            r = await client.delete("/artifacts/ws-1/children/art-1")
 
         assert r.status_code == 200
         body = r.json()
@@ -699,7 +713,7 @@ class TestRemoveArtifactFromWorkspace:
             "mantle.services.workspace_service.remove_artifact_from_container",
             side_effect=HTTPException(status_code=404, detail="Artifact not found"),
         ):
-            r = await client.post("/artifacts/missing/remove", json={"container_id": "ws-1"})
+            r = await client.delete("/artifacts/ws-1/children/missing")
         assert r.status_code == 404
 
 
@@ -770,7 +784,7 @@ class TestBatchFetch:
             app.dependency_overrides.pop(get_store_db, None)
 
         assert r.status_code == 200
-        out = r.json()["artifacts"]
+        out = r.json()["items"]
         assert [a["id"] for a in out] == ["a-1"]
 
     @pytest.mark.asyncio
@@ -794,7 +808,7 @@ class TestBatchFetch:
             app.dependency_overrides.pop(get_store_db, None)
 
         assert r.status_code == 200
-        out = r.json()["artifacts"]
+        out = r.json()["items"]
         assert len(out) == 1
         assert out[0]["id"] == "ws-1"
         assert out[0]["root_id"] == "ws-1"
@@ -839,8 +853,12 @@ class TestReorder:
                 "mantle.db.backend.get_artifact",
                 side_effect=lambda _db, aid: SimpleNamespace(root_id=aid),
             ), patch(
+                # The count matters: this function returns the number of edges it updated, and the
+                # route refuses when that is short of the ids asked for — a reorder is one intent,
+                # and applying some of it produces an arrangement nobody chose. Two ids are sent
+                # below, so two is the honest stub.
                 "mantle.db.backend.reorder_collection_artifacts",
-                return_value=None,
+                return_value=2,
             ) as svc:
                 r = await client.patch(
                     "/artifacts/container-1/children/order",
@@ -849,7 +867,17 @@ class TestReorder:
         finally:
             app.dependency_overrides.pop(get_store_db, None)
         assert r.status_code == 200
-        assert r.json() == {"order_version": 0}
+        # Asserting a literal `order_version` here would be wrong: the route accepts an
+        # `order_version` field but never reads it, and the value is derived from the membership
+        # edges (`lattice_api.order_fingerprint`) — a real token, not a constant. Pinning it to a
+        # specific value would silently permit a regression to a hardcoded answer, which is how two
+        # clients reordering the same container could both succeed while the second silently
+        # discarded the first's arrangement. What matters here is the shape and that the route
+        # still calls the service exactly once; the token's own properties are covered by
+        # `test_child_order_version_is_real.py`.
+        body = r.json()
+        assert set(body) == {"order_version"}
+        assert isinstance(body["order_version"], int)
         svc.assert_called_once()
 
 
@@ -949,7 +977,16 @@ class TestUploadInitiate:
 
 class TestListCommits:
     @pytest.mark.asyncio
-    async def test_400_when_not_collection(self, client: AsyncClient):
+    async def test_a_missing_artifact_yields_an_empty_page_not_a_type_error(self, client: AsyncClient):
+        """With authorization stubbed by this module's autouse fixture, there is nothing left to
+        refuse a missing id: `artifacts_router.check_access` is patched to a granting stub, so
+        `_artifact_exists` is the only remaining gate. In production `check_access` runs first,
+        calls the same `get_raw_artifact`, and answers 404 for missing-or-denied, so a branch that
+        reports a type restriction on a missing artifact is unreachable there.
+
+        The honest answer under a granting stub is the one the endpoint has always given for an
+        artifact with no commits: an empty page. That is what this asserts.
+        """
         store = MagicMock()
         _patch_db_collection(store, container_doc=None)
         from mantle.services.dependencies import get_store_db
@@ -959,7 +996,8 @@ class TestListCommits:
             r = await client.get("/artifacts/missing/commits")
         finally:
             app.dependency_overrides.pop(get_store_db, None)
-        assert r.status_code == 400
+        assert r.status_code == 200, r.json()
+        assert r.json() == {"items": [], "total": 0, "has_more": False}
 
     @pytest.mark.asyncio
     async def test_returns_commit_list(self, client: AsyncClient):
@@ -989,9 +1027,9 @@ class TestListCommits:
             app.dependency_overrides.pop(get_store_db, None)
         assert r.status_code == 200
         body = r.json()
-        assert len(body["commits"]) == 1
-        assert body["commits"][0]["id"] == "c-1"
-        assert body["commits"][0]["message"] == "initial"
+        assert len(body["items"]) == 1
+        assert body["items"][0]["id"] == "c-1"
+        assert body["items"][0]["message"] == "initial"
 
 
 # ---------------------------------------------------------------------------
@@ -1027,7 +1065,15 @@ class TestRevertArtifact:
         self, client: AsyncClient
     ):
         """`POST /artifacts/{id}/revert` calls workspace_service.revert_artifact and
-        returns the restored committed version's dict shape."""
+        returns the restored committed version — through `_artifact_body`.
+
+        `_artifact_body` guarantees every declared key is present, `null` when unset — a client can
+        program against a fixed shape, unlike a raw `to_dict()`, which omits unset fields and so
+        varies with the data.
+
+        The assertion checks the two values that matter and the guarantee, rather than equality
+        with a literal: an equality test here would fail the next time a field is added to the
+        response, which is the kind of churn the guarantee exists to prevent."""
         store = MagicMock()
         _patch_db_collection(store, artifact_doc=_artifact_doc())
         from mantle.services.dependencies import get_store_db
@@ -1044,7 +1090,14 @@ class TestRevertArtifact:
         finally:
             app.dependency_overrides.pop(get_store_db, None)
         assert r.status_code == 200
-        assert r.json() == {"id": "art-1", "state": "committed"}
+        body = r.json()
+        assert body["id"] == "art-1"
+        assert body["state"] == "committed"
+        from mantle.routers.artifacts_router import _ARTIFACT_KEYS
+        missing = [k for k in _ARTIFACT_KEYS if k not in body]
+        assert not missing, (
+            "revert declares `ok=ArtifactResponse`, which promises every key is present "
+            "(`null` when unset), but the body omits %r" % missing)
 
     @pytest.mark.asyncio
     async def test_dedicated_revert_route_204_when_no_committed_version(
@@ -1154,17 +1207,32 @@ class TestUploadStatus:
 
 
 class TestMultipartPartUrl:
+    """The route is retired. This class pins its absence.
+
+    Presigned multipart parts would upload straight to the object store, bypassing Mantle, which
+    cannot envelope-encrypt them on that path — an operation that never worked, so it is removed
+    rather than kept to explain itself.
+
+    Asserting only the status would be a weak guard — every absent route answers 404. The schema
+    assertion is the real one: the operation must not be advertised, because a client generates
+    from the spec, not from a probe.
+    """
+
     @pytest.mark.asyncio
-    async def test_multipart_is_gated_409(self, client: AsyncClient):
-        # Presigned multipart parts upload directly to the object store, bypassing
-        # Mantle's byte-path encryption — so the endpoint is disabled (409). Content
-        # is uploaded via the proxied PUT /artifacts/{id}/content instead.
-        r = await client.get(
-            "/artifacts/any/multipart-part-url",
-            params={"part_number": 1},
-        )
-        assert r.status_code == 409
-        assert "proxied" in r.json()["detail"].lower()
+    async def test_the_operation_is_no_longer_advertised(self, client: AsyncClient):
+        from mantle.main import app
+
+        paths = app.openapi()["paths"]
+        assert not [p for p in paths if "multipart-part-url" in p], (
+            "the retired route is back in the schema: %r"
+            % [p for p in paths if "multipart-part-url" in p])
+
+    @pytest.mark.asyncio
+    async def test_calling_it_is_an_ordinary_404(self, client: AsyncClient):
+        r = await client.get("/artifacts/any/multipart-part-url", params={"part_number": 1})
+        assert r.status_code == 404
+        assert "proxied" not in (r.text or "").lower(), (
+            "a 409-era explanation is still being served — the handler is still wired")
 
 
 # ---------------------------------------------------------------------------
@@ -1423,7 +1491,7 @@ class TestListVisibleActionFilter:
         ):
             r = await client.get("/artifacts/visible?action=create")
         assert r.status_code == 200
-        ids = {a["id"] for a in r.json()}
+        ids = {a["id"] for a in r.json()["items"]}
         # Only the create-capable collection — the read-only one is excluded.
         assert ids == {"col-mine"}
         # Provisioning gate is always resolved against "read"; the visible set
@@ -1440,7 +1508,7 @@ class TestListVisibleActionFilter:
         ):
             r = await client.get("/artifacts/visible")
         assert r.status_code == 200
-        ids = {a["id"] for a in r.json()}
+        ids = {a["id"] for a in r.json()["items"]}
         assert ids == {"col-readonly", "col-mine"}
         # No extra resolve for the default path — 'read' covers both the
         # provisioning gate and the visible set.

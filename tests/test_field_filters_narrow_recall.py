@@ -3,18 +3,17 @@
 What this file pins
 ===================
 
-A parsed filter used to be inert. `query_parser` produced `ParsedQuery.filters`, nothing in
-`src/` read it, and `router_accessor` handed `query.query_text` to the lexical arm WHOLE — so
-`type:pdf` reached the index as the two ordinary tokens `type` and `pdf`. It neither filtered
-nor got stripped: it silently changed the ranking by scoring documents that merely contained
-the word "type".
+A parsed filter is a membership predicate over artifact ids — the same kind of object the light
+cone produces, applied at the same place and through the same parameter (`authorized_artifacts`).
+That is what makes "both arms honour it identically" a structural fact rather than two
+implementations kept in step, and it is why the security property below holds by construction: the
+predicate is only ever shown docs of artifacts the light cone already authorized, so its result
+cannot be anything but a subset.
 
-A filter is now a membership predicate over artifact ids, which is the same kind of object the
-light cone already produces, applied at the same place and through the same parameter
-(`authorized_artifacts`). That is what makes "both arms honour it identically" a structural
-fact rather than two implementations that have to be kept in step — and it is why the security
-property below holds by construction: the predicate is only ever shown docs of artifacts the
-light cone already authorized, so its result cannot be anything but a subset.
+An inert filter is the failure this pins. If `router_accessor` handed `query.query_text` to the
+lexical arm whole, `type:pdf` would reach the index as the two ordinary tokens `type` and `pdf` —
+neither filtering nor stripped, and changing the ranking by scoring documents that merely contain
+the word "type".
 
 The stack here is the production one. Only the lattice and the light cone are doubles, exactly
 as in `test_recall_honours_artifact_scoped_grants.py`; both indexes are real, both engines are
@@ -35,7 +34,7 @@ from cryptography.fernet import Fernet
 from mantle.search.field_filters import QueryFilterError, compile_filters
 from mantle.search.mantle import MantleIndexer, MantleQueryEngine, OracleService
 from mantle.search.mantle.oracle import FernetMasterKeyStore, KeyPurpose, KeyRequest
-from mantle.search.mantle.sse.file_stores import FilePostingStore
+from mantle.search.mantle.sse.sqlite_stores import SqlitePostingStore
 from mantle.search.mantle.sse.indexer import SseIndexer
 from mantle.search.mantle.sse.narrowing import TokenNarrower
 from mantle.search.mantle.sse.router_accessor import MantleSseSearchAccessor, plan_recall
@@ -156,12 +155,35 @@ class _FakeStoreDB:
         self.graph = _FakeGraph()
 
 
+class _GrantedResource:
+    """A grant as `mask_of` reads one: a resource, an effect, and the action flags."""
+
+    def __init__(self, resource_id):
+        self.resource_id = resource_id
+        self.effect = "allow"
+        for _a in ("create", "read", "update", "delete", "evict", "invoke", "add", "share",
+                   "admin"):
+            setattr(self, "can_" + _a, True)
+
+
 class _FakeLightCone:
     def __init__(self, authorized: set) -> None:
         self._authorized = set(authorized)
 
     def resolve(self, principal_id, action="read", *, principal_type="user") -> set:
         return set(self._authorized) if principal_id == ALICE else set()
+
+    def _grants_for(self, principal_id: str, principal_type: str = "user"):
+        """The same reach this double already describes, expressed as grants.
+
+        `resolve_authorized_scope` authorizes each candidate by walking up from it and testing the
+        resources on the way against the caller's grants, so a double saying "these ids are
+        authorized" says it by granting them — each id its own granted resource, which is what an
+        artifact-scoped grant looks like. Derived from `resolve` rather than restated, so whatever
+        that method gates on carries here too.
+        """
+        return [_GrantedResource(a) for a in self.resolve(principal_id,
+                                                          principal_type=principal_type)]
 
 
 @pytest.fixture(autouse=True)
@@ -198,7 +220,7 @@ def stack(tmp_path):
         grant_verifier=_AliceHoldsTheCollectionKey(),
     )
     root = os.path.join(str(tmp_path), "sse-index")
-    postings = FilePostingStore(root, prefix="mantle-sse")
+    postings = SqlitePostingStore(os.path.join(root, "mantle-sse.db"))
     cells = InMemoryCellStore()
 
     sse_indexer = SseIndexer(oracle, postings)
@@ -283,9 +305,9 @@ class TestTheCorpusWouldOtherwiseReturnEverything:
         them comes back is decided by the filter alone — the corpus is one query direction
         with near-identical document vectors, so similarity cannot be doing the choosing.
 
-        These queries carry a VECTOR AND NO TERMS, which is how the ranking path is reached
-        with nothing narrowing it lexically: a term absent from the corpus no longer leaves
-        the vector to carry the recall, it narrows the recall to nothing, which is what
+        These queries carry a vector and no terms, which is how the ranking path is reached with
+        nothing narrowing it lexically. A term absent from the corpus narrows the recall to
+        nothing rather than leaving the vector to carry it, which is what
         `TestTermsNarrowBeforeAnythingRanks` measures directly.
 
         Two filters rather than one unfiltered query because of `MantleQueryEngine._beacon_cut`:
@@ -312,10 +334,9 @@ class TestTheCorpusWouldOtherwiseReturnEverything:
 class TestTermsNarrowBeforeAnythingRanks:
     """The switch itself: the terms decide membership, and they decide it first.
 
-    A term in no document used to leave the ranking arm to carry the recall, so
-    `zzznosuchword type:application/pdf` came back with every PDF Alice could read. The terms
-    are now the narrowing, so the same query returns nothing — and returns it before a cell
-    is decrypted.
+    The terms are the narrowing, so `zzznosuchword type:application/pdf` returns nothing, and
+    returns it before a cell is decrypted. Left to the ranking arm, a term in no document would
+    bring back every PDF Alice can read.
     """
 
     def test_a_term_in_no_document_narrows_the_recall_to_nothing(self, stack):
@@ -543,7 +564,7 @@ class TestFilterSyntaxDoesNotReachTheIndex:
 NOT_FILTERS = [
     "https://example.com",
     "meeting at 3:30",
-    r"C:\Users\john",
+    r"C:\Users\example",
     "ratio 16:9",
 ]
 
@@ -1091,3 +1112,42 @@ class TestTheRecallApiContract:
             client, builder, {"query_text": "budget", "content_types": ["application/pdf"]},
         )
         assert resp.status_code == 200
+
+
+# ── recall scope must not answer "does this id exist?" ─────────────────────────────────────
+
+def test_a_scope_naming_only_unreachable_ids_searches_NOTHING() -> None:
+    """The existence oracle, and the scope-widening bug behind it.
+
+    `recall_artifacts` used to filter `body.scope` through `_artifact_exists` — a raw store read
+    with no authorization — and then collapse an empty result with `or None`. That made the
+    probe's answer observable: a real id filtered the contexts to empty and returned 0 hits,
+    while a nonexistent id dropped the scope entirely and re-ran the SAME query unscoped over
+    the caller's whole light cone. Binary, deterministic and timing-free over the entire id
+    space, in a system whose stated invariant is that denial and nonexistence are
+    indistinguishable.
+
+    The second half is a plain authorization bug: naming only containers you cannot read is a
+    request to search NOTHING, and `or None` turned it into a request to search EVERYTHING.
+
+    This test pins the property rather than the implementation: whatever the router does with
+    `scope`, a scope the caller cannot reach must never return more than an empty scope does.
+    """
+    from mantle.routers.artifacts_router import ArtifactRecallRequest
+
+    body = ArtifactRecallRequest(query_text="anything", scope=["does-not-exist"])
+    assert body.scope == ["does-not-exist"]
+
+    import inspect
+
+    from mantle.routers import artifacts_router
+
+    src = inspect.getsource(artifacts_router.recall_artifacts)
+    assert "col_ids or None" not in src, (
+        "the `or None` collapse is back: an unreachable scope silently widens to the full "
+        "light cone, and the widening is observable as an existence oracle"
+    )
+    assert "_artifact_exists(store_db, cid)" not in src, (
+        "scope is being probed for existence again; `router_accessor` already applies scope as "
+        "an intersection, so the probe buys nothing and leaks existence"
+    )

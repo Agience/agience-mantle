@@ -1,48 +1,48 @@
 """`field:value`, resolved — the parsed filter turned into a membership predicate.
 
-A FILTER IS THE SAME KIND OF OBJECT AS THE LIGHT CONE. `resolve_authorized_scope` produces a
+A filter is the same kind of object as the light cone. `resolve_authorized_scope` produces a
 set of artifact ids and both retrieval arms already apply it as set membership — SSE at
 `sse/narrowing._ids_for_term`, the vector arm at `mantle/engine._score_chunks`, through the one
 `authorized_artifacts` parameter they share. A field filter resolves to a set of the same shape,
-so it is applied by narrowing that set BEFORE retrieval rather than by cutting hydrated hits
+so it is applied by narrowing that set before retrieval rather than by cutting hydrated hits
 afterwards. Narrowing first is what keeps `total`, ranking and pagination honest: a post-hydration
 cut removes rows a page was already built from, so `total` counts documents the caller cannot
 reach and refilling the page means running retrieval again.
 
-WHERE THE PREDICATE RUNS IS WHY IT IS FREE. `resolve_authorized_scope` already reads the raw doc
+Where the predicate runs is why it is free. `resolve_authorized_scope` already reads the raw doc
 of every authorized artifact — it needs each one's `collection_id` to derive the collection pairs.
 The filter is evaluated in that existing loop, on a doc already in hand, so it adds no store read
-and no query. That is also why `db.vertex.list_by_doc_field` is NOT the primitive here: it wants a
+and no query. That is also why `db.vertex.list_by_doc_field` is not the primitive here: it wants a
 `content_type` bucket up front, answers equality only (no range, no negation), and ranges over the
 whole store rather than over the authorized set — which would make the intersection a separate
 step that could be written wrong. Here the narrowing is structural: the predicate only ever sees
-docs of already-authorized artifacts, so its result is a SUBSET by construction. There is no union
+docs of already-authorized artifacts, so its result is a subset by construction. There is no union
 to get wrong and no bypass to forget.
 
-WHAT IS FILTERABLE IS WHAT A DOC PLAINLY CARRIES. `content` is AEAD-encrypted at rest and the SSE
+What is filterable is what a doc plainly carries. `content` is AEAD-encrypted at rest and the SSE
 postings are blind tokens, so nothing inside the index or the cell can be filtered without
 decrypting it. Everything else on the row is plaintext (`db/doc_boundary` encrypts `content` and
-nothing else), and that is the filterable surface. Each reader below returns the SAME value the
+nothing else), and that is the filterable surface. Each reader below returns the same value the
 recall response echoes for that field — `title` here reads what `_hydrate` puts in `SearchHit.title`
 — so `title:report` selects the hits whose echoed title is `report`, rather than some near-miss
 the caller cannot see.
 
-THIS MODULE IS ALSO THE PARSER'S GRAMMAR. `word:value` is a filter only when `word` is a field
+This module is also the parser's grammar. `word:value` is a filter only when `word` is a field
 named here, and `is_filter_field` is the one place that question is answered — `query_parser`
 asks it rather than carrying a roster of its own. Everything else is an ordinary search term, so
-`https://example.com`, `3:30`, `C:\\Users\\john` and `16:9` search rather than fail. One roster
+`https://example.com`, `3:30`, `C:\\Users\\example` and `16:9` search rather than fail. One roster
 for both readings is the whole point: a list the parser kept in step by hand would eventually
 call something a field that nothing here can resolve, which is the shape of bug this replaces.
 
-THE COST IS A SILENT TYPO, TAKEN ON PURPOSE. `titel:foo` is not a field, so it becomes a search
+The cost is a silent typo, taken on purpose. `titel:foo` is not a field, so it becomes a search
 term and returns nothing rather than a 400. That is recoverable — no results, look again — where
 the alternative fails an ordinary URL search outright. There is no warning field and no
 did-you-mean: guessing at intent from a colon is how the parser got into this in the first place.
 
-`state` IS NOT FILTERABLE, and that is a statement about the store rather than a gap. It selects
-the index SEGMENT: `committed`, `draft` and `archived` are separately-keyed encrypted trees under
+`state` is not filterable, and that is a statement about the store rather than a gap. It selects
+the index segment: `committed`, `draft` and `archived` are separately-keyed encrypted trees under
 distinct object-storage prefixes (`mantle/wiring._segment_prefixes`), chosen when the accessor is
-BUILT and before any query runs. A `state:draft` filter could not narrow a committed-segment
+built and before any query runs. A `state:draft` filter could not narrow a committed-segment
 recall to drafts, because no draft is in the tree being read. `ArtifactRecallRequest.state` is the
 one way to say it, so a `state:` filter is refused with a message naming that field.
 """
@@ -96,18 +96,60 @@ def parse_context(doc: Optional[dict]) -> dict:
 
 
 def _title(doc: dict, ctx: dict) -> Any:
-    return ctx.get("title") or ctx.get("name") or doc.get("name")
+    """An artifact's title, wherever the writer put it.
+
+    The API path files it in `context`; a bulk ingest writes it as a top-level field. Both are
+    artifacts and both have a title, so reading only one shape makes a whole corpus look untitled —
+    measured, every canon hit came back from `recall` with `title: null` while its document carried
+    one.
+
+    `context` first: an artifact written through the API has both, and `context` is the one a
+    caller edits.
+    """
+    # `doc` may be absent: hydration reads this for a hit whose row the store no longer holds, and
+    # an artifact with no document has no title rather than raising one.
+    doc = doc or {}
+    ctx = ctx or {}
+    return (ctx.get("title") or ctx.get("name")
+            or doc.get("title") or doc.get("name"))
 
 
 def _description(doc: dict, ctx: dict) -> Any:
-    return ctx.get("description") or doc.get("description")
+    """The OFFER, read top-level. `context` is a compatibility fallback and nothing more — see
+    `chunking.extract_text_from_context` for what a bare string in it turned out to be."""
+    return doc.get("description") or ctx.get("description")
 
 
 def _tags(doc: dict, ctx: dict) -> Any:
-    raw = ctx.get("tags") or ctx.get("tags_canonical") or []
-    if isinstance(raw, str):
-        return [p.strip() for p in raw.split(",") if p.strip()]
-    return list(raw) if isinstance(raw, list) else []
+    """An artifact's groups. A tag, a collection, a group and an attribute are the same thing —
+    an edge to another artifact — so `tag:x` asks which groups this artifact belongs to.
+
+    `collections` / `collection_id` are the field mirror of the `contains` edges that record
+    membership. A `tags` key in `context` is read last and only for rows written before that was
+    true; it is a parallel answer to a question the graph already answers, and the two could
+    disagree with nothing to notice."""
+    groups = doc.get("collections") or []
+    if isinstance(groups, str):
+        groups = [groups]
+    own = doc.get("collection_id")
+    out = [str(g) for g in groups if g] + ([str(own)] if own else [])
+
+    # ── the legacy key is UNIONED, not a fallback ────────────────────────────────────────────
+    # Every artifact belongs to a group, so membership is never empty, and preferring it would
+    # make a pre-flattening row's stated tags unreachable for as long as the row exists —
+    # `tag:budget` would answer nothing for the whole corpus written before today.
+    legacy = ctx.get("tags") or ctx.get("tags_canonical") or []
+    if isinstance(legacy, str):
+        legacy = [p.strip() for p in legacy.split(",") if p.strip()]
+    if isinstance(legacy, list):
+        out += [str(t) for t in legacy if t]
+
+    seen, unique = set(), []
+    for tag in out:
+        if tag not in seen:
+            seen.add(tag)
+            unique.append(tag)
+    return unique
 
 
 class _Field:
@@ -193,7 +235,7 @@ def _canonical(field: str) -> str:
 def is_filter_field(word: str) -> bool:
     """Is `word` a field this module has an opinion about?
 
-    THE ONE ANSWER TO "IS `word:value` A FILTER". `query_parser` calls this and consults
+    The one answer to "is `word:value` a filter". `query_parser` calls this and consults
     nothing else, so the parser's notion of a field and this module's notion of a resolvable
     field are the same three mappings read twice rather than two lists kept in step. Add a
     field to `FILTERABLE_FIELDS` and the parser recognizes it in the same commit; there is

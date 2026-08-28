@@ -87,12 +87,28 @@ def person_artifact_id(user_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"agience://person/{user_id}"))
 
 
+def inbox_workspace_id(user_id: str) -> str:
+    """Deterministic id for the workspace first login creates, alongside
+    :func:`person_artifact_id`.
+
+    `_materialize_inbox` has a PARAMETER of this name, which shadows this function
+    inside that body. Nothing there calls it, and the symmetry with
+    :func:`person_artifact_id` is worth more than renaming a used signature.
+
+    Provisioning runs as a side effect of a read, so two requests on a first login
+    arrive together as a matter of course. Deriving the id is what makes them
+    converge: both racers address the same row instead of each minting a UUID and
+    leaving one workspace owned and orphaned.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"agience://workspace/inbox/{user_id}"))
+
+
 def _seeds_base() -> Optional[Path]:
     """Root of the platform SEED corpus, or None when Mantle runs BARE.
 
     Mantle bundles NO seed content — it is a bare encrypted data plane. The
     Agience platform seed corpus is an INSTALL-PACKAGE artifact (it lives in
-    agience-beam, not in the Mantle image), provided at deploy time by pointing
+    `agience-observe/package/seeds`, not in the Mantle image), provided at deploy time by pointing
     ``AGIENCE_SEEDS_ROOT`` at the mounted seeds. Unset ⇒ no seed application
     (bare) — the runtime provisioners (People/Authorities collections, Person
     cards, issuers) still run; only the declarative grant seeds are skipped."""
@@ -412,7 +428,7 @@ def _apply_grant_set(
 def _ensure_observations_container(store_db: Database, user_id: str) -> Optional[str]:
     """Ensure the user owns the container their observation events are addressed to.
 
-    ⭐ PROVISIONED HERE BECAUSE THE READ PATH MUST NOT WRITE. `events/observation.py` records an
+    Provisioned here because the read path does not write. `events/observation.py` records an
     event for every MCP tool call and addresses it to this container — which is what keeps one
     principal's queries out of the event feed of everyone holding a grant on whatever those
     queries matched. That addressing needs the container to exist and to carry the owner grant
@@ -437,7 +453,22 @@ def _ensure_inbox_workspace(store_db: Database, user_id: str) -> Optional[str]:
     if existing:
         primary = min(existing, key=lambda w: getattr(w, "created_time", "") or "")
         return primary.id
-    new_ws = workspace_service.create_workspace(store_db, user_id, "Inbox")
+    # The id is DERIVED, not minted. This block is check-then-act and nothing makes it
+    # atomic, so two requests on a first login both see the empty list and both create.
+    # With a fresh UUID each that left a second workspace owned and orphaned, resolved
+    # afterwards by `min(created_time)` and reported to nobody.
+    #
+    # A pinned id makes the two writes address the SAME row, so the duplicate cannot
+    # exist. Measured 2026-08-26: `create_collection` is `put_artifact` — the same
+    # call as `update_collection` — so the second write UPSERTS rather than raising.
+    # That is last-writer-wins, which is safe only because both racers write identical
+    # content here; it is NOT an arbiter, so do not build create-then-catch on it.
+    #
+    # Existing users are untouched: this runs only when the user has no workspace at
+    # all, so an Inbox already carrying a random UUID keeps it and needs no migration.
+    new_ws = workspace_service.create_workspace(
+        store_db, user_id, "Inbox", artifact_id=inbox_workspace_id(user_id),
+    )
     return new_ws.id
 
 

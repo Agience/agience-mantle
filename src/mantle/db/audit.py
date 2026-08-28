@@ -64,17 +64,34 @@ def append_access_events(db, batch: List[Dict[str, Any]]) -> int:
 
 
 def access_log_of(db, artifact_id: str, *, limit: int = 100, offset: int = 0,
-                  result: Optional[str] = None) -> List[Dict[str, Any]]:
+                  result: Optional[str] = None, since: Optional[str] = None,
+                  until: Optional[str] = None) -> List[Dict[str, Any]]:
     """An artifact's access history, newest first — a bounded walk of `ix_ae_artifact`.
 
     OFFSET is acceptable HERE (unlike artifact paging): the log is viewed newest-first in
-    small admin pages, and the index already orders the walk — no deep-skip workload exists."""
+    small admin pages, and the index already orders the walk — no deep-skip workload exists.
+
+    `since` / `until` bound the walk by time. This log is APPEND-ONLY and grows
+    with use, so without them the only way to reach an old event was to page through everything
+    newer than it. Both are inclusive ISO-8601 timestamps compared against `ts`, which is the
+    column the index already orders by, so the bound narrows the walk rather than filtering
+    after it.
+
+    `ts` is stored as an ISO-8601 STRING, so this is a lexicographic comparison. That is exact
+    for the format actually written (UTC, fixed width) and would not be for mixed offsets — the
+    writer above is the only producer, which is what makes it safe."""
     q = ("SELECT principal_id, action, result, ts, ctx FROM access_event"
          " WHERE artifact_id = ?")
     params: list = [artifact_id]
     if result in ("allowed", "denied"):
         q += " AND result = ?"
         params.append(result)
+    if since:
+        q += " AND ts >= ?"
+        params.append(str(since))
+    if until:
+        q += " AND ts <= ?"
+        params.append(str(until))
     q += " ORDER BY ts DESC LIMIT ? OFFSET ?"
     params += [int(limit), int(offset)]
     out = []

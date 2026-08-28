@@ -29,6 +29,20 @@ from . import seq as _seq
 from . import edge as _edge
 from .seq import LatticeConn, SeqAllocator
 
+
+import logging as _logging
+
+_log = _logging.getLogger(__name__)
+
+
+class MissingCollection(LookupError):
+    """An artifact named a collection that is not in this store.
+
+    Not raised by `_place` — see the comment there for the 54 tests that says why. Defined so a
+    caller that wants the strict contract can enforce it at its own boundary, where the blast
+    radius is its own.
+    """
+
 try:                                    # the declared seam, when mantle is importable
     from .store import ArtifactStore as _ArtifactStoreABC
 except Exception:                       # stand-alone: the package must import on its own
@@ -113,6 +127,10 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
                 "LatticeArtifactStore requires an explicit `origin` — the authoring "
                 "observer's stable identity. There is no default: a generated one "
                 "would change on restart and fork this node's proper time.")
+        #: Artifacts written whose named collection was not in the store, so no containment edge
+        #: was recorded. Counted rather than raised — see `_place`. A non-zero value here means
+        #: this process created artifacts that no grant can reach.
+        self.unplaced = 0
         self.origin = origin
         self.leaves = int(leaves)
         self.db = path_or_conn if isinstance(path_or_conn, LatticeConn) else LatticeConn(str(path_or_conn))
@@ -298,6 +316,7 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
         # doc it points at can never be observed disagreeing, and an update that changes `ct`
         # re-posts under the new type rather than leaving a stale discriminator behind.
         self._index_lists(cur, aid, d, cols["ct"], had_prev=prev is not None)
+        self._place(cur, d, stamp_rev=True)
         return d
 
     def _recount(self, cur: sqlite3.Cursor, old: Optional[Dict[str, Any]],
@@ -315,7 +334,7 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
         def add(name: str, delta: int) -> None:
             d[name] = d.get(name, 0) + delta
 
-        # THE `state` COUNTERS PARTITION ON THE RECORDED VALUE, NOT ON `K.state_of`.
+        # The `state` counters partition on the recorded value, not on `K.state_of`.
         #
         # `K.STATE_WHEN_ABSENT` says what a doc with no `state` IS — and every reader of an
         # ARTIFACT derives from it. These counters are not that reader. `vertex` is a mixed
@@ -568,6 +587,83 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
         self._write_row(cur, doc, origin, seq_val)
         return 1
 
+    # ── membership: one fact, one write ──────────────────────────────────────
+    #: The graph face this store writes containment through, built on the first
+    #: placement. `allocator_for` reuses the allocator already registered for this
+    #: connection, so the two stores draw from one proper-time sequence — the same
+    #: guarantee `open_lattice` gives when it constructs them together.
+    _graph_face = None
+
+    def _place(self, cur: sqlite3.Cursor, doc: Dict[str, Any], stamp_rev: bool = True) -> None:
+        """Write the origin containment edge for `doc["collection_id"]`.
+
+        An artifact's collection is ONE fact and this is the one write that records it. The
+        document's `collection_id` is what a reader filters on; the `contains` edge is what
+        authorization walks — `LightConeResolver.resolve` seeds from a principal's grants and
+        expands through `list_origin_descendants`, a BFS over exactly these edges. Two writers for
+        one fact drift, and drift here is silent in the worst direction: an artifact that every
+        listing shows inside a collection and that no grant on that collection reaches.
+
+        It hangs off `_write_row`, which is the one point every artifact write reaches —
+        `put_artifact` calls it directly and `put_many` reaches it through `_put_one` — on the
+        caller's cursor and inside the caller's savepoint. An artifact and its membership commit or
+        roll back together, and there is no window in which one exists without the other.
+
+        The member is the ROOT, not the version. `add_artifact_to_collection` is called with
+        `root_id or id` on the API path, and grants are held on the root — a collection contains a
+        lineage, so editing an artifact does not add a second membership for its new version.
+
+        `is_origin` marks the artifact's one canonical parent, which `list_origin_descendants`
+        requires — it skips any `contains` edge without it. SECONDARY membership (the same artifact
+        appearing in another container) is a separate, explicit act and keeps its own path,
+        `add_artifact_to_collection(..., origin=False)`.
+
+        The collection must itself be an artifact: a collection IS an artifact, and is a vertex for
+        that reason. A document naming a collection that is not here records no edge, because an
+        edge to a vertex that does not exist is a relation to nothing.
+        """
+        cid = doc.get("collection_id")
+        aid = doc.get("root_id") or doc.get("id")
+        if not cid or not aid or str(cid) == str(aid):
+            return
+        cid, aid = str(cid), str(aid)
+        row = cur.execute("SELECT 1 FROM vertex WHERE id = ?", (cid,)).fetchone()
+        if not row:
+            # ── a container that is not here is LOUD, and still not fatal ───────────────────
+            # This used to `return` in silence, on the reasoning that an edge to a vertex that
+            # does not exist is a relation to nothing. True — and the consequence was worse than
+            # the edge would have been: the artifact lands, every listing shows it inside the
+            # collection it names, and NO grant on that collection reaches it, because
+            # authorization walks the edge and there is none.
+            #
+            # Measured 2026-08-25 on 71/home: 3,894 artifacts name a collection with no vertex,
+            # across six collection ids, with no error and no counter recording any of it. One
+            # principal lost 3,897 of its 4,082 artifacts that way.
+            #
+            # Raising was tried and reverted. `MissingCollection` on this branch failed 54 tests
+            # across the suite: writing an artifact that names a collection nobody created is
+            # relied on widely, including by the change-feed and lattice-api suites. That is a
+            # migration, not a one-line correctness fix, so the honest landing is to make the
+            # condition impossible to miss rather than impossible to create. The durable half of
+            # this lives in the gate — `agience-cloud/deploy/data_integrity_check.py` counts
+            # artifacts naming a collection that does not exist, so the population can only
+            # shrink.
+            _log.warning(
+                "artifact %r names collection %r, which is not in this store: no containment "
+                "edge written. It will appear in listings that read `collection_id` and be "
+                "reachable by no grant.", aid, cid)
+            self.unplaced += 1
+            return
+        if self._graph_face is None:
+            from .edge import LatticeGraphStore
+            self._graph_face = LatticeGraphStore(self.db, origin=self.origin, leaves=self.leaves)
+        self._graph_face._add_one(
+            cur,
+            (cid, aid, "contains",
+             {"root_id": aid, "is_origin": 1}),
+            stamp_rev,
+        )
+
     def _lww(self, cur: sqlite3.Cursor, aid: str, origin: str, seq_val: int) -> str:
         row = cur.execute("SELECT _origin, _seq FROM vertex WHERE id = ?", (aid,)).fetchone()
         if row is None:
@@ -754,6 +850,25 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
                 return
             old = json.loads(r["doc"])
             cur.execute("DELETE FROM vertex WHERE id = ?", (artifact_id,))
+            if accounted:
+                # And the edges go with it. `edge_key = blake2b(src ‖ dst ‖ label)` is derived
+                # from the id strings, so an edge left behind is not inert garbage: the next
+                # artifact created with this id inherits every one of them, `is_origin=1` and
+                # `propagate` mask included — and the inbound `contains` edge is exactly what
+                # `list_origin_descendants` walks to decide who holds authority over a subtree.
+                # Delete-then-recreate was silently granting the new artifact the old one's reach.
+                #
+                # In this transaction, not after it. `LatticeConn.write()` is reentrant, so
+                # `_retire_edges_touching` joins the open one — the vertex and its edges commit
+                # together or not at all, which is the whole reason both stores share a connection.
+                #
+                # Only on an accounted delete. An eviction (`accounted=False`) drops a cached
+                # copy of a row this node did not author and that still exists at its author, and
+                # edges are separately replicated objects with their own feed — `mesh/sync`
+                # consumes them through `graph.add_edges`, not as a property of the vertex. Taking
+                # them here would delete objects the eviction sweep never selected, and a later
+                # reach restores the vertex without them. See `evict_artifact`.
+                _edge.retire_edges_touching(self.db, artifact_id, leaves=self.leaves)
             _seq.xor_leaf(cur, int(r["_leaf"]), K.row_hash(artifact_id, r["_seq"]))
             _seq.bump(cur, _schema.c_vertex_total(), -1)
             if accounted:

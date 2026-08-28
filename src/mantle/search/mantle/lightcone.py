@@ -88,6 +88,7 @@ import logging
 from types import MappingProxyType
 from typing import (
     AbstractSet,
+    Any,
     Callable,
     Dict,
     FrozenSet,
@@ -102,6 +103,7 @@ from typing import (
 
 from mantle.attenuation import ACTIONS, Mask
 from mantle.db import backend as db_store
+from mantle.db.constants import state_of
 from mantle.entities.grant import mask_of
 from mantle.services import context_service
 
@@ -211,11 +213,30 @@ class LightConeResolver:
         # bit AND the effect. The bare flag check this replaced let a `deny`-effect grant
         # seed the cone — for key issuance (`oracle.LightConeGrantVerifier`) and for
         # search-result decryption alike.
-        granted_ids = [
-            g.resource_id
-            for g in grants
-            if g.resource_id and mask_of(g).allows(action)
-        ]
+        masked = [(g.resource_id, mask_of(g)) for g in grants if g.resource_id]
+        granted_ids = [rid for rid, m in masked if m.allows(action)]
+
+        # Absorbing a deny is not the same as subtracting one. `allows()` keeps a deny grant from
+        # seeding the cone, which covers a deny standing alone; a deny sitting beside an allow on
+        # the same resource needs what the allow seeded removed. With allow-read and deny-read both
+        # on `col-1` and no subtraction:
+        #       resolve('u1', 'read') -> {'col-1', 'art-a'}
+        #       check_access('col-1') -> 404
+        # `recall` returns the denied artifact and hydration decrypts its content inline.
+        # Worse, this set feeds `LightConeGrantVerifier` -> `OracleService`, and keys are
+        # derived per (principal, collection) while `contexts` is deliberately un-narrowed
+        # below — so the denied principal was issued a key for the WHOLE COLLECTION.
+        #
+        # The module docstring's own contract is "this resolver must not exceed
+        # `check_access`", which tests deny first and 404s. Both sibling implementations
+        # already subtract — `lattice_api.get_active_collection_ids_for_user` and
+        # `db/access.invokable_resources` — and this one is the path that decides key custody.
+        #
+        # `carries`, not `allows`, for the deny pile: a deny grant's bits name the actions it
+        # denies, so `allows()` is false for every one of them by construction. `db/access.py`
+        # states the same rule where it sorts the two piles.
+        denied_ids = [rid for rid, m in masked if m.is_deny and m.carries(action)]
+
         if not granted_ids:
             return set()
 
@@ -223,6 +244,14 @@ class LightConeResolver:
         # add to it.
         granted: Set[str] = set(granted_ids)
         granted.update(db_store.list_origin_descendants(self._db, granted_ids, action))
+
+        # Deny expands the same way the allow does. A deny on a collection has to reach that
+        # collection's members, or denying a container leaves every artifact inside it reachable.
+        # `db/access.invokable_resources` expands both piles for exactly this reason.
+        if denied_ids:
+            denied: Set[str] = set(denied_ids)
+            denied.update(db_store.list_origin_descendants(self._db, denied_ids, action))
+            granted -= denied
 
         # The context lattice, seeded from everything containment already authorized — the
         # two are one structure, so a context edge hanging off a descendant is as real as one
@@ -293,6 +322,114 @@ def _raw_artifact(store_db, artifact_id: str):
     return get_raw_artifact(store_db, artifact_id)
 
 
+def _raw_artifacts(store_db, artifact_ids):
+    """Raw artifact docs for MANY ids, in as few round trips as the store allows.
+
+    The narrowed set for an ordinary question reaches thousands — a description narrows to 4,013
+    and a common phrase to 8,517 — and this loop read one document per candidate. Measured on the
+    4,013 case: 1.58s of a 5.58s recall, 389us per candidate, for rows the lattice can hand over in
+    one statement. The same argument `ranking._reach_rank` already makes about its own reads:
+    `id` is the primary key, so `IN (...)` is that index walk done once.
+
+    Falls back to the per-id read when the batched shape is unavailable, so a store that does not
+    answer SQL — a test double, a non-lattice backend — behaves exactly as before.
+
+    A missing id simply does not come back, which is the same absence `_raw_artifact` returned as
+    `None`; the caller already skips those, and skipping is what keeps an id the narrowing named
+    but the store cannot show out of an authorized set.
+
+    Root ids resolve too, and they have to. `ingest/pipeline_unified._sse_index_artifact` indexes
+    under `artifact.root_id or artifact.id`, so for a versioned artifact every posting names the
+    ROOT -- and an identity-addressed member has a root that is deliberately never materialised
+    ("the root is the identity and the id is the version",
+    `workspace_service.upsert_identity_member`). A root is therefore an id the narrowing legitimately
+    names and `SELECT ... WHERE id IN (...)` can never answer.
+
+    Measured 2026-08-25 on 71/home: the `Claude Code` capture collection held 97 containment edges,
+    NONE of whose targets existed as a vertex, and 183 captures whose roots were all unmaterialised.
+    Every hook capture -- session transcripts, file mirrors, commits -- was narrowed to and then
+    dropped one line later by `if not doc: continue`. `recall("Session transcript agience-build")`
+    answered with canon documents and never the transcript. The lane wrote for a month and returned
+    nothing it wrote.
+
+    So a second hop resolves whatever the first could not, through `versions_of_many` -- the store's
+    own batched lineage read over `ix_v_root_id`, one statement per `IN_CHUNK` roots rather than one
+    per miss. It runs ONLY on the misses, so the ordinary path (every id a real vertex) pays one
+    extra `dict` comparison and no query at all.
+    """
+    import json as _json
+
+    wanted = [str(a) for a in artifact_ids]
+    out: Dict[str, Any] = {}
+    if not wanted:
+        return out
+    try:
+        conn = store_db.artifacts.db.read()
+    except Exception:  # noqa: BLE001 — no SQL handle: fall back to the point reads
+        conn = None
+    if conn is not None:
+        try:
+            for start in range(0, len(wanted), 400):
+                chunk = wanted[start:start + 400]
+                rows = conn.execute(
+                    "SELECT id, doc FROM vertex WHERE id IN (%s)" % ",".join("?" * len(chunk)),
+                    chunk,
+                )
+                for artifact_id, blob in rows:
+                    try:
+                        doc = _json.loads(blob) if isinstance(blob, (str, bytes)) else blob
+                    except Exception:  # noqa: BLE001 — a malformed row is an absent row
+                        continue
+                    if isinstance(doc, dict):
+                        out[str(artifact_id)] = doc
+            _resolve_roots(store_db, wanted, out)
+            return out
+        except Exception:  # noqa: BLE001 — the batched shape did not work here
+            out = {}
+    for artifact_id in wanted:
+        try:
+            doc = _raw_artifact(store_db, artifact_id)
+        except Exception:  # noqa: BLE001 — store reads raise broadly
+            continue
+        if doc:
+            out[artifact_id] = doc
+    _resolve_roots(store_db, wanted, out)
+    return out
+
+
+def _resolve_roots(store_db, wanted, out) -> None:
+    """Fill in, by ROOT, whatever `wanted` the id lookup could not answer. Mutates `out`.
+
+    The newest COMMITTED version wins, which is the same choice `get_latest_committed_artifact`
+    makes and for the same reason: `versions_of_many` orders each lineage oldest-first by
+    `(_origin, _seq)` -- the gap-free proper-time identity -- so the last committed doc in the list
+    is the current one. A draft is not substituted for a missing commit: `recall` reads the
+    committed segment, and answering a committed query with a draft would return content that was
+    never published.
+
+    Never raises. A store with no `versions_of_many` (a test double, a non-lattice backend) leaves
+    `out` exactly as the id lookup left it, which is the behaviour every caller had before this.
+    """
+    missing = [a for a in wanted if a not in out]
+    if not missing:
+        return
+    try:
+        lineages = store_db.artifacts.versions_of_many(missing) or {}
+    except Exception:  # noqa: BLE001 — no lineage read here; the misses stay missing
+        return
+    for root_id, docs in lineages.items():
+        for doc in reversed(list(docs or ())):
+            if not isinstance(doc, dict):
+                continue
+            # `state_of` is the store layer's one answer for what a doc carrying no `state`
+            # is in; a second answer here would file a stateless doc differently from the way
+            # the index segments already file it.
+            if state_of(doc) != "committed":
+                continue
+            out[str(root_id)] = doc
+            break
+
+
 #: The no-timestamps answer, for a scope that read no docs. Read-only so the shared default
 #: cannot be written through by one caller and observed by the next.
 _NO_TIMESTAMPS: Mapping[str, str] = MappingProxyType({})
@@ -361,6 +498,168 @@ def _token_narrowing(
         logger.warning("token narrowing failed; narrowing to nothing", exc_info=True)
         return frozenset()
     return frozenset(str(a) for a in (found or ()))
+
+
+def authorized_page(store_db, lightcone, principal_id: str, *, action: str = "read",
+                    offset: int = 0, limit: int = 100,
+                    principal_type: str = "user") -> List[str]:
+    """Ids this principal may `action`, in id order, WITHOUT materialising the whole light cone.
+
+    The enumerating route asks "what may this principal reach", builds the answer, sorts it and
+    takes a slice. Measured 2026-08-25 on 71/home, `list_origin_descendants` walking DOWN:
+
+        collection:concepts-consolidated       5,484 descendants     0.2s
+        stage.2.world                        121,682 descendants     4.1s
+        stage.1.grammar                      188,321 descendants     7.0s
+        stage.0.lexicon                      RAISES EdgesTruncated (>1,000,000)   34-51s
+
+    ~27 microseconds per edge, so 1.85M would be ~50s even with the cap lifted. And it does not
+    fail locally: the raise happens inside `resolve_authorized_scope`, so a principal granted on
+    the lexicon loses the enumerating route for EVERY collection it holds. Consequence measured:
+    only 12,494 vertices (0.57%) were reachable by any principal whose cone could be computed.
+
+    This inverts it the way the NARROWED route already works — walk UP per candidate with
+    `origin_chain`, which is `O(candidates x depth)` and never builds the set. Each id is checked
+    by exactly the walk `_reaches` uses, so this can only return what the enumerating route would
+    have returned; it just never has to hold it.
+
+    The honest cost, stated because it is the opposite trade: this SCANS ids in order and checks
+    each, so it is fast when the caller's reach is dense (the first page fills almost immediately)
+    and slow when it is sparse (a principal who may see ten artifacts in a 2.17M-row store walks a
+    long way to find them). That is why it is a FALLBACK and not the default — the enumerating
+    route is better for a small cone, and a small cone is the one it can still compute.
+
+    Ordering is by id, which is what the caller sliced a sorted set by, so `offset` indexes into
+    the same sequence it always did.
+    """
+    allow, deny = _grant_sets(lightcone, principal_id, principal_type, action)
+    if not allow:
+        return []
+    try:
+        conn = store_db.artifacts.db.read()
+    except Exception:  # noqa: BLE001 — no SQL handle: this route cannot run
+        return []
+    out: List[str] = []
+    passed = 0
+    try:
+        rows = conn.execute(
+            "SELECT id, json_extract(doc,'$.root_id') FROM vertex ORDER BY id")
+    except Exception:  # noqa: BLE001
+        return []
+    for artifact_id, root_id in rows:
+        aid = str(artifact_id)
+        if not _reaches(store_db, aid, action, allow, deny, root_id=str(root_id or aid)):
+            continue
+        passed += 1
+        if passed <= offset:
+            continue
+        out.append(aid)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _grant_sets(lightcone, principal_id: str, principal_type: str, action: str):
+    """`(allow, deny)` — the resources this principal's grants allow or deny for `action`."""
+    from mantle.entities.grant import mask_of
+
+    allow, deny = set(), set()
+    for g in (lightcone._grants_for(principal_id, principal_type) or []):   # noqa: SLF001
+        rid = getattr(g, "resource_id", None)
+        if not rid:
+            continue
+        m = mask_of(g)
+        if m.is_deny and m.carries(action):
+            deny.add(str(rid))
+        elif m.allows(action):
+            allow.add(str(rid))
+    return allow, deny
+
+
+def _reaches(store_db, artifact_id: str, action: str, allow: set, deny: set,
+             root_id: Optional[str] = None) -> bool:
+    """Does a grant sit on this artifact, or above it on an edge that still conducts `action`?
+
+    The same walk `check_access` and `oracle.LightConeGrantVerifier` read — `origin_chain` yields
+    the artifact, its root, then each origin ancestor, stopping at the first edge whose propagate
+    mask does not carry the action. Deny is checked at every level before allow, so nothing further
+    up re-allows what a nearer deny refused.
+    """
+    from mantle.db.backend import OriginChainUnterminated, origin_chain
+
+    try:
+        for resource in origin_chain(store_db, artifact_id, action, root_id=root_id):
+            if resource in deny:
+                return False
+            if resource in allow:
+                return True
+    except OriginChainUnterminated:
+        return False
+    except Exception:  # noqa: BLE001 — an unreadable chain under-reaches, which is fail-closed
+        return False
+    return False
+
+
+def _custody_contexts(store_db, lightcone, principal_id: str, action: str,
+                      principal_type: str) -> list:
+    """The `(cell_principal, collection)` pairs this principal may hold keys for.
+
+    Derived from the COLLECTIONS, not from every artifact the principal can reach. Those are two
+    routes to one answer and only one of them scales: a collection with more members than
+    `edges_of` will return makes the artifact route raise `EdgesTruncated`, and this store has
+    1,841,335 members in `stage.0.lexicon` against 68 collections in total. `vertex(ct)` is
+    indexed, so finding the 68 is a keyed read.
+
+    Two sources, because a grant can confer custody two ways:
+
+      * a collection the principal REACHES — by a grant on it or on an ancestor that still
+        conducts the action;
+      * the collection of an artifact granted DIRECTLY. An artifact-scoped grant widens custody to
+        that artifact's whole collection, because keys are derived per collection and there is no
+        narrower one. That is the existing contract, not a new allowance.
+    """
+    from mantle.db.constants import COLLECTION_CONTENT_TYPE
+
+    from .principal import resolve_cell_principal
+
+    allow, deny = _grant_sets(lightcone, principal_id, principal_type, action)
+    if not allow:
+        return []
+
+    pairs, seen = set(), set()
+
+    def _add(collection_id: str) -> None:
+        if not collection_id or collection_id in seen:
+            return
+        seen.add(collection_id)
+        try:
+            cell = resolve_cell_principal(store_db, collection_id)
+        except Exception:  # noqa: BLE001 — a collection whose root cannot be resolved confers no
+            return         # custody; substituting the collection id would derive the wrong key
+        if cell:
+            pairs.add((cell, collection_id))
+
+    try:
+        collections = [str(a.get("id")) for a in
+                       store_db.artifacts.list_artifacts(content_type=COLLECTION_CONTENT_TYPE)
+                       if a.get("id")]
+    except Exception:  # noqa: BLE001 — no collection listing is an empty custody answer
+        collections = []
+    for collection_id in collections:
+        if _reaches(store_db, collection_id, action, allow, deny):
+            _add(collection_id)
+
+    for resource in allow:
+        if resource in deny:
+            continue
+        try:
+            doc = _raw_artifact(store_db, resource)
+        except Exception:  # noqa: BLE001
+            doc = None
+        if doc:
+            _add(str(doc.get("collection_id") or resource))
+
+    return sorted(pairs)
 
 
 def resolve_authorized_scope(
@@ -438,6 +737,102 @@ def resolve_authorized_scope(
     return no hits for empty contexts.
     """
     from .principal import resolve_cell_principal
+
+    # ── the narrowed route, when there is a narrowing to run ─────────────────────────────────────
+    # Enumerating asks "what may this principal reach", materialises it, and MEETS the token
+    # lookup's answer into it. On a corpus that does not survive: `stage.0.lexicon` holds 1,841,335
+    # members, so `list_origin_descendants` raises at the 1,000,000-edge cap and a recall by anyone
+    # granted there fails — including for every OTHER collection they hold.
+    #
+    # The same set is `matched` filtered by authorized rather than `authorized` filtered by
+    # matched, and the second form needs no set: the lookup already produced the candidates, and
+    # each is checked with the walk `check_access` uses. `O(candidates x depth)` instead of
+    # `O(everything authorized)`, and the meet's contract is unchanged — a token naming an artifact
+    # outside the light cone is dropped by the per-candidate check exactly as intersection dropped
+    # it, so the narrowing is still no existence oracle.
+    #
+    # `contexts` comes from the COLLECTIONS rather than from the artifacts, because it is needed
+    # BEFORE any candidate exists — the lookup is keyed per `(principal, collection)`. See
+    # `_custody_contexts`.
+    #
+    # Without a `token_lookup` there is nothing to filter and the enumerating route below still
+    # runs. That path answers "everything I may see", which has no smaller form.
+    if token_lookup is not None:
+        contexts = _custody_contexts(store_db, lightcone, principal_id, action, principal_type)
+        if not contexts:
+            return AuthorizedScope([], frozenset())
+        allow, deny = _grant_sets(lightcone, principal_id, principal_type, action)
+        matched = _token_narrowing(token_lookup, contexts)
+
+        kept: set = set()
+        stamps: Dict[str, str] = {}
+        # ── the chain above a COLLECTION is walked once, not once per artifact ──────────────
+        # `origin_chain` yields `artifact_id`, then `root_id`, then each origin ancestor, stopping
+        # at the first edge whose propagate mask does not carry the action. Two facts make the tail
+        # shareable, and the first one is the one I got wrong twice:
+        #
+        #   * `root_id` is the artifact's VERSION root, not its collection. Measured, it equals the
+        #     artifact's own id for 5,000 of 5,000 sampled synsets and 3,000 of 3,000 canon rows —
+        #     so keying a cache on it gives one entry per artifact and never hits. That version was
+        #     written, shipped and written up as effective before the call count was looked at.
+        #   * The first true ANCESTOR is the collection, and a narrowed set spans very few:
+        #     600 sampled artifacts had 2 distinct origin parents.
+        #
+        # So the walk is consumed lazily and handed off at the first resource that is neither the
+        # artifact nor its version root. Everything above that point is a property of the ancestor,
+        # not of the artifact, and is memoised on it. The generator keeps its own mask logic — this
+        # does not re-implement `_propagates`, it just stops reading.
+        #
+        # Scoped to this call, so a cached authorization answer cannot outlive the `allow`/`deny`
+        # sets it is an answer for.
+        _above: Dict[str, bool] = {}
+
+        def _authorized(artifact_id: str, root_id: str) -> bool:
+            """`_reaches`, with the shared tail memoised on the first ancestor."""
+            from mantle.db.backend import OriginChainUnterminated, origin_chain
+
+            try:
+                for resource in origin_chain(store_db, artifact_id, action, root_id=root_id):
+                    if resource in deny:
+                        return False
+                    if resource in allow:
+                        return True
+                    if resource != artifact_id and resource != root_id:
+                        if resource not in _above:
+                            _above[resource] = _reaches(
+                                store_db, resource, action, allow, deny, root_id=resource)
+                        return _above[resource]
+            except OriginChainUnterminated:
+                return False
+            except Exception:  # noqa: BLE001 — an unreadable chain under-reaches, fail-closed
+                return False
+            return False
+
+        # One batched read for the whole narrowed set rather than one per candidate — see
+        # `_raw_artifacts`. The loop below is unchanged in what it decides; only where the doc
+        # comes from has moved.
+        docs = _raw_artifacts(store_db, matched)
+        for artifact_id in matched:
+            doc = docs.get(str(artifact_id))
+            if not doc:
+                # An id the lookup named and the store cannot show. It is not authorized here:
+                # the walk needs the doc's root, and admitting it unchecked would let the
+                # narrowing add an id the light cone never authorized.
+                continue
+            if not _authorized(str(artifact_id),
+                                str(doc.get("root_id") or artifact_id)):
+                continue
+            if artifact_predicate is not None:
+                try:
+                    if not artifact_predicate(doc):
+                        continue
+                except Exception:  # noqa: BLE001 — a malformed doc must not fail the search
+                    continue
+            kept.add(str(artifact_id))
+            modified = doc.get("modified_time")
+            if modified:
+                stamps[str(artifact_id)] = str(modified)
+        return AuthorizedScope(contexts, frozenset(kept), stamps)
 
     authorized = lightcone.resolve(
         principal_id, action=action, principal_type=principal_type

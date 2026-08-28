@@ -36,6 +36,21 @@ _OP_EXCLUDE = {                # operational state is per-box, never replicated 
     "application/vnd.agience.mesh-cursor+json",
     "application/vnd.agience.content-cursor+json", "application/vnd.agience.shard-done+json",
     "application/vnd.agience.s3sync-cursor+json",   # S3-sync publish/consume cursors are per-box
+    # `db/lattice_api.py::mark_materialized` records that this box has indexed an artifact, and
+    # `services/workspace_service.py:1164,1197` read it as a skip condition. Replicated, a marker
+    # written on node A would make node B skip indexing an artifact B has never indexed — silently,
+    # with nothing to see but a search result that is not there.
+    "application/vnd.agience.materialized-marker+json",
+    # A sensor reading describes one box — `agience-cloud/scripts/sensor_*.py` write this node's
+    # services, store, authority, certificate and code into `host.<id>`. Replicated, a reading
+    # written on node A would claim node B's services are whatever A measured, its disk is A's disk,
+    # and its certificate expires when A's does. Every one of those is confidently wrong rather than
+    # missing, which is the worse failure: an operator would act on it.
+    #
+    # `sensor_common.py` carries this as a warning — "this content type must not be minted on a
+    # node with MESH_ROLE set" — and this line is the enforcement: a rule written in a comment
+    # beside the code that would violate it is not a rule.
+    "application/vnd.agience.sensor+json",
     "application/x-ember-state",
 }
 
@@ -164,7 +179,7 @@ def _require_lattice(store_part, what: str):
 def _origin_of(store) -> str:
     """This observer's identity as the store understands it.
 
-    Deliberately the store's `origin`, not `_node_id()`. `_seq` is scoped `WHERE _origin = :me`, so
+    Deliberately the store's `origin`, not `_node_id`. `_seq` is scoped `WHERE _origin =:me`, so
     a publish scan keyed on a different string than the one stamped at write returns zero rows —
     forever, silently, on a node that is writing normally. The env var and the store must agree, and
     when they do not it is the store that is right, because the store is what stamped the rows."""
@@ -238,9 +253,45 @@ _MERKLE_PUBLISHED = "published"
 _S3SYNC_CT = "application/vnd.agience.s3sync-cursor+json"
 
 
+#: A directory to use as the mesh plane instead of S3, decomposed as trust -> plane -> sweep: the
+#: mesh plane is for peering, and durability is a separate concern from it.
+#:
+#: The mesh plane still requires S3 today: `mantle_common.sh` states that the mesh plane IS the
+#: durable content tier — there is no separate mesh bucket — and `CONTENT_DURABLE_BUCKET` is
+#: refused-if-absent. "Peering, not backup" has not escaped S3; it only changes what the S3 is for.
+#:
+#: `mesh/carrier.SpoolPlane` — a directory that is a mesh plane — is exported with no caller:
+#: measured 2026-08-26, `grep SpoolPlane` finds only its definition and its `__all__` entry.
+#: `MESH_SPOOL_DIR` is that caller.
+MESH_SPOOL_DIR = "MANTLE_MESH_SPOOL_DIR"
+
+
 def _mesh_s3(store):
-    """The authoritative OVH S3 client (a GarageContentStore: has ._s3 + .bucket + get/put/exists).
-    Reuse the tiered content store's origin if present, else open OVH directly. None if creds absent."""
+    """The mesh plane: a spool directory if one is configured, else the authoritative OVH S3 client.
+
+    A plane is three verbs — `put` / `get` / `exists` — plus a boto-shaped `_s3` for listing. That is
+    the whole contract, which is why a directory can stand in for a bucket and *"the mesh cannot tell
+    the difference"*. Returns None when neither is available, and the caller treats that as "no
+    plane" exactly as before.
+
+    The spool is checked first, deliberately: it is an explicit operator choice — the variable is
+    unset everywhere today — and a node that names a spool has said which plane it means. Falling
+    through to S3 after that would silently prefer the bucket over the instruction.
+
+    It is a plane, not a backup, and the difference is durability. A spool directory is exactly as
+    durable as the directory: on a local disk it is a single-box plane, useful for a loopback mesh, a
+    test, or a carrier that spools frames off the air. Pointed at shared storage it is a real
+    multi-node plane. It is not a second copy of anything — nothing here replicates the spool
+    itself, and treating it as durable because peering runs over it is the confusion "peering, not
+    backup" exists to end.
+    """
+    import os
+
+    spool = (os.getenv(MESH_SPOOL_DIR) or "").strip()
+    if spool:
+        from mantle.mesh.carrier import SpoolPlane
+        return SpoolPlane(spool)
+
     remote = getattr(getattr(store, "content", None), "remote", None)
     if remote is not None:
         return remote
@@ -384,6 +435,59 @@ def _new_docs(store, batch: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any
     return new
 
 
+#: Content types that confer authority. An inbound row of one of these decides what a principal may
+#: do, so applying it unverified means write access to the mesh plane is lattice authority.
+_AUTHORITY_TYPES = ("+grant+json", "grant+json", ".grant", "vnd.agience.grant")
+
+
+def _confers_authority(content_type) -> bool:
+    ct = str(content_type or "").lower()
+    return any(marker in ct for marker in _AUTHORITY_TYPES)
+
+
+def _withhold_unverified_authority(batch, *, stats=None):
+    """Refuse inbound rows that confer authority while nothing verifies them. `(kept, refused)`.
+
+    The peering daemon has exactly one sync mechanism — its own comment says "the one path …
+    no second mechanism" — and it verifies nothing: `_apply_artifacts` filters on `id` +
+    content-type and upserts, and `_is_replicated` returns True for grants. An inbound grant from
+    anyone who could write to the plane becomes a grant in this lattice, with no signature, no
+    principal and no authority checked — write access to the plane would equal full lattice
+    authority.
+
+    This fails closed, and visibly, rather than quietly dropping grants out of `_is_replicated`. A
+    type silently removed from the replicated set is indistinguishable from one nobody publishes,
+    and the day signing lands nobody would know to put it back. Refusing at apply time keeps the
+    intent ("grants replicate") and states the precondition ("when they can be verified"), counts
+    every refusal into `stats`, and logs the first one per batch.
+
+    No node declares `MANTLE_RUN_MESH` or `MESH_ROLE` across either peer tier — the mesh runs
+    nowhere today — so this closes the hole before it opens rather than changing the behaviour of a
+    running system.
+
+    The verifier is not wired here: `mesh/node.py::sync_from` takes an `authority_pub` and raises on
+    tamper, but it belongs to the shard/region subsystem (`anchor_routing`, `directory`, `service`)
+    and is not an alternative wiring of this daemon — signing this path is work, not a config
+    choice. Until that work lands, "verify what it applies" can only mean "refuse what it cannot
+    verify".
+    """
+    if not batch:
+        return batch, 0
+    kept, refused = [], []
+    for d in batch:
+        (refused if _confers_authority(d.get("content_type")) else kept).append(d)
+    if refused:
+        if stats is not None:
+            stats["refused_unverified_authority"] = (
+                stats.get("refused_unverified_authority", 0) + len(refused))
+        log.warning(
+            "mesh apply refused %d inbound authority row(s) — nothing on this path verifies a "
+            "grant's signature or issuing principal, so applying one would make write access to "
+            "the plane equal lattice authority (ruling 1, TRUST). First: id=%r type=%r",
+            len(refused), refused[0].get("id"), refused[0].get("content_type"))
+    return kept, len(refused)
+
+
 def _apply_artifacts(store, items: List[Dict[str, Any]], *, stats: Optional[Dict[str, int]] = None) -> int:
     """Upsert consumed artifact docs. `stamp_rev=False` preserves the origin `_rev` so a replicated
     row keeps its origin revision and does not echo around the mesh forever.
@@ -393,8 +497,9 @@ def _apply_artifacts(store, items: List[Dict[str, Any]], *, stats: Optional[Dict
     no-op re-applies. Populating it changes nothing about what is written or the load-bearing
     `handled` return / cursor guard; the default (None) is a pure no-op."""
     batch = [d for d in items if d.get("id") and _is_replicated(d.get("content_type"))]
+    batch, refused_authority = _withhold_unverified_authority(batch, stats=stats)
     if not batch:
-        return 0
+        return refused_authority
     nd = None
     if stats is not None or _DELIVER_PEER_SIGNALS:   # additive metric — a read, never the write path
         nd = _new_docs(store, batch)
@@ -410,7 +515,8 @@ def _apply_artifacts(store, items: List[Dict[str, Any]], *, stats: Optional[Dict
             return declined
     written = store.artifacts.put_many(batch, batch=500, stamp_rev=False)
     n = written if isinstance(written, int) else len(batch)
-    if n < len(batch):
+    n += refused_authority
+    if n - refused_authority < len(batch):
         # A short write means the segment did NOT fully apply. Raise so the caller holds the cursor
         # and records failed_key, rather than silently banking partial progress.
         raise RuntimeError("partial apply: wrote %d of %d" % (n, len(batch)))
@@ -478,7 +584,7 @@ def _deliver_new(store, new_docs) -> None:
 
 # ── consumed peer rows are invisible to every local-origin walk ──────────────────────────────────
 #
-# `page_by_origin` walks `WHERE _origin = :me`. A consumed row carries the peer's `_origin` by
+# `page_by_origin` walks `WHERE _origin =:me`. A consumed row carries the peer's `_origin` by
 # design — that is what "preserve the origin's version" means — so it is invisible to every
 # local-origin scan on this node, including `content_tier.promote_local_content`. Its content
 # therefore never gets promoted to durable S3 by that path: it exists only on local Garage and dies
@@ -644,7 +750,7 @@ def _apply_edges(store, items: List[Dict[str, Any]]) -> int:
     # A write failure must not be swallowed: returning 0 on exception would be indistinguishable
     # from "nothing to apply", so the caller would see no exception, record no failed_key, and
     # advance the cursor past an edge segment that never landed — a failed edge segment lost
-    # permanently and invisible to mesh_lag()["stuck"]. Raising is what makes the cursor-hold and
+    # permanently and invisible to mesh_lag["stuck"]. Raising is what makes the cursor-hold and
     # the stuck report work for edges at all.
     if _edges(store) is None:
         # ArcadeDB: `add_edges` has no `stamp_rev` keyword and `_rev` carries no authorship, so
@@ -674,6 +780,62 @@ def _apply_edges(store, items: List[Dict[str, Any]]) -> int:
             "edge segment partially applied: %d of %d edges handled. Holding the consume cursor "
             "so this segment is retried rather than silently skipped." % (handled, len(stamped)))
     return len(stamped)
+
+
+def _withheld_endpoints(v, erecs, priv_set, *, cap: int = 200000):
+    """The endpoint ids an edge must not be published toward, as `(ids, exhaustive)`.
+
+    Leaf assembly filters vertices by `_is_replicated` and ships edges unconditionally. Excluding a
+    content type that is an edge endpoint therefore sends the edge and withholds its vertex, and the
+    peer ends up holding a membership edge to an artifact that is not there — which is exactly
+    `contains_edges_to_missing_vertex`, an invariant `agience-cloud/deploy/data_integrity_check.py`
+    pins at 0.
+
+    Measured on 71/home: 18 `contains` edges point at `application/vnd.agience.shard-done+json`
+    vertices, which are in `_OP_EXCLUDE` — the current store publishes 18 dangling edges the moment
+    the mesh is switched on.
+
+    Three reasons an endpoint is withheld:
+
+      * its content type does not replicate (`_is_replicated`);
+      * it is grant-gated (`priv_set`) — an edge would otherwise leak the existence of a withheld id
+        even though the row itself is correctly held back;
+      * it is not in this store at all — publishing an edge to a vertex we do not have propagates a
+        dangling edge rather than creating one, which is no better.
+
+    Bounded by the leaf, not by the store: only the endpoints named by `erecs` are looked up, so
+    this stays O(edges in the leaf) however large the excluded population grows. Non-exhaustive
+    makes the caller refuse to publish the leaf, the same contract `_private_set` has — a leaf whose
+    edges cannot be resolved exactly must not be advertised as authoritative.
+    """
+    ids = set()
+    for er in erecs or ():
+        f, t = er.get("f"), er.get("t")
+        if f:
+            ids.add(f)
+        if t:
+            ids.add(t)
+    if not ids:
+        return set(), True
+    if len(ids) > cap:
+        return set(), False
+    if v is None or not hasattr(v, "get_many"):
+        # No typed vertex store: we cannot tell whether an endpoint replicates. Fail closed.
+        return set(), False
+    try:
+        docs = v.get_many(ids)
+    except Exception:
+        return set(), False
+    withheld = set()
+    for aid in ids:
+        d = docs.get(aid)
+        if not d:
+            withheld.add(aid)                       # not here: do not propagate a dangling edge
+        elif not _is_replicated(d.get("content_type")):
+            withheld.add(aid)
+        elif aid in priv_set:
+            withheld.add(aid)
+    return withheld, True
 
 
 def _private_set(store, *, cap: int = 200000):
@@ -734,14 +896,14 @@ def _refresh_leaves_lattice(store, leaves_to_refresh, n: int, cur: Dict[str, Any
                             digests: List[int]) -> Dict[str, Any]:
     """Refresh leaf digests on a lattice store — from the incremental tree, minus operational rows.
 
-    A re-query of the leaf is not viable: the Arcade form is one indexed `WHERE _leaf = :li` per
+    A re-query of the leaf is not viable: the Arcade form is one indexed `WHERE _leaf =:li` per
     leaf, but the lattice store exposes no `page_by_leaf`, so the equivalent would be a full keyset
     pass of the corpus per refresh — O(corpus) per reconcile round instead of O(operational rows).
     That defeats the reason this function exists: a full rescan is already expensive, and
     the corpus changes faster than the scan completes, so a rescan-built tree is stale before it
     finishes.
 
-    `merkle_leaves()` alone is not enough either. It is O(1) and incrementally maintained, which is
+    `merkle_leaves` alone is not enough either. It is O(1) and incrementally maintained, which is
     the right shape, but `vertex._write_row` XORs every row into its leaf, including `_OP_EXCLUDE`
     cursors and tasks — publishing that tree as-is would give two perfectly converged nodes
     different roots forever, over state that must never replicate. This function corrects for that
@@ -939,7 +1101,15 @@ def publish_merkle_incremental(store, *, leaves: int = 0,
         lines = [json.dumps(_proj(d), separators=(",", ":"))
                  for d in docs if d and _is_replicated(d.get("content_type"))
                  and d.get("id") not in priv_set]
-        lines += [json.dumps(er, separators=(",", ":")) for er in erecs]
+        # An edge publishes only if BOTH its endpoints do — see `_withheld_endpoints`. Without
+        # this, excluding a content type ships the edge and withholds the vertex, which hands the
+        # peer a dangling membership edge.
+        held, held_exh = _withheld_endpoints(v, erecs, priv_set)
+        if not held_exh:
+            incomplete = True
+            continue
+        lines += [json.dumps(er, separators=(",", ":")) for er in erecs
+                  if er.get("f") not in held and er.get("t") not in held]
         # An empty leaf is still uploaded as an empty object (contract M6): a missing file is an
         # unresolvable 404 diff that keeps a genuinely-empty range "differing" forever.
         s3.put("%s%s/%05d.ndjson.enc" % (_MESH_LEAF_PREFIX, node, li),
@@ -986,8 +1156,8 @@ def _replicated_count(store) -> int:
     (an unfiltered `count(*)` is O(1)-ish, ~0-40ms), and a row with a NULL `content_type` matches
     none of the equality counts, so it stays correctly in the total.
 
-    On lattice both terms are counter lookups and no `count(*)` is issued at all: `count()` and
-    `count_by_content_type()` read incrementally maintained counter rows, so this is
+    On lattice both terms are counter lookups and no `count(*)` is issued at all: `count` and
+    `count_by_content_type` read incrementally maintained counter rows, so this is
     O(|_OP_EXCLUDE|) keyed reads instead of a scan — an unfiltered `count(*)` loads every row to
     produce one integer, which can OOM a process on a large corpus."""
     try:
@@ -1146,7 +1316,7 @@ def reconcile_merkle(store, *, max_leaves: int = 64, max_seconds: float = 0.0) -
     # again — a livelock that burns S3 bandwidth and never converges. The whole local tree is
     # refreshed (not just the coarse indices pulled): applied rows land in local leaves at the local
     # resolution, which need not equal the coarse indices fetched, and `refresh_leaves` recomputes
-    # from the incremental `merkle_leaves()` in one pass anyway.
+    # from the incremental `merkle_leaves` in one pass anyway.
     refreshed = (refresh_leaves(store, range(len(local)), leaves=len(local))["refreshed"]
                  if fetched else 0)
     out_r = {"applied": applied, "peers": peers, "leaves_fetched": fetched, "refreshed": refreshed,
@@ -1395,7 +1565,7 @@ def _reach_candidates(store) -> List[str]:
 # skipping those artifacts from `digest`/`bucket_ids`. Ids come from ingested content (wiki titles
 # etc.), so apostrophes are common, and a skip of this kind is invisible: a short scan looks exactly
 # like a small corpus. Left un-stripped, the same literal terminates the string and raises on commit.
-# Parameterization avoids both failure modes, the same as `publish_to_s3`'s `id > :cur` page above
+# Parameterization avoids both failure modes, the same as `publish_to_s3`'s `id >:cur` page above
 # and as `arcade.py` throughout.
 
 

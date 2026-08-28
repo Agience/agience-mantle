@@ -60,16 +60,39 @@ def content_handle():
     root = db_path.parent
     keys_dir = Path(os.getenv("KEYS_DIR") or (root / "keys"))
 
-    keyfile = keys_dir / "content.key"
-    if not keyfile.exists():
+    # ── two key directories, because they hold two different kinds of key ───────────────────────
+    # `KEYS_DIR` is the node's SERVICE identity — `mantle.private.pem`, `origin.private.pem`, the
+    # nonce secret. The CONTENT CIPHER is a different thing: it belongs with the store it encrypts,
+    # because a store moved without its key is unreadable, which is the silent-partition failure
+    # `_secret/README.md` describes. So the default has always been `<store>/keys`.
+    #
+    # Setting `KEYS_DIR` for the service keys silently redirected the content lookup too. Measured
+    # on 71/home 2026-08-24: `content.key` sat in `C:/agience-data/shard/keys/` beside the lattice,
+    # `KEYS_DIR` pointed at `agience-home/keys` which has no such file, so `local_content_tier()`
+    # returned None, the whole `cas_ref` branch of `get_bytes_decrypted` was skipped, and the S3
+    # mirror behind it was NEVER CONSULTED — 310,003 artifacts reported as having no retrievable
+    # body while their bodies sat in the bucket, decryptable, the whole time.
+    #
+    # Resolved by looking, not by preferring: whichever directory actually holds `content.key`.
+    # `KEYS_DIR` is tried first, so a deployment that does keep the cipher there is unchanged.
+    content_keys = None
+    for cand in (keys_dir, root / "keys"):
+        if (cand / "content.key").exists():
+            content_keys = cand
+            break
+    if content_keys is None:
         raise RuntimeError(
-            "no content.key under %s — this node cannot encrypt or read stored content. That is a "
-            "PROVISIONING fault, not an empty store: reading on would treat every blob as missing "
-            "and report 'no results' for content that is present and unreadable." % keys_dir)
+            "no content.key in %s or %s — this node cannot encrypt or read stored content. That is "
+            "a PROVISIONING fault, not an empty store: reading on would treat every blob as missing "
+            "and report 'no results' for content that is present and unreadable."
+            % (keys_dir, root / "keys"))
 
     from mantle.shard.sqlite_store import _open_content_tier, _open_lattice_content
-    cache = _open_lattice_content(str(root), str(keys_dir), str(db_path))
-    _CONTENT = _open_content_tier(cache, str(keys_dir))
+    cache = _open_lattice_content(str(root), str(content_keys), str(db_path))
+    # `cred_dir` is where the S3/CDN mirror's credentials live, which is the SERVICE keys dir —
+    # they are infrastructure credentials, not the store's cipher, and the two need not be
+    # co-located. Passing both means neither has to move for the other to be found.
+    _CONTENT = _open_content_tier(cache, str(content_keys), cred_dir=str(keys_dir))
     return _CONTENT
 
 

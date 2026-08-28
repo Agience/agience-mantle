@@ -9,10 +9,15 @@ the collection origin-root (`FileContentCache`, P9.3), and reconciling the two i
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 from typing import Any, Dict, Optional, Type, TypeVar
+
+#: Module logger. `query_documents(unreadable="skip")` is the only user: a skipped document is a
+#: fact the store noticed and the caller may not repeat, so it is said once here as well.
+_log = logging.getLogger(__name__)
 
 #: The one attenuation operator's column form. Safe to import at module scope from the data
 #: layer: `mantle.attenuation` is stdlib-only and imports nothing else in `mantle` — that
@@ -36,6 +41,16 @@ except ImportError:                     # mantle dir itself on the path
 #: lineage predicates below match on it rather than on `doc.get("state")` so a stateless doc is
 #: resolved the same way here, in the entity layer, and in the index segment map.
 from mantle.db.constants import state_of
+
+#: Raised by `graph.edges_of` when more edges exist than it was allowed to return. Imported by
+#: NAME rather than caught as `Exception`, because several readers below deliberately absorb a
+#: failed edge read (an unreadable row withholds reach — fail-closed) and truncation is the one
+#: failure where absorbing it produces a WRONG answer rather than a conservative one. Every
+#: `except Exception` around an `edges_of` call in this module re-raises this first.
+from mantle.db.edge import EdgesTruncated
+# Stdlib-only module (it says so), so importing it here adds no cycle. Needed as an
+# `except` clause, which cannot be satisfied by a lazy in-function import.
+from mantle.services.acting_principal import KeyCustodyDenied as _KeyCustodyDenied
 
 try:
     from mantle.entities.artifact import Artifact as ArtifactEntity
@@ -222,7 +237,18 @@ def get_artifact(db: LatticeDatabase, artifact_id: str) -> Optional[ArtifactEnti
     return from_lattice_doc(db.artifacts.get_artifact(artifact_id), ArtifactEntity)
 
 
-def update_artifact(db: LatticeDatabase, entity: ArtifactEntity) -> Optional[ArtifactEntity]:
+#: NOT `Optional`. The annotation said this could
+#: return `None` and the body never could: one `return entity`, no error path. **Eight guards
+#: across three files were written against that promise and not one of them could fire.**
+#:
+#: The guards were individually reasonable; the defect was one level down. A signature that
+#: advertises a failure mode the body cannot produce does not make callers safer — it makes them
+#: write dead code that reads as error handling.
+#:
+#: And it did not even cover the real failure: if `put_artifact` ever returned without
+#: persisting, `is None` would not have caught it either. The only failure that reaches a client
+#: is `put_artifact` RAISING, which propagates past every one of those guards.
+def update_artifact(db: LatticeDatabase, entity: ArtifactEntity) -> ArtifactEntity:
     db.artifacts.put_artifact(to_lattice_doc(entity))
     _boundary.emit_artifact_change(entity, "artifact.updated")
     return entity
@@ -400,6 +426,11 @@ def list_draft_artifacts(db: LatticeDatabase, collection_id: str) -> list:
 
 def count_children(db: LatticeDatabase, root_id: str) -> int:
     """Count outbound containment edges from an artifact (as a container).
+
+    Exact or it raises: `edges_of` propagates `EdgesTruncated` rather than silently capping at
+    1000 and returning that count for every container larger than it — a count that would be
+    wrong in a way no caller could detect, the kind of "measurement I cannot justify" this store's
+    discipline refuses.
     """
     return len(db.graph.edges_of(root_id, label=_CONTAINS, direction="out"))
 
@@ -408,15 +439,19 @@ def has_children(db: LatticeDatabase, root_id: str) -> bool:
     """Whether an artifact has any containment children.
 
     "I could not ask" is not "no". A read that cannot run is an error, not a negative answer.
+
+    `partial_ok=True` because one row answers the question: this is the deliberate bounded peek
+    `edges_of` keeps the flag for, not an accidental truncation.
     """
-    return bool(db.graph.edges_of(root_id, label=_CONTAINS, direction="out", limit=1))
+    return bool(db.graph.edges_of(root_id, label=_CONTAINS, direction="out", limit=1,
+                                  partial_ok=True))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BRICK 3 — collections (Group 2): container CRUD, membership edges, order keys
 #
 # "A container IS an artifact" (`entities/collection.py`: `Collection = Artifact`) — container docs
-# live in the same store, discriminated by content_type, so the collection CRUD IS the artifact CRUD.
+# live in the same store, discriminated by content_type, so the collection CRUD is the artifact CRUD.
 #
 # Membership = an edge collection → root. Relation mapping (lattice-native): **the LABEL is the
 # relation kind** — containment is the label `contains` (what store expressed as
@@ -439,7 +474,9 @@ def get_collection_by_id(db: LatticeDatabase, id: str) -> Optional[Any]:
     return from_lattice_doc(db.artifacts.get_artifact(id), CollectionEntity)
 
 
-def update_collection(db: LatticeDatabase, entity: Any) -> Optional[Any]:
+#: NOT `Optional`, same shape as `update_artifact` above: one
+#: `return entity`, no error path, and callers testing it wrote dead guards.
+def update_collection(db: LatticeDatabase, entity: Any) -> Any:
     """A container update is an artifact update — same chokepoint as `create_collection`.
 
     A rename or a description edit is the change a live tree is most likely to be showing
@@ -491,6 +528,33 @@ def get_last_order_key(db: LatticeDatabase, collection_id: str) -> Optional[str]
     """The maximum `order_key` currently used in this collection."""
     keys = [k for k in (_eprop(e, "order_key") for e in _membership_edges(db, collection_id)) if k]
     return max(keys) if keys else None
+
+
+def order_fingerprint(db: LatticeDatabase, collection_id: str) -> int:
+    """A version for this container's current child order — derived, never stored.
+
+    Derived, not a counter: ordering lives in the edges' `order_key`, so the edges are the
+    version — a counter beside them would be a second source of truth to keep in step. This reads
+    the one that already exists.
+
+    A hardcoded literal here would repeat what cost this surface a real guarantee: an
+    `order_version` that is accepted but read nowhere, answered with a constant, lets two clients
+    reordering the same container both succeed — the second silently discarding the first's
+    arrangement — while a client echoing the constant back believes it is protected. A field that
+    advertises a guarantee it does not keep is worse than not offering one.
+
+    The fingerprint covers the sequence of member roots, not their `order_key` values: two states
+    with the same members in the same order are the same state, however the keys are spelled, so a
+    no-op reorder does not invalidate anyone's token. Adding or removing a child does change it —
+    correctly, because a position echoed back across a membership change is stale.
+    """
+    pairs = sorted(
+        ((_eprop(e, "order_key") or "", str(e.get("dst") or ""))
+         for e in _membership_edges(db, collection_id)))
+    payload = "\n".join(dst for _key, dst in pairs)
+    # Six bytes: ~2.8e14 values, far inside JSON's safe integer range, and wide enough that a
+    # collision — which would mean a MISSED conflict — is not a practical concern.
+    return int.from_bytes(hashlib.sha256(payload.encode("utf-8")).digest()[:6], "big")
 
 
 def add_artifact_to_collection(db: LatticeDatabase, collection_id: str, root_id: str,
@@ -660,17 +724,30 @@ def remove_all_edges_for_root(db: LatticeDatabase, root_id: str) -> int:
         for e in (db.graph.edges_of(root_id, direction="in") or []):
             if db.graph.delete_edge(e.get("src"), root_id, e.get("label")):
                 removed += 1
+    except EdgesTruncated:
+        # "Delete EVERY edge pointing at this root" cannot be answered from a clipped list, and
+        # reporting the count it managed would read as completion. `graph.delete_edges_touching`
+        # is the uncapped form if a caller needs one.
+        raise
     except Exception:
         return removed
     return removed
 
 
 def get_origin_parent(db: LatticeDatabase, root_id: str):
-    """``(parent_id, propagate_mask)`` via the creation edge, or None (already a root)."""
+    """``(parent_id, propagate_mask)`` via the creation edge, or None (already a root).
+
+    `None` means "this is a root", which is an authority statement — a root is its own encrypted
+    -search principal. A truncated read falling through to `None` would promote an artifact out of
+    its parent's key scope, so truncation is raised rather than absorbed with the unreadable-row
+    case below.
+    """
     try:
         for e in (db.graph.edges_of(root_id, label=_CONTAINS, direction="in") or []):
             if _eprop(e, "is_origin"):
                 return (e.get("src"), _prop_mask(e))
+    except EdgesTruncated:
+        raise
     except Exception:
         pass
     return None
@@ -691,27 +768,103 @@ def get_origin_root(db: LatticeDatabase, artifact_id: str) -> str:
         current = parent_id
 
 
+#: How far an origin chain may run before the lattice is declared malformed. A containment chain is
+#: a few levels deep in practice; a number this size is reached only by a cycle the edge writer
+#: should have made impossible.
+ORIGIN_WALK_CEILING = 10_000
+
+
+def origin_chain(db: LatticeDatabase, artifact_id: str, action: str,
+                 *, root_id: Optional[str] = None, ceiling: int = ORIGIN_WALK_CEILING):
+    """The resources a grant could sit on to reach `artifact_id` under `action`, nearest first.
+
+    Yields the artifact, then its root, then each origin ancestor — and STOPS at the first edge
+    whose propagate mask does not carry `action`.
+
+    That mask is the attenuation, and it is why this is a walk rather than a lookup. A grant does
+    not reach an artifact because it names an ancestor; it reaches it because every edge on the
+    path between them carries the action. `list_origin_descendants` prunes the subtree behind such
+    an edge on the way DOWN; this stops at the same edge on the way UP, through the same
+    `attenuation.propagates` operator, so the two directions cannot disagree about which edges
+    conduct.
+
+    It answers WHERE to look, not whether the answer is yes: a caller supplies its own notion of
+    "does this principal hold a grant on this resource", because that differs between a user (a
+    ledger lookup) and a grant key (a bundle already resolved and masked at authentication). One
+    walk, two grant sources.
+
+        for resource in origin_chain(db, artifact_id, "read"):
+            g = my_grants_on(resource)
+            if g is not None:
+                return g
+
+    A chain that does not terminate raises rather than returning what it managed to collect: a
+    truncated authorization answer is not a smaller one, it is a different one.
+    """
+    seen = set()
+    first = str(artifact_id)
+    yield first
+    seen.add(first)
+
+    # `root_id` is a parameter because every caller already holds the document — re-reading it here
+    # would put a second store read on an authorization path that runs per artifact. The fallback
+    # exists for a caller that has only an id.
+    cursor = str(root_id) if root_id else None
+    if cursor is None:
+        try:
+            doc = db.artifacts.get_artifact(first)
+        except Exception:  # noqa: BLE001 — store reads raise broadly; an unreadable doc has no chain
+            doc = None
+        cursor = str((doc or {}).get("root_id") or first)
+    if cursor not in seen:
+        yield cursor
+        seen.add(cursor)
+
+    while True:
+        if len(seen) > ceiling:
+            raise OriginChainUnterminated(
+                "origin chain from %r did not terminate within %d hops; the lattice is malformed"
+                % (artifact_id, ceiling))
+        parent = get_origin_parent(db, cursor)
+        if parent is None:
+            return
+        parent_id, mask = parent
+        if not parent_id or str(parent_id) in seen:
+            return
+        if not _propagates(mask, action):
+            return                      # attenuated: nothing above this edge reaches through it
+        parent_id = str(parent_id)
+        yield parent_id
+        seen.add(parent_id)
+        cursor = parent_id
+
+
+class OriginChainUnterminated(RuntimeError):
+    """An origin chain ran past its ceiling. Raised rather than truncated, because a partial chain
+    would answer a narrower authorization question than the one that was asked."""
+
+
 def list_origin_descendants(db: LatticeDatabase, root_ids: list, action: str) -> set:
     """The propagation light-cone: every id reachable from *root_ids* via origin containment
     edges whose `propagate` mask allows *action* (None mask = unrestricted). BFS,
     globally-unique vertices, seeds excluded.
 
-    The per-edge prune is `attenuation.propagates`, not a local membership test. It used to be
-    spelled `mask is not None and action not in mask` here and, separately and identically, in
-    `services.dependencies.check_access` — one rule written twice, which is the shape the
-    attenuation module exists to stop. `propagates` decodes the column through `Mask` and asks
-    `allows`, and the decoder is proved bit-for-bit equal to the old expression across every
+    The per-edge prune is `attenuation.propagates` rather than a local membership test. Spelled
+    inline as `mask is not None and action not in mask` it would be one rule written twice, here and
+    in `services.dependencies.check_access`, which is the shape the attenuation module exists to
+    stop. `propagates` decodes the column through `Mask` and asks `allows`, and the decoder is
+    proved bit-for-bit equal to that expression across every
     known column shape × every action in `tests/test_attenuation_algebra.py`
     (`test_the_decoder_reproduces_the_lattice_column_on_every_known_shape`), so no live edge
     changes meaning: NULL still propagates everything, `'[]'` and the compact `"r"` form still
     propagate nothing.
 
-    One deliberate difference, in the fail-closed direction: an *unknown* action name used to
-    pass a NULL mask (`action not in None` never ran, because the `is not None` short-circuited
-    first) and now propagates nothing, because `Mask.allows` answers False for any verb outside
-    CRUDEASIO. Both in-tree callers already reject unknown actions before reaching here
-    (`lightcone.resolve` returns the empty set, `check_access` raises 400), so this only closes
-    a hole for a future caller that does not."""
+    One deliberate difference, in the fail-closed direction: an *unknown* action name propagates
+    nothing, because `Mask.allows` answers False for any verb outside CRUDEASIO. A NULL mask
+    would instead pass everything, since `action not in None` never runs — the `is not None`
+    check short-circuits first. Both in-tree callers already reject unknown actions before
+    reaching here (`lightcone.resolve` returns the empty set, `check_access` raises 400), so this
+    only closes a hole for a future caller that does not."""
     if not root_ids:
         return set()
     seen = set(root_ids)
@@ -722,6 +875,16 @@ def list_origin_descendants(db: LatticeDatabase, root_ids: list, action: str) ->
         for node in frontier:
             try:
                 edges = db.graph.edges_of(node, label=_CONTAINS, direction="out") or []
+            except EdgesTruncated:
+                # Raised rather than swallowed. This walk is the light cone: `lightcone.resolve`
+                # seeds from it and hands the result to `OracleService` to derive content keys.
+                # `except Exception: continue` suits an unreadable edge row, where dropping a node
+                # under-reaches and is fail-closed; a truncated read means "there are more members
+                # and I did not look at them", and continuing past it
+                # produces an authorization answer that is quietly different from the one the graph
+                # supports. Nothing above this can distinguish that from a genuinely small
+                # container, so it has to travel.
+                raise
             except Exception:
                 continue
             for e in edges:
@@ -743,10 +906,18 @@ def list_origin_descendants(db: LatticeDatabase, root_ids: list, action: str) ->
 
 def get_relationship_target(db: LatticeDatabase, from_root_id: str,
                             relationship: str) -> Optional[str]:
-    """The root_id behind the first outbound edge with this typed relationship label."""
+    """The root_id behind the first outbound edge with this typed relationship label.
+
+    "First" is now a defined thing: `edges_of` orders by `edge_key`, which is
+    `blake2b(src ‖ dst ‖ label)` and therefore identical on every node. Before that ordering this
+    function returned whichever row SQLite visited first, so a node could disagree with its peer
+    about a typed relationship's target while both held the same edges.
+    """
     try:
         for e in (db.graph.edges_of(from_root_id, label=relationship, direction="out") or []):
             return e.get("dst")
+    except EdgesTruncated:
+        raise
     except Exception:
         pass
     return None
@@ -853,7 +1024,7 @@ def archive_artifact(db: LatticeDatabase, user_id: str, artifact_id: str) -> boo
 # applied to that small set. `_grant_docs` — the whole plane — is for the two questions that
 # genuinely range over all of it.
 #
-# Expiry: store compared `expires_at > DATE_ISO8601(DATE_NOW())` as strings. `_unexpired` parses
+# Expiry: store compared `expires_at > DATE_ISO8601(DATE_NOW)` as strings. `_unexpired` parses
 # both sides when it can (tolerating 'Z' vs '+00:00' — the string compare misorders those) and
 # falls back to the string compare only when parsing fails.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -871,7 +1042,7 @@ def _doc_mask(d: Dict[str, Any]):
     The lattice reads grants as dicts and never as entities on the hot paths, so the natural
     spelling here was `d.get("can_read")` — half the question. A `deny`-effect grant carries
     the bits naming what it denies, so the bare `.get` answers True for it and the grant reads
-    as authorizing. That is audit S1, in the encoding the entity-side detectors cannot see.
+    as authorizing. That is, in the encoding the entity-side detectors cannot see.
 
     `SimpleNamespace` rather than handing the mapping straight to `mask_of`: `grant_is_allow`
     is `getattr`-duck-typed, and a dict would present as having no `effect` at all — closed,
@@ -966,7 +1137,9 @@ def get_grant_by_id(db: LatticeDatabase, grant_id: str) -> Optional[Any]:
     return from_lattice_doc(raw, GrantEntity)
 
 
-def update_grant(db: LatticeDatabase, entity: Any) -> Optional[Any]:
+#: NOT `Optional`, same shape as `update_artifact` above: one
+#: `return entity`, no error path, and callers testing it wrote dead guards.
+def update_grant(db: LatticeDatabase, entity: Any) -> Any:
     db.artifacts.put_artifact(_to_grant_doc(entity))
     return entity
 
@@ -1063,7 +1236,13 @@ def upsert_user_collection_grant(db: LatticeDatabase, *, user_id: str, collectio
             setattr(user_grant, k, v)
         if name is not None:
             user_grant.name = name
-        return (update_grant(db, user_grant) or user_grant), True
+        #: NO `or user_grant` FALLBACK. `update_grant` has one
+        #: `return entity` and `GrantEntity` defines neither `__bool__` nor `__len__`, so the
+        #: right-hand side was never evaluated. It read as "use the stored copy if the write
+        #: gave nothing back", which is a sentence about a failure mode this function does not
+        #: have — and the two sides were the same object anyway.
+        update_grant(db, user_grant)
+        return user_grant, True
     grant = GrantEntity(
         id=str(_uuid.uuid4()),
         resource_id=collection_id,
@@ -1169,13 +1348,36 @@ def get_commit_by_id(db: LatticeDatabase, commit_id: str) -> Optional[Dict[str, 
 
 
 def get_commits_for_collection(db: LatticeDatabase, collection_id: str) -> list:
-    """Commits whose item set touches this collection, newest first (raw dicts)."""
-    item_ids = {d.get("id") for d in _typed_docs(db, _COMMIT_ITEM_CT)
-                if d.get("collection_id") == collection_id}
+    """Commits whose item set touches this collection, newest first (raw dicts).
+
+    Each dict carries its resolved `adds` / `removes`, derived from `CommitItem` — the only
+    place the changed version-ids live. Without this, the commits API would publish `adds: []`
+    and `removes: []` for every commit: a changeset history in which nothing ever changed, and
+    silent because the route would default the missing attributes to `[]`.
+
+    It costs nothing extra to resolve here: this function already scans every `CommitItem` doc to
+    decide which commits touch the collection, so resolving from that same scan avoids the
+    per-commit lookup a router-level fix would add.
+
+    Scoped to `collection_id`: a commit spanning two collections reports only the ids that moved
+    in this one, which is what a caller asking for this container's history means."""
+    items_here = {}
+    for d in _typed_docs(db, _COMMIT_ITEM_CT):
+        if d.get("collection_id") == collection_id and d.get("id"):
+            items_here[d["id"]] = d
     out = []
     for c in _typed_docs(db, _COMMIT_CT):
-        if set(c.get("item_ids") or []) & item_ids:
-            out.append({k: v for k, v in c.items() if k not in _LATTICE_INTERNAL})
+        mine = [items_here[i] for i in (c.get("item_ids") or []) if i in items_here]
+        if not mine:
+            continue
+        row = {k: v for k, v in c.items() if k not in _LATTICE_INTERNAL}
+        adds, removes = [], []
+        for it in mine:
+            target = removes if it.get("item_type") == "remove" else adds
+            target.extend(it.get("artifact_version_ids") or [])
+        row["adds"] = adds
+        row["removes"] = removes
+        out.append(row)
     out.sort(key=lambda c: c.get("timestamp") or "", reverse=True)
     return out
 
@@ -1192,7 +1394,20 @@ def is_materialized(db: LatticeDatabase, artifact_id: str) -> bool:
 
 
 def mark_materialized(db: LatticeDatabase, artifact_id: str) -> None:
-    """Idempotent (upsert) — called wherever indexing is enqueued."""
+    """Idempotent (upsert) — called by the index JOB, after the work.
+
+    Called after the work, not at enqueue time: a marker written at enqueue time would say work
+    was queued while its reader treats it as work done. Called from
+    `pipeline_unified._mark_indexed`.
+
+    Best-effort by design: the marker is an optimisation, and failing to write one costs a
+    re-index, not correctness. It is not best-effort silently: the reader
+    (`services/workspace_service.py:1164`) treats a missing marker as "not yet indexed", which is
+    the safe direction, and a present one as "skip" — so a silent write failure is survivable, but
+    a silent write is not diagnosable, which is why a write failure is logged at debug with the
+    artifact id and the exception type. The swallow itself is kept deliberately, because raising
+    here would fail an ingest over a cache entry.
+    """
     from datetime import datetime, timezone
     try:
         db.artifacts.put_artifact({
@@ -1200,8 +1415,9 @@ def mark_materialized(db: LatticeDatabase, artifact_id: str) -> None:
             "content_type": _MATERIALIZED_CT,
             "at": datetime.now(timezone.utc).isoformat(),
         })
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 — see the docstring: survivable, but not silent
+        _log.debug("mark_materialized(%s) did not write: %s: %s",
+                   artifact_id, type(exc).__name__, exc)
 
 
 # ── from-import compat: the handful of names routers/services import directly ─
@@ -1228,10 +1444,108 @@ _SIDE_PLANE_CTS = frozenset({
 _decrypt_artifact_content = _boundary.decrypt_artifact_content
 
 
-def query_documents(db: LatticeDatabase, cls: Type[T], collection_name: str,
-                    filters: dict) -> list:
+def _is_missing_acting_principal(exc: BaseException) -> bool:
+    """Is this decryption failure really "nobody is acting", rather than "the bytes will not open"?
+
+    Walks `__cause__`/`__context__` because the boundary wraps the original. Matched on the
+    exception TYPE, not on message text: a message is prose and changes, and a scan that silently
+    skipped every document because a rename broke a substring match is exactly the failure this
+    guard exists to prevent.
+    """
+    try:
+        from mantle.services.acting_principal import NoActingPrincipal
+    except Exception:
+        return False
+    seen = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, NoActingPrincipal):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _is_key_custody_denial(exc: BaseException) -> bool:
+    """Is this a REFUSAL to issue key material, rather than bytes that will not open?
+
+    `KeyCustodyDenied` is the base every refusal subclasses, chosen over listing `GrantDenied` by
+    hand for the reason its own docstring gives: "any new refusal type is caught by the first
+    clause automatically, without a hand-listed tuple that a new subclass could silently fall
+    through into". Matched on TYPE and walked through `__cause__`/`__context__`, like
+    `_is_missing_acting_principal`, because the boundary wraps the original.
+
+    A denial is NOT damage. `propagate='[]'` on a `contains` edge is `attenuation`'s absorbing
+    deny — a deliberate statement that no authority crosses that edge — and an artifact behind one
+    is not broken, it is simply not this caller's to read.
+    """
+    try:
+        from mantle.services.acting_principal import KeyCustodyDenied
+    except Exception:
+        return False
+    seen = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, KeyCustodyDenied):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def iter_documents(db: LatticeDatabase, cls: Type[T], collection_name: str,
+                   filters: dict, *, unreadable: str = "raise",
+                   skipped_out: Optional[list] = None,
+                   denied: str = "raise",
+                   denied_out: Optional[list] = None):
     """Equality-filtered scan of one typed plane (store's generic AQL helper).
-    `artifacts` = every doc NOT in a typed side-plane (store's collection scoping preserved)."""
+    `artifacts` = every doc NOT in a typed side-plane (store's collection scoping preserved).
+
+    `unreadable` decides what a document that cannot be hydrated does to the scan:
+
+      * ``"raise"`` (default) — it ends the scan. A read that returns a short list because one
+        document was unreadable is worse than no read: the caller cannot tell a filtered result
+        from a truncated one, so every ordinary caller keeps this.
+      * ``"skip"`` — it is left out and the scan continues. This is for maintenance passes, whose
+        job is to do what can be done to the rest, and only where the caller reports what it
+        skipped. `search.init_search` is the case it exists for: without it, a single artifact whose
+        content was written under a key the node does not hold raises out of this loop and blocks
+        the rebuild of every other document.
+
+    `skipped_out`, when given, receives one `(id, reason)` per skipped document. An explicit
+    collector rather than an attribute on the returned list: a list cannot carry one, and a caller
+    that must report what it could not read should have to ask for that, not discover it.
+
+    Skipping is opt-in and per call rather than a property of the store, because "carry on without
+    it" is a statement about what the CALLER is doing, and a store cannot know that.
+
+    `denied` is the same shape for a DIFFERENT thing, and the two are kept apart on purpose:
+
+      * ``unreadable`` — the bytes will not open. Damage.
+      * ``denied`` — key custody was REFUSED. The caller may not read this document, which is a
+        real and correct answer rather than a fault. `propagate='[]'` on a `contains` edge is
+        `attenuation`'s absorbing deny; an artifact behind one is working exactly as configured.
+
+    Folding a denial into ``unreadable`` would file a deliberate authorization decision as
+    corruption, and would report a store that is behaving correctly as a damaged one.
+
+      * ``"raise"`` (default) — a denial ends the scan. `KeyCustodyDenied`'s own docstring states
+        the rule this keeps: **"not authorized" must not become "no results"**. Every ordinary
+        caller keeps this, so no read can quietly narrow to what the caller happens to be allowed.
+      * ``"omit"`` — the document is left out and the scan continues, for a maintenance pass whose
+        job is to act on what it MAY read. Indexing a document you may not read is not a thing
+        that should happen, so for those callers omission is the correct behaviour rather than a
+        concession. `denied_out` receives one `(id, reason)` per omitted document.
+
+    A pass that is denied EVERYTHING still raises, even under ``"omit"``: that is a
+    misprovisioned run, not a store with a few deny edges in it, and returning an empty list
+    would report "nothing to do" for "I was allowed to see nothing".
+    """
+    if unreadable not in ("raise", "skip"):
+        raise ValueError("query_documents: unreadable must be 'raise' or 'skip', got %r"
+                         % (unreadable,))
+    if denied not in ("raise", "omit"):
+        raise ValueError("query_documents: denied must be 'raise' or 'omit', got %r" % (denied,))
     if collection_name == COLLECTION_ARTIFACTS:
         docs = (d for d in db.artifacts.list_artifacts()
                 if d.get("content_type") not in _SIDE_PLANE_CTS)
@@ -1241,11 +1555,97 @@ def query_documents(db: LatticeDatabase, cls: Type[T], collection_name: str,
             raise ValueError("query_documents: unmapped collection %r on the lattice"
                              % (collection_name,))
         docs = _typed_docs(db, ct)
-    out = []
+    skipped: list = []
+    refused: list = []
+    considered = 0
     for d in docs:
-        if all(d.get(k) == v for k, v in (filters or {}).items()):
-            out.append(from_lattice_doc(d, cls))
-    return out
+        if not all(d.get(k) == v for k, v in (filters or {}).items()):
+            continue
+        considered += 1
+        if unreadable == "raise" and denied == "raise":
+            yield from_lattice_doc(d, cls)
+            continue
+        _id = str(d.get("id") or d.get("_key") or "?")   # off the RAW doc: hydration is what failed
+        try:
+            hydrated = from_lattice_doc(d, cls)
+        # A refusal needs its OWN clause: `GrantDenied` is `KeyCustodyDenied` -> `PermissionError`
+        # and is NOT a `ContentDecryptionError`, so it reaches here unwrapped and the clause below
+        # never sees it. Measured on 71/home — one `GrantDenied` escaping this loop ended a
+        # 2,165,867-artifact rebuild. `NoActingPrincipal` subclasses the same base, so the
+        # fails-for-every-document case is re-raised here exactly as it is below.
+        except _KeyCustodyDenied as exc:
+            if denied == "raise" or _is_missing_acting_principal(exc):
+                raise
+            refused.append((_id, "%s: %s" % (type(exc).__name__, exc)))
+        except _boundary.ContentDecryptionError as exc:
+            # The boundary also WRAPS a refusal in some paths, so the same question is asked again
+            # on the chain. A deny is not damage: it is `attenuation`'s absorbing deny doing its
+            # job, and filing it under `unreadable` would report a correctly-configured store as a
+            # corrupted one.
+            if _is_key_custody_denial(exc) and not _is_missing_acting_principal(exc):
+                if denied == "raise":
+                    raise
+                refused.append((_id, "%s: %s" % (type(exc).__name__, exc)))
+                continue
+            # Narrow by design. `ContentDecryptionError` covers two different things, and only one
+            # of them is a document worth skipping:
+            #
+            #   * the content does not decrypt with the keys this node holds — data, and the case
+            #     this mode exists for;
+            #   * the CALLER has no acting principal, so no key material could be issued at all
+            #     (`acting_principal.NoActingPrincipal`, surfaced through the same boundary).
+            #
+            # The second is a misconfigured run, not a damaged store, and it fails for EVERY
+            # document. Skipping it would rebuild an index from whatever happened to be readable
+            # and report that as complete — measured here, 142 healthy artifacts read as unreadable
+            # from a script that simply had no principal in scope. So that case is re-raised: a run
+            # that cannot read anything must say so, not quietly produce a smaller index.
+            if unreadable == "raise" or _is_missing_acting_principal(exc):
+                raise
+            skipped.append((_id, "%s: %s" % (type(exc).__name__, exc)))
+        else:
+            yield hydrated
+    if skipped:
+        if skipped_out is not None:
+            skipped_out.extend(skipped)
+        _log.warning("query_documents(%s): %d document(s) could not be hydrated and were skipped; "
+                     "first is %s (%s)", collection_name, len(skipped), skipped[0][0], skipped[0][1])
+    if refused:
+        # Denied EVERYTHING is a misprovisioned run, not a store with a few deny edges in it.
+        # Returning [] there would report "nothing to do" for "I was allowed to see nothing" —
+        # the same failure the `NoActingPrincipal` guard above exists to prevent, one layer out.
+        if considered and len(refused) == considered:
+            raise PermissionError(
+                "query_documents(%s): key custody was refused for ALL %d document(s), so this "
+                "caller may read none of them. Returning an empty result would report 'nothing to "
+                "do' for 'I was allowed to see nothing'. First: %s (%s)"
+                % (collection_name, considered, refused[0][0], refused[0][1]))
+        if denied_out is not None:
+            denied_out.extend(refused)
+        _log.warning("query_documents(%s): %d of %d document(s) refused key custody and were "
+                     "omitted — these are deny decisions, not damage; first is %s (%s)",
+                     collection_name, len(refused), considered, refused[0][0], refused[0][1])
+
+
+
+def query_documents(db: LatticeDatabase, cls: Type[T], collection_name: str,
+                    filters: dict, *, unreadable: str = "raise",
+                    skipped_out: Optional[list] = None,
+                    denied: str = "raise",
+                    denied_out: Optional[list] = None) -> list:
+    """:func:`iter_documents`, materialised. The list form every ordinary caller wants.
+
+    A scan of the artifacts plane hydrates every document, which means DECRYPTING every
+    document, so the list is far larger than the rows it came from. Measured on 71/home: the
+    materialised form of 2,165,743 artifacts drove a reindex past 16 GB of working set and into
+    the pagefile before it had written a single index entry. A caller walking the whole plane
+    should iterate:func:`iter_documents` in bounded chunks and let each chunk fall out of scope;
+    this wrapper is for the bounded reads — one collection, one filter — where the whole result
+    is the point and it is small.
+    """
+    return list(iter_documents(db, cls, collection_name, filters,
+                               unreadable=unreadable, skipped_out=skipped_out,
+                               denied=denied, denied_out=denied_out))
 
 
 def get_collections_by_owner_id(db: LatticeDatabase, owner_id: str) -> list:
@@ -1280,6 +1680,11 @@ def _collection_ids_for_root(db: LatticeDatabase, root_id: str,
             if verdict:
                 continue
             out.append(cid)
+    except EdgesTruncated:
+        # "Every collection holding an edge to this root" is what the sharing checks and the
+        # collection breadcrumbs read; a clipped list here quietly turns a shared artifact into an
+        # unshared one.
+        raise
     except Exception:
         return out
     return out
@@ -1340,6 +1745,7 @@ __all__ = [
     "CollectionEntity",
     "create_collection", "get_collection_by_id", "update_collection", "delete_collection",
     "get_last_order_key", "add_artifact_to_collection", "remove_artifact_from_collection",
+    "origin_chain", "OriginChainUnterminated", "ORIGIN_WALK_CEILING",
     "set_edge_order_key", "reorder_collection_artifacts", "list_collection_artifacts",
     "count_other_containers_for_root",
     "GrantEntity",

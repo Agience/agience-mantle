@@ -118,7 +118,7 @@ def evict(store, *, budget: int) -> Dict[str, Any]:
         for d in page:
             scored.append((current_mass(d, now=now, tau=tau), d["id"]))
         after = page[-1]["id"]
-        # A short page is the last page — true against the LIMIT THAT WAS ASKED FOR, so it is
+        # A short page is the last page — true against the limit that was asked for, so it is
         # tested against that same name and never a second literal.
         if len(page) < _PAGE:
             break

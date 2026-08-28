@@ -52,10 +52,10 @@ CONTEXT_LABEL = "context"
 #: a permitted, navigable path that transmits no authority. It is not a new encoding; it is the
 #: value `artifacts_router` already writes on a non-lineage link, read by the one decoder.
 #:
-#: The default used to be `None`, which the column defines as *unrestricted* and the decoder
-#: turns into :data:`attenuation.TOP` — so a context edge written with no arguments propagated
-#: **every** CRUDEASIO action. A default that confers maximum authority is the wrong default for
-#: a security-relevant edge: it makes the careless write the dangerous one, and it means an
+#: A `None` default is what the column defines as *unrestricted*, and the decoder turns it into
+#: :data:`attenuation.TOP`, so a context edge written with no arguments would propagate **every**
+#: CRUDEASIO action. A default that confers maximum authority is the wrong default for a
+#: security-relevant edge: it makes the careless write the dangerous one, and it means an
 #: endpoint that forwards a caller-supplied pair without a mask hands out full authority over
 #: whatever it names. Fail-closed is the only defensible direction here, and unlike a
 #: containment edge (whose NULL default is load-bearing for a corpus already on disk) no context
@@ -67,6 +67,27 @@ CONTEXT_LABEL = "context"
 #: `None` keeps meaning what the column has always meant — this changes the *default*, never the
 #: decoding of a stored value.
 DEFAULT_CONTEXT_PROPAGATE: Tuple[str, ...] = ()
+
+#: The cap :meth:`LatticeGraphStore.edges_of` reads to when the caller does not name one.
+#:
+#: It is a memory backstop, not a page size — matched to `dst_ids_by_label`'s, because both answer
+#: "everything about this one thing" rather than "the next N". The old value was 1000 and it was
+#: reached in practice: a container with more members than that returned 1000 edges and no way to
+#: know it. Exceeding this now raises :class:`EdgesTruncated`, so the number bounds how much a
+#: single read may materialize, and never how much of the graph a caller is allowed to see.
+EDGES_OF_LIMIT = 1_000_000
+
+
+class EdgesTruncated(RuntimeError):
+    """More edges exist on this node than the read was allowed to return.
+
+    Raised rather than returning a short list because the two are indistinguishable to the caller,
+    and eight in-tree callers of `edges_of` want every edge — including the authorization light
+    cone. "I could not ask" is not "no", and a clipped edge list is the version of that mistake
+    that shows up later as a document that stopped coming back.
+
+    A caller that genuinely wants a bounded peek passes `partial_ok=True` and never sees this.
+    """
 
 
 class LatticeGraphStore(_GraphStoreABC):  # type: ignore[misc,valid-type]
@@ -229,14 +250,13 @@ class LatticeGraphStore(_GraphStoreABC):  # type: ignore[misc,valid-type]
 
     @staticmethod
     def _hash_content(row: sqlite3.Row) -> Dict[str, Any]:
-        """The node-invariant content of an existing edge row, for `edge_hash` on the XOR-out. Must
-        reconstruct exactly what was hashed in on the prior write: promoted columns + the blob props."""
-        try:
-            blob = json.loads(row["props"]) if row["props"] else {}
-        except Exception:
-            blob = {}
-        return {"force": row["force"], "propagate": row["propagate"],
-                "is_origin": row["is_origin"], "order_key": row["order_key"], **blob}
+        """The node-invariant content of an existing edge row, for `edge_hash` on the XOR-out.
+
+        :func:`_edge_row_content` is the implementation — one reconstruction shared with every
+        retirement path, because a XOR-out that does not reproduce the XOR-in byte for byte
+        strands the row's contribution in the merkle leaf permanently.
+        """
+        return _edge_row_content(row)
 
     @staticmethod
     def _unpack(e: Any) -> Tuple[str, str, str, Dict[str, Any]]:
@@ -259,17 +279,29 @@ class LatticeGraphStore(_GraphStoreABC):  # type: ignore[misc,valid-type]
                 "FROM edge WHERE edge_key = ?", (key,)).fetchone()
             if prev is None:
                 return False
-            cur.execute("DELETE FROM edge WHERE edge_key = ?", (key,))
-            if cur.rowcount < 1:
-                return False
-            # XOR the edge's contribution back out of the shared merkle tree — a delete is just
-            # xor_leaf(old_hash), XOR being its own inverse (same reason vertex delete works).
-            _seq.xor_leaf(cur, K.leaf_of(key.hex(), self.leaves),
-                          K.edge_hash(key, self._hash_content(prev)))
-            _seq.bump(cur, _schema.c_edge_total(), -1)
-            _seq.bump(cur, _schema.c_edge_label(label), -1)   # the extent falls too
-            _seq.vacate(cur, prev["_origin"])   # an accounted removal
-            return True
+            return _retire_edge_row(cur, key, label, prev, leaves=self.leaves)
+
+    def delete_edges_touching(self, node_id: str) -> int:
+        """Delete every edge with `node_id` on either side. Returns how many rows went.
+
+        An edge outliving its node is an authorization fact with nothing to anchor it.
+        `edge_key = blake2b(src ‖ dst ‖ label)` is derived from the id strings, so a dangling edge
+        is not garbage waiting on a sweep but a live row that any future artifact created with the
+        same id inherits, `is_origin=1` and `propagate` mask included. That is the
+        edge `list_origin_descendants` walks to decide who holds authority over a subtree, so a
+        delete-then-recreate silently hands the new artifact the old one's grant reach.
+
+        BOTH SIDES, and that is the point rather than thoroughness for its own sake: authority
+        descends along the arrow, so it is the INBOUND `contains` edge — the one naming this node
+        as a member of someone's collection — that confers reach over it. Deleting only the
+        outbound half would leave exactly the dangerous half behind.
+
+        The per-row accounting is `_retire_edge_row`, the same function `delete_edge` calls, so
+        this cannot drift from single-edge deletion: the merkle XOR-out, the total, the per-label
+        extent and the proper-time vacate all happen here exactly once per row.
+        """
+        with self.db.write() as cur:
+            return _retire_edges_touching(cur, node_id, leaves=self.leaves)
 
     # ── the context relation ─────────────────────────────────────────────────
     # A typed name over `add_edge` / `edges_of`, not a second write path: `add_context_edge`
@@ -313,7 +345,8 @@ class LatticeGraphStore(_GraphStoreABC):  # type: ignore[misc,valid-type]
         return self.delete_edge(context_id, node_id, CONTEXT_LABEL)
 
     def context_edges(self, node_id: str, *, direction: str = "out",
-                      limit: int = 1000) -> List[Dict[str, Any]]:
+                      limit: int = EDGES_OF_LIMIT,
+                      partial_ok: bool = False) -> List[Dict[str, Any]]:
         """Full context-edge rows on one side of `node_id`.
 
         Rows, not neighbour ids, because `is_origin` and `propagate` are the whole question a
@@ -324,7 +357,8 @@ class LatticeGraphStore(_GraphStoreABC):  # type: ignore[misc,valid-type]
         contexts this node sits in*. Both are composite index seeks (`ix_e_src` / `ix_e_dst`
         are `(src, label)` / `(dst, label)`), so neither direction is the expensive one.
         """
-        return self.edges_of(node_id, label=CONTEXT_LABEL, direction=direction, limit=limit)
+        return self.edges_of(node_id, label=CONTEXT_LABEL, direction=direction, limit=limit,
+                             partial_ok=partial_ok)
 
     @staticmethod
     def _encode(propagate: Any) -> Any:
@@ -416,21 +450,61 @@ class LatticeGraphStore(_GraphStoreABC):  # type: ignore[misc,valid-type]
         return out
 
     def edges_of(self, node_id: str, *, label: Optional[str] = None,
-                 direction: str = "out", limit: int = 1000) -> List[Dict[str, Any]]:
+                 direction: str = "out", limit: int = EDGES_OF_LIMIT,
+                 partial_ok: bool = False) -> List[Dict[str, Any]]:
         """Full edge rows, not just neighbor ids — needed wherever `force`,
         `propagate`, `is_origin` or `order_key` matter (grant propagation reads
-        `is_origin`; ordered collections read `order_key`)."""
+        `is_origin`; ordered collections read `order_key`).
+
+        Raises :class:`EdgesTruncated` rather than returning a short list. A bare `LIMIT 1000` with
+        no `ORDER BY` and a plain list back leaves a caller unable to tell a complete answer from a
+        clipped one, which is the cap discipline every other surface in the package holds. Eight
+        in-tree callers want every edge, and one of them is
+        `lattice_api.list_origin_descendants` — which means the **authorization light cone was
+        silently and non-deterministically incomplete past 1000 edges**. It also made
+        `count_children` return exactly 1000 for any larger container, and
+        `remove_artifact_from_collection` report success having removed nothing, because
+        `_find_membership` looked for its edge in a list the edge had been clipped out of.
+
+        Refusing is the discipline this store already applies wherever degradation would be
+        invisible (`ListIndexUnbuilt` rather than `[]`, `Page.truncated`, `edge_mark`'s
+        `exhaustive`). Under-reaching a light cone is fail-closed for authority, which is why it
+        was survivable — but it is silent, and silent under-reach in a search result reads as
+        "that document just isn't there".
+
+        ``partial_ok=True`` is for callers that genuinely want a bounded peek and have said so:
+        `has_children` asks for one row to answer a yes/no question, and a truncated answer is the
+        answer it wanted. Everything else gets all of them or an exception.
+
+        ``ORDER BY edge_key`` makes the result deterministic AND node-invariant — `edge_key` is
+        `blake2b(src ‖ dst ‖ label)`, identical on every node, so two nodes reading the same edge
+        set walk it in the same order. That matters beyond tidiness:
+        `lattice_api.get_relationship_target` returns "the first outbound edge with this label",
+        and without the ordering that is whichever row SQLite happens to visit first.
+        """
         key = "src" if direction == "out" else "dst"
         params: List[Any] = [node_id]
         clause = ""
         if label:
             clause = " AND label = ?"
             params.append(label)
-        params.append(int(limit))
+        capped = max(0, int(limit))
+        # One more than asked for: the extra row is how "there are more" is learned without a
+        # second query, and it is the same trick `edge_mark` uses for its `exhaustive` term.
+        params.append(capped + 1)
         rows = self.db.read().execute(
             "SELECT src, dst, label, force, propagate, is_origin, order_key, "
-            "_origin, _seq, props FROM edge WHERE %s = ?%s LIMIT ?" % (key, clause),
-            params).fetchall()
+            "_origin, _seq, props FROM edge WHERE %s = ?%s ORDER BY edge_key LIMIT ?"
+            % (key, clause), params).fetchall()
+        if len(rows) > capped:
+            if not partial_ok:
+                raise EdgesTruncated(
+                    "%s has more than %d %sedge(s) %sbound; refusing to return a clipped list "
+                    "that a caller cannot tell from a complete one — raise `limit` or pass "
+                    "`partial_ok=True` if a bounded peek is what you meant"
+                    % (node_id, capped, ("%s " % label) if label else "", direction)
+                )
+            rows = rows[:capped]
         return [self._row(r) for r in rows]
 
     def dst_ids_by_label(self, label: str, *, limit: int = 1_000_000) -> List[str]:
@@ -643,3 +717,92 @@ def edge_mark(db: LatticeConn, node_id: str, *, direction: str = "out",
         if isinstance(v, int) and v > hi:
             hi = v
     return (min(len(rows), cap), hi, len(rows) <= cap)
+
+
+# ── retiring edges: one accounting, three callers ────────────────────────────────────────────
+def _edge_row_content(row: Any) -> Dict[str, Any]:
+    """The node-invariant content of an existing edge row, for `edge_hash` on the XOR-out.
+
+    Must reconstruct EXACTLY what was hashed in on the prior write — promoted columns plus the
+    blob props — or the XOR does not cancel and the row's contribution is stranded in the leaf
+    forever. `LatticeGraphStore._hash_content` is this function; `add_edge`'s XOR-out and every
+    retirement below go through the one reconstruction for that reason.
+    """
+    try:
+        blob = json.loads(row["props"]) if row["props"] else {}
+    except Exception:
+        blob = {}
+    return {"force": row["force"], "propagate": row["propagate"],
+            "is_origin": row["is_origin"], "order_key": row["order_key"], **blob}
+
+
+def _retire_edge_row(cur: Any, key: bytes, label: str, prev: Any, *, leaves: int) -> bool:
+    """Delete one already-read edge row and account for it. `prev` must carry
+    `_origin, force, propagate, is_origin, order_key, props`.
+
+    The four things a deletion owes, in the caller's transaction:
+
+    1. XOR the edge's contribution back out of the shared merkle tree. XOR is its own inverse, so
+       a delete is just `xor_leaf(old_hash)` — the same reason vertex delete works.
+    2. Drop the edge total.
+    3. Drop the per-label extent, in the same transaction as the total so the two cannot drift.
+    4. Vacate the origin's proper-time slot — an accounted removal.
+
+    Single-sourced because there are now three callers (`delete_edge`, `delete_edges_touching`,
+    and the vertex delete path through :func:`retire_edges_touching`) and an accounting that is
+    written out three times is an accounting that will be wrong in one of them. `live_rows +
+    vacated == last_seq` is a checked invariant of this store; a retirement that skipped step 4
+    would break it silently, and one that skipped step 1 would leave every node unable to agree
+    on a merkle root.
+    """
+    cur.execute("DELETE FROM edge WHERE edge_key = ?", (key,))
+    if cur.rowcount < 1:
+        return False
+    _seq.xor_leaf(cur, K.leaf_of(key.hex(), leaves),
+                  K.edge_hash(key, _edge_row_content(prev)))
+    _seq.bump(cur, _schema.c_edge_total(), -1)
+    _seq.bump(cur, _schema.c_edge_label(label), -1)
+    _seq.vacate(cur, prev["_origin"])
+    return True
+
+
+def _retire_edges_touching(cur: Any, node_id: str, *, leaves: int) -> int:
+    """Retire every edge with `node_id` on either side, in the caller's transaction.
+
+    Reads the rows first and retires them by `edge_key`, rather than issuing one
+    `DELETE ... WHERE src = ? OR dst = ?`: the accounting needs each row's `label` and `_origin`
+    and its content for the merkle XOR-out, none of which survive a bulk delete. A self-edge
+    matches both sides, so the keys are de-duplicated — retiring one twice would double-count the
+    vacate and break `live_rows + vacated == last_seq`.
+
+    No `LIMIT`. Every other read in this module that caps says so and lets the caller see it
+    (`edges_of`, `edge_mark`); a capped DELETE cannot, because the rows it left behind are
+    indistinguishable from rows that were never there — and here they are exactly the dangling
+    authorization edges the deletion exists to remove.
+    """
+    rows = cur.execute(
+        "SELECT edge_key, label, _origin, force, propagate, is_origin, order_key, props "
+        "FROM edge WHERE src = ? OR dst = ?", (node_id, node_id)).fetchall()
+    seen: set = set()
+    gone = 0
+    for r in rows:
+        key = r["edge_key"]
+        if key in seen:
+            continue                      # a self-edge matched both sides
+        seen.add(key)
+        if _retire_edge_row(cur, key, r["label"], r, leaves=leaves):
+            gone += 1
+    return gone
+
+
+def retire_edges_touching(db: LatticeConn, node_id: str, *, leaves: int) -> int:
+    """Retire every edge on either side of `node_id`. Module-level for the same reason
+    :func:`edge_mark` is: the artifact store shares this `LatticeConn`, and its delete path must
+    take the edges with the vertex without also being handed a graph store.
+
+    `LatticeConn.write()` is reentrant, so calling this from inside an open write transaction
+    joins it rather than opening a second one — which is what makes "the vertex and its edges go
+    together" atomic rather than merely adjacent.
+    """
+    with db.write() as cur:
+        return _retire_edges_touching(cur, node_id, leaves=leaves)

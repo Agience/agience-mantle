@@ -12,7 +12,7 @@ separate backend here; :mod:`services.grant_key_service` owns that path.
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from mantle.entities.grant import Grant as GrantEntity, grant_is_allow, grant_is_deny
 

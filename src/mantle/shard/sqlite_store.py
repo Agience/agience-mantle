@@ -350,8 +350,37 @@ def _open_lattice_content(root, keys_dir, db_path):
             raise KeyError("no origin_root for collection %r" % collection)
         return collection_key(root_secret, origin_root)
 
+    # ── keys from EARLIER ERAS, so a rotation does not orphan what is already on disk ────────
+    # A rotation replaces `content.key` and rewrites nothing, so the store immediately holds two
+    # populations that differ only in which key opens them. Measured 2026-08-25 on 71/home after
+    # `content.key` was replaced on 08-24 at 11:05: of 197 blobs sampled across 12 random shards,
+    # 138 opened only under the previous key and 59 only under the current one, and NONE were
+    # corrupt. Every CAS-backed artifact on the node — 313,982 of them — had stopped being
+    # readable, and the surfaced error named a missing object rather than a key.
+    #
+    # Named by CONFIGURATION, never discovered: `MANTLE_CONTENT_KEY_PREVIOUS` is a path list
+    # (`os.pathsep`-separated). A key file that merely appears next to the current one must not
+    # silently change what this node can decrypt — that is the same class of surprise as the
+    # rotation itself. An unreadable or wrong-length entry is skipped with a warning rather than
+    # failing the open: a node that cannot read one previous era must still serve the current one.
+    import logging as _logging
+    log = _logging.getLogger(__name__)
+    previous: list = []
+    for candidate in (os.environ.get("MANTLE_CONTENT_KEY_PREVIOUS") or "").split(os.pathsep):
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        try:
+            secret = hashlib.blake2b(Path(candidate).read_bytes().strip(), digest_size=32).digest()
+            previous.append(shared_content_key(secret))
+        except Exception:
+            log.warning("previous content key %r could not be read; skipping it", candidate)
+    if previous:
+        log.info("content cache: %d previous key era(s) configured for reads", len(previous))
+
     return FileContentCache(str(cas), key=shared_content_key(root_secret),
-                            legacy_key_for_collection=legacy_key_for if roots else None)
+                            legacy_key_for_collection=legacy_key_for if roots else None,
+                            previous_keys=previous)
 
 
 def _import_content_tier():
@@ -370,7 +399,7 @@ def _import_content_tier():
         return None
 
 
-def _open_content_tier(content, keys_dir):
+def _open_content_tier(content, keys_dir, *, cred_dir=None):
     """The one read path on the lattice backend: `FileContentCache` inside the mantle
     `TieredContentStore`, with the S3/CDN mirror behind it when the box has creds.
 
@@ -388,11 +417,21 @@ def _open_content_tier(content, keys_dir):
     if imp is None:
         return None
     TieredContentStore, content_cipher = imp
-    try:
-        from mantle.shard.content_tier import open_ovh_store
-        remote = open_ovh_store(Path(keys_dir))
-    except Exception:
-        remote = None
+    # `keys_dir` holds the store's CIPHER; `cred_dir` (the service keys dir) holds the mirror's
+    # CREDENTIALS. They are different kinds of secret and need not sit together, so each is tried
+    # rather than assuming one directory has both — a node whose `content.key` lives beside its
+    # store and whose `ovh.*` keys live in `KEYS_DIR` is a normal configuration, not a broken one.
+    remote = None
+    for _d in (cred_dir, keys_dir):
+        if not _d:
+            continue
+        try:
+            from mantle.shard.content_tier import open_ovh_store
+            remote = open_ovh_store(Path(_d))
+        except Exception:
+            remote = None
+        if remote is not None:
+            break
     if type(content).__name__ != "FileContentCache":
         # No per-collection local cache to front — e.g. a node holding only an imported index (no
         # cas/ dir and no collection origin_roots, exactly the wiki-index-on-lumen case). Without a

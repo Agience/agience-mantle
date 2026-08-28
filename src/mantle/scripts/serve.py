@@ -14,7 +14,7 @@ This is a thin wrapper and stays one: every flag below maps to a uvicorn paramet
 name, and anything uvicorn offers that is not here is still reachable by invoking uvicorn
 directly. `uvicorn mantle.main:app --host 0.0.0.0 --port 8081` remains exactly equivalent.
 
-⚠ `KEYS_DIR` must hold a keyset before this will boot — `main.py`'s lifespan loads key material
+`KEYS_DIR` must hold a keyset before this will boot — `main.py`'s lifespan loads key material
 off disk and refuses to invent it. `mantle-init-keys` writes a throwaway one for development.
 """
 from __future__ import annotations
@@ -54,7 +54,8 @@ def main(argv: list | None = None) -> int:
     # Imported here rather than at module scope so `--help` works, and reports the real defaults,
     # in an environment where the `[service]` extra is not installed.
     #
-    # ⚠ THE BASE INSTALL PUTS THIS COMMAND ON THE PATH BUT CANNOT RUN IT. `[project.scripts]`
+    # The base install puts this command on the path without being able to run it.
+    # `[project.scripts]`
     # declares `mantle-serve` unconditionally, while uvicorn arrives only with `[service]` — so
     # `pip install agience-mantle` followed by `mantle-serve` is a reachable first move, and the
     # bare `ModuleNotFoundError: No module named 'uvicorn'` it used to raise names the missing

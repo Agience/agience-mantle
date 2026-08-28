@@ -3,6 +3,7 @@
 # so the pin is already in effect by the time numpy loads. Setting it again at the top of
 # this file keeps that guarantee independent of import order elsewhere in the suite.
 import os as _os
+import time as _time
 
 _os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 del _os
@@ -107,7 +108,7 @@ def _init_test_jwt_keys():
     """
     Generate an in-memory RSA key pair so create_jwt_token / verify_token work
     in tests without key files on disk.  Mirrors what the init container does at
-    runtime so tests never need to call init_jwt_keys() directly.
+    runtime so tests never need to call init_jwt_keys directly.
     """
     from cryptography.hazmat.primitives.asymmetric import rsa
     from cryptography.hazmat.primitives import serialization
@@ -146,7 +147,7 @@ def _test_keys_base(tmp_path_factory):
     but it is created HERE rather than in the system temp directory, and this is a performance
     fix worth ~500x on Windows.
 
-    ``tempfile.mkdtemp()`` puts its directory in ``%TEMP%``, and the fixture below never removed
+    ``tempfile.mkdtemp`` puts its directory in ``%TEMP%``, and the fixture below never removed
     it, so every suite run leaked one directory per test (~3000) into a directory shared with
     every other program on the machine. On NTFS the cost of creating an entry grows with the
     number of entries already present — 8.3 short-name generation has to scan for a free alias
@@ -363,14 +364,14 @@ collect_ignore: list = []
 _IGNORE_UNCOLLECTABLE: set = set()
 
 # The seeds/types package tree is split across repos: seeds live at
-# `agience-bundle/package/seeds`; types live at `agience-crystal/src/types`, with
+# `agience-observe/package/seeds`; types live at `agience-crystal/src/types`, with
 # a vendored copy at `agience-chorus/src/astra/web/vendor/package/types`.
 # `_package_root` is the one place that resolves both locations, so the gate here
 # and the tests below it agree on where the tree lives.
 #
-#     MANTLE_PACKAGE_ROOT=<genesis>/agience-bundle/package python -m pytest -q tests
+#     MANTLE_PACKAGE_ROOT=<workspace>/agience-observe/package python -m pytest -q tests
 #
-# points the gate at the bundle tree. Because that root holds seeds but not
+# points the gate at the observe package tree. Because that root holds seeds but not
 # types, the seed-dependent tests run and the type-dependent ones still skip —
 # reviving the type-dependent tests needs `_package_root` to resolve a second,
 # separate root for `types/`.
@@ -386,7 +387,7 @@ _TREE_DEPENDENT = {
     "test_seed_drift.py",                      # asserts seed files match manifest/persona lists
 }
 
-#: A roster of BARE FILENAMES matched against `item.fspath.name`, so a renamed file drops out of the
+#: A roster of bare filenames matched against `item.fspath.name`, so a renamed file drops out of the
 #: gate without anything failing — the marker simply stops being applied, and on a machine with the
 #: tree mounted nothing looks different at all. Checked here, at collection, where a stale name is
 #: an immediate loud error rather than a skip that quietly stops happening.
@@ -408,13 +409,13 @@ assert not _TREE_DEPENDENT_MISSING, (
 def pytest_collection_modifyitems(config, items):
     """Quarantine inherited tests that don't apply to standalone Mantle."""
     # (2) Seed/type-tree tests — only when that tree isn't present.
-    # `_package_root.have_tree()` is the one place that answers this, so the gate
+    # `_package_root.have_tree` is the one place that answers this, so the gate
     # and the tree-dependent tests always agree on whether the tree is mounted.
     if _have_tree():
         return
     skip = pytest.mark.skip(
         reason="requires a package root holding BOTH seeds/ and types/ — the tree is SPLIT: "
-               "seeds at agience-bundle/package/seeds, types at agience-crystal/src/types. "
+               "seeds at agience-observe/package/seeds, types at agience-crystal/src/types. "
                "NOT in agience-origin. See the note above."
     )
     for item in items:
@@ -422,3 +423,120 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip)
 
 
+# ── the source-race re-verify ────────────────────────────────────────────────────────────────────
+# 42 test files in this suite `ast.parse` source off disk, 4 of them across into sibling repos,
+# and seven interactive sessions edit this workspace while a 6-9 minute run is in flight. Four full
+# runs gave failure sets of 2 / 4 / 0 / 9, largely disjoint, all passing in isolation; two were
+# traced to the minute to another session rewriting the exact file being parsed.
+#
+# Re-verify, not retry: a failed test is rerun once, and only
+# when a source file was written while that test ran. When the tree is quiet nothing is rerun, so a
+# genuinely flaky test still fails and stays visible — which is the whole difference between this
+# and a blanket retry, and the reason a retry in a gate is a thing to add deliberately.
+#
+# Both outcomes are reported at the end of the run: a rescue is a line with a number attached, so
+# the question *"is this race worth more effort"* becomes measurable instead of anecdotal.
+from . import source_race as _race  # noqa: E402
+
+
+def pytest_sessionstart(session):
+    _race.mark_suite_start()
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_protocol(item, nextitem):
+    """Owns the protocol, it does not wrap it — and the difference is the whole mechanism.
+
+    The wrapper version ran the protocol, saw the failure, reran, and logged the passing reports.
+    The run still ended `1 failed, 1 passed` and exited 1: by the time a wrapper resumes, the
+    first failure has already been reported, and nothing can un-report it. The rescue printed and
+    changed nothing — a mechanism that announces a result it did not produce.
+
+    Running both attempts with `log=False` and reporting only the outcome that stands is what makes
+    the rescue real. `logstart`/`logfinish` are emitted by hand because taking over the protocol
+    means taking over the whole of it.
+    """
+    from _pytest.runner import runtestprotocol
+
+    item.ihook.pytest_runtest_logstart(nodeid=item.nodeid, location=item.location)
+    started = _time.time()
+    reports = runtestprotocol(item, nextitem=nextitem, log=False)
+
+    if any(r.failed for r in reports):
+        moved = _race.the_tree_moved_during(started)
+        if moved:
+            # The tree moved while this test ran, so its failure may be a parse of a file that was
+            # being rewritten. Ask once more, against what is on disk now.
+            second = runtestprotocol(item, nextitem=nextitem, log=False)
+            if any(r.failed for r in second):
+                _race.CONFIRMED.append((item.nodeid, len(moved)))
+            else:
+                _race.RESCUES.append((item.nodeid, len(moved)))
+            reports = second
+
+    for r in reports:
+        item.ihook.pytest_runtest_logreport(report=r)
+    item.ihook.pytest_runtest_logfinish(nodeid=item.nodeid, location=item.location)
+    return True
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """The number that decides whether this is worth keeping. Silence here would make a rescue
+    indistinguishable from a test that simply passed, which is the failure mode of every retry."""
+    if _race.RESCUES:
+        terminalreporter.write_sep("-", "source-race re-verify")
+        for nodeid, n in _race.RESCUES:
+            terminalreporter.write_line(
+                "RESCUED  %s — failed, %d source file(s) changed while it ran, passed on re-verify"
+                % (nodeid, n))
+    if _race.CONFIRMED:
+        terminalreporter.write_sep("-", "source-race re-verify (failed twice)")
+        for nodeid, n in _race.CONFIRMED:
+            terminalreporter.write_line(
+                "CONFIRMED  %s — %d source file(s) changed while it ran, and it failed again"
+                % (nodeid, n))
+
+
+
+
+@pytest.fixture(autouse=True)
+def _content_tier_for_unit_tests(request, monkeypatch):
+    """A working content store for the artifact write path, so a write with content can store it.
+
+    Artifact bytes live in the CAS: `workspace_service._store_content_in_s3` puts them there and
+    returns the `cas/<sha256>` address, and `db/doc_boundary` keeps the body out of the document
+    and hydrates it back on read. A create or update carrying content therefore needs a content
+    store and an acting principal to seal the envelope for — which unit tests built on MagicMock
+    do not have. Before this, the failure was swallowed and the bytes stayed inline, so those
+    tests passed over a write that silently did nothing.
+
+    Patched at the artifact write path rather than at `content_service`. Patching the service
+    globally reaches every test that exercises the real content routes — the upload path, the
+    deferred mirror record, the tier itself — and replaces the thing under test. This substitutes
+    only the step the artifact write makes, and addresses the bytes exactly as the real one does
+    so an assertion on the ref sees a genuine content address.
+
+    Tests that exercise `_store_content_in_s3` itself opt out with
+    ``@pytest.mark.real_content_store``.
+    """
+    if request.node.get_closest_marker("real_content_store"):
+        return
+    import hashlib
+
+    from mantle.services import workspace_service
+
+    def _addressed(artifact_id, content, context_str, owner_id=None, collection_id=None):
+        key = workspace_service._safe_content_key(
+            _loads_or_empty(context_str), artifact_id)
+        ref = ("cas/" + hashlib.sha256(content.encode("utf-8")).hexdigest()) if owner_id else None
+        return key, content, ref
+
+    def _loads_or_empty(raw):
+        import json as _json
+        try:
+            parsed = _json.loads(raw) if raw else {}
+            return parsed if isinstance(parsed, dict) else {}
+        except (TypeError, ValueError):
+            return {}
+
+    monkeypatch.setattr(workspace_service, "_store_content_in_s3", _addressed)

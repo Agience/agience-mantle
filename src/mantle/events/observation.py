@@ -1,9 +1,9 @@
 """Observation events — a read is an observation, and it is recorded as one.
 
-⭐ A QUERY IS AN OBSERVATION [John, 2026-08-13]. `db/edge.py` already defines one: *"an edge is an
-observation: it records that some observer looked and found a relation."* A `recall` is exactly
-that — an observer looked, and found. This module does not invent an audit vocabulary beside the
-artifact universe; it records the looking, in the universe's own terms.
+A query is an observation. `db/edge.py` defines one: *"an edge is an observation: it records that
+some observer looked and found a relation."* A `recall` is exactly that — an observer looked, and
+found. This module records the looking in the artifact universe's own terms rather than in a
+separate audit vocabulary.
 
 Why this is an EVENT and not an edge
 ------------------------------------
@@ -27,7 +27,7 @@ is the fold of the other.
 
 Why the container is a per-principal `Observations`, and not the artifacts that matched
 --------------------------------------------------------------------------------------
-⛔ ADDRESSING THIS AT THE MATCHED ARTIFACTS WOULD LEAK THE QUERY. `routers/events_router.
+Addressing this at the matched artifacts would leak the query. `routers/events_router.
 _event_visible_to` decides visibility as *"would the ordinary read path serve the artifact this
 event is about"*:
 
@@ -49,18 +49,17 @@ same place for the same reason. A separate container rather than the Inbox becau
 is not mail: it is a log the observer owns, and filing it into the workspace a person actually
 reads would bury the one in the other.
 
-⛔ PROVISIONED THERE, NEVER HERE. The recording path only ever LOOKS the container up — see
-:func:`_lookup_container` for why a write on the read path is the one thing this module must not
-do.
+The container is provisioned elsewhere. The recording path only looks it up — see
+:func:`_lookup_container` for why the read path carries no write.
 
 The result is the property that was asked for: an agent's queries are visible to the principal who
 made them and to anyone that principal grants, and to nobody else.
 
-⚠ THE RESULT SET GOES UNDER `artifacts`, AND THE KEY IS LOAD-BEARING. `event_bus.redact_content`
-strips `FEED_BODY_FIELDS = ("content", "content_encrypted")` by NAME, at the payload top level and
-inside `artifact` / `artifacts` — nowhere else. `recall` hits carry a `content` field. Under any
-other key (`hits`, `results`, …) the redaction does not reach them and artifact plaintext lands in
-the durable log permanently, where the whole point of `redact_content` is that it cannot. The
+The result set goes under `artifacts`, and the key is load-bearing. `event_bus.redact_content`
+strips `FEED_BODY_FIELDS = ("content", "content_encrypted")` by name, at the payload top level and
+inside `artifact` / `artifacts`, and nowhere else. `recall` hits carry a `content` field, so under
+any other key (`hits`, `results`, …) the redaction does not reach them and artifact plaintext lands
+in the durable log permanently. The
 descriptors built here carry no body anyway; the key name is the second line of that defence, and
 the one that survives someone later passing raw hits through.
 
@@ -71,6 +70,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import uuid
 from typing import Any, Dict, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
@@ -95,11 +95,20 @@ _container_cache: Dict[str, str] = {}
 _cache_lock = threading.Lock()
 
 
+def observations_container_id(principal_id: str) -> str:
+    """Deterministic id for a principal's `Observations` container.
+
+    Derived, not minted, so two racing provisioning calls converge on one row instead of
+    leaving the principal owning two containers of the same content type.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"agience://observations/{principal_id}"))
+
+
 def _lookup_container(store_db, principal_id: str) -> Optional[str]:
     """The principal's existing `Observations` container id. **Never creates one.**
 
-    ⛔ THE OBSERVATION PATH DOES NOT WRITE, and that is the whole reason this is split from
-    :func:`ensure_observations_container`. Creating the container here would put a store WRITE on
+    The observation path does not write, which is why this is split from
+    :func:`ensure_observations_container`. Creating the container here would put a store write on
     the path of every read:
 
     * the first observation for each principal would pay a container create — measured at ~11s on
@@ -151,8 +160,18 @@ def ensure_observations_container(store_db, principal_id: str) -> Optional[str]:
     CRUDEASIO", which is the owner grant the visibility rule then depends on — see the module
     docstring on why the container, and not the matched artifacts, is what an observation names.
 
-    Find-then-create rather than create-then-catch: two racing calls would otherwise leave one
-    principal owning two containers of the same content type with nothing to say which is theirs.
+    The id is DERIVED. This is check-then-act and nothing makes it atomic, so find-then-create
+    does not prevent the race — it IS the race. An earlier version of this docstring claimed the
+    opposite ("find-then-create rather than create-then-catch: two racing calls would otherwise
+    leave one principal owning two containers"); that outcome is what find-then-create produces,
+    not what it avoids. Both racers see no container and both create one, and with a minted UUID
+    each the principal ends up owning two containers of the same content type with nothing to say
+    which is theirs — exactly the harm the sentence was worried about.
+
+    Pinning the id makes both writes address the same row. See
+    :func:`seed_provisioning.user_provisioning.inbox_workspace_id`, the same fix for the same
+    defect on the first-login path, for the measurement this rests on: a duplicate create UPSERTS
+    rather than raising, so this converges but must never be read as an arbiter.
     """
     existing = _lookup_container(store_db, principal_id)
     if existing:
@@ -165,6 +184,7 @@ def ensure_observations_container(store_db, principal_id: str) -> Optional[str]:
             content_type=OBSERVATIONS_CONTENT_TYPE,
             name=OBSERVATIONS_NAME,
             description="Queries and reads made by this principal, newest last.",
+            artifact_id=observations_container_id(principal_id),
         ).id
     except Exception:
         logger.debug("observations container not provisioned for %s", principal_id, exc_info=True)
@@ -246,7 +266,7 @@ def record_observation(
         event_bus.publish_event_sync(event_bus.Event(
             name=OBSERVED,
             payload=payload,
-            # ⛔ artifact_id STAYS None. See the module docstring: naming a matched artifact hands
+            # artifact_id stays None. See the module docstring: naming a matched artifact hands
             # this observer's query to everyone who can read that artifact.
             artifact_id=None,
             container_id=container_id,

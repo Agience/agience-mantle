@@ -109,8 +109,10 @@ class TestExtractArtifactFields:
             fields = pipeline_unified._extract_artifact_fields(artifact)
         assert fields["title"] == "Encryption Library"
         assert fields["description"] == "A test"
-        assert fields["tags"] == "test"
         assert fields["content"] == "hello world"
+        # A tag is group MEMBERSHIP now, not a key in the context blob (§112) — the words of the
+        # groups this artifact belongs to, with the scheme dropped.
+        assert fields["tags"] == "ws"
 
     def test_falls_back_to_artifact_name_for_containers(self):
         from mantle.search.ingest import pipeline_unified
@@ -377,8 +379,16 @@ class TestDeleteArtifact:
             acting_as("origin-root-1", principal_type="user"),
         ):
             # Write through the real path — it resolves the principal from a real handle.
+            #
+            # The text goes in an offer field, because that is what is indexed. The lexical arm
+            # indexes the offer (`_OFFER_FIELDS`: title, description, tags) and never the raw body —
+            # a body's term count is unbounded and posting lists are read-modify-write, so indexing
+            # it makes write cost
+            # scale with the corpus. A fixture passing only `content` now filters to nothing and
+            # returns ARM_SKIPPED, so the write under test never happens and this fails on its own
+            # precondition rather than on the behaviour it is checking.
             pipeline_unified._sse_index_artifact(
-                artifact, "ws-child", {"content": "the secret the user deleted"},
+                artifact, "ws-child", {"title": "the secret the user deleted"},
             )
             assert list(sse_index.postings) == [("origin-root-1", "art-1")], (
                 "precondition: the write path must key postings under the ORIGIN ROOT"
@@ -390,8 +400,8 @@ class TestDeleteArtifact:
             )
 
         assert sse_index.postings == {}, (
-            "delete_artifact_from_index left postings behind: %r. The deleted artifact's "
-            "content is still retrievable through the owning principal's own search path."
+            "delete_artifact_from_index left postings behind: %r. The deleted artifact is "
+            "still retrievable through the owning principal's own search path."
             % (sse_index.postings,)
         )
         # Only meaningful once the effect above holds — reporting success is correct
@@ -604,3 +614,301 @@ class TestASecretIsNotASearchTarget:
         sse.assert_not_called()
         vec_mock.assert_not_called()
         assert outcome.wrote_nothing and not outcome.failed
+
+
+class TestALexiconEntrysNamesAreIndexed:
+    """A synset's `lemmas` are the words that MEAN it, and for a dictionary entry that is the
+    offer — the record exists to say these words mean this.
+
+    Only the first lemma becomes the title, and the two lexicons order them differently, so the
+    OEWN oxygen synset is titled `O` while its Princeton twin is titled `oxygen`. The OEWN copy is
+    the one in this store's SSE index, and its gloss never says the word either. Measured before
+    this rule existed, `recall("what is oxygen")` did not narrow to that artifact AT ALL and
+    answered `LOX / air / artificial blood` — every hyponym carries `oxygen` inside its own title,
+    so the hyponyms were findable and the concept was not.
+    """
+
+    @staticmethod
+    def _entry(content_type, lemmas):
+        return SimpleNamespace(
+            id="wn-oewn-14672278-n",
+            root_id="wn-oewn-14672278-n",
+            state="committed",
+            created_by="ingest",
+            collection_id="stage.0.lexicon",
+            context="",
+            content="a nonmetallic bivalent element",
+            name="O",
+            description="",
+            lemmas=lemmas,
+            content_type=content_type,
+            created_time="2026-05-09T00:00:00Z",
+        )
+
+    def test_a_synsets_lemmas_are_indexed_as_its_tags(self):
+        from mantle.search.ingest import pipeline_unified
+
+        artifact = self._entry("text/x-wordnet", ["o", "atomic number 8", "oxygen"])
+        with patch.object(
+            pipeline_unified, "extract_text_from_artifact", return_value="a gloss",
+        ):
+            fields = pipeline_unified._extract_artifact_fields(artifact)
+        assert "oxygen" in fields.get("tags", ""), (
+            "the word that names this concept must reach the index — %r" % (fields,)
+        )
+
+    def test_prose_lemmas_are_NOT_indexed(self):
+        """`lemmas` is not one thing in this corpus.
+
+        On a wiki artifact it is key terms extracted FROM the body by `astra/doc_index`. Indexing
+        those would be indexing the content, which this pipeline is built not to do. So the rule
+        reads the TYPE, never merely whether the field is present — one field, two meanings, two
+        writers, which is the shape of every other defect this corpus has produced.
+        """
+        from mantle.search.ingest import pipeline_unified
+
+        artifact = self._entry("text/markdown", ["gorilla", "monsoon", "wrestling"])
+        with patch.object(
+            pipeline_unified, "extract_text_from_artifact", return_value="a body",
+        ):
+            fields = pipeline_unified._extract_artifact_fields(artifact)
+        assert "wrestling" not in fields.get("tags", ""), (
+            "body-extracted terms must not become tags — %r" % (fields,)
+        )
+
+    def test_the_lemmas_survive_alongside_group_membership(self):
+        """The lemmas are ADDED to the artifact's groups, never substituted for them.
+
+        A tag is an edge to another artifact, so a lexicon entry's names are added to its
+        membership rather than to a `tags` key in the context blob, which nothing reads. The
+        property under test: a synset's other names must reach the index, because its title is only
+        the first of them and its gloss often never says the word at all.
+        """
+        from mantle.search.ingest import pipeline_unified
+
+        artifact = self._entry("text/x-wordnet", ["oxygen"])
+        artifact.collection_id = "collection:stage.0.lexicon"
+        with patch.object(
+            pipeline_unified, "extract_text_from_artifact", return_value="a gloss",
+        ):
+            fields = pipeline_unified._extract_artifact_fields(artifact)
+        tags = fields.get("tags", "")
+        assert "oxygen" in tags, tags                       # the entry's own other name
+        assert "lexicon" in tags, tags                      # the group it belongs to
+        assert "collection" not in tags, tags               # the scheme is not a tag
+
+
+class TestAMergedConceptIsIndexable:
+    """A colimit of synsets names itself the way the synsets do, so it is findable like them.
+
+    `ember.consolidate.colimit` merges the synsets that mean one thing into a single
+    `application/x-concept` object carrying their union. Measured 2026-08-24 on 71/home: all 5,484
+    of them carry `lemmas` and NONE of `title` / `name` / `description`, with `content` empty — so
+    `_extract_artifact_fields` returned `{}` and every one was skipped as "no analyzable fields".
+
+    That is COMPACTIFICATION §5 exactly inverted: consolidate into a heavier object, then index
+    only the lighter members, and a search can never reach the thing the merge produced. It is
+    also silent — the pipeline reports a skip, not a failure — so nothing anywhere said the
+    consolidation had made 5,484 unfindable objects.
+    """
+
+    @staticmethod
+    def _colimit(lemmas, content_type="application/x-concept",
+                 colimit_of=("wn-decade.n.01", "wn-oewn-15174893-n")):
+        """What the consolidator actually writes: names, no title, no body."""
+        return SimpleNamespace(
+            id="concept-be603d8ac3dd0185fcf653e18a8dc72d",
+            root_id="concept-be603d8ac3dd0185fcf653e18a8dc72d",
+            state="committed",
+            created_by="op.consolidate.colimit",
+            collection_id="stage.0.lexicon",
+            context="",
+            content="",
+            name=None,
+            description=None,
+            lemmas=lemmas,
+            colimit_of=list(colimit_of) if colimit_of else None,
+            content_type=content_type,
+            created_time="2026-08-24T00:00:00Z",
+        )
+
+    @staticmethod
+    def _conceptnet_term(word, lemmas):
+        """A ConceptNet 5.7 term: the SAME content type, and its lemmas are its title split.
+
+        Measured 2026-08-24: 1,165,110 of these on 71/home against 5,484 colimits, all sharing
+        `application/x-concept`. They carry a title and a description of their own, so nothing here
+        needs their lemmas — and promoting them would put `hour` and `clock` in the tags of
+        `12 hour clock`, which is the title indexed twice.
+        """
+        return SimpleNamespace(
+            id="cn-12_hour_clock",
+            root_id="cn-12_hour_clock",
+            state="committed",
+            created_by="ingest.conceptnet",
+            collection_id="stage.2.world",
+            context="",
+            content="%s — ConceptNet 5.7 concept" % word,
+            name=word,
+            description="the concept %s" % word,
+            lemmas=lemmas,
+            colimit_of=None,
+            content_type="application/x-concept",
+            created_time="2026-08-24T00:00:00Z",
+        )
+
+    def test_a_colimit_with_only_lemmas_is_still_indexable(self):
+        from mantle.search.ingest import pipeline_unified
+
+        artifact = self._colimit(["decade", "decennary", "decennium"])
+        with patch.object(
+            pipeline_unified, "extract_text_from_artifact", return_value="",
+        ):
+            fields = pipeline_unified._extract_artifact_fields(artifact)
+        assert fields, (
+            "a merged concept with names must reach the index; empty fields is the skip that "
+            "made 5,484 of them unfindable"
+        )
+
+    def test_the_title_is_the_first_lemma(self):
+        """The synset rule applied, not restated: only the first of them becomes the title.
+
+        A synset gets that title from its source; a colimit has no source to get one from, so it
+        is derived here. `word` is not read — the consolidator writes it, it is that same first
+        lemma, and a second carrier is a second thing to keep true. It does not survive
+        `Artifact.from_dict` either, which is the form this function is handed.
+        """
+        from mantle.search.ingest import pipeline_unified
+
+        artifact = self._colimit(["decade", "decennary", "decennium"])
+        with patch.object(
+            pipeline_unified, "extract_text_from_artifact", return_value="",
+        ):
+            fields = pipeline_unified._extract_artifact_fields(artifact)
+        assert fields.get("title") == "decade", fields
+
+    def test_every_name_the_merge_absorbed_reaches_the_index(self):
+        """The point of the merge is that these words mean the same thing.
+
+        Indexing only the title would make the colimit reachable by one of its names and leave the
+        rest answered by the members it consolidated — which is the state this replaced.
+        """
+        from mantle.search.ingest import pipeline_unified
+
+        artifact = self._colimit(["decade", "decennary", "decennium"])
+        with patch.object(
+            pipeline_unified, "extract_text_from_artifact", return_value="",
+        ):
+            fields = pipeline_unified._extract_artifact_fields(artifact)
+        tags = fields.get("tags", "")
+        assert "decennary" in tags, tags
+        assert "decennium" in tags, tags
+
+    def test_a_prose_artifacts_lemmas_are_still_not_indexed(self):
+        """The rule is about the RECORD, not about the field being present.
+
+        On a wiki artifact `lemmas` holds terms `astra/doc_index` pulled out of the body, and
+        indexing those would be indexing the content.
+        """
+        from mantle.search.ingest import pipeline_unified
+
+        artifact = self._colimit(["gorilla", "monsoon"], content_type="text/markdown",
+                                 colimit_of=None)
+        artifact.content = "a body"
+        with patch.object(
+            pipeline_unified, "extract_text_from_artifact", return_value="a body",
+        ):
+            fields = pipeline_unified._extract_artifact_fields(artifact)
+        assert "monsoon" not in fields.get("tags", ""), fields
+        assert fields.get("title") != "gorilla", (
+            "a body term must not become the title either — %r" % (fields,)
+        )
+
+    def test_a_conceptnet_term_shares_the_type_and_is_NOT_promoted(self):
+        """The content type is not the discriminator, and believing it was is the bug.
+
+        `application/x-concept` has two writers. Keying the rule on the type promoted 1,165,110
+        ConceptNet terms whose `lemmas` are their own title, split into words — putting `hour` and
+        `clock` into the tags of `12 hour clock`, a record that already carries all three stems in
+        its title. `colimit_of` is what separates them, because carrying it is what being a merge
+        means.
+        """
+        from mantle.search.ingest import pipeline_unified
+
+        artifact = self._conceptnet_term("12 hour clock", ["12", "hour", "clock"])
+        with patch.object(
+            pipeline_unified, "extract_text_from_artifact", return_value="a gloss",
+        ):
+            fields = pipeline_unified._extract_artifact_fields(artifact)
+        assert fields.get("title") == "12 hour clock", fields
+        assert "clock" not in fields.get("tags", ""), (
+            "a ConceptNet term's lemmas are its title split up, not names it goes by — %r"
+            % (fields,)
+        )
+
+    def test_a_colimit_is_recognised_by_colimit_of_and_not_by_its_type(self):
+        """Same type, same field, opposite answers — decided by whether it is a merge."""
+        from mantle.search.ingest import pipeline_unified
+
+        merge = self._colimit(["decade", "decennary"])
+        term = self._conceptnet_term("decade", ["decade"])
+        with patch.object(
+            pipeline_unified, "extract_text_from_artifact", return_value="",
+        ):
+            assert pipeline_unified._lemmas_are_names(merge) is True
+            assert pipeline_unified._lemmas_are_names(term) is False
+
+
+class TestAnArtifactAnnouncesItselfOnce:
+    """One offer, not two. A description that repeats the title is not a second claim.
+
+    Measured 2026-08-24 across 2,167,300 artifacts on 71/home: 1,175,579 carry both fields, and
+    1,164,574 of those -- 99% -- have a description containing the title verbatim, in one repeated
+    template (`Workspace document imported from <title>`). Nothing carries a description and no
+    title. Only 11,005 descriptions in the whole corpus say something their title does not.
+    """
+
+    def test_a_template_description_is_dropped(self):
+        from mantle.search.ingest import pipeline_unified
+
+        kept = pipeline_unified._description_that_adds_something(
+            "agience-build/AGENTS.md",
+            "agience-build/AGENTS.md",
+        )
+        assert kept == "", "the same words twice is one claim, not two"
+
+    def test_a_description_that_adds_words_is_kept(self):
+        """Containment is not the test -- this one contains its title and is not a duplicate."""
+        from mantle.search.ingest import pipeline_unified
+
+        kept = pipeline_unified._description_that_adds_something(
+            "oxygen", "oxygen: a nonmetallic bivalent element")
+        assert "nonmetallic" in kept
+
+    def test_a_description_with_no_title_beside_it_is_kept(self):
+        from mantle.search.ingest import pipeline_unified
+
+        assert pipeline_unified._description_that_adds_something(
+            "", "a slowly moving mass of ice") == "a slowly moving mass of ice"
+
+    def test_the_duplicate_never_reaches_the_index(self):
+        """The whole point: `_fields_to_index` is what the SSE arm is handed."""
+        from mantle.search.ingest import pipeline_unified
+
+        out = pipeline_unified._fields_to_index({
+            "title": "agience-build/AGENTS.md",
+            "description": "agience-build/AGENTS.md",
+            "tags": "workspace",
+        })
+        assert "description" not in out, out
+        assert out.get("title") == "agience-build/AGENTS.md"
+        assert out.get("tags") == "workspace"
+
+    def test_a_real_offer_still_reaches_the_index(self):
+        from mantle.search.ingest import pipeline_unified
+
+        out = pipeline_unified._fields_to_index({
+            "title": "oxygen",
+            "description": "a nonmetallic bivalent element",
+        })
+        assert out.get("description") == "a nonmetallic bivalent element", out

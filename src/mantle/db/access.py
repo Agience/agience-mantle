@@ -45,7 +45,7 @@ def _grant_mask(d: Dict[str, Any]):
     is why `d.get("can_invoke")` was the natural spelling and why it was only ever half the
     question: the bit says *which* action, the effect says whether the grant authorizes at all.
     A deny grant carrying `can_invoke` answers True to the bare `.get` and would authorise
-    actuation (audit S1's sharpest sibling).
+    actuation's sharpest sibling).
 
     The doc is viewed through a `SimpleNamespace` rather than passed as a mapping because
     `grant_is_allow` is `getattr`-duck-typed: a dict would read as "no effect attribute" and
@@ -82,10 +82,58 @@ class _DB:
 
 
 def _descendants(db, la, rid):
-    """Read-reachable containment descendants of `rid`, or empty when there is no graph to walk."""
+    """The COLLECTIONS gated by a grant on `rid` — never its members.
+
+    `gated_collections` puts collection ids in a set, so expanding a grant to its member artifacts
+    adds nothing it can use and costs everything. Measured 2026-08-25 on 71/home: a grant on
+    `stage.0.lexicon` sent `list_origin_descendants` through **1,846,819** containment edges to
+    discover which of **70** collections were gated, and raised `EdgesTruncated` above the
+    1,000,000-edge cap before returning any of them. That failure reached
+    `consolidate_colimit` -> `is_public`, so consolidation could not run at all on a store whose
+    lexicon had grown past the cap.
+
+    So this asks the COLLECTIONS instead. They are few, they each name their own parent, and the
+    walk is up rather than down: `O(collections x depth)` instead of `O(members)`. The answer is
+    identical — a member is not a collection and never belonged in the set.
+
+    Nesting is supported here even though this store does not use it: measured, ZERO collections
+    are contained by another, so the loop below finds nothing to add today. It is written for the
+    tree rather than for the current shape, because a flat store is a fact about now.
+    """
     if db.graph is None:
         return []
-    return la.list_origin_descendants(db, [rid], _READ)
+    out, seen = [], {str(rid)}
+    frontier = [str(rid)]
+    while frontier:
+        parent = frontier.pop()
+        for cid in _collection_children(db, parent):
+            if cid in seen:
+                continue                      # a cycle is a lie about the tree; do not walk it twice
+            seen.add(cid)
+            out.append(cid)
+            frontier.append(cid)
+    return out
+
+
+def _collection_children(db, parent: str):
+    """Collection ids whose origin parent is `parent`, read off the vertex table.
+
+    One indexed statement over the collection rows rather than a graph walk over the parent's
+    membership — see `_descendants` for the measurement that made this necessary.
+    """
+    try:
+        conn = db.artifacts.db.read()
+    except Exception:                          # noqa: BLE001 — no SQL handle: nothing to add
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT v.id FROM vertex v WHERE v.ct = ? AND EXISTS("
+            "  SELECT 1 FROM edge e WHERE e.dst = v.id AND e.label = 'contains' "
+            "  AND e.is_origin = 1 AND e.src = ?)",
+            ("application/vnd.agience.collection+json", parent))
+        return [str(r[0]) for r in rows]
+    except Exception:                          # noqa: BLE001
+        return []
 
 
 def grounding_of(art: Dict[str, Any]) -> Optional[str]:
@@ -179,15 +227,45 @@ def gated_owner_map(store) -> Dict[str, str]:
     return owners
 
 
+def is_made_public(store, art: Dict[str, Any]) -> bool:
+    """Made public ⇔ the `PUBLIC_PRINCIPAL` holds a Read grant reaching this artifact.
+
+    The grant half of :func:`is_public`, and only that half. The two halves answer to different
+    callers, and this one is what the API takes.
+
+    `is_public` also returns True for **born public**: ungrounded, or grounded in a collection no
+    grant gates. That reading belongs to the ember/shard model this module was written for, where an
+    ungated collection IS the un-keyed TOP and carries nothing secret. It is the wrong reading for
+    Mantle's API, where "no grant" is the ordinary state of a private thing: a collection before its
+    grants are attached, and — because `lattice_api._stamp_origin_root` deliberately leaves the
+    field unset rather than guess a principal — any artifact whose key root could not be
+    established. Adopting born-public into `services.dependencies.check_access` would have made
+    every one of those world-readable, which is the fail-OPEN direction and the opposite of the
+    README's binding invariant that authorization is decided only by the light cone and grants.
+
+    This half is safe there because it is a positive act by somebody holding authority: a Read grant
+    to the commons, subject to the same clamp (`grant_service.clamp_to_issuer`) and the same
+    attenuation as any other grant. It is also **exactly** what `mesh/sync._withheld_lattice`
+    consults (`reachable_collections(store, PUBLIC_PRINCIPAL)`, "keep made-public members"), so the
+    API and the mesh now answer the same question from the same function rather than from two
+    readings that happened to disagree.
+    """
+    reach = reachable_collections(store, PUBLIC_PRINCIPAL)
+    g = grounding_of(art)
+    return (g is not None and g in reach) or str(art.get("id") or "") in reach
+
+
 def is_public(store, art: Dict[str, Any]) -> bool:
     """Public ⇔ born public (ungrounded, or its grounding collection is gated by no grant — the un-keyed
     top) or made public (the `PUBLIC_PRINCIPAL` holds a Read grant reaching it, on the collection or the
-    artifact). Making a private thing public is a grant to the public entity — no copy, no re-key."""
+    artifact). Making a private thing public is a grant to the public entity — no copy, no re-key.
+
+    Both halves. See :func:`is_made_public` for the half the API takes, and why.
+    """
     g = grounding_of(art)
     if g is None or g not in gated_collections(store):
         return True                                   # born public
-    reach = reachable_collections(store, PUBLIC_PRINCIPAL)   # made public
-    return g in reach or str(art.get("id") or "") in reach
+    return is_made_public(store, art)                 # made public
 
 
 def can_read(store, art: Dict[str, Any], principal: Optional[str]) -> bool:
@@ -265,7 +343,7 @@ def invokable_resources(store, principal: Optional[str]) -> Set[str]:
     what `may_invoke` and `DischargeAuthority.may_discharge` answer from, and actuation fires
     the world. `d.get("can_invoke")` asked only whether the bit was set, so a `deny`-effect
     grant carrying `can_invoke` — the exact shape written to say "this principal must never
-    fire this" — authorised discharge. That was audit S1's sharpest sibling, and it failed OPEN.
+    fire this" — authorised discharge. That was 's sharpest sibling, and it failed OPEN.
 
     Deny is then subtracted rather than merely skipped, so this agrees with `check_access`,
     where deny is tested first and wins over any allow at any level of the walk. Subtraction

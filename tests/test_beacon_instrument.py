@@ -8,7 +8,7 @@
 """Beacon fills the `Read` contract, deliberately leaves `Dynamics` and `Instrument` unfilled, and
 diverges from the aperture in ways that are correct rather than fixable.
 
-`ARCHITECTURE-TARGET.md` §3 states that the same crystal runs on a full node (the aperture) and on
+`agience-pharos/genesis/ARCHITECTURE-TARGET.md` §3 states that the same crystal runs on a full node (the aperture) and on
 a constrained store (beacon). These are the checks that fail if beacon stops being a complete,
 honest embodiment of the one thing it does.
 
@@ -33,8 +33,8 @@ Failure modes, stated before the assertions:
      `signal_rank` / `_permutation_core` must resolve identically on every frame — a second
      implementation is how a module surface and an embodiment start naming different ranks while
      both look right.
-  5. **Beacon acquires a heavy dependency.** It exists to keep mantle shippable while entroptics
-     stays private. `test_the_instrument_imports_with_beam_entroptics_and_prism_blocked` blocks all
+  5. **Beacon acquires a heavy dependency.** It exists to keep mantle shippable on its own.
+     `test_the_instrument_imports_with_beam_and_prism_blocked` blocks all
      three at the import system, control first.
   6. **A tolerance gets typed in.** Every level here descends from `engine.DEFAULT_FAR` or from the
      frame's own dtype; `test_no_level_survives_a_change_of_far` and the `_float_noise` checks make
@@ -80,6 +80,11 @@ def _build(v: dict) -> np.ndarray:
         u = rng.normal(size=v["N"])
         w = rng.normal(size=v["F"])
         m += v["snr"] * np.outer(u / np.linalg.norm(u), w / np.linalg.norm(w))
+    dead = int(v.get("dead_cols", 0))
+    if dead:
+        # Drawn first, killed after: the live 120 x (F - dead) block is byte-identical to the same
+        # case built without the dead columns, which is what makes the invariance check meaningful.
+        m[:, v["F"] - dead:] = 0.0
     return m
 
 
@@ -161,7 +166,7 @@ def test_the_two_unfilled_contracts_are_unfilled_for_different_reasons() -> None
 
     `Instrument` — a question beacon's domain poses perfectly well, answered elsewhere in the
     product. The aperture projects a corpus matrix as readily as a signal frame; what decides it is
-    that mantle is the Apache giveaway and the entroptics wrapper is the AGPL product.
+    that mantle is the Apache giveaway and the aperture wrapper is the AGPL product.
     `absorb_transmit`'s own docstring names it: "the coupled band is the frame's projection onto
     the resolved subspace."
 
@@ -600,7 +605,7 @@ def test_principal_directions_survives_the_removal_because_it_is_a_read() -> Non
 # 10 · The dependency floor — what makes beacon shippable at all
 # ═════════════════════════════════════════════════════════════════════════════════════════════
 
-_BLOCKED = ("beam", "entroptics", "prism")
+_BLOCKED = ("beam", "prism")
 
 #: The permitted prism modules, enumerated by exact name — narrower than a prefix match. What
 #: beacon asks for is one module: `prism.rounding`, the single-sourced floating-point rounding
@@ -624,7 +629,7 @@ _PERMITTED = ("prism", "prism.canonical", "prism.environment", "prism.errors", "
 #: The control probes: modules that must still fail to import. `prism.conservation` is the pointed
 #: one — it is where this same law is applied with numpy, the module a careless import would reach
 #: for — and the other two prove the block covers the whole package minus the measured closure.
-_MUST_REFUSE = ("beam", "entroptics", "prism.conservation", "prism.instrument", "prism.minting")
+_MUST_REFUSE = ("beam", "prism.conservation", "prism.instrument", "prism.minting")
 
 _PROBE = '''
 import sys, json
@@ -723,7 +728,7 @@ def _probe() -> dict:
 
 def test_the_blocker_actually_fires() -> None:
     """The precondition, promoted to a test. Everything below concludes from the absence of beam,
-    entroptics and every prism module but one. If the blocker silently did nothing — the outcome
+    and every prism module but one. If the blocker silently did nothing — the outcome
     for a finder written against the legacy `find_module` hook, which Python 3.12 ignores — those
     conclusions would be vacuous while the suite stayed green. A guard that cannot be shown to fire
     is indistinguishable from no guard.
@@ -739,7 +744,7 @@ def test_the_blocker_actually_fires() -> None:
 def test_the_one_permitted_prism_module_is_reachable_and_needs_nothing() -> None:
     """The other side of the allowance, and it must fail if the law stops being free to reach.
 
-    `prism.rounding` is imported with `beam`, `entroptics` and the rest of `prism` blocked, and
+    `prism.rounding` is imported with `beam` and the rest of `prism` blocked, and
     then exercised — an import that resolves nothing proves only that a file parses. If this
     fails, the law has acquired a dependency and beacon would have to carry its own copy again."""
     v = _probe()
@@ -748,10 +753,10 @@ def test_the_one_permitted_prism_module_is_reachable_and_needs_nothing() -> None
         f"{v.get('law_error')}")
 
 
-def test_the_instrument_imports_with_beam_entroptics_and_prism_blocked() -> None:
-    """Pins against beacon acquiring an edge to `beam`, `entroptics` or a prism module other than
+def test_the_instrument_imports_with_beam_and_prism_blocked() -> None:
+    """Pins against beacon acquiring an edge to `beam` or a prism module other than
     the one rounding law — directly, or transitively through something it imports — which would
-    stop mantle being shippable while entroptics stays private. That is the entire reason this
+    stop mantle being shippable on its own. That is the entire reason this
     embodiment exists.
 
     Checked by removing them from the import system, not by reading import statements: a
@@ -769,7 +774,7 @@ def test_the_instrument_imports_with_beam_entroptics_and_prism_blocked() -> None
     to a count, pools a plane and walks the scale ladder — every measurement beacon makes."""
     v = _probe()
     assert all(v["blocker_fires"].values()), "blocker did not fire; this result would mean nothing"
-    assert v["works"], f"the embodiment broke without beam/entroptics/prism: {v.get('error')}"
+    assert v["works"], f"the embodiment broke without beam/prism: {v.get('error')}"
     assert v["k_signal"] >= 1 and v["resolvable"] == v["k_signal"]
     assert v["basis_shape"] == [16, v["k_signal"]]
     assert v["accumulated"] >= 1 and v["scales"] >= 1

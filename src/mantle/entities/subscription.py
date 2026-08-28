@@ -9,7 +9,7 @@ and nothing more.
 
 The same reasoning as `entities/collection.py`'s `Collection = Artifact`: the data model is uniform,
 so a new *kind* of thing is a new `content_type`, not a new plane. This module is the codec for
-that content type — :class:`Subscription` is a typed view over an `Artifact`, never a second
+that content type —:class:`Subscription` is a typed view over an `Artifact`, never a second
 storage shape.
 
     content_type = application/vnd.agience.subscription+json
@@ -113,8 +113,33 @@ class Subscription:
             "batch_limit": self.batch_limit,
         }, separators=(",", ":"), ensure_ascii=False)
 
+    #: The artifact fields a subscription OWNS — the only ones it may write.
+    #:
+    #: Everything else on an `Artifact` belongs to the store or to the artifact's identity, and a
+    #: subscription that wrote those would be writing a value it never read. `_overlay_onto` uses
+    #: this list on the update path; see `save_subscription` for why the update starts from the
+    #: stored artifact rather than from a fresh one.
+    OWNED_FIELDS = ("collection_id", "name", "content_type", "context", "state")
+
     def to_artifact(self) -> Artifact:
-        """Render to the artifact that will be stored."""
+        """Render to the artifact that will be stored. **For a CREATE, not for an update.**
+
+        This constructs from eight fields, and an artifact has more than eight. On a create that
+        is right — there is nothing to preserve — and `lattice_api.create_artifact` stamps
+        `origin_root` on the way through. On an update it is not: writing this over a stored
+        subscription drops `root_id`, `origin_root`, `content_ref` and `description`, because
+        `update_artifact` puts the whole document and `to_lattice_doc` strips the Nones on the way
+        in, so the absent fields are absent in the row afterwards.
+
+        `origin_root` is the one that hurts. `entities/artifact.py` states the invariant verbatim
+        where it declares the field: it must SURVIVE the storage round trip, because it is the key
+        principal the artifact's content was encrypted under — "a key root that a `from_dict`
+        silently dropped would be recomputed, or defaulted, on the next save, re-keying content
+        whose ciphertext was written under the old value."
+
+        And a durable subscription is acked constantly, so this ran on every ack
+        (`ack` → `advance_cursor` → `save_subscription`). Use:meth:`_overlay_onto` for an update.
+        """
         return Artifact(
             id=self.id,
             collection_id=self.container_id or "",
@@ -125,6 +150,20 @@ class Subscription:
             created_by=self.owner_id,
             state=Artifact.STATE_COMMITTED,
         )
+
+    def _overlay_onto(self, existing: Any) -> Any:
+        """Write this subscription's own fields onto the STORED artifact and return it.
+
+        The inverse of the shape that broke: instead of building a fresh artifact and copying a
+        couple of survivors back onto it, start from what is stored and change only what a
+        subscription owns (:data:`OWNED_FIELDS`). Nothing else has to be enumerated, so a field
+        added to `Artifact` tomorrow is preserved here without anyone remembering to come back —
+        which is the property the two hand-copied fields did not have.
+        """
+        mine = self.to_artifact()
+        for field in self.OWNED_FIELDS:
+            setattr(existing, field, getattr(mine, field))
+        return existing
 
     @classmethod
     def from_artifact(cls, artifact: Any) -> Optional["Subscription"]:
@@ -250,17 +289,38 @@ def save_subscription(db: Any, subscription: Subscription) -> Subscription:
     One function for both, because the store already distinguishes them and a caller holding a
     `Subscription` should not have to. A subscription with no id is new; one with an id that the
     store does not hold is also new, which is what makes a client-chosen id work.
+
+    The update starts from the stored artifact rather than from a fresh one. `update_artifact` puts
+    the
+    whole document — there is no field-level update on this store, and there should not be, because
+    an artifact is one versioned object — so a writer holding a partial view must read the whole
+    before it writes. This function used to build a fresh 8-field artifact and hand-copy
+    `created_time` and `created_by` back onto it, which is the same idea applied to two fields and
+    forgotten for four: `root_id`, `origin_root`, `content_ref` and `description` were dropped on
+    every save.
+
+    `origin_root` is the key principal the artifact's content is encrypted under, and a durable
+    subscription is saved on every ack — so the ack loop was destroying the subscription's key
+    root at whatever rate its consumer ran. `Subscription._overlay_onto` inverts the shape so the
+    preserved set is "everything not named", which is the only version of this that stays correct
+    when `Artifact` grows a field.
     """
     from mantle.db import backend as store
 
-    artifact = subscription.to_artifact()
-    existing = store.get_artifact(db, artifact.id) if subscription.id else None
+    existing = store.get_artifact(db, subscription.id) if subscription.id else None
     if existing is None:
+        artifact = subscription.to_artifact()
         store.create_artifact(db, artifact)
     else:
-        artifact.created_time = getattr(existing, "created_time", artifact.created_time)
-        artifact.created_by = getattr(existing, "created_by", artifact.created_by)
-        store.update_artifact(db, artifact)
+        #: NO `or existing` FALLBACK. `store.update_artifact` has
+        #: one `return entity` and no error path, so the right-hand side was never evaluated.
+        #:
+        #: The ninth instance, and nobody knew it was here. The C-4 sweep counted eight across
+        #: four files; this one is in `entities/`, spelled as an `or` rather than an `if`, so a
+        #: sweep that walked `ast.If` tests could not see it at all. It surfaced the moment the
+        #: guard test learned to read `BoolOp` — the widening found a real instance on its first
+        #: run, which is the argument for widening an instrument over re-running it.
+        artifact = store.update_artifact(db, subscription._overlay_onto(existing))
     subscription.id = artifact.id
     return subscription
 

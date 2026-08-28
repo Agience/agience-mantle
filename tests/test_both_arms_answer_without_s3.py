@@ -34,7 +34,7 @@ import pytest
 
 from mantle.search.mantle import wiring
 from mantle.search.mantle.file_cell_store import FileCellStore
-from mantle.search.mantle.sse import FilePostingStore
+from mantle.search.mantle.sse import SqlitePostingStore
 from .helpers import make_oracle, req, self_request
 
 DIM = 16
@@ -141,7 +141,7 @@ def _reach(text: str) -> set:
 
 class TestTheStoresAreLocal:
     def test_both_arms_resolve_to_a_local_backend(self, air_gapped):
-        assert isinstance(wiring._build_sse_store(), FilePostingStore)
+        assert isinstance(wiring._build_sse_store(), SqlitePostingStore)
         assert isinstance(wiring._build_cell_store(), FileCellStore)
 
     def test_the_availability_probes_both_say_yes(self, air_gapped):

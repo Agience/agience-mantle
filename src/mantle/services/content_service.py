@@ -370,7 +370,7 @@ def _bootstrap_local_content() -> None:
     """Make the local CAS openable: the `cas/` directory, and a `content.key` to derive its
     at-rest key from.
 
-    THE WRITE PATH ONLY, and the rule is `shard/content.py`'s, reused rather than restated: a write
+    The write path only, and the rule is `shard/content.py`'s, reused rather than restated: a write
     on a provisioned node may bootstrap the first content key (`_content_key(create=True)` —
     exclusive-create, so concurrent writers cannot mint two), and NOTHING may create the keys
     directory. An absent keys dir means the volume is not mounted, and minting a key into a fresh
@@ -502,6 +502,7 @@ def mirror_failure_is_transient(exc: BaseException) -> bool:
 def put_bytes_encrypted(content_key: str, data: bytes, content_type: str,
                         owner_id: Optional[str], *,
                         collection_id: Optional[str] = None,
+                        creator_id: Optional[str] = None,
                         cas: bool = True,
                         on_mirror_deferred=None) -> Optional[str]:
     """Write raw bytes envelope-encrypted for *owner_id*, to every tier this node has.
@@ -554,7 +555,26 @@ def put_bytes_encrypted(content_key: str, data: bytes, content_type: str,
     if owner_id:
         try:
             from mantle.services import content_crypto
-            body = content_crypto.encrypt_content(owner_id, data)
+            # The scope is part of the binding. `collection_id` goes into the AAD
+            # (`content_crypto._scoped_aad`), so a blob sealed under col-A raises `InvalidTag` when
+            # presented under col-B. Omitted, it selects the legacy owner-only AAD for every object
+            # the CAS holds, which makes `content_crypto`'s central claim — "a scoped blob does not
+            # travel" — true of nothing in the corpus while the tests asserting it still pass by
+            # calling the module directly with a scope this caller never supplied.
+            #
+            # `creator_id` is what authorizes the first write. `oracle._authorize` has a create base
+            # case for exactly this instant — "the creator of an artifact holds that artifact's key
+            # at the moment it creates it ... this authorizes the instant between, which is the only
+            # instant in which no grant can exist yet" — and it needs all three facts, so a fresh
+            # install is unusable without this one.
+            #
+            # The symptom was a first `create_artifact` on a virgin store answering
+            # `ContentEncryptionError: content encryption unavailable`, reproduced 2026-08-17 by
+            # following the README quickstart. `manage_bootstrap`'s docstring records the
+            # opposite as MEASURED ("201, then a recall that returns it"); that measurement
+            # predates `collection_id` being passed here at all.
+            body = content_crypto.encrypt_content(
+                owner_id, data, collection_id=collection_id, creator_id=creator_id)
         except OverflowError:
             raise                      # the cipher's own size bound — surfaced, not relabelled
         except Exception as exc:
@@ -583,12 +603,26 @@ def put_bytes_encrypted(content_key: str, data: bytes, content_type: str,
 
     if not edge_store_configured():
         if ref is None:
+            # Name which of the three it was. They are different faults with different fixes, and
+            # collapsed into one message they send a reader to check a keys directory that was
+            # present and correct all along when the local tier was simply never asked.
+            if not cas:
+                why = (" — and this write does not use the local CAS (cas=False): its caller "
+                       "keeps the authoritative copy itself, so there is no ref to record and "
+                       "nothing here to fall back to. On a node with no object store that is "
+                       "COMPLETE, not broken: the bytes live wherever the caller put them")
+            elif not owner_id:
+                why = (" — and the local CAS needs an owner to seal an envelope for; an "
+                       "unenveloped object in a content-addressed store is reachable by anyone "
+                       "who can name its address")
+            elif local_error is not None:
+                why = f" ({type(local_error).__name__}: {local_error})"
+            else:
+                why = " — no keys directory, so no content key and no local CAS"
             raise ContentStoreUnavailable(
                 f"nothing on this node can store {content_key!r}: no object store is configured "
                 f"(no credentials resolve for the edge bucket) and the local content tier is "
-                f"unavailable"
-                + (f" ({type(local_error).__name__}: {local_error})" if local_error else
-                   " — no keys directory, so no content key and no local CAS")
+                f"unavailable" + why
             )
         return ref                     # air-gapped node: local IS the store. Quiet, and complete.
 
@@ -646,8 +680,10 @@ def get_bytes_decrypted(content_key: str, owner_id: Optional[str], *,
     Shape is checked too, so a ref cannot address a path. Together that is the light cone: naming
     someone else's address yields an error, never their bytes.
 
-    On the object-store leg, legacy plaintext objects (no ``MEC1`` magic) still pass through
-    unchanged — those genuinely predate envelope encryption and that is not a failure path.
+    **The object-store leg demands one too.** Whoever writes a bucket object chooses whether it
+    carries the ``MEC1`` magic, so an unenveloped object there is indistinguishable from one an
+    attacker PUT, and serving it would turn bucket write access into content forgery. Both legs
+    refuse it, and there is no flag that says otherwise.
 
     If decryption fails, this raises: the caller gets an error instead of ciphertext dressed as
     plaintext.
@@ -664,7 +700,8 @@ def get_bytes_decrypted(content_key: str, owner_id: Optional[str], *,
                 logger.info("local CAS read missed for %s (%s: %s)",
                             cas_ref, type(exc).__name__, exc)
             else:
-                return _decrypt_envelope(cas_ref, blob, owner_id, require_encrypted=True)
+                return _decrypt_envelope(cas_ref, blob, owner_id, require_encrypted=True,
+                                         collection_id=collection_id)
 
     if not content_key or not edge_store_configured():
         # `content_key` is the object store's whole address; without one there is nothing to ask
@@ -676,18 +713,48 @@ def get_bytes_decrypted(content_key: str, owner_id: Optional[str], *,
         )
     response = _s3_edge_internal.get_object(Bucket=_EDGE_BUCKET, Key=content_key)
     raw = response["Body"].read()
-    if owner_id:
-        return _decrypt_envelope(content_key, raw, owner_id)
-    return raw
+
+    # The object store leg demands an envelope, exactly as the local tier above does.
+    #
+    # `_decrypt_envelope` with `require_encrypted` left at False, or a bare `return raw` when there
+    # is no owner, serves whatever the bucket holds: `decrypt_content` returns a blob unchanged when
+    # the four-byte `MEC1` magic is absent, and the magic is chosen by whoever wrote the object.
+    #
+    # So anyone able to PUT into the edge bucket — a stolen presigned PUT, MinIO root
+    # credentials, or a compromised durable bucket that `ensure_edge_object_present` hydrates
+    # FROM — could replace an object with chosen plaintext and have it served as artifact
+    # content, with no tag to fail and nothing in the response saying so. Store write became
+    # content forgery.
+    #
+    # The local CAS leg has always passed `require_encrypted=True` (see above), and
+    # `doc_boundary` passes it for inline content with a comment describing this same attack.
+    # This leg was the one that did not.
+    if not owner_id:
+        # No owner is no envelope, and an object nobody can authenticate is not content.
+        raise ContentDecryptionError(
+            f"stored object {content_key!r} has no owner to open an envelope for; refusing to "
+            f"return unauthenticated bytes as content"
+        )
+    return _decrypt_envelope(content_key, raw, owner_id, require_encrypted=True,
+                             collection_id=collection_id)
 
 
 def _decrypt_envelope(name: str, raw: bytes, owner_id: str, *,
-                      require_encrypted: bool = False) -> bytes:
+                      require_encrypted: bool = False,
+                      collection_id: Optional[str] = None) -> bytes:
     """Open the per-principal envelope, or raise. One implementation for both tiers, so neither
-    can drift into returning ciphertext the other would refuse."""
+    can drift into returning ciphertext the other would refuse.
+
+    *collection_id* is the scope the blob was sealed under. `decrypt_content` tries the scoped AAD
+    first and falls back to the legacy owner-only binding, counting the fallback on success — so
+    passing it is what MIGRATES the corpus rather than breaking it: objects written before the
+    scope was threaded through still open, and `content_crypto.legacy_aad_reads` counts how many
+    remain.
+    """
     try:
         from mantle.services import content_crypto
-        return content_crypto.decrypt_content(owner_id, raw, require_encrypted=require_encrypted)
+        return content_crypto.decrypt_content(owner_id, raw, require_encrypted=require_encrypted,
+                                              collection_id=collection_id)
     except Exception as exc:
         logger.error("failed to decrypt stored content %s", name, exc_info=True)
         raise ContentDecryptionError(

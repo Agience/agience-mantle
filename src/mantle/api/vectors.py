@@ -70,7 +70,7 @@ def validate_vector(values: Sequence[float], space_id: Optional[str]) -> Supplie
     When no AnchorSet is provisioned the dimension is accepted as-is; the vector arm
     already reports that deployment state on its own.
 
-    THAT ACCEPTANCE IS THE WRITER'S, NOT THE READER'S. A stored vector on an unseeded node is
+    That acceptance is the writer's, not the reader's. A stored vector on an unseeded node is
     provenance for data at rest and is placed when a set arrives, so accepting it costs the
     writer nothing; a QUERY vector on the same node can never be placed, and
     :func:`project_to_anchor_space` refuses it there rather than answering by recency.
@@ -139,9 +139,8 @@ def project_to_anchor_space(vector: SuppliedVector) -> List[float]:
     query carrying no vector at all comes back as. A caller that supplied a vector could not
     tell that it had been ignored.
 
-    ⚠ THE 400 COVERS A HYBRID QUERY TOO, and that is deliberate rather than incidental: this
-    function already refuses a text+vector recall whose vector names a foreign space, even
-    though its text half would have narrowed perfectly well. Refusing a foreign space and
+    The 400 covers a hybrid query too: a text+vector recall whose vector names a foreign space is
+    refused, even though its text half would narrow perfectly well. Refusing a foreign space and
     accepting a nonexistent one would be the same request answered two ways. Dropping the
     ``vector`` field turns any such call into a text query, which works — see
     :meth:`search.mantle.sse.router_accessor.MantleSseSearchAccessor._by_coverage`, whose

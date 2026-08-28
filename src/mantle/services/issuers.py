@@ -120,7 +120,17 @@ def create_issuer_artifact(
         raise ValueError("an external issuer must bind an 'audience'")
     system_id = _system_principal_id()
     if not system_id:
-        raise RuntimeError("system principal unavailable — cannot own issuer artifact")
+        # A named exception, not a bare `RuntimeError` [P-9, 2026-08-26]. The router caught
+        # `RuntimeError` here and returned `str(exc)` as a 503 — which was correct for THIS raise,
+        # whose message is curated, and wrong for every other `RuntimeError` the call stack can
+        # produce. A broad handler over a narrow intent turns any internal error's text into a
+        # response body, which is the whole of P-9.
+        #
+        # `SystemPrincipalUnavailable` already exists for exactly this condition and is already
+        # raised for it by `services/system_identity.py:44`. This was the drift, not the fix.
+        from .acting_principal import SystemPrincipalUnavailable
+        raise SystemPrincipalUnavailable(
+            "system principal unavailable — cannot own issuer artifact")
 
     ctx: Dict[str, Any] = {
         "content_type": ISSUER_CONTENT_TYPE, "issuer": issuer, "role": role,

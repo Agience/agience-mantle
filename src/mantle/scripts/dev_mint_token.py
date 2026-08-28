@@ -5,7 +5,7 @@
     python -m mantle.scripts.dev_mint_token --keys-dir ./.data/keys
     python src/mantle/scripts/dev_mint_token.py --keys-dir ./.data/keys   # no install needed
 
-⛔ KEYS_DIR IS THE ROOT CREDENTIAL OF A STANDALONE NODE. Anyone who can read that directory can
+KEYS_DIR is the root credential of a standalone node. Anyone who can read that directory can
 already mint this token by hand: `mantle.private.pem` is the signing key, and
 `authority.manifest.json` is the node telling itself to trust the matching public half. This
 command does not create that exposure — it *names* it. Read access to `KEYS_DIR` is full access to
@@ -137,7 +137,7 @@ def audience() -> str:
     re-bind from Phase 2 (`load_settings_from_db` recomputes `AUTHORITY_ISSUER` at the end); a
     one-shot command has no Phase 2, so it reloads.
 
-    THE ONE CASE THIS CANNOT SEE is a stored `branding.origin_uri` row: that lives in the lattice,
+    The one case this cannot see is a stored `branding.origin_uri` row: that lives in the lattice,
     the running node reads it at Phase 2, and this command opens no store. An operator who set the
     authority through the settings API rather than the environment must set `AUTHORITY_ISSUER` in
     this shell too, or the node answers `401 Invalid token audience` — which names the mismatch. Not
@@ -156,7 +156,7 @@ def audience() -> str:
 def default_ttl_seconds() -> int:
     """The lifetime, taken from the package's own declared user-token lifetime.
 
-    NOT A NUMBER CHOSEN HERE. `services/auth_service.ACCESS_TOKEN_EXPIRE_HOURS` is what this
+    Not a number chosen here. `services/auth_service.ACCESS_TOKEN_EXPIRE_HOURS` is what this
     distribution already says an end-user access token lives for, and this token is exactly that —
     a user token, on the user branch of `resolve_auth`. `peer_signing._TTL` (300s) is the other
     lifetime in the tree and is the wrong one to copy: it is sized for one outbound peer call, and a
@@ -226,7 +226,7 @@ def mint(keys_dir: Path, *, subject: str, aud: str, ttl_seconds: int,
     claims = {"iss": _ISSUER, "sub": subject, "aud": aud, "iat": issued, "exp": exp}
 
     def _seg(obj) -> str:
-        return _b64url(json.dumps(obj, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+        return _b64url(json.dumps(obj, separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode("utf-8"))
 
     signing_input = ("%s.%s" % (_seg(header), _seg(claims))).encode("ascii")
     signature = _load_private_key(keys_dir).sign(

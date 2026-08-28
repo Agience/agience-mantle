@@ -4,13 +4,13 @@
 
 """A store built from the permissive half alone, demonstrated end to end.
 
-`_scratch/ARCHITECTURE-TARGET.md` §3 splits the product line by licence: the permissive surface
+`agience-pharos/genesis/ARCHITECTURE-TARGET.md` §3 splits the product line by licence: the permissive surface
 (`prism · mantle · crystal · beacon`) is the giveaway, the copyleft surface (`ember · chorus ·
 origin · the aperture`) is the product. §5 declares a `store` profile that installs
 `prism-py + mantle`, measures with beacon, stores, and searches. Every other test in this repo
-runs inside a workspace where `ember` and `entroptics` are importable, so a green suite there is
+runs inside a workspace where `ember` is importable, so a green suite there is
 evidence about this box, not about a giveaway install. This file stands a store up in a fresh
-interpreter with `ember`, `entroptics` and `beam` removed from the import system for the whole
+interpreter with `ember` and `beam` removed from the import system for the whole
 scenario, and measures what that store can and cannot do.
 
 ## The control
@@ -26,10 +26,9 @@ consulted). So the control is checked before anything else runs:
      string, which discriminates "blocked by the control" from "absent anyway";
   3. that alone is not enough, because the marker appears for an absent package too.
      `test_the_blocked_packages_are_really_installed_here` runs each root in a separate
-     interpreter with no blocker and records whether it genuinely imports. On this box, `ember`
-     and `entroptics` import, so the control is blocking two live packages; `beam` does not exist
-     in this workspace, so its being blocked is not evidence, and this file says so rather than
-     counting it.
+     interpreter with no blocker and records whether it genuinely imports. On this box `ember`
+     imports, so the control is blocking a live package; `beam` does not exist in this workspace,
+     so its being blocked is not evidence, and this file says so rather than counting it.
 
 The scenario runs in a subprocess rather than a fixture because `conftest.py` imports `mantle` at
 collection time — by the time any in-process fixture could install a finder, mantle's whole import
@@ -77,10 +76,13 @@ from functools import lru_cache
 
 import pytest
 
-# The three roots blocked for this scenario. `ember` holds the runner and the aperture,
-# `entroptics` is the generic instrument behind it, `beam` is the aperture's former home. All
-# three are the copyleft half or private; a `store`-profile install has none of them.
-BLOCKED = ("ember", "entroptics", "beam")
+# The roots blocked for this scenario. `ember` holds the runner and the aperture; `beam` is the
+# aperture's former home. Both are the copyleft half; a `store`-profile install has neither.
+#
+# A THIRD ENTRY — the aperture library — WAS REMOVED 2026-08-25 [John]. The file no
+# longer demonstrates that a store runs with the aperture library absent - only that it runs
+# without the copyleft runner. Nothing now holds that edge at zero; it is a convention, not a gate.
+BLOCKED = ("ember", "beam")
 
 #: The marker the control's `ImportError` carries, to discriminate "this import was blocked by
 #: the control" from "this import failed because the package is not there" — two outcomes that
@@ -99,7 +101,7 @@ MARK = "REFUSED by the giveaway control"
 _SCENARIO = r'''
 import json, math, os, sys, tempfile, traceback
 
-BLOCKED = ("ember", "entroptics", "beam")
+BLOCKED = ("ember", "beam")
 MARK = "REFUSED by the giveaway control"
 R = {"blocked": list(BLOCKED)}
 
@@ -124,7 +126,7 @@ class Blocker:
     defines only that hook is silently skipped, which would make the whole scenario vacuous while
     staying green.
 
-    Matches on the root package, so `ember.anything` and `entroptics.reads` are blocked too: an
+    Matches on the root package, so `ember.anything` and `ember.optics` are blocked too: an
     edge entering through a submodule would otherwise walk past the control."""
 
     def find_spec(self, fullname, path=None, target=None):
@@ -145,7 +147,7 @@ for n in BLOCKED:
     except BaseException as exc:
         bite[n] = "raised " + type(exc).__name__
 # and a submodule, to prove the match is on the root rather than the exact name
-for n in ("ember.optics", "entroptics.reads", "beam.optics"):
+for n in ("ember.optics", "ember.runtime", "beam.optics"):
     try:
         __import__(n)
         bite[n] = "IMPORTED"
@@ -169,7 +171,7 @@ try:
     from mantle.services.acting_principal import ActingPrincipal, set_acting_principal
     from mantle.search.mantle.oracle import (FernetMasterKeyStore, GrantDenied, KeyPurpose,
                                              KeyRequest, OracleService)
-    from mantle.search.mantle.sse import (FilePostingStore, SseIndexer, TokenNarrower,
+    from mantle.search.mantle.sse import (SqlitePostingStore, SseIndexer, TokenNarrower,
                                           blind_tokens as bt, posting, tokenize)
     R["imports_ok"] = True
 except BaseException:
@@ -280,7 +282,7 @@ try:
     root = os.path.join(tempfile.mkdtemp(prefix="giveaway-store-"), "sse-index")
     oracle = OracleService(FernetMasterKeyStore(Fernet(Fernet.generate_key())),
                            grant_verifier=SingleRequesterVerifier(READER))
-    postings = FilePostingStore(root, prefix="mantle-sse")
+    postings = SqlitePostingStore(os.path.join(root, "mantle-sse.db"))
 
     indexer = SseIndexer(oracle, postings)
     written = {}
@@ -289,18 +291,45 @@ try:
     R["store"] = {"documents": len(CORPUS), "blind_tokens_written": written,
                   "blind_tokens_total": sum(written.values()), "root": root}
 
-    # The files on disk must carry no plaintext, or "encrypted index" is only a label.
+    # ⛔ TWO DIFFERENT CLAIMS, MEASURED SEPARATELY, because conflating them let one of them be
+    # false for as long as this test has existed.
+    #
+    # CORPUS TEXT must never be at rest. That is what "encrypted index" means and it is the
+    # property the whole SSE design buys: terms reach the store already HMAC-blinded under a key
+    # the store cannot derive, and entries arrive AES-GCM sealed. This holds.
+    #
+    # IDENTIFIERS are at rest, in cleartext, in every backend. `principal_id` and `artifact_id`
+    # arrive as cleartext strings from the caller and each store writes them somewhere it can look
+    # them up by: the file store escaped them into directory and file NAMES (reversible —
+    # `decode_component` is its inverse), S3 interpolates them RAW into object keys
+    # (`{prefix}/{principal_id}/sse/manifests/{artifact_id}.enc`), and `SqlitePostingStore` keeps
+    # them as TEXT columns. Nothing changed about what is revealed; what changed is that SQLite
+    # keeps it in file CONTENT while the other two keep it in NAMES — and this check only ever
+    # read content, so it reported clean over a tree whose directory listing said `store-owner`.
+    #
+    # Asserted rather than deleted, and asserted in the positive: the ids ARE expected here. A
+    # future change that blinds them will fail this and should, because that is a property worth
+    # noticing the arrival of.
+    #
+    # ⚠ FIXING IT PROPERLY IS NOT A STORE CHANGE. Blinding an id requires a key, and a store holds
+    # none by design — it receives ciphertext and opaque tokens and nothing else. So the blinding
+    # belongs where the keys are (`indexer` / `narrowing`, which already derive per-owner SSE
+    # keys), applies to all three backends at once, and needs a full reindex to migrate. An unkeyed
+    # hash inside one store would make this check pass while confirming membership for anyone who
+    # can guess an id, which is worse than the honest version.
     files = []
     for dirpath, _d, filenames in os.walk(root):
         files.extend(os.path.join(dirpath, f) for f in filenames)
     blob = b"".join(open(p, "rb").read() for p in files)
-    leaked = [w for w in (b"encryption", b"lattice", b"merkle", b"tracy", b"aperture",
-                          b"art-optics-1", b"col-lattice", b"store-owner", b"title")
-              if w in blob]
+    # Words that appear ONLY in the corpus text — never in an id — so a hit is unambiguously
+    # indexed content and not an identifier the store legitimately holds.
+    corpus_text = (b"encryption", b"merkle", b"tracy", b"aperture", b"title")
+    identifiers = (b"art-optics-1", b"store-owner")
     R["store"]["files_on_disk"] = len(files)
     R["store"]["bytes_on_disk"] = len(blob)
     R["store"]["non_ciphertext_files"] = [p for p in files if not p.endswith(".enc")]
-    R["store"]["plaintext_leaked"] = [w.decode() for w in leaked]
+    R["store"]["plaintext_leaked"] = [w.decode() for w in corpus_text if w in blob]
+    R["store"]["identifiers_at_rest"] = [w.decode() for w in identifiers if w in blob]
 except BaseException:
     _fatal("standing the store up")
 
@@ -338,7 +367,7 @@ try:
     R["search"] = searched
 
     # The same index survives a reopen: a store is not a process-lifetime cache.
-    reopened = TokenNarrower(oracle, FilePostingStore(root, prefix="mantle-sse"))
+    reopened = TokenNarrower(oracle, SqlitePostingStore(os.path.join(root, "mantle-sse.db")))
     R["search_after_reopen"] = sorted(_narrow(reopened, "encryption", ALL))
 except BaseException:
     _fatal("searching the encrypted index")
@@ -406,7 +435,7 @@ try:
     root2 = os.path.join(tempfile.mkdtemp(prefix="giveaway-selfonly-"), "sse-index")
     self_only = OracleService(FernetMasterKeyStore(Fernet(Fernet.generate_key())),
                               grant_verifier=SelfContextVerifier())
-    p2 = FilePostingStore(root2, prefix="mantle-sse")
+    p2 = SqlitePostingStore(os.path.join(root2, "mantle-sse.db"))
     ix2 = SseIndexer(self_only, p2)
     for col, aid, fields in CORPUS:
         ix2.index_artifact(OWNER, col, aid, fields, _owner_write())
@@ -452,24 +481,30 @@ try:
         owner_tok = bt.blind_token(owner_key, bt.FIELD_TITLE, stem)
         intruder_tok = bt.blind_token(intruder_key, bt.FIELD_TITLE, stem)
         addressed[term] = {
-            "owner_token_addresses_a_posting": p2.get_posting(OWNER, owner_tok) is not None,
-            "intruder_token_under_owner": p2.get_posting(OWNER, intruder_tok) is not None,
-            "intruder_token_under_intruder": p2.get_posting(INTRUDER, intruder_tok) is not None,
+            "owner_token_addresses_a_posting": bool(p2.get_entries(OWNER, owner_tok)),
+            "intruder_token_under_owner": bool(p2.get_entries(OWNER, intruder_tok)),
+            "intruder_token_under_intruder": bool(p2.get_entries(INTRUDER, intruder_tok)),
         }
     ref["blind_tokens"] = addressed
 
-    # (d) the ciphertext does not open under the intruder's key even when handed to them
+    # (d) the ciphertext does not open under the intruder's key even when handed to them.
+    #
+    # A slot is a set of per-entry blobs now, so this hands over ONE of them. The claim is
+    # unchanged and so is the demonstration: the bytes are real ciphertext, they open under the
+    # owner's derived key, and they do not open under the intruder's.
     stem = tokenize("lattice")[0]
     tok = bt.blind_token(owner_key, bt.FIELD_TITLE, stem)
-    ct = p2.get_posting(OWNER, tok)
-    ref["ciphertext_handed_over_bytes"] = len(ct) if ct else 0
-    # `aad=` mirrors the slot binding `SseIndexer` writes with; the intruder attempt below
-    # fails on the KEY, so it needs none.
+    handed = p2.get_entries(OWNER, tok)
+    entry_artifact, entry_collection, ct = handed[0]
+    ref["ciphertext_handed_over_bytes"] = len(ct)
+    # `aad=` mirrors the per-entry binding `SseIndexer` writes with — the slot AND the entry's
+    # own (artifact, collection). The intruder attempt below fails on the KEY, so it needs none.
     ref["opens_under_owner_key"] = bool(
-        posting.unpack_posting(ct, posting.derive_posting_key(owner_key, tok),
-                               aad=posting.posting_aad(OWNER, tok)))
+        posting.unpack_entry(ct, posting.derive_posting_key(owner_key, tok),
+                             aad=posting.entry_aad(OWNER, tok, entry_artifact,
+                                                   entry_collection)))
     try:
-        posting.unpack_posting(ct, posting.derive_posting_key(intruder_key, tok))
+        posting.unpack_entry(ct, posting.derive_posting_key(intruder_key, tok))
         ref["opens_under_intruder_key"] = True
     except posting.PostingError as exc:
         ref["opens_under_intruder_key"] = False
@@ -785,20 +820,20 @@ def test_the_scenario_completed() -> None:
 def test_the_blocked_packages_are_really_installed_here() -> None:
     """The positive control, and it is allowed to report a partial answer.
 
-    Catches the case where the whole file passes because `ember` and `entroptics` were never
-    importable in this environment, so blocking them blocked nothing. `beam` is in exactly that
-    state (archived, §3), which is why this test asserts only that at least one blocked root
-    genuinely imports and reports the rest. Asserting all three would fail on a true fact about
-    the workspace and teach the next reader to delete the check."""
+    Catches the case where the whole file passes because `ember` was never importable in this
+    environment, so blocking it blocked nothing. `beam` is in exactly that state (archived, §3),
+    which is why this test asserts only that at least one blocked root genuinely imports and
+    reports the rest. Asserting both would fail on a true fact about the workspace and teach the
+    next reader to delete the check."""
     v = _installed_without_the_blocker()
     _report("0a · POSITIVE CONTROL — do the blocked packages import with NO blocker?", v)
     live = [n for n, r in v.items() if r["imports"]]
     assert live, (
-        "none of ember/entroptics/beam imports on this box, so removing them removes NOTHING and "
+        "neither ember nor beam imports on this box, so removing them removes NOTHING and "
         f"every measurement in this file is vacuous: {v}")
-    assert "entroptics" in live, (
-        "entroptics — the generic instrument the AGPL aperture wraps — is not importable here, so "
-        "the single most load-bearing removal in this demonstration is not being demonstrated")
+    assert "ember" in live, (
+        "ember — the copyleft runner this store is demonstrated without — is not importable here, "
+        "so the load-bearing removal in this demonstration is not being demonstrated")
 
 
 def test_the_blocker_bites_before_anything_else_runs() -> None:
@@ -832,9 +867,24 @@ def test_1_the_store_holds_documents_and_writes_only_ciphertext() -> None:
     assert s["documents"] == 8
     assert all(n > 0 for n in s["blind_tokens_written"].values()), s["blind_tokens_written"]
     assert s["files_on_disk"] > 0, "nothing was written — the plaintext scan below is vacuous"
-    assert s["non_ciphertext_files"] == [], s["non_ciphertext_files"]
+    assert s["bytes_on_disk"] > 0, "an empty index makes the scan vacuous too"
+    # NO CORPUS TEXT AT REST. The claim "encrypted index" reduces to exactly this, and it holds:
+    # terms arrive HMAC-blinded under a key the store cannot derive, entries arrive AES-GCM sealed.
     assert s["plaintext_leaked"] == [], (
-        f"readable plaintext in the on-disk index: {s['plaintext_leaked']}")
+        f"readable corpus text in the on-disk index: {s['plaintext_leaked']}")
+    # AND THE IDENTIFIERS ARE THERE, which is asserted in the positive on purpose — see the long
+    # note beside the scan. Every backend keeps `principal_id` and `artifact_id` in cleartext (file
+    # names, S3 object keys, SQLite columns); this records it where it can be seen rather than
+    # leaving it to be rediscovered. A change that blinds them will fail here, and should.
+    assert s["identifiers_at_rest"] == ["art-optics-1", "store-owner"], (
+        f"the set of identifiers at rest changed: {s['identifiers_at_rest']} — if they are now "
+        f"blinded that is an improvement, and this assertion is the thing that noticed"
+    )
+    # `non_ciphertext_files` is recorded rather than asserted on. As "every file here is a `.enc`
+    # blob" it was a suffix proxy for "nothing writes a readable side-car", and the store is three
+    # SQLite files (`.db`, `-wal`, `-shm`) holding sealed blobs in BLOB columns. The property holds
+    # and the corpus-text scan above measures it directly.
+    assert s["non_ciphertext_files"], "recorded for the report; the SQLite files are expected here"
 
 
 def test_1_an_unauthorised_principal_gets_nothing_derivable() -> None:
@@ -866,7 +916,7 @@ def test_2_the_encrypted_lexical_index_returns_real_hits() -> None:
     engine to itself would pass on an engine that returns whatever it happens to hold."""
     v = _scenario()
     s = v["search"]
-    _report("2a · SEARCH over the encrypted index (no ember, no entroptics)", s)
+    _report("2a · SEARCH over the encrypted index (no ember)", s)
     for q, rec in s.items():
         assert rec["hits"] == rec["expected"], f"{q}: {rec['hits']} != oracle {rec['expected']}"
         assert set(rec["coverage"]) == set(rec["hits"]), (

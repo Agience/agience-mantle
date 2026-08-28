@@ -42,7 +42,7 @@ def _public_base() -> str:
     about where this node answers. Treating it as declared would hand the IdP a redirect to
     localhost from a production host, so it is rejected here as firmly as an empty value.
 
-    THE TEST IS WHETHER IT WAS DECLARED, NOT WHAT IT SAYS — `config.declared_public_uri()`, the
+    The test is whether it was declared, not what it says — `config.declared_public_uri()`, the
     same distinction `config.authority_is_declared()` draws for the authority and deliberately not
     a second reading of it. Matching the VALUE against `http://localhost` instead refuses the one
     sentence a node on a laptop can truthfully say about itself: `MANTLE_URI=http://localhost:8081`

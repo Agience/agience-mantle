@@ -187,15 +187,17 @@ def test_lexical_surface_imports_and_works_without_numpy() -> None:
     assert v["lexical_imports"], f"lexical surface failed to import: {v.get('lexical_error')}"
     assert v["lexical_works"], f"lexical surface imported but broke: {v.get('lexical_work_error')}"
     assert not v["numpy_in_sys_modules"], "numpy reached sys.modules despite the blocker"
-    assert v["coverage"] == {"a1": [2, 0]}, (
+    # The counts only — `Coverage` also names which stems matched, and this test is about the
+    # lexical surface working with numpy blocked, not about that tuple's width.
+    assert {a: c[:2] for a, c in (v["coverage"] or {}).items()} == {"a1": [2, 0]}, (
         "the index-then-narrow round trip produced no coverage: %r" % (v.get("coverage"),))
 
 
 def test_semantic_surface_still_requires_numpy() -> None:
     """The other half of the split: `mantle.search.beacon.engine` must fail without numpy.
 
-    If this ever passes, `[semantic]` is declaring a dependency the code no longer has — the split
-    would have drifted, and the extras would be describing an arrangement that is no longer true."""
+    If this ever passes, `[semantic]` declares a dependency the code does not have: the split has
+    drifted, and the extras describe an arrangement that is not the one in the tree."""
     v = _verdict()
     assert v["blocker_fires"], "blocker did not fire; this result would mean nothing"
     assert v["semantic_fails"], (

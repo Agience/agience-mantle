@@ -1,9 +1,9 @@
 """`PUT /artifacts/{id}/content` on a node with no object store.
 
-The route's byte path is `services/content_service.py`, and it used to be one call to
-`put_object`: a node with no bucket credentials failed EVERY upload, and the read that followed
-found nothing. This file holds the shape that replaced it — the tier `db/content_tier.py` already
-implements for ingest, reached through `db.backend.content_handle()`:
+The route's byte path is `services/content_service.py`. A single call to `put_object` there would
+fail every upload on a node with no bucket credentials, and the read that followed would find
+nothing. This file holds the tier `db/content_tier.py` implements for ingest, reached through
+`db.backend.content_handle()`:
 
   * write   → the node's own encrypted CAS first, the object store after it, and a node with no
               object store is a complete configuration rather than a degraded one;
@@ -305,14 +305,37 @@ def test_the_object_store_still_gets_the_write_and_still_answers_the_read(node, 
     fake.get_object.assert_called_once()
 
 
-def test_a_legacy_plaintext_object_store_object_still_passes_through(node, envelope):
-    """Objects predating envelope encryption genuinely carry no magic; that is compatibility on the
-    object-store leg, and it is exactly what the CAS leg refuses."""
+def test_an_unenveloped_object_store_object_is_refused_not_served(node, envelope):
+    """Whoever writes the object chooses whether it carries `MEC1` magic. So a blob without the
+    magic is not "legacy" — it is indistinguishable from one an attacker PUT, and serving it turns
+    bucket write access into content forgery. Both tiers demand an envelope, with no way to ask
+    them not to: there is no flag, no env var, and no caller-supplied override on this path."""
     fake = MagicMock()
-    fake.get_object.return_value = {"Body": MagicMock(read=lambda: b"pre-envelope bytes")}
+    fake.get_object.return_value = {"Body": MagicMock(read=lambda: b"chosen plaintext")}
+    with patch.object(cs, "_s3_edge_internal", fake),             patch.object(cs, "edge_store_configured", return_value=True):
+        with pytest.raises(cs.ContentDecryptionError):
+            cs.get_bytes_decrypted("artifacts/a-1.content", "owner-a")
+
+
+def test_no_switch_exists_to_re_admit_unenveloped_content(node, envelope):
+    """The escape hatch this file briefly carried pointed operators at `legacy_aad_reads` as the
+    signal for when to close it again — a counter that cannot increment on this leg at all. A
+    disable switch whose exit condition never fires is a permanent hole, so there is no switch."""
+    import inspect
+    src = inspect.getsource(cs)
+    assert "ALLOW_LEGACY_PLAINTEXT" not in src
+    assert "_allow_legacy_plaintext" not in src
+
+
+def test_an_object_with_no_owner_is_refused_rather_than_returned_raw(node, envelope):
+    """The old code returned the bucket's bytes verbatim when there was no owner to decrypt for.
+    An object nobody can authenticate is not content, whatever the bucket says."""
+    fake = MagicMock()
+    fake.get_object.return_value = {"Body": MagicMock(read=lambda: b"chosen plaintext")}
     with patch.object(cs, "_s3_edge_internal", fake), \
             patch.object(cs, "edge_store_configured", return_value=True):
-        assert cs.get_bytes_decrypted("artifacts/a-1.content", "owner-a") == b"pre-envelope bytes"
+        with pytest.raises(cs.ContentDecryptionError):
+            cs.get_bytes_decrypted("artifacts/a-1.content", "")
 
 
 def test_the_inline_content_mirror_writes_no_unreferenced_cas_object(node, envelope):
@@ -450,3 +473,243 @@ def test_no_object_store_means_no_bucket_probe(node, envelope):
     fake.head_bucket.assert_not_called()
     fake.create_bucket.assert_not_called()
     cs._BUCKET_CHECKED = False
+
+
+# ---------------------------------------------------------------------------
+# The scope is part of the binding — asserted THROUGH the wiring, not around it
+# ---------------------------------------------------------------------------
+
+def test_a_blob_sealed_under_one_collection_does_not_open_under_another(node, envelope):
+    """`content_crypto`'s central claim, asserted where it actually has to hold.
+
+    The module docstring says a scoped blob does not travel: presented under col-B, the read
+    raises. That was true of the primitive and false of the corpus, because `put_bytes_encrypted`
+    called `encrypt_content(owner_id, data)` without the scope, so every CAS object took the
+    legacy owner-only AAD. `tests/test_content_crypto.py` passed throughout — it calls
+    `content_crypto` directly with a `collection_id` the production caller never supplied.
+
+    So this test goes through `put_bytes_encrypted` / `get_bytes_decrypted`. It fails on any
+    future edit that drops the scope on either leg, which the direct-call tests cannot see.
+    """
+    ref = cs.put_bytes_encrypted("artifacts/a-1.content", b"scoped body", "text/plain",
+                                 "owner-a", collection_id="col-a")
+
+    assert cs.get_bytes_decrypted("artifacts/a-1.content", "owner-a", cas_ref=ref,
+                                  collection_id="col-a") == b"scoped body"
+
+    with pytest.raises(cs.ContentDecryptionError):
+        cs.get_bytes_decrypted("artifacts/a-1.content", "owner-a", cas_ref=ref,
+                               collection_id="col-b")
+
+
+def test_a_scoped_blob_does_not_open_with_the_scope_dropped(node, envelope):
+    """Presenting no scope selects the legacy owner-only AAD. A blob sealed WITH a scope must not
+    open that way — otherwise "drop the collection_id" would be a downgrade any caller could
+    perform, and the binding would be advisory."""
+    ref = cs.put_bytes_encrypted("artifacts/a-1.content", b"scoped body", "text/plain",
+                                 "owner-a", collection_id="col-a")
+    with pytest.raises(cs.ContentDecryptionError):
+        cs.get_bytes_decrypted("artifacts/a-1.content", "owner-a", cas_ref=ref)
+
+
+def test_an_unscoped_blob_still_opens_so_the_corpus_migrates_rather_than_breaks(node, envelope):
+    """Everything written before the scope was threaded through carries the legacy binding. The
+    dual-read in `decrypt_content` opens those under the owner-only AAD and counts the fallback on
+    success, so `legacy_aad_reads` measures what is left to migrate instead of reading zero for
+    reasons unrelated to whether legacy objects exist."""
+    from mantle.services import content_crypto
+
+    ref = cs.put_bytes_encrypted("artifacts/a-1.content", b"legacy body", "text/plain", "owner-a")
+
+    before = content_crypto.legacy_aad_reads
+    assert cs.get_bytes_decrypted("artifacts/a-1.content", "owner-a", cas_ref=ref,
+                                  collection_id="col-a") == b"legacy body"
+    assert content_crypto.legacy_aad_reads == before + 1, \
+        "an un-migrated blob must be counted, or the counter cannot signal when to drop the fallback"
+
+
+# ---------------------------------------------------------------------------
+# : conditional GET, and a caller's say in Content-Disposition.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_download_carries_an_etag(routed, client):
+    """G4. The artifact already stored `content_sha256` — the PUT side uses it to make an
+    identical re-upload a no-op — so the value an ETag wants was already on the artifact."""
+    payload = b"etag me"
+    await client.put("/artifacts/a-1/content", content=payload)
+    got = await client.get("/artifacts/a-1/content")
+    assert got.status_code == 200
+    assert got.headers.get("etag"), got.headers
+    assert got.headers["etag"].strip('"'), "an empty ETag is worse than none"
+
+
+@pytest.mark.asyncio
+async def test_a_matching_if_none_match_is_304_with_no_body(routed, client):
+    payload = b"unchanged bytes"
+    await client.put("/artifacts/a-1/content", content=payload)
+    first = await client.get("/artifacts/a-1/content")
+    etag = first.headers["etag"]
+
+    again = await client.get("/artifacts/a-1/content", headers={"if-none-match": etag})
+    assert again.status_code == 304, again.text
+    assert again.content == b"", "a 304 must not carry the body it just said was unchanged"
+    assert again.headers.get("etag") == etag
+
+
+@pytest.mark.asyncio
+async def test_a_star_if_none_match_is_304(routed, client):
+    """`*` means 'any current representation' and is legal in `If-None-Match`."""
+    await client.put("/artifacts/a-1/content", content=b"star")
+    r = await client.get("/artifacts/a-1/content", headers={"if-none-match": "*"})
+    assert r.status_code == 304, r.text
+
+
+@pytest.mark.asyncio
+async def test_a_stale_if_none_match_still_sends_the_bytes(routed, client):
+    """The inverted guard. If every conditional request 304'd, the tests above would pass on a
+    route that had simply stopped serving content."""
+    payload = b"fresh bytes"
+    await client.put("/artifacts/a-1/content", content=payload)
+    r = await client.get("/artifacts/a-1/content",
+                         headers={"if-none-match": '"not-the-right-digest"'})
+    assert r.status_code == 200, r.text
+    assert r.content == payload
+
+
+@pytest.mark.asyncio
+async def test_disposition_inline_is_accepted(routed, client):
+    """G5. `attachment` was unconditional, so a viewer could not render an image or a PDF in
+    place. It stays the DEFAULT — a download is the safe assumption for arbitrary uploaded
+    bytes — but it is now the caller's choice."""
+    await client.put("/artifacts/a-1/content", content=b"inline me")
+    r = await client.get("/artifacts/a-1/content", params={"disposition": "inline"})
+    assert r.status_code == 200, r.text
+    cd = r.headers.get("content-disposition")
+    if cd:  # only sent when the artifact carries a filename
+        assert cd.startswith("inline"), cd
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_disposition_is_refused(routed, client):
+    """It is a `Literal`, so a typo is a 422 rather than a silently ignored word."""
+    await client.put("/artifacts/a-1/content", content=b"x")
+    r = await client.get("/artifacts/a-1/content", params={"disposition": "sideways"})
+    assert r.status_code == 422, r.status_code
+
+
+@pytest.mark.asyncio
+async def test_a_304_never_reads_or_decrypts_the_bytes(routed, client, monkeypatch):
+    """The point of checking the ETag BEFORE the tier read, not after.
+
+    The handler's own comment calls `get_bytes_decrypted` the most obviously blocking call in the
+    router — a whole-blob read plus decrypt whose duration scales with artifact size. Answering
+    304 after paying for that would save only the transfer.
+
+    Proved by making the read explode: if the conditional path touched it, this would be a 500."""
+    import mantle.services.content_service as content_service
+
+    await client.put("/artifacts/a-1/content", content=b"expensive to decrypt")
+    etag = (await client.get("/artifacts/a-1/content")).headers["etag"]
+
+    def explode(*_a, **_k):
+        raise AssertionError("the 304 path read and decrypted the blob")
+
+    monkeypatch.setattr(content_service, "get_bytes_decrypted", explode)
+    r = await client.get("/artifacts/a-1/content", headers={"if-none-match": etag})
+    assert r.status_code == 304, r.text
+
+
+# ---------------------------------------------------------------------------
+# : serving arbitrary stored bytes safely, and refusing early.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stored_markup_cannot_run_against_a_viewers_session(routed, client):
+    """T4. The stored `Content-Type` is the uploader's own string — trusted verbatim and echoed
+    back as this response's media type.
+
+    `nosniff` (global middleware) does NOT cover this: it stops a browser GUESSING a type, and
+    the danger is a type honestly declared `text/html`. An allowlist was rejected — this is a
+    general artifact store, and refusing unfamiliar types would break legitimate uploads to
+    protect against a rendering decision the SERVER makes. `sandbox` gives the response a unique
+    origin with scripting off, so markup cannot run, while images and PDFs still render."""
+    await client.put("/artifacts/a-1/content",
+                     content=b"<script>fetch('/artifacts/visible')</script>",
+                     headers={"content-type": "text/html"})
+    r = await client.get("/artifacts/a-1/content", params={"disposition": "inline"})
+    assert r.status_code == 200
+    assert r.headers.get("content-type", "").startswith("text/html"), r.headers
+    assert "sandbox" in (r.headers.get("content-security-policy") or ""), r.headers
+
+
+@pytest.mark.asyncio
+async def test_a_declared_oversize_body_is_refused_before_it_is_read(routed, client):
+    """T7. The 413 used to arrive from an `OverflowError` inside the encrypt, so a caller who
+    announced a huge upload had it accepted, buffered whole, hashed, and only then refused.
+
+    Sending a real oversize body is not the test — the point is that the verdict comes from the
+    DECLARED length, so a lying `Content-Length` is refused with no body of that size anywhere."""
+    r = await client.put(
+        "/artifacts/a-1/content",
+        content=b"tiny",
+        headers={"content-length": str(2 ** 31), "content-type": "application/octet-stream"},
+    )
+    assert r.status_code == 413, r.text
+    assert "before reading it" in r.text, r.text
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_upload_is_unaffected_by_the_precondition(routed, client):
+    """The inverted guard: a real `Content-Length` must still pass."""
+    payload = b"a normal body with an honest length"
+    r = await client.put("/artifacts/a-1/content", content=payload,
+                         headers={"content-type": "application/octet-stream"})
+    assert r.status_code == 200, r.text
+    assert r.json()["size"] == len(payload)
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_upload_reports_no_mirror_owed(routed, client):
+    """T6. The deferred-mirror case was recorded server-side and invisible to the caller: an
+    unchanged `200` with no field saying a mirror leg was still owed.
+
+    The reasoning for not failing is right — the bytes ARE durable on this node — but 'durable
+    here' and 'replicated' are different answers, and only one of them was being given. This node
+    has no mirror configured, so the honest answer is `false`."""
+    r = await client.put("/artifacts/a-1/content", content=b"no mirror here")
+    assert r.status_code == 200, r.text
+    assert r.json()["mirror_pending"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_mirror_is_reported_to_the_caller(routed, client, monkeypatch):
+    """The case the field exists for: a mirror this node HAS and could not reach."""
+    import mantle.services.content_service as content_service
+
+    real = content_service.put_bytes_encrypted
+
+    def defer(key, body, ctype, owner, *a, on_mirror_deferred=None, **k):
+        ref = real(key, body, ctype, owner, *a, **k)
+        if on_mirror_deferred is not None:
+            on_mirror_deferred(ref, RuntimeError("mirror unreachable"))
+        return ref
+
+    monkeypatch.setattr(content_service, "put_bytes_encrypted", defer)
+    r = await client.put("/artifacts/a-1/content", content=b"owed a mirror leg")
+    monkeypatch.undo()
+
+    assert r.status_code == 200, r.text
+    assert r.json()["mirror_pending"] is True, r.json()
+
+
+@pytest.mark.asyncio
+async def test_a_dedup_owes_no_mirror(routed, client):
+    """A dedup wrote nothing, so no mirror leg was created and none can be owed."""
+    payload = b"stored once, uploaded twice"
+    await client.put("/artifacts/a-1/content", content=payload)
+    again = await client.put("/artifacts/a-1/content", content=payload)
+    body = again.json()
+    assert body["deduplicated"] is True and body["mirror_pending"] is False, body

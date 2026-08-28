@@ -25,6 +25,27 @@ def db(tmp_path):
     return api.open_database(str(tmp_path / "mantle-lattice.db"), origin="test-mantle")
 
 
+def _owns(db, *resource_ids: str) -> None:
+    """Give OWNER the nine-flag grant `create_container` mints for a creator.
+
+    A key cannot carry more than its issuer holds (`grant_service.clamp_to_issuer`), so minting
+    against a resource the issuer has no grant on now yields a key with no bits. That is the
+    correct answer and it is unreachable in production — every live path to `mint` runs behind
+    `_require_admin`, and a creator's self-grant carries all nine flags
+    (`workspace_service.py:148-157`). These tests are about what bundles DO with bits, so they
+    have to start from an issuer who actually holds them.
+    """
+    for rid in resource_ids:
+        api.create_grant(db, GrantEntity(
+            id=f"g-own-{rid}", resource_id=rid,
+            grantee_type=GrantEntity.GRANTEE_USER, grantee_id=OWNER, granted_by=OWNER,
+            can_create=True, can_read=True, can_update=True, can_delete=True, can_evict=True,
+            can_invoke=True, can_add=True, can_share=True, can_admin=True,
+            state=GrantEntity.STATE_ACTIVE,
+        ))
+
+
+
 # ── minting ──────────────────────────────────────────────────────────────────
 
 def test_a_minted_token_authenticates_back_to_its_grant(db):
@@ -60,6 +81,7 @@ def test_partial_flags_do_not_inherit_the_entity_default(db):
     `Grant.__init__` defaults `can_read=True`, so a spec built by `dict.update` would
     hand out a read the caller never asked for.
     """
+    _owns(db, "col-1")
     grant, _ = gks.mint(db, user_id=OWNER, name="k", resource_id="col-1",
                         flags={"can_invoke": True})
 
@@ -68,6 +90,7 @@ def test_partial_flags_do_not_inherit_the_entity_default(db):
 
 
 def test_a_role_preset_can_be_used_instead_of_bits(db):
+    _owns(db, "col-1")
     grant, _ = gks.mint(db, user_id=OWNER, name="k", resource_id="col-1", role="viewer")
 
     assert grant.can_read is True
@@ -78,6 +101,7 @@ def test_a_role_preset_can_be_used_instead_of_bits(db):
 
 def test_one_key_carries_several_resources_at_different_levels(db):
     """The point of the whole design: read here, read/write there, one token."""
+    _owns(db, "col-ro", "col-rw")
     bundle, raw = gks.mint(db, user_id=OWNER, name="bundle")
     gks.add_member(db, bundle_id=bundle.id, resource_id="col-ro",
                    granted_by=OWNER, flags={"can_read": True})
@@ -100,6 +124,7 @@ def test_a_bundle_root_reaches_nothing_by_itself(db):
 
 def test_narrowing_the_bundle_narrows_every_member_at_once(db):
     """The ceiling is why a bundle is worth having over N separate keys."""
+    _owns(db, "col-a", "col-b")
     bundle, raw = gks.mint(db, user_id=OWNER, name="bundle")
     for res in ("col-a", "col-b"):
         gks.add_member(db, bundle_id=bundle.id, resource_id=res, granted_by=OWNER,

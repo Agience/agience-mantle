@@ -153,10 +153,39 @@ def test_the_manifest_is_written_last(tmp_path: Path, monkeypatch):
     order = []
     import mantle.oci.store as mod
     real = mod.put_content
+    # `**kw` rather than a fixed signature: `put_content` gained a `collection` keyword on
+    # 2026-08-24 (repository == collection), and a double that pins the old shape fails on the
+    # change instead of measuring the ordering it exists to measure. Forwarded verbatim so the
+    # real call still receives it.
     monkeypatch.setattr(mod, "put_content",
-                        lambda s, k, d: (order.append(hashlib.sha256(d).hexdigest()), real(s, k, d))[1])
+                        lambda s, k, d, **kw: (order.append(hashlib.sha256(d).hexdigest()),
+                                               real(s, k, d, **kw))[1])
     ingest_image(cs, keys, image, repository="agience-mantle")
     assert order[-1] == man.split(":")[1], "the manifest was not written last"
+
+
+def test_the_repository_is_the_collection_the_blobs_land_in(tmp_path: Path, monkeypatch):
+    """The ruling, asserted [John, 2026-08-24]. `oci/__init__.py` has always said "repository ==
+    a collection"; until now nothing supplied it, and on a real node — whose store SCOPES writes —
+    the ingest could not run at all.
+
+    Checked at the seam rather than through a scoping store, because `FsContentStore` (what these
+    tests use) accepts no collection and would swallow the distinction. What matters is that the
+    value reaching `put_content` is the repository the caller named.
+    """
+    root, _man = make_layout(tmp_path / "layout")
+    image = read_layout(root)[0]
+    cs, keys = _store(tmp_path)
+
+    seen = []
+    import mantle.oci.store as mod
+    real = mod.put_content
+    monkeypatch.setattr(mod, "put_content",
+                        lambda s, k, d, **kw: (seen.append(kw.get("collection")), real(s, k, d))[1])
+    ingest_image(cs, keys, image, repository="agience-mantle")
+
+    assert seen and set(seen) == {"agience-mantle"}, \
+        "blobs landed in %s, not in the repository's collection" % set(seen)
 
 
 def test_the_record_carries_digests_not_store_refs(tmp_path: Path):

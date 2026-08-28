@@ -58,6 +58,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from mantle.api.errors import ERROR_DESCRIPTIONS
 from mantle.db.store import Database
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -65,6 +66,8 @@ from pydantic import BaseModel, Field
 from mantle.db import backend as db_store
 from mantle.services import issuers as issuers_svc
 from mantle.services.bootstrap_types import AUTHORITY_COLLECTION_SLUG, PEOPLE_COLLECTION_SLUG
+
+
 from mantle.services.dependencies import (
     AuthContext,
     get_store_db,
@@ -76,6 +79,28 @@ from mantle.services.dependencies import (
 )
 from mantle.services.operator import resolve_operator_id
 from mantle.services.platform_topology import get_id_optional
+
+from mantle.services.acting_principal import SystemPrincipalUnavailable
+
+
+
+#: `responses=` for one route, applied to `/system` 2026-08-26.
+#:
+#: A LOCAL BUILDER, ON PURPOSE. `mantle/api/errors.py` says why in its own words: *"one home
+#: for the prose, not one home for the builder — the per-route assembly is three lines and each
+#: surface's differs, so the builders stay local and only this table is shared."* What must never
+#: be duplicated is what a code MEANS on this node.
+#:
+#: Every route here is admin-gated, and that is where most of the missing codes came from.
+#: `get_auth` answers `401` before a handler runs, and `require_platform_admin` raises `403` —
+#: neither appears as a `raise` in these handlers, so a sweep that reads only handler bodies
+#: reports "this operation cannot fail" about a surface where the two commonest failures are
+#: authentication and authorisation.
+def _errors(*codes: int, ok: Optional[type] = None, ok_code: int = 200) -> dict:
+    out = {c: {"description": ERROR_DESCRIPTIONS[c]} for c in codes}
+    if ok is not None:
+        out[ok_code] = {"model": ok}
+    return out
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +191,7 @@ class AdminChangeResponse(BaseModel):
 
 @router.post(
     "/issuers",
+    responses=_errors(400, 401, 403, 500, 503),
     status_code=status.HTTP_201_CREATED,
     response_model=IssuerCreatedResponse,
     summary="Add a trusted issuer",
@@ -189,14 +215,30 @@ async def create_issuer(
             namespace=body.namespace, role=body.role,
         )
     except ValueError as exc:
+        # Deliberately raised, with a curated message naming what the caller must change —
+        # "role must be 'external' or 'platform'", "an external issuer must bind an 'audience'".
+        # Returning that text IS the point of a 400.
         raise HTTPException(status_code=400, detail=str(exc))
-    except RuntimeError as exc:
+    except SystemPrincipalUnavailable as exc:
+        # NARROWED FROM `except RuntimeError` [P-9, 2026-08-26]. The broad handler returned
+        # `str(exc)` for ANY RuntimeError the call stack could raise — a library's, sqlite's,
+        # anything — straight into the response body. It was right about the one raise it was
+        # written for and wrong about every other one, which is exactly the shape P-9 names:
+        # *"an unhandled exception's text is internal detail, and it is being returned to the
+        # caller."*
         raise HTTPException(status_code=503, detail=str(exc))
+    except Exception:
+        # Anything else is unhandled by definition: logged in full, and the caller is told only
+        # that it failed. The same pattern `artifacts_router` already uses for its 500s — one of
+        # which says so outright: *"The server log carries the underlying error."*
+        logger.error("issuer creation failed for %s", body.issuer, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create the issuer")
     return IssuerCreatedResponse(id=art.id, issuer=body.issuer, role=body.role)
 
 
 @router.get(
     "/issuers",
+    responses=_errors(401, 403),
     response_model=IssuerListResponse,
     summary="List trusted issuers",
     description="Every issuer this node accepts tokens from, with the admin who authorized it. Admin-only.",
@@ -222,6 +264,7 @@ async def list_issuers(
 
 @router.delete(
     "/issuers/{artifact_id}",
+    responses=_errors(401, 403, 404),
     response_model=IssuerRevokedResponse,
     summary="Revoke trust in an issuer",
     description="Takes effect immediately; tokens from this issuer stop verifying. Admin-only.",
@@ -248,9 +291,16 @@ def _authority_id(db: Database) -> str:
     if authority_id:
         return authority_id
     from mantle.services.seed_provisioning.user_provisioning import ensure_authority_collection
+    #: NO GUARD — the C-4 family, one instance further out than the grants audit measured.
+    #: `ensure_authority_collection` is annotated `-> str` and its id is
+    #: `derive_uuid(...)` — a uuid5 string, never empty — so `if not authority_id` could not
+    #: fire and the `503` was unreachable.
+    #:
+    #: C-4 swept for callers of three named functions and this one is a caller of a FOURTH,
+    #: so the sweep could not see it. The shape is not "the annotation says Optional" — here
+    #: the annotation is honest — it is "the caller guards against a value the callee cannot
+    #: produce". That is the wider class, and it is not detectable by looking at annotations.
     authority_id = ensure_authority_collection(db)
-    if not authority_id:
-        raise HTTPException(status_code=503, detail="Authority collection unavailable")
     return authority_id
 
 
@@ -297,6 +347,7 @@ def _card_context(card: dict) -> dict:
 
 @router.get(
     "/users",
+    responses=_errors(401, 403),
     response_model=PlatformUserListResponse,
     summary="List platform users",
     description=(
@@ -371,6 +422,7 @@ def _platform_user_page(
 
 @router.post(
     "/seed",
+    responses=_errors(401, 403, 409),
     response_model=SeedResponse,
     summary="Apply the platform seed corpus",
     description="Idempotent. Admin-only. 409 when this node is bare (no seed corpus mounted).",
@@ -411,6 +463,7 @@ async def seed_platform(
 
 @router.post(
     "/users/{user_id}/grant-admin",
+    responses=_errors(401, 403),
     response_model=AdminChangeResponse,
     summary="Grant a user platform admin",
     description=(
@@ -449,6 +502,7 @@ async def grant_platform_admin(
 
 @router.delete(
     "/users/{user_id}/revoke-admin",
+    responses=_errors(400, 401, 403),
     response_model=AdminChangeResponse,
     summary="Revoke a user's platform admin",
     description=(
@@ -485,6 +539,7 @@ async def revoke_platform_admin(
 
 @router.post(
     "/erasure/{person_id}",
+    responses=_errors(400, 401, 403),
     summary="Inventory or erase everything grounded at one person",
     description=(
         "A dry run unless `apply=true`. The inventory comes back in the same shape either "

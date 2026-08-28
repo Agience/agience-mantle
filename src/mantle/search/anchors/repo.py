@@ -130,9 +130,45 @@ class StoreAnchorRepo:
         self._cid: Optional[str] = None   # memoized AnchorSet collection id
 
     def _collection_id(self) -> Optional[str]:
+        """The AnchorSet collection id for READING — resolved, never created.
+
+        The registry lookup alone is not a resolution. `get_id_optional` answers only from this
+        process's topology registry, so a fresh CLI run whose registry has not loaded the slug gets
+        `None` and `load()` reports an empty AnchorSet, while the service whose registry did load it
+        routes on the same collection: `count()` saying 0, a bulk load saying 37 and `/status`
+        saying 21 are three processes reading one store, none of them lying.
+
+        The derived id is the tie-breaker, because every process computes it from the same inputs —
+        `uuid5(instance_namespace, "agience", slug)` — and it is what `_ensure_collection_id` falls
+        back to when it writes. A read resolves the same way the write path does.
+
+        This resolves without creating. `_ensure_collection_id` is the write path's helper and it
+        registers, persists and mints a collection if none exists, so calling it from `load()` would
+        make a read create an empty AnchorSet as a side effect. This derives the same id and returns
+        it only if that collection exists, and `None` otherwise, which is the answer for "nothing
+        has written an AnchorSet here yet".
+        """
+        from mantle.db import backend as db_store
         from mantle.services.bootstrap_types import ANCHORSET_COLLECTION_SLUG
         from mantle.services.platform_topology import get_id_optional
-        return get_id_optional(ANCHORSET_COLLECTION_SLUG)
+
+        cid = get_id_optional(ANCHORSET_COLLECTION_SLUG)
+        if cid and db_store.get_collection_by_id(self._db, cid) is not None:
+            return cid
+        try:
+            # The same two imports `_ensure_collection_id` derives with, so the read and the
+            # write cannot disagree about which collection the slug names.
+            from mantle.services.peer_signing import get_instance_namespace
+            from mantle.services.seed_provisioning.loader import derive_uuid
+
+            ns = get_instance_namespace() or _ANCHORSET_FALLBACK_NS
+            derived = derive_uuid(ns, "agience", ANCHORSET_COLLECTION_SLUG)
+            if derived and db_store.get_collection_by_id(self._db, derived) is not None:
+                return derived
+        except Exception:
+            logger.debug("AnchorRepo: could not derive the AnchorSet collection id",
+                         exc_info=True)
+        return None
 
     def _ensure_collection_id(self) -> str:
         """Return the AnchorSet collection id, CREATING the collection (and
@@ -192,6 +228,48 @@ class StoreAnchorRepo:
             logger.info("Created AnchorSet collection %s at runtime", cid)
         self._cid = cid
         return cid
+
+    def clear(self) -> int:
+        """Remove every anchor artifact from the set. Returns how many were removed.
+
+        A set that only grows is a trap: `bulk_add` adds, so a seed you regret is permanent short
+        of store surgery. An anchor id is the cluster id — it names the cell path, the HKDF `info`,
+        the AEAD associated data and the mesh region — so a set carrying regions nobody wanted
+        mis-routes every query afterwards while every call answers 200. Loading a corrected
+        16-anchor set over an existing 21 produces 37, with the superseded regions still routing.
+
+        Deletes rather than archives, and it is the one place in this repo where that is right: an
+        archived artifact still occupies its cluster id, and the id is the thing being reclaimed.
+        """
+        # `_ensure_collection_id` rather than `_collection_id`. The latter is a registry lookup only
+        # (`get_id_optional`) and answers None in any process whose topology registry has not loaded
+        # the slug, so `count()` reports 0 in a fresh CLI run while the collection sits right there,
+        # and a clear keyed on it would remove nothing and report success. The resolving path falls
+        # back to the stable derived id (`uuid5` of the instance namespace),
+        # which is the same collection every process computes.
+        cid = self._ensure_collection_id()
+        if not cid:
+            return 0
+        from mantle.db import backend as db_store
+        from mantle.services.bootstrap_types import ANCHOR_CONTENT_TYPE
+        try:
+            docs = db_store.list_collection_artifacts(self._db, cid)
+        except Exception:
+            logger.warning("AnchorRepo: failed listing AnchorSet %s for clear", cid, exc_info=True)
+            return 0
+        removed = 0
+        for d in docs:
+            if d.get("content_type") != ANCHOR_CONTENT_TYPE:
+                continue
+            aid = d.get("id") or d.get("_key")
+            if not aid:
+                continue
+            try:
+                db_store.delete_artifact(self._db, str(aid))
+                removed += 1
+            except Exception:
+                logger.warning("AnchorRepo: could not remove anchor %s", aid, exc_info=True)
+        return removed
 
     def load(self) -> Optional[AnchorSet]:
         cid = self._collection_id()

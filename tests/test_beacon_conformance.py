@@ -2,7 +2,7 @@
 
 There are two implementations of one question ("how many independent directions does this
 frame have"), and they cannot import each other: `beam/optics.py` is the full aperture and
-depends on a local entroptics checkout; `mantle/search/beacon` is the reduced,
+depends on a local checkout of the upstream instrument; `mantle/search/beacon` is the reduced,
 dependency-free engine that ships to corporate installs, and mantle must stay beam-free
 (the target DAG is `mantle => origin` only).
 
@@ -49,6 +49,11 @@ def _build(v: dict) -> np.ndarray:
         u = rng.normal(size=v["N"])
         w = rng.normal(size=v["F"])
         m += v["snr"] * np.outer(u / np.linalg.norm(u), w / np.linalg.norm(w))
+    dead = int(v.get("dead_cols", 0))
+    if dead:
+        # Drawn first, killed after: the live 120 x (F - dead) block is byte-identical to the same
+        # case built without the dead columns, which is what makes the invariance check meaningful.
+        m[:, v["F"] - dead:] = 0.0
     return m
 
 
@@ -92,6 +97,43 @@ def test_collapsed_axis_is_marked_degraded():
     read = beacon.signal_rank(_build(case))
     assert read.live_channels <= 1
     assert read.degraded is True
+
+
+def test_a_dead_channel_is_dropped_from_the_shape_as_well_as_the_energy():
+    """The `dead_channels` case is a frame measured at 10 channels and stored at 16.
+
+    A dead channel is the absence of a measurement, not a measurement of zero. It carries no energy
+    so it contributes no singular value — but left in the shape it still counts toward `n`, the
+    modes available, and the occupancy is a fraction of that. The same frame then reads more
+    coherent purely because of the stride it was written at: 0.255912 stored wide against 0.409459
+    stored tight, a factor of 1.600.
+
+    So the pin is an invariance before it is a number. Both reads are taken here — the stored frame
+    and the tight one — and they must be equal to the bit, which is also what makes this read agree
+    with the aperture's `phi`. The pinned constant is asserted alongside it, because an invariance
+    alone would still hold if both sides moved together.
+    """
+    case = next((v for v in _VECTORS if v.get("dead_cols")), None)
+    assert case is not None, "the dead-channel vector must exist; the invariance is unpinned without it"
+
+    stored = _build(case)
+    tight = stored[:, :case["F"] - case["dead_cols"]]
+    assert np.count_nonzero(stored[:, case["F"] - case["dead_cols"]:]) == 0,         "the case did not actually build dead columns, so it proves nothing"
+
+    # `occupancy_fraction` is engine-internal: it is not part of the beacon cut, and
+    # `test_exported_surface_is_only_the_beacon_cut` below is what keeps it that way. A gate may
+    # reach past the published surface; a caller may not.
+    from mantle.search.beacon import engine as _engine
+
+    wide = _engine.occupancy_fraction(stored)
+    narrow = _engine.occupancy_fraction(tight)
+    assert wide == narrow, (
+        "occupancy moved %.9f -> %.9f between the same frame stored wide and stored tight, so a "
+        "dead channel is still being counted in the denominator" % (wide, narrow))
+    assert wide == case["beacon"]["occupancy"], (
+        "occupancy pinned at %.17g, measured %.17g. Both engines read this constant; if the change "
+        "is intended, regenerate screen_read_vectors.json in the SAME commit."
+        % (case["beacon"]["occupancy"], wide))
 
 
 def test_every_read_names_its_instrument():

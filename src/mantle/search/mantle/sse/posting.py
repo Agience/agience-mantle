@@ -42,7 +42,7 @@ import json
 import logging
 import os
 import threading
-from typing import Iterable, List, Optional, Protocol
+from typing import Any, Iterable, List, Optional, Protocol, Tuple
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
@@ -71,6 +71,17 @@ _HKDF_SALT_V1 = b"agience-mantle-sse-posting-v1"
 # or UUID). Both ids are fixed-length so length-prefixing isn't needed.
 _INFO_PREFIX_POSTING = b"posting:"
 _INFO_PREFIX_MANIFEST = b"manifest:"
+
+#: A third tree, ``ownerindex:``, was here. It keyed the owner-index accelerator — one blob per
+#: principal holding that owner's whole ``token -> entries`` map — which existed because a probe on
+#: the file store was an `open()` (4,520 of them for a ten-term query over 194 owners, mostly
+#: misses). `SqlitePostingStore` makes a probe an indexed lookup on a primary key, so the
+#: accelerator has nothing left to collapse and was removed rather than repaired, along with the
+#: partial-index-read-as-complete failure that made a whole prior corpus unfindable.
+#:
+#: Its key derivation and AAD prefix are gone with it. An index tree written before the change still
+#: holds `index.enc` blobs; nothing opens them, and `mantle.system.manage_sse_index` does not carry
+#: them across.
 
 # ---------------------------------------------------------------------------
 # AEAD associated data — slot binding
@@ -103,6 +114,16 @@ _INFO_PREFIX_MANIFEST = b"manifest:"
 # separation. That is worth having and worth being honest about.
 _AAD_PREFIX_POSTING = b"sse-posting-aad-v1:"
 _AAD_PREFIX_MANIFEST = b"sse-manifest-aad-v1:"
+
+#: Per-ENTRY binding — the slot plus the entry's own identity within it.
+#:
+#: The entry-level layout is what makes this binding possible. A whole-slot blob holds every
+#: collection's entries, so there is no single collection to bind and collection separation can only
+#: be a plaintext post-filter. An entry is one ``(artifact_id, collection_id)`` pair, so both go into
+#: its AAD, and an entry moved between artifacts, between collections, or between tokens fails
+#: authentication instead
+#: of being re-filtered on read.
+_AAD_PREFIX_ENTRY = b"sse-entry-aad-v1:"
 
 
 # ---------------------------------------------------------------------------
@@ -193,9 +214,23 @@ def derive_manifest_key(owner_sse_key: bytes, artifact_id: str) -> bytes:
     """
     _validate_owner_sse_key(owner_sse_key)
     _validate_artifact_id(artifact_id)
+    # UTF-8, not ASCII. An artifact id is any non-empty string — `_validate_artifact_id` says so
+    # and enforces nothing else — so `.encode("ascii")` refused every id carrying a diacritic and
+    # took the whole SSE arm down with it: `cn-archæological`, `cn-ardèche` and their neighbours
+    # indexed `sse=failed`, and `stage.0.lexicon` is 1.84M ConceptNet entries. Measured on 71/home:
+    # 100% of a reindex pass failed this way.
+    #
+    # The change cannot invalidate an existing key, which is why it is a fix rather than a
+    # migration. UTF-8 and ASCII agree byte-for-byte on every id that encodes as ASCII, so every
+    # key already derived re-derives identically; and an id that is not ASCII raised here instead
+    # of deriving anything, so there is no stored manifest to orphan.
+    #
+    # The rest of this module already reached this conclusion for canonical JSON — see the
+    # `ensure_ascii=False` / `.encode("utf-8")` pairs below and the RFC 8785 note in
+    # `search/mantle/cell.py`. This derivation was simply missed.
     return _hkdf(
         ikm=bytes(owner_sse_key),
-        info=_INFO_PREFIX_MANIFEST + artifact_id.encode("ascii"),
+        info=_INFO_PREFIX_MANIFEST + artifact_id.encode("utf-8"),
     )
 
 
@@ -359,6 +394,66 @@ def deserialize_entries(plaintext: bytes) -> List[dict]:
     return entries
 
 
+def entry_aad(principal_id: str, blind_token: str,
+              artifact_id: str, collection_id: str) -> bytes:
+    """AEAD associated data binding ONE posting entry to its ``(principal, token, artifact,
+    collection)`` slot.
+
+    Every component is length-prefixed so no two different tuples can produce the same bytes — the
+    same rule :func:`posting_aad` states for its pair, and it matters more here because there are
+    four parts and two of them are caller-supplied ids that may contain any character.
+
+    The collection is bound in here, which a whole-slot blob cannot do. See
+    :data:`_AAD_PREFIX_ENTRY`: an entry re-filed under another collection fails the tag rather than
+    depending on a plaintext post-filter on the read path.
+    """
+    if not principal_id:
+        raise ValueError("entry_aad requires a non-empty principal_id")
+    _validate_blind_token(blind_token)
+    _validate_artifact_id(artifact_id)
+    parts = (principal_id, blind_token, artifact_id, collection_id or "")
+    body = ":".join("%d:%s" % (len(p.encode("utf-8")), p) for p in parts)
+    return _AAD_PREFIX_ENTRY + body.encode("utf-8")
+
+
+def pack_entry(entry: dict, key: bytes, *, aad: Optional[bytes] = None) -> bytes:
+    """Serialize + encrypt ONE posting entry. Build ``aad`` with :func:`entry_aad`.
+
+    One entry, one blob, which is what makes indexing a body affordable. The list form below seals
+    every entry for a term together, so adding one artifact to a term means decrypting every entry
+    already there, scanning them, and re-encrypting all of them: **O(artifacts already carrying that
+    term)** per token, on a write that touches one artifact.
+
+    That is what made write cost a function of corpus size, measured on 71/home before this
+    changed: 14.6s for a POST carrying one name, 16.4s for 4 KB of prose, and 3.5s for 4 KB of
+    ``'x '`` — "cost is terms, not bytes". A body contributes thousands of distinct stems, so
+    indexing one was unaffordable by construction and `pipeline_unified._OFFER_FIELDS` excluded
+    `content` for exactly that reason. With an entry as its own blob, adding an artifact to a term is
+    one sealed write and one row, independent of how many artifacts already carry it.
+
+    The envelope is the same ``{"entries": [...]}`` shape with a single element, so
+    :func:`deserialize_entries` reads either form and one decoder covers both.
+    """
+    return encrypt_blob(serialize_entries([entry]), key, aad=aad)
+
+
+def unpack_entry(blob: bytes, key: bytes, *, aad: Optional[bytes] = None,
+                 allow_unbound: bool = True) -> dict:
+    """Decrypt + deserialize ONE posting entry. Inverse of :func:`pack_entry`.
+
+    Raises :class:`PostingMalformed` if the blob does not hold exactly one entry: a single-entry slot
+    that decoded to two would mean two artifacts sharing one row, and to zero would mean a row whose
+    key names an entry it does not carry. Both are index corruption rather than an empty answer.
+    """
+    entries = deserialize_entries(
+        decrypt_blob(blob, key, aad=aad, allow_unbound=allow_unbound))
+    if len(entries) != 1:
+        raise PostingMalformed(
+            f"a per-entry posting blob must hold exactly one entry, got {len(entries)}"
+        )
+    return entries[0]
+
+
 def pack_posting(entries: List[dict], key: bytes, *,
                  aad: Optional[bytes] = None) -> bytes:
     """Serialize + encrypt in one call. Returns the at-rest blob.
@@ -418,7 +513,7 @@ def deserialize_manifest(plaintext: bytes) -> List[str]:
     Returns the list of blind tokens. Raises :class:`PostingMalformed` if the JSON is not an
     object or does not carry a ``tokens`` list.
 
-    ANY OTHER KEY IS IGNORED, which is what makes dropping ``field_dls`` a format change
+    Any other key is ignored, which is what makes dropping ``field_dls`` a format change
     needing no reindex: an older manifest carries it, this reads past it, and the token list —
     the only thing the indexer and the deletion path ever wanted — is unchanged.
     """
@@ -560,20 +655,107 @@ class PostingStore(Protocol):
     is already safe for concurrent operations.
     """
 
-    # Posting-list operations
+    # ------------------------------------------------------------------
+    # Entry operations — the write path
+    # ------------------------------------------------------------------
+    #
+    # The mutation belongs to the store rather than to the caller, which is what keeps the write off
+    # O(entries). A caller-side `get_posting` → decrypt every entry → scan → re-encrypt every entry →
+    # `put_posting` is a read-modify-write over a blob whose size grows with the number of artifacts
+    # carrying that term, and no store can make that cheap while the blob is the unit.
+    #
+    # These are entry-level operations rather than "one object per entry", so each backend picks its
+    # own shape. Per-entry rows suit SQLite — an add is one upsert, a delete is one `DELETE … WHERE`,
+    # a read is an indexed range scan on the key prefix. They would be pathological in S3: one object
+    # per (owner × term × artifact) is an object explosion, and every probe would become a LIST
+    # instead of a GET. So
+    # `S3PostingStore` keeps one object per token internally and does the read-modify-write itself,
+    # where the round trip dominates anyway. The protocol states the operation; the store states the
+    # layout.
+
+    def add_entry(self, principal_id: str, blind_token: str, artifact_id: str,
+                  collection_id: str, blob: bytes) -> None:
+        """Insert or replace ONE sealed entry in a slot, keyed by ``(artifact_id, collection_id)``.
+
+        That pair is the entry's unique key — the field is implicit in the blind token — so
+        re-indexing the same artifact in the same collection replaces in place.
+        """
+
+    def get_entries(self, principal_id: str, blind_token: str) -> List[Tuple[str, str, bytes]]:
+        """Every entry in one slot as ``(artifact_id, collection_id, sealed_blob)``. ``[]`` for a miss.
+
+        The identity comes back with the bytes, which is what makes the per-entry AAD enforced
+        rather than merely written. The reader cannot know an entry's ``(artifact, collection)``
+        before opening it, so without this it would pass ``aad=None`` and write a binding nothing
+        checks.
+
+        With it, the reader builds :func:`entry_aad` from the ROW KEY and authenticates against
+        it. The key is plaintext and mutable by anyone with write access to the store; the sealed
+        entry names the slot it was minted for. Move a row to another artifact, another collection
+        or another token and it fails the tag — the same shape as the master-key binding in
+        `oracle._unframe_master_key`.
+
+        Returning the identity reveals nothing new: those ids are already at rest in cleartext as
+        the row key (and as an object key in S3, and as a path component in the retired file
+        store).
+
+        Order is unspecified deliberately: the reader turns these into a SET of artifact ids and no
+        ranking reads a posting list, so imposing an order would be a cost with no consumer.
+        """
+
+    def delete_entries_for_artifact(self, principal_id: str, blind_token: str,
+                                    artifact_id: str) -> int:
+        """Remove every entry for ``artifact_id`` in one slot, across all its collections. Returns
+        how many went. Used by the deletion path, which knows the artifact and not its collections."""
+
+    def delete_entry(self, principal_id: str, blind_token: str, artifact_id: str,
+                     collection_id: str) -> bool:
+        """Remove exactly one ``(artifact, collection)`` entry. Returns whether it was there.
+
+        Distinct from the method above because partial revocation removes an artifact from ONE
+        collection while it remains in others — dropping all of them would un-index it everywhere.
+        """
+
+    # ------------------------------------------------------------------
+    # Legacy blob operations — read for migration, never written
+    # ------------------------------------------------------------------
+    #
+    # An index written before the entry layout holds one blob per token carrying every entry, and
+    # splitting one requires the owner's SSE key, which a store does not have and a blob-copying
+    # migration cannot get. So the conversion happens where the keys already are: `narrowing` reads a
+    # legacy blob when a slot has no entries, and `indexer` absorbs one into entries on the next
+    # write to that slot and deletes it. The index write path writes no legacy blobs.
+    #
+    # This is the same dual-read discipline the AAD binding used, and for the same reason: the
+    # alternative is a flag day on a store that is otherwise still perfectly readable.
+
     def get_posting(self, principal_id: str, blind_token: str) -> Optional[bytes]:
-        """Return the encrypted posting blob, or None. Concurrency-safe — see the class
+        """Return the legacy whole-slot blob, or None. Concurrency-safe — see the class
         docstring."""
 
     def put_posting(self, principal_id: str, blind_token: str, blob: bytes) -> None:
-        """Persist (or overwrite) the posting blob."""
+        """Persist a legacy whole-slot blob.
+
+        Retained for tests and for a migration writing a fixture, rather than for the index write
+        path. `SseIndexer` calls `add_entry`."""
 
     def delete_posting(self, principal_id: str, blind_token: str) -> None:
-        """Remove the posting list. No-op if absent."""
+        """Remove the legacy blob. No-op if absent. Called once a slot's entries have been absorbed."""
 
     def list_tokens_for_owner(self, principal_id: str) -> List[str]:
-        """Return every blind token with a stored posting list under
-        ``principal_id``. Used by bulk re-key / migration paths."""
+        """Every blind token this owner has anything stored under — entries or a legacy blob.
+
+        BOTH, because the callers are re-key and migration passes: one that saw only the new layout
+        would silently skip every slot not yet converted. Used by bulk re-key and by
+        `mantle.system.manage_sse_index`."""
+
+    def list_owners(self) -> List[str]:
+        """Every principal with anything stored here.
+
+        Read off the STORE, not the artifact table: a rebuild must cover what the search will
+        look at, and an owner whose artifacts were all deleted can still hold posting lists.
+        Used by bulk re-key and by `mantle.system.manage_sse_index`.
+        """
 
     # Manifest operations
     def get_manifest(self, principal_id: str, artifact_id: str) -> Optional[bytes]:
@@ -585,16 +767,119 @@ class PostingStore(Protocol):
     def delete_manifest(self, principal_id: str, artifact_id: str) -> None:
         """Remove the manifest. No-op if absent."""
 
+    # ------------------------------------------------------------------
+    # Which analysis wrote this index
+    # ------------------------------------------------------------------
+    #
+    # A blind token is an HMAC of an ANALYSED term, so the analysis is part of the index format in
+    # the strongest sense available: the store holds hashes and cannot re-derive a term it has
+    # never seen, so nothing can migrate an index in place. A client whose pipeline has moved reads
+    # a store filed under the old terms and finds nothing, silently — the query is well-formed, the
+    # store is healthy, and the answer is empty.
+    #
+    # These two make that condition a fact rather than an inference. Optional on purpose: a store
+    # that predates them, or a third-party implementation, answers "unknown" through
+    # `analyzer_generation_of` below rather than raising, because a stamp is a diagnostic and must
+    # not be the thing that takes an index offline.
+
+    def analyzer_generation(self) -> Optional[int]:
+        """Which `tokenizer.ANALYZER` wrote this index, or ``None`` if it has never been stamped.
+
+        ``None`` is not "generation 0". It means either an empty store, or one written before
+        stamping existed — `analyzer_generation_of` is where those are told apart, because only the
+        caller holding the store can ask whether it has any owners.
+        """
+
+    def record_analyzer_generation(self, generation: int) -> None:
+        """Record which analysis is writing. Idempotent; last writer wins.
+
+        Called on the write path rather than at open, so an empty store is not stamped with a
+        generation it never used. A store that is written by two generations is already broken and
+        the last stamp is the honest one: it names the analysis whose terms are now mixed in.
+        """
+
+
+def analyzer_generation_of(store: Any) -> Optional[int]:
+    """The generation a store was written by, or ``None`` if it cannot say.
+
+    ``getattr`` rather than a direct call: the two methods above are optional, and a store that
+    does not implement them must read as "cannot say" rather than raise. A diagnostic that can
+    break a working index is worse than the condition it diagnoses.
+    """
+    fn = getattr(store, "analyzer_generation", None)
+    if not callable(fn):
+        return None
+    try:
+        got = fn()
+    except Exception:
+        return None
+    return int(got) if isinstance(got, int) else None
+
+
+def stamp_analyzer_generation(store: Any, generation: int) -> None:
+    """Record the writing generation, if the store can hold one. Never raises into the caller —
+    failing to write a diagnostic must not fail the index write it accompanies."""
+    fn = getattr(store, "record_analyzer_generation", None)
+    if not callable(fn):
+        return
+    try:
+        fn(int(generation))
+    except Exception:
+        pass
+
 
 class InMemoryPostingStore:
     """Thread-safe dict-backed PostingStore. Test default; not durable."""
 
     def __init__(self) -> None:
         self._postings: dict[tuple[str, str], bytes] = {}
+        #: ``(principal, token) -> {(artifact, collection): blob}``. Nested rather than flat so
+        #: `get_entries` and `delete_entries_for_artifact` are both one dict lookup plus a walk of
+        #: only that slot — the same access shape the SQLite primary key gives.
+        self._entries: dict[tuple[str, str], dict[tuple[str, str], bytes]] = {}
         self._manifests: dict[tuple[str, str], bytes] = {}
+        self._analyzer: Optional[int] = None
         self._lock = threading.RLock()
 
-    # Posting-list operations
+    # Entry operations
+    def add_entry(self, principal_id: str, blind_token: str, artifact_id: str,
+                  collection_id: str, blob: bytes) -> None:
+        if not isinstance(blob, (bytes, bytearray)):
+            raise TypeError("InMemoryPostingStore.add_entry expects bytes")
+        with self._lock:
+            slot = self._entries.setdefault((principal_id, blind_token), {})
+            slot[(artifact_id, collection_id or "")] = bytes(blob)
+
+    def get_entries(self, principal_id: str, blind_token: str) -> List[Tuple[str, str, bytes]]:
+        with self._lock:
+            slot = self._entries.get((principal_id, blind_token), {})
+            return [(aid, cid, blob) for (aid, cid), blob in slot.items()]
+
+    def delete_entries_for_artifact(self, principal_id: str, blind_token: str,
+                                    artifact_id: str) -> int:
+        with self._lock:
+            slot = self._entries.get((principal_id, blind_token))
+            if not slot:
+                return 0
+            doomed = [k for k in slot if k[0] == artifact_id]
+            for k in doomed:
+                del slot[k]
+            if not slot:
+                del self._entries[(principal_id, blind_token)]
+            return len(doomed)
+
+    def delete_entry(self, principal_id: str, blind_token: str, artifact_id: str,
+                     collection_id: str) -> bool:
+        with self._lock:
+            slot = self._entries.get((principal_id, blind_token))
+            if not slot:
+                return False
+            gone = slot.pop((artifact_id, collection_id or ""), None) is not None
+            if not slot:
+                del self._entries[(principal_id, blind_token)]
+            return gone
+
+    # Legacy whole-slot blobs — read for migration, never written by the index path
     def get_posting(self, principal_id: str, blind_token: str) -> Optional[bytes]:
         with self._lock:
             return self._postings.get((principal_id, blind_token))
@@ -608,8 +893,21 @@ class InMemoryPostingStore:
             self._postings.pop((principal_id, blind_token), None)
 
     def list_tokens_for_owner(self, principal_id: str) -> List[str]:
+        """Both layouts — see the Protocol. A lister that saw only one would make a re-key pass
+        silently skip every slot in the other."""
         with self._lock:
-            return [tok for (oid, tok) in self._postings if oid == principal_id]
+            return sorted(
+                {tok for (oid, tok) in self._postings if oid == principal_id}
+                | {tok for (oid, tok) in self._entries if oid == principal_id}
+            )
+
+    def list_owners(self) -> List[str]:
+        with self._lock:
+            return sorted(
+                {oid for (oid, _tok) in self._postings}
+                | {oid for (oid, _tok) in self._entries}
+                | {oid for (oid, _aid) in self._manifests}
+            )
 
     # Manifest operations
     def get_manifest(self, principal_id: str, artifact_id: str) -> Optional[bytes]:
@@ -623,6 +921,15 @@ class InMemoryPostingStore:
     def delete_manifest(self, principal_id: str, artifact_id: str) -> None:
         with self._lock:
             self._manifests.pop((principal_id, artifact_id), None)
+
+    # Analyzer generation
+    def analyzer_generation(self) -> Optional[int]:
+        with self._lock:
+            return self._analyzer
+
+    def record_analyzer_generation(self, generation: int) -> None:
+        with self._lock:
+            self._analyzer = int(generation)
 
 
 __all__ = [

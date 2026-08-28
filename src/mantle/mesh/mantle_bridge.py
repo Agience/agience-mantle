@@ -28,7 +28,12 @@ def fetch_visible(mantle_url: str, token: str) -> List[dict]:
     req = Request(mantle_url.rstrip("/") + "/artifacts/visible",
                   headers={"authorization": "Bearer " + token})
     with urlopen(req, timeout=20) as r:
-        return json.load(r)
+        body = json.load(r)
+    #: `/artifacts/visible` returns `{items, total, has_more}` since 2026-08-25 (P-6/P-7). The
+    #: bare-list form is read too, so a bridge pointed at an older node still works.
+    #: This takes ONE page. `has_more` says whether there are others, and nothing here pages
+    #: yet — a shard built from a truncated visible set is a partial node, not a wrong one.
+    return body["items"] if isinstance(body, dict) else body
 
 
 def build_node_from_mantle(node_id: str, mantle_url: str, token: str,

@@ -1,4 +1,4 @@
-"""THE EMBEDDABLE SURFACE IS STDLIB + `cryptography`. NOTHING ELSE. Enforced, not documented.
+"""The embeddable surface is stdlib + `cryptography`. Nothing else. Enforced, not documented.
 
 `pyproject.toml` declares `dependencies = ["cryptography"]` for the base install — the whole
 product claim that Mantle is a standalone data store rests on that being true. A claim like this
@@ -57,9 +57,17 @@ STORE_MODULES = frozenset({
 NAMED_SURFACE = ("services/acting_principal.py",)
 
 # Sibling Agience packages and the reasoning stack. An embedding consumer installs NONE of these.
+#
+# A non-Agience entry was removed 2026-08-25 [John: that brand must not appear in this repo], and
+# the guard did NOT weaken — measured, not assumed. `FORBIDDEN` is the specific-message half; the
+# load-bearing half is the ALLOWLIST below (`INTERNAL | STDLIB | ALLOWED_THIRD_PARTY`), which every
+# import and every loaded module is checked against. A root that is in none of those fails whether
+# or not it is named here, so the removed entry is still rejected — it just reports as "unexpected
+# package" rather than "sibling package". Do not re-add a name to restore a guarantee that never
+# depended on it.
 FORBIDDEN = {
     "chorus", "ember", "beam", "iris", "sage", "lumen", "aria", "astra", "ophan", "seraph",
-    "crystal", "prism", "origin", "facet", "tekton", "bundle", "entroptics",
+    "crystal", "prism", "origin", "facet", "tekton", "bundle",
 }
 # Absolute imports that resolve INSIDE mantle (the package is importable both as `mantle.x` and,
 # service-side, with `src/mantle` itself on the path).

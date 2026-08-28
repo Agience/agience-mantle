@@ -36,7 +36,8 @@ Module map:
 - :mod:`.indexer` — commit-path indexer (parallel to ``MantleIndexer``).
 - :mod:`.narrowing` — blind-token membership + query coverage: which artifacts carry these
   stems, and how many of them each one carries. Same posting lists, no corpus statistic.
-- :mod:`.s3_stores` / :mod:`.file_stores` — production storage backends.
+- :mod:`.s3_stores` / :mod:`.sqlite_stores` — production storage backends. `.file_stores`
+  holds only the filesystem path law now, shared with the vector arm's local cell store.
 """
 
 from __future__ import annotations
@@ -80,10 +81,10 @@ from .posting import (
     unpack_posting,
     upsert_entry,
 )
-from .file_stores import FilePostingStore
 from .indexer import SseIndexer
 from .narrowing import Coverage, CoverageLookup, TokenNarrower, phrase_stems
 from .s3_stores import S3PostingStore
+from .sqlite_stores import SqlitePostingStore
 from .tokenizer import (
     porter_stem,
     split_words,
@@ -146,8 +147,8 @@ __all__ = [
     "phrase_stems",
     # S3-backed production store
     "S3PostingStore",
-    # File-backed production store — the standalone index
-    "FilePostingStore",
+    # SQLite-backed production store — the standalone index
+    "SqlitePostingStore",
     # Router-shape adapter
     "MantleSseSearchAccessor",
 ]

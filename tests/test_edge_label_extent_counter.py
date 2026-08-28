@@ -157,7 +157,7 @@ def test_reopening_a_populated_legacy_store_does_not_certify_itself(tmp_path):
 # certify is `crystal.ontology.seed_lattice._relation_signature`. What stays here is the
 # counter itself, which is mantle's: sections 1, 2 and 3 test the store, not its reader.
 #
-# mantle is the standalone database, below crystal (`ARCHITECTURE-TARGET.md` §2); a mantle test
+# mantle is the standalone database, below crystal (`agience-pharos/genesis/ARCHITECTURE-TARGET.md` §2); a mantle test
 # importing `crystal.ontology` would mean this repo could not be tested without crystal
 # installed.
 
@@ -409,3 +409,59 @@ def test_the_count_star_guard_has_teeth(tmp_path):
 # it; a `crystal/src` copy of the scan below covers that file instead. This walk covers
 # `mantle/src`, and a file that leaves `mantle/src` leaves the walk — without the copy, that
 # file would go unscanned.
+
+
+# ── re-emitting a source is not a duplication hazard ──────────────────────────────────────────
+#
+# `ember.corpus.stage0_sources.ingest_stage0_oewn` guards itself with a completion marker and says
+# why: *"a completed ingest is skipped, since re-emitting ~200k edges would duplicate them"*.
+# `add_edges` says the opposite in its own docstring — idempotent on `edge_key`, "exactly one row
+# and one edge counter increment".
+#
+# Both cannot be true, and which one is right decides whether the served lexicon can be repaired.
+# OEWN carries 0 `derivation` and 0 `pertainym` edges while the cached source file holds 74,646 and
+# 8,072 of them and `_SENSE_RELATIONS_KEPT` already keeps both — the data is simply older than the
+# code. Re-running the ingest is the fix, and the docstring above is the only thing standing in
+# front of it.
+#
+# Measured here rather than argued, so the two statements cannot drift apart again.
+
+
+def test_re_emitting_the_same_edges_adds_no_rows(tmp_path):
+    """Three identical emissions leave one row each — the `edge_key` upsert, exercised."""
+    L = _fresh(tmp_path)
+    edges = [("wn-able", "wn-ability", "derivation", {}),
+             ("wn-able", "wn-power", "derivation", {}),
+             ("wn-quickly", "wn-quick", "pertainym", {})]
+
+    for _ in range(3):
+        L.graph.add_edges(list(edges))
+
+    rows = L.db.read().execute("SELECT count(*) FROM edge").fetchone()[0]
+    assert rows == len(edges), (
+        "re-emitting a source duplicated its edges: %d rows for %d edges" % (rows, len(edges)))
+
+
+def test_re_emitting_the_same_edges_does_not_inflate_the_counters(tmp_path):
+    """The row count is only half of it — a counter that grew on every re-run would make the
+    extent a lie while the table stayed correct, which is the harder failure to notice."""
+    L = _fresh(tmp_path)
+    edges = [("wn-able", "wn-ability", "derivation", {}),
+             ("wn-able", "wn-power", "derivation", {}),
+             ("wn-quickly", "wn-quick", "pertainym", {})]
+
+    L.graph.add_edges(list(edges))
+
+    def _counters():
+        return {str(name): n for name, n in
+                L.db.read().execute("SELECT name, n FROM counter")
+                if "edge" in str(name).lower()}
+
+    after_first = _counters()
+    for _ in range(2):
+        L.graph.add_edges(list(edges))
+
+    assert _counters() == after_first, (
+        "re-emitting moved the edge counters: %s -> %s" % (after_first, _counters()))
+    assert after_first.get("edge:label:derivation") == 2
+    assert after_first.get("edge:label:pertainym") == 1

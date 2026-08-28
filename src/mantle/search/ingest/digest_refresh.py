@@ -72,7 +72,8 @@ MembersProvider = Callable[
     [str], Tuple[Iterable[Tuple[str, Mapping[str, str]]], bool]
 ]
 
-__all__ = ["CollectionDigestRefresher", "DigestOutcome"]
+__all__ = ["CollectionDigestRefresher", "DigestOutcome",
+           "install_digest_refresher", "note_membership_change"]
 
 
 class DigestOutcome:
@@ -108,9 +109,9 @@ class CollectionDigestRefresher:
     injected for the same reason every other component in this arm injects them: the rule this
     class implements has no opinion about any of them, and holding one would be a second
     opinion about custody, about what a collection contains, or — mantle never imports
-    entroptics — about which instrument takes the read. Pass
-    ``read=entroptics.proximity.mp_deviation,
-    engine_id=entroptics.proximity.ENGINE_ID_PROXIMITY`` (or your own).
+    library — about which instrument takes the read. Pass
+    ``read=<probe>.mp_deviation,
+    engine_id=<probe>.ENGINE_ID_PROXIMITY`` (or your own).
     """
 
     def __init__(self, slot, members_provider: MembersProvider, *, read, engine_id: str) -> None:
@@ -204,3 +205,48 @@ class CollectionDigestRefresher:
         with self._lock:
             self._pending[slot] = 0
             self._covered[slot] = int(rows)
+
+
+# ---------------------------------------------------------------------------
+# The installed refresher — how a membership change reaches this module
+# ---------------------------------------------------------------------------
+
+#: The refresher a host has installed, or None. A store with none maintains no digests, which is
+#: the state a plain `pip install agience-mantle` is in: `CollectionDigestRefresher` needs a
+#: proximity instrument, and mantle cannot resolve one. See `install_digest_refresher`.
+_REFRESHER = None
+
+
+def install_digest_refresher(refresher) -> None:
+    """Install the refresher membership changes report to. `None` uninstalls it.
+
+    A host builds the refresher with its own instrument — `wiring.build_digest_refresher(
+    members_provider, read=..., engine_id=...)` — and installs it here. Mantle then reports
+    membership changes without knowing what takes the read, which is the same shape
+    `match.set_corpus_stats` and `demurrage.set_slow_rate_source` use.
+
+    Idempotent, and last writer wins: a process installs one refresher at boot.
+    """
+    global _REFRESHER
+    _REFRESHER = refresher
+
+
+def note_membership_change(principal_id: str, collection_id: str) -> None:
+    """Record that a collection's membership changed. Safe to call when nothing is installed.
+
+    Counting is O(1) and lock-held only for an increment, so this sits on the write path without
+    being the reason a write is slow. The expensive half — enumerating the collection and taking
+    the read — happens in `refresh_if_spent`, past the trigger.
+
+    Never raises. A digest is an accelerator for a query nobody has issued yet, so a fault here
+    must not fail the membership change that prompted it; the collection simply keeps the digest
+    it has, and the next change asks again.
+    """
+    r = _REFRESHER
+    if r is None:
+        return
+    try:
+        r.note_write(str(principal_id), str(collection_id))
+    except Exception:  # noqa: BLE001 - a digest must never break a write
+        logger.debug("proximity: could not record a membership change for %s", collection_id,
+                     exc_info=True)

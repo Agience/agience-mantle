@@ -17,7 +17,6 @@ Covers the artifact-lifecycle spine:
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -265,15 +264,15 @@ class TestWorkspaceCrud:
         ensure.assert_not_called()
 
     def test_update_workspace_replaces_content(self):
-        """A top-level artifact's BODY can be rewritten, and the rewrite reindexes.
+        """A top-level artifact's body can be rewritten, and the rewrite reindexes.
 
         Every artifact created without a `container_id` is a top-level one carrying content
         (`create_container`'s own `content` parameter), so this is the ordinary edit path for a
-        note, a transcript or a captured file — not an exotic case. It used to accept the new
-        body and drop it: `update_workspace` had no `content` parameter at all, so the router's
-        top-level branch had nothing to hand it to and returned 200 unchanged. A writer that
-        cannot rewrite an artifact has to create a second one, which is how a store ends up
-        holding several copies of the same file with nothing marking which is current.
+        note, a transcript or a captured file — not an exotic case. Without a `content` parameter
+        on `update_workspace`, the router's top-level branch would have nothing to hand a new body
+        to and would return 200 unchanged. A writer that cannot rewrite an artifact has to create a
+        second one, which is how a store ends up holding several copies of the same file with
+        nothing marking which is current.
         """
         db = MagicMock()
         ws = _ws()
@@ -509,19 +508,23 @@ class TestUpdateArtifactStateMachine:
         assert new_draft.state == ArtifactEntity.STATE_DRAFT
         assert out.content == "edited"
 
-    def test_store_content_in_s3_keeps_small_text_inline_clears_large(self):
-        small_content = "x" * 1024
-        large_content = "x" * (131_072 + 1)
-        context = '{"content_type":"text/plain"}'
+    @pytest.mark.real_content_store
+    def test_store_content_in_s3_addresses_the_bytes(self):
+        """Content goes to the CAS and the caller gets its address back.
 
-        small_key, small_inline = ws_svc._store_content_in_s3("a-small", small_content, context)
-        large_key, large_inline = ws_svc._store_content_in_s3("a-large", large_content, context)
+        There is no inline/clear split by size: the row never carries a body at any size, so
+        there is no threshold to test and no size at which the answer differs.
+        """
+        content = "x" * 1024
+        with patch("mantle.services.content_service.put_bytes_encrypted",
+                   return_value="cas/" + "d" * 64) as put_cas:
+            key, echoed, ref = ws_svc._store_content_in_s3(
+                "a-1", content, '{"content_type":"text/plain"}', owner_id="owner-1")
 
-        assert small_key == "artifacts/a-small.content"
-        assert small_inline == small_content
-        assert large_key == "artifacts/a-large.content"
-        assert large_inline == ""
-
+        assert key == "artifacts/a-1.content"
+        assert ref == "cas/" + "d" * 64
+        assert echoed == content, "the caller keeps the body for indexing and the API response"
+        assert put_cas.call_args.kwargs["cas"] is True
     def test_editing_committed_reuses_existing_draft(self):
         db = MagicMock()
         committed = _artifact(aid="committed-id", state=ArtifactEntity.STATE_COMMITTED)
@@ -709,10 +712,10 @@ class TestDeleteRevert:
         remove_edges.assert_called_once_with(db, art.root_id)
 
     def test_delete_detaches_a_sub_collections_members_by_default(self):
-        """`a-1` is itself a container here (it has members), a shape the old code never
-        checked for at all — it deleted the container's own row and left the members' edges
-        pointing at an id that no longer resolved to anything. The default must detach them
-        instead, the same rule `delete_workspace` applies to a top-level container."""
+        """`a-1` is itself a container here, so it has members. Unchecked, the delete removes the
+        container's own row and leaves the members' edges pointing at an id that resolves to
+        nothing; the default detaches them instead, the same rule `delete_workspace` applies to a
+        top-level container."""
         db = MagicMock()
         art = _artifact()
         with (
@@ -748,6 +751,12 @@ class TestDeleteRevert:
             patch("mantle.services.workspace_service.store.delete_artifacts_by_root") as destroy,
             patch("mantle.services.workspace_service.store.remove_artifact_from_collection") as evict,
             patch("mantle.services.workspace_service.store.count_other_containers_for_root", return_value=0),
+            # A sub-collection's exclusive member is origin-parented in it, so the caller's grant
+            # reaches it and the cascade may destroy it. Stated here because `db` is a MagicMock:
+            # without it the origin lookup returns a mock that is not this container and the guard
+            # fails closed, turning this into a refusal test.
+            patch("mantle.services.workspace_service.store.get_origin_parent",
+                  return_value=("a-1", 0)),
             patch("mantle.search.ingest.pipeline_unified.delete_artifact_from_index"),
         ):
             ws_svc.delete_artifact(db, "user-1", "ws-1", "a-1", cascade=True)
@@ -889,12 +898,62 @@ class TestRemoveArtifactFromWorkspace:
             patch("mantle.services.workspace_service.store.get_current_in_collection", return_value=art),
             patch("mantle.services.workspace_service.store.delete_artifact") as del_art,
             patch("mantle.search.ingest.pipeline_unified.delete_artifact_from_index"),
+            # Authorized caller: the draft cleanup is a deletion and needs `delete` on the
+            # artifact itself — `evict` on the container authorizes the unlink, not the
+            # destruction of a version. Passing no `auth` fails closed, which is what the
+            # companion test below asserts.
+            patch("mantle.services.dependencies.check_access", return_value=None),
         ):
-            result = ws_svc.remove_artifact_from_container(db, "user-1", "ws-1", "a-1")
+            result = ws_svc.remove_artifact_from_container(
+                db, "user-1", "ws-1", "a-1", auth=object())
 
         rm_edge.assert_called_once_with(db, "ws-1", art.root_id)
         del_art.assert_called_once_with(db, art.id)
         assert result.id == art.id
+
+    def test_an_unauthorized_caller_unlinks_but_does_NOT_delete_the_draft(self):
+        """The assertion that catches the gap `evict`-only authorization would leave open.
+
+        `evict` on the container is not enough on its own: a caller who could evict could destroy
+        a draft version homed there — another user's unfinished work — under a container
+        permission, with the artifact's own grants never consulted.
+
+        The edge must still come off (that is a container property); the draft must survive.
+        """
+        db = MagicMock()
+        art = _artifact(state=ArtifactEntity.STATE_DRAFT, collection_id="ws-1")
+        with (
+            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
+            patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
+            patch("mantle.services.workspace_service.store.get_edge", return_value={"_id": "ws-1/a-1"}),
+            patch("mantle.services.workspace_service.store.remove_artifact_from_collection") as rm_edge,
+            patch("mantle.services.workspace_service.store.get_current_in_collection", return_value=art),
+            patch("mantle.services.workspace_service.store.delete_artifact") as del_art,
+            patch("mantle.search.ingest.pipeline_unified.delete_artifact_from_index"),
+            patch("mantle.services.dependencies.check_access",
+                  side_effect=HTTPException(status_code=404, detail="Not found")),
+        ):
+            ws_svc.remove_artifact_from_container(db, "user-1", "ws-1", "a-1", auth=object())
+
+        rm_edge.assert_called_once_with(db, "ws-1", art.root_id)
+        del_art.assert_not_called()
+
+    def test_no_auth_at_all_also_leaves_the_draft(self):
+        """Fails CLOSED on the absence of a caller context, not open. "Could not tell" must never
+        resolve to "delete it"."""
+        db = MagicMock()
+        art = _artifact(state=ArtifactEntity.STATE_DRAFT, collection_id="ws-1")
+        with (
+            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
+            patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
+            patch("mantle.services.workspace_service.store.get_edge", return_value={"_id": "ws-1/a-1"}),
+            patch("mantle.services.workspace_service.store.remove_artifact_from_collection"),
+            patch("mantle.services.workspace_service.store.get_current_in_collection", return_value=art),
+            patch("mantle.services.workspace_service.store.delete_artifact") as del_art,
+        ):
+            ws_svc.remove_artifact_from_container(db, "user-1", "ws-1", "a-1")
+
+        del_art.assert_not_called()
 
     def test_falls_back_to_get_current_when_not_in_workspace(self):
         """Artifact in different collection: fallback to get_current_in_collection."""
@@ -1179,3 +1238,58 @@ class TestBindingResolution:
         ):
             result = ws_svc.resolve_binding(db, "user-1", "ws-1", "memory")
         assert result == "col-1"
+
+
+class TestANamedLineageMaterialisesItsRoot:
+    """A supplied `root_id` must become a real vertex, or every edge to it dangles.
+
+    `Artifact` states the contract — "First version of an artifact: id == root_id. The root doc
+    persists forever and is the stable target of `collection_artifacts` edges" — and
+    `vertex.py::_place` writes the containment edge to `root_id or id`, "The member is the ROOT,
+    not the version." `create_workspace_artifact` minted a fresh uuid4 regardless, so a caller
+    passing `root_id` (the identity-addressed path, `upsert_identity_member`) created a version
+    pointing at a root nothing ever wrote.
+
+    Measured 2026-08-25 on 71/home: the `Claude Code` capture collection held 97 containment edges
+    of which 0 pointed at an existing vertex, and 183 captures with 0 materialised roots. Every
+    session transcript and file mirror the hooks had written was placed and unreachable, because
+    authorization walks edges and every edge ended nowhere.
+    """
+
+    @staticmethod
+    def _create(root_id, existing_root):
+        db = MagicMock()
+        with (
+            patch("mantle.services.workspace_service.get_workspace"),
+            patch("mantle.services.workspace_service.store.create_artifact"),
+            patch("mantle.services.workspace_service.store.add_artifact_to_collection"),
+            patch("mantle.services.workspace_service._link_to_target_collections"),
+            patch("mantle.services.workspace_service._emit_event"),
+            patch("mantle.services.workspace_service.store.upsert_user_collection_grant"),
+            patch("mantle.services.workspace_service.store.get_raw_artifact",
+                  return_value=existing_root),
+        ):
+            return ws_svc.create_workspace_artifact(
+                db, "user-1", "ws-1", context="{}", content="", order_key="a0",
+                root_id=root_id, enqueue_index=False,
+            )
+
+    def test_the_first_version_becomes_the_root(self):
+        art = self._create("root-abc", existing_root=None)
+        assert art.id == "root-abc", (
+            "the containment edge is written to root_id; if no vertex answers to it, the "
+            "artifact is placed nowhere"
+        )
+        assert art.root_id == "root-abc"
+
+    def test_a_later_version_keeps_its_own_id(self):
+        """A rewrite must not collide with the root it is a version of."""
+        art = self._create("root-abc", existing_root={"id": "root-abc"})
+        assert art.id != "root-abc"
+        assert art.root_id == "root-abc"
+
+    def test_no_root_id_is_unchanged(self):
+        """The ordinary create still mints its own id and is its own root."""
+        art = self._create(None, existing_root=None)
+        assert art.id == art.root_id
+        assert art.id != "root-abc"

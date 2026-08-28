@@ -149,6 +149,15 @@ WRITE_SITES: dict[tuple[str, str], tuple[str, str]] = {
     ("search/mantle/oracle.py", "put"): (
         OFF_FEED, "encrypted-search cell writes. Derived from artifacts already on the feed; "
                   "announcing the derivation as well would double every indexed change."),
+    ("search/anchors/repo.py", "clear"): (
+        OFF_FEED, "removes the anchors of a superseded AnchorSet. Anchors are the COORDINATE "
+                  "SYSTEM, not content — an anchor's id is a cluster id naming a cell path, an "
+                  "HKDF info and a mesh region, so replacing a set is one geometry change, not N "
+                  "artifact deletions. It is already announced where it means something: the "
+                  "AnchorSet fingerprint changes, `/status` reports `matches_cells: false`, and "
+                  "every cell must be rewritten before search answers again. A subscriber given "
+                  "16 delete rows would learn less than the fingerprint tells it, and would have "
+                  "to reconstruct the one fact that matters from the pieces."),
 
     # ── membership edges: the artifact did not change, its placement did ───────────────────
     ("db/lattice_api.py", "add_artifact_to_collection"): (
@@ -344,7 +353,7 @@ def test_the_substrate_skip_still_matches_the_tree() -> None:
 
 
 def test_the_table_has_not_drifted_from_the_tree() -> None:
-    """An allow-table naming sites that no longer exist stops being evidence about the tree."""
+    """An allow-table naming sites that are not in the tree stops being evidence about it."""
     sites = _scan(SRC)
     stale = sorted(set(WRITE_SITES) - set(sites))
     assert not stale, (

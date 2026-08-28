@@ -1,10 +1,10 @@
 """One attenuation operator, and no second copy of it anywhere under `src/mantle`.
 
 `mantle.attenuation` holds the meet — the intersection of CRUDEASIO authority that the
-bundle ceiling, the light cone and the `edge.propagate` column all compose with. It exists
-because the algebra used to be implemented twice, in two encodings, and the two disagreed
-about the zero element: `Grant.masked_by` knew deny was absorbing and the light-cone path
-did not, which is audit finding S1. A second copy would not have to be wrong on the day it
+bundle ceiling, the light cone and the `edge.propagate` column all compose with. One
+implementation, because two encodings of the algebra disagree about the zero element:
+`Grant.masked_by` treats deny as absorbing and a separate light-cone path does not, which is
+audit finding S1. A second copy would not have to be wrong on the day it
 is written; it only has to drift later.
 
 Naming a duplicate does not stop it reappearing, so this file measures instead of asking:
@@ -107,7 +107,7 @@ def test_the_owner_exports_the_whole_algebra_the_consumers_need() -> None:
     from mantle import attenuation
 
     for name in ("Mask", "DENY", "TOP", "NOTHING", "ACTIONS", "FLAG_OF",
-                 "attenuate", "compose", "propagates"):
+                 "meet", "compose", "propagates"):
         assert hasattr(attenuation, name), f"attenuation.{name} is missing"
     for name in ("from_propagate", "to_propagate", "from_flags", "to_flags",
                  "allows", "carries", "intersect"):
@@ -181,8 +181,8 @@ def _sites(root: pathlib.Path) -> dict:
 
 #: Every surviving site, with what it actually does. A new entry means stating that.
 #:
-#: The six RE-POINT entries this table used to carry are GONE — every one of them has been
-#: re-pointed at `mantle.attenuation` and its detector no longer fires:
+#: These six sites carry no RE-POINT entry, because each is re-pointed at `mantle.attenuation`
+#: and its detector does not fire:
 #:
 #:   * `lattice_api.list_origin_descendants` and `dependencies.check_access` (both `mask-in`)
 #:     now call `attenuation.propagates(column_value, action)`.

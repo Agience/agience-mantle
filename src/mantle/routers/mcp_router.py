@@ -3,7 +3,7 @@
 `mantle.agience.ai/mcp` exposes the store as Model Context Protocol tools, so any MCP client
 (Claude, an IDE, an agent runtime) can use the lattice without a bespoke integration.
 
-THE SURFACE IS ROUND. A client that can only read what something else put there has no use for
+The surface is round: a client that can only read what something else put there has no use for
 a store, so the tools cover the whole loop: `create_artifact`, `update_artifact` and
 `delete_artifact` write, `recall` finds. Neither is a second implementation — each dispatches
 into the same REST handler `POST`/`PATCH`/`DELETE /artifacts` use, so the self-grant, the
@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from mantle.db.store import Database
 from mantle.services.dependencies import AuthContext, get_auth, get_store_db
@@ -56,6 +56,33 @@ def _error(req_id: Any, code: int, message: str) -> Dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
 
 
+class JsonRpcResponse(BaseModel):
+    """The body of a `200` from this endpoint's scope, applied 2026-08-26.
+
+    This operation published `"schema": {}`: a generated client received a JSON-RPC envelope
+    and had no type for it, on the one transport where the envelope carries the ERROR as well as
+    the result.
+
+    `result` and `error` are mutually exclusive and exactly one is present — that is JSON-RPC,
+    not a convention of this server. **A caller must branch on which key it got, not on the HTTP
+    status**: a tool that fails answers `200` with `error` set, because the transport succeeded
+    even though the call did not.
+
+    Declared via `responses=`, never `response_model=`, for the reason the `/artifacts` audit
+    recorded: `response_model` FILTERS, and `result` is deliberately open — every tool returns its
+    own shape, so a model that narrowed it would silently drop the payload it exists to carry.
+    """
+    jsonrpc: str = Field("2.0", description="Always `2.0`.")
+    id: Optional[Any] = Field(
+        None, description="Echoes the request's `id`. `null` when the request could not be parsed "
+                          "far enough to have one.")
+    result: Optional[Any] = Field(
+        None, description="Present on success. Its shape is the TOOL's — deliberately open.")
+    error: Optional[Dict[str, Any]] = Field(
+        None, description="Present on failure: `{code, message}`. ⚠ Its presence, not the HTTP "
+                          "status, is how a caller learns the call failed.")
+
+
 # ── the tool surface ──────────────────────────────────────────────────────────────────────────
 #: Every entry names the REST handler it dispatches into. Adding a tool here must never mean adding
 #: a query — if a tool needs data no endpoint exposes, add the endpoint first and call it.
@@ -64,8 +91,10 @@ TOOLS: List[Dict[str, Any]] = [
         "name": "list_artifacts",
         "title": "List artifacts",
         "description": (
-            "List artifacts the caller may act on, newest first. Returns only what the caller's "
-            "grants reach — an artifact absent from this list may exist and simply not be visible."
+            "List artifacts the caller may act on, in id order — NOT newest first, and not by "
+            "relevance to anything. This tool matches on nothing; use `recall` to find something. "
+            "Returns only what the caller's grants reach, so an artifact absent from this list "
+            "may exist and simply not be visible."
         ),
         "inputSchema": {
             "type": "object",
@@ -122,7 +151,10 @@ TOOLS: List[Dict[str, Any]] = [
             "recallable. Supply `container_id` to file the artifact inside that collection "
             "instead — the caller needs create permission on it, and a member of a collection "
             "starts as a DRAFT, which is indexed in a separate segment and is found by `recall` "
-            "only with `state: \"draft\"` until something commits it.\n"
+            "only with `state: \"draft\"` until something commits it — UNLESS you also pass "
+            "`identity`, which writes the member COMMITTED and overwrites it in place, because "
+            "an identity names something that lives outside the store rather than a draft you "
+            "are working on here.\n"
             "PASS `identity` WHEN THIS THING MAY BE STORED AGAIN — a file you will re-capture, a "
             "session you will extend, a note you will revise. It makes the write idempotent, so "
             "the second call updates the first artifact rather than leaving two copies with "
@@ -177,7 +209,12 @@ TOOLS: List[Dict[str, Any]] = [
                         "of one document answers `recall` with whichever copy scored best — which "
                         "may be any of them, including a stale one.\n"
                         "Scoped to you: the same name from a different principal is a different "
-                        "artifact. Top-level only — not valid with `container_id`."
+                        "artifact.\n"
+                        "VALID WITH `container_id`, AND WORTH COMBINING. Filing your artifacts in "
+                        "one collection makes them share an origin root, which is the unit the "
+                        "encrypted index is keyed on — so recall reads one owner instead of one "
+                        "per artifact. Top-level artifacts are each their own root, which is "
+                        "correct for a collection itself and expensive for a hundred notes."
                     ),
                 },
                 "container_id": {
@@ -185,6 +222,27 @@ TOOLS: List[Dict[str, Any]] = [
                     "description": (
                         "Artifact id of a collection to file this inside. Omit for a top-level "
                         "artifact; see the draft note above before supplying one."
+                    ),
+                },
+                "vector": {
+                    "type": "array", "items": {"type": "number"},
+                    "description": (
+                        "The semantic arm's ingress. Mantle NEVER EMBEDS, so the only way a "
+                        "vector reaches the vector arm is a writer handing one over on the "
+                        "write that produced the content it describes. Shape is validated "
+                        "(finite, bounded dimension, non-zero norm); quality never is — that "
+                        "would be a claim about someone else's model.\n"
+                        "Requires `space_id`. Omit both and the artifact is lexical-only, "
+                        "which is what every write did before."
+                    ),
+                },
+                "space_id": {
+                    "type": "string",
+                    "description": (
+                        "Names the embedding space `vector` lives in — required whenever it is "
+                        "present, and it must equal the seeded AnchorSet's `model_id`. One node "
+                        "serves exactly one space; a vector in any other is refused with a 400 "
+                        "naming both."
                     ),
                 },
             },
@@ -292,7 +350,11 @@ TOOLS: List[Dict[str, Any]] = [
             "`ordering`. READ `ordering` TO KNOW WHAT `score` MEANS: `coverage` — the usual "
             "answer — makes it the integer count of distinct query stems that hit carries, "
             "which is a count and not a relevance measure, comparable between the hits of one "
-            "response and across no two; `semantic` makes it a cosine; `recency` makes it null. "
+            "response and across no two; `semantic` makes it a cosine; `reach` makes it how "
+            "far that hit reaches toward what the query is ABOUT, in spreads above what a "
+            "hit of its size would reach by nothing (bigger is better; negative is a reading, "
+            "not an absence) — and `reach` is the one ordering that CUTS, so `total` counts "
+            "what survived the cut rather than every match; `recency` makes it null. "
             "Only artifacts the caller's grants reach are searched, so an empty result means "
             "'nothing you may see matched', never 'nothing exists'."
         ),
@@ -323,6 +385,23 @@ TOOLS: List[Dict[str, Any]] = [
                         "narrows a search, it does not constitute one."
                     ),
                 },
+                "candidates": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Return the RAW narrowed candidate set instead of an ordered, cut page. "
+                        "Same authorization, same light cone, same narrowing — what is skipped is "
+                        "the server's ordering and its cut.\n"
+                        "USE THIS WHEN YOU HAVE A BETTER FRAME THAN THE SERVER DOES. A caller "
+                        "holding the query's embedding can rank the candidates itself and decide "
+                        "how many to keep by reading their own features; the server, ranking "
+                        "inside one request, must decide that from scores alone. Measured on "
+                        "71/dev: the server's cut returned ONE hit for a query whose answer sat "
+                        "at rank #2 of the same candidate set.\n"
+                        "The default stays false because a caller with no ranker of its own is "
+                        "better served by an answer than by a pile."
+                    ),
+                },
                 "state": {
                     "type": "string", "enum": ["committed", "draft", "archived"],
                     "default": "committed",
@@ -345,6 +424,30 @@ TOOLS: List[Dict[str, Any]] = [
                          "description": "Page size."},
                 "from": {"type": "integer", "default": 0, "minimum": 0,
                          "description": "How many matching artifacts to skip."},
+                "vector": {
+                    "type": "array", "items": {"type": "number"},
+                    "description": (
+                        "The query's vector — the reader's half of the semantic arm, and the "
+                        "exact counterpart of `vector` on `create_artifact`: a writer supplies "
+                        "the vector of what it stores, a reader supplies the vector of what it "
+                        "is looking for. Mantle embeds neither.\n"
+                        "It ACCOMPANIES `query_text` rather than replacing it — the lexical arm "
+                        "reads the text, the semantic arm reads this, and each contributes what "
+                        "it found. Sent alone it is a kNN recall.\n"
+                        "Requires `space_id`. Answered with `ordering: \"semantic\"` and a "
+                        "cosine per hit, or a 400 naming both spaces when this node ranks in a "
+                        "different one."
+                    ),
+                },
+                "space_id": {
+                    "type": "string",
+                    "description": (
+                        "Names the embedding space `vector` lives in. Required alongside it, "
+                        "because two vectors are comparable only within a named space and "
+                        "Mantle cannot infer one from the numbers. Must equal the seeded "
+                        "AnchorSet's `model_id`."
+                    ),
+                },
             },
             "additionalProperties": False,
         },
@@ -387,12 +490,25 @@ async def _call_tool(name: str, args: Dict[str, Any], *, auth: AuthContext,
             auth=auth, store_db=store_db,
         )
     if name == "create_artifact":
-        # The arguments ARE the REST body. `CreateArtifactRequest` is what validates them, one
+        # The arguments are the REST body. `CreateArtifactRequest` is what validates them, one
         # frame down, exactly as it does for a POST — so there is no MCP-side shaping to drift
         # from the API's, and the self-grant, the index enqueue, the event and the state default
         # are the ones `workspace_service` applies to every write.
+        #
+        # This call bypasses FastAPI entirely and hands the handler its argument directly, so it
+        # must track the handler's signature by hand: passing a raw dict where the handler expects
+        # `CreateArtifactRequest` (matching `update_artifact` and `recall` two calls below) raises
+        # a `TypeError` at call time rather than a type error at import time — this seam has
+        # broken that way twice.
+        #: `response=` is a throwaway, and it must be passed. The handler lowers its status to
+        #: 200 when the write turned out not to create anything/C7) by writing to the
+        #: `Response` FastAPI injects. MCP carries no HTTP status, so the object is discarded here
+        #: — but the parameter is required, and omitting it is a `TypeError` at call time, not a
+        #: type error at import time.
         return await artifacts.create_artifact(
-            request=request, body=dict(args), auth=auth, store_db=store_db,
+            request=request, response=Response(),
+            body=artifacts.CreateArtifactRequest(**dict(args)),
+            auth=auth, store_db=store_db,
         )
     if name == "update_artifact":
         # Same split as the REST body: `artifact_id` is a path parameter over HTTP, so it comes
@@ -424,7 +540,14 @@ async def _call_tool(name: str, args: Dict[str, Any], *, auth: AuthContext,
 # ── the endpoint ──────────────────────────────────────────────────────────────────────────────
 async def _dispatch(msg: Dict[str, Any], *, auth: AuthContext, store_db: Database,
                     request: Request) -> Optional[Dict[str, Any]]:
-    """Handle one JSON-RPC message. Returns None for notifications (nothing may be sent back)."""
+    """Handle one JSON-RPC message. Returns None for notifications (nothing may be sent back).
+
+    A batch element need not be an object: `[1, 2]` is well-formed JSON and a well-formed array,
+    so a non-object element can reach here, and `msg.get` on it would raise `AttributeError` — a
+    500 for a request the server understood well enough to reject.
+    """
+    if not isinstance(msg, dict):
+        return _error(None, INVALID_REQUEST, "each message must be an object")
     if msg.get("jsonrpc") != "2.0":
         return _error(msg.get("id"), INVALID_REQUEST, "jsonrpc must be '2.0'")
 
@@ -458,19 +581,38 @@ async def _dispatch(msg: Dict[str, Any], *, auth: AuthContext, store_db: Databas
         return _result(req_id, {"tools": TOOLS})
 
     if method == "tools/call":
-        params = msg.get("params") or {}
+        # `params` and `arguments` are caller-supplied JSON and need not be objects: an unchecked
+        # `params.get(...)` on a string raises `AttributeError` out of the handler and becomes a
+        # 500, and a non-object `arguments` reaching `_call_tool` surfaces "AttributeError: 'str'
+        # object has no attribute 'get'" to the model as though the tool had failed. Reproduced
+        # 2026-08-17 for four shapes; a 500 on a malformed request tells a client the server broke,
+        # when the truth is the message did.
+        params = msg.get("params")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return _error(req_id, INVALID_PARAMS, "params must be an object")
         name = params.get("name")
         if name not in _TOOLS_BY_NAME:
             return _error(req_id, INVALID_PARAMS, f"unknown tool {name!r}")
+        args = params.get("arguments")
+        if args is None:
+            args = {}
+        if not isinstance(args, dict):
+            return _error(req_id, INVALID_PARAMS,
+                          f"arguments must be an object for {name}")
+        violation = _schema_violation(name, args)
+        if violation is not None:
+            return _error(req_id, INVALID_PARAMS, violation)
         try:
-            data = await _call_tool(name, params.get("arguments") or {},
+            data = await _call_tool(name, args,
                                     auth=auth, store_db=store_db, request=request)
         except KeyError as e:                       # a required argument was absent
             return _error(req_id, INVALID_PARAMS, f"missing argument: {e}")
         except ValidationError as e:                # an argument the request model refuses
             return _error(req_id, INVALID_PARAMS, f"invalid arguments for {name}: {e}")
         except HTTPException as e:
-            # The API's own refusal, carried WORD FOR WORD. Those messages were written to name
+            # The API's own refusal, carried word for word. Those messages were written to name
             # a remedy — which field to send instead of `state:`, which operator a field cannot
             # take, that a node's AnchorSet is unprovisioned — and an MCP client puts a tool
             # error in front of the model, which is the one reader that can act on it. Restating
@@ -489,7 +631,7 @@ async def _dispatch(msg: Dict[str, Any], *, auth: AuthContext, store_db: Databas
                 "isError": True,
             })
         data = _jsonable(data)
-        # ⭐ THE OBSERVATION IS RECORDED HERE BECAUSE HERE IS THE ONLY PLACE ALL SEVEN TOOLS MEET.
+        # The observation is recorded here, the one place all seven tools meet.
         # Every tool reaches its answer through `_call_tool` above and leaves through this line, so
         # one emit is complete coverage of the MCP surface by construction — the same argument the
         # change feed makes for `db.doc_boundary.emit_artifact_change`. Per-tool emits would be
@@ -500,7 +642,7 @@ async def _dispatch(msg: Dict[str, Any], *, auth: AuthContext, store_db: Databas
         # actually handed, and that is this shape. It is also why the refusal paths above do not
         # reach here — a refused tool call produced no answer to describe, and the refusal is
         # already the audited event on the access path.
-        _observe(name, params.get("arguments") or {}, data, auth=auth, store_db=store_db)
+        _observe(name, args, data, auth=auth, store_db=store_db)
         return _result(req_id, {
             "content": [{"type": "text", "text": _as_text(data)}],
             "structuredContent": data if isinstance(data, dict) else {"result": data},
@@ -512,6 +654,40 @@ async def _dispatch(msg: Dict[str, Any], *, auth: AuthContext, store_db: Databas
 #: The argument each tool carries its question in. Only `recall` has one — the others are
 #: addressed by id — and an absent entry means "this tool asked no question", not "look harder".
 _QUERY_ARG = {"recall": "query_text"}
+
+
+def _schema_violation(name: str, args: Dict[str, Any]) -> Optional[str]:
+    """Why *args* does not satisfy the tool's declared `inputSchema`, or ``None``.
+
+    `additionalProperties: false` is enforced here rather than merely declared. Every tool schema
+    declares it, and unread it lets a misspelled argument be dropped so the tool runs without it.
+    The resulting failure is never about the typo: `recall` with `query` instead of
+    `query_text` reached the handler with no query at all and came back "query_text or vector is
+    required" — a true statement about a request the caller thought they had made.
+
+    An agent is the only reader of these messages and the only thing that can act on one. Naming
+    the key it got wrong, beside the keys that exist, is the difference between one corrected
+    call and a retry loop.
+
+    Deliberately NOT a JSON Schema implementation. It reads the two assertions the schemas
+    actually make — `required` and `additionalProperties: false` — because those are the two an
+    agent gets wrong. Types are left to the request models one frame down, which already refuse
+    them with a message written for a human and reused verbatim; duplicating that here would be
+    a second validator to drift from the first.
+    """
+    schema = (_TOOLS_BY_NAME.get(name) or {}).get("inputSchema") or {}
+    declared = schema.get("properties") or {}
+    missing = [k for k in (schema.get("required") or []) if k not in args]
+    if missing:
+        return "missing required argument(s) %s for %s" % (", ".join(sorted(missing)), name)
+    if schema.get("additionalProperties") is False:
+        unknown = sorted(k for k in args if k not in declared)
+        if unknown:
+            return (
+                "unknown argument(s) %s for %s; it accepts %s"
+                % (", ".join(unknown), name, ", ".join(sorted(declared)) or "no arguments")
+            )
+    return None
 
 
 def _results_of(data: Any) -> Any:
@@ -552,7 +728,7 @@ def _observe(name: str, args: Dict[str, Any], data: Any, *, auth: AuthContext,
         tool=name,
         query_text=args.get(query_arg) if query_arg else None,
         hits=_results_of(data),
-        # WHICH MACHINE looked. `principal_id` above is whose authority it looked with; for an
+        # Which machine looked. `principal_id` above is whose authority it looked with; for an
         # `mcp_client` those are different, and this column is the whole of what makes "which
         # agent" answerable.
         actor=getattr(auth, "actor", None),
@@ -587,6 +763,27 @@ def _as_text(data: Any) -> str:
         "REST handler that owns it, with the caller's own principal, so MCP reaches nothing "
         "the API would not."
     ),
+    #: The two answers besides `200`, declared 2026-08-26's scope, applied
+    #: where the ratchet said it had not been).
+    #:
+    #: And the error codes stop there, deliberately. This is JSON-RPC: a tool that fails
+    #: answers **200** carrying an error object, not an HTTP error — so the usual sweep of "what
+    #: can the handler raise" would document codes this transport never uses and hide the ones it
+    #: does. The two below are the transport's own, raised before any message is dispatched.
+    responses={
+        200: {"model": JsonRpcResponse,
+              "description":
+              "A JSON-RPC response envelope. ⚠ A FAILING TOOL ARRIVES HERE, not in the 4xx: "
+              "`error` is set and `result` is absent, because the transport succeeded even though "
+              "the call did not."},
+        202: {"description":
+              "Accepted. A batch of nothing but notifications has no response to return, so the "
+              "body is empty by construction rather than by omission."},
+        400: {"description":
+              "The envelope itself is unusable — unparseable JSON, or an empty batch. The body is "
+              "a JSON-RPC error object. ⚠ A failing TOOL does not arrive here: that answers `200` "
+              "with an error member, which is what JSON-RPC specifies."},
+    },
 )
 @mcp_router.post("/", include_in_schema=False)
 async def mcp_post(request: Request,
@@ -627,6 +824,19 @@ async def mcp_post(request: Request,
         "405 with `Allow: POST`, which is the spec's own answer for a server that offers no "
         "GET stream. A 200 stream that never emits would leave the client waiting forever."
     ),
+    #: It declared a `200` it can never send. FastAPI documents `200` by default, and this
+    #: handler has exactly one `return` — `405`. So the spec promised a success this route does
+    #: not have, and a generated client had a branch for it and none for the answer it always
+    #: gets. `status_code=405` makes the default match the only reality; `responses` then
+    #: carries the description a caller can act on.
+    status_code=405,
+    responses={
+        405: {"description":
+              "Always. This server originates nothing, so there is no GET stream to join. The "
+              "`Allow: POST` header names the verb that works. ⚠ This is the ONLY answer this "
+              "operation gives — it is not an error condition, it is the endpoint's whole "
+              "contract."},
+    },
 )
 @mcp_router.get("/", include_in_schema=False)
 async def mcp_get() -> Response:

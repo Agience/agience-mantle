@@ -6,21 +6,38 @@
 # reduced instrument that makes such a store genuinely useful on its own.
 #
 # Everything in this file is Apache-2.0 and public. `shannon_bits` below reproduces
-# Entroptics's one entropy definition (`entropy.shannon_bits`, private/AGPL)
-# independently — same relationship `cut.py`'s `gap_split` has to the implementation
-# it reproduces: no import edge, own arithmetic, same formula.
+# the upstream library's one entropy definition (`entropy.shannon_bits`) independently
+# — same relationship `cut.py`'s `gap_split` has to the implementation it reproduces:
+# no import edge, own arithmetic, same formula.
 # ---------------------------------------------------------------------------
 
 """Density — which spans of an artifact's content are worth showing as a recall preview.
 
 Beacon's cut (`cut.py`) picks which *candidates* belong in a result set, scored by
 similarity to the query. This is the same cut primitive (`top_break`) turned on a
-different spectrum: which *spans of one document* are information-dense, scored by
-their own Shannon entropy — independent of the query entirely. A recall preview built
-on a blind `content[:N]` prefix shows whatever the document opens with, truncated at a
-typed length regardless of what it cuts through; this shows whatever the document is
-actually saying the most, per character, for as long as the cut says there is signal
-and not a character longer — no length is ever typed here.
+different spectrum: which *spans of one document* stand out from that document's own
+other spans. A recall preview built on a blind `content[:N]` prefix shows whatever the
+document opens with, truncated at a typed length regardless of what it cuts through;
+this shows a span the cut found — for as long as the cut says there is signal and not
+a character longer. No length is ever typed here.
+
+No stemmer here, which is a rule rather than an omission. A query-aware cut by Porter
+stems per window is wrong twice over. It is slow — stemming every window of every hit
+takes the server side of a recall from ~0.25s to 1.96s, on the hot path in front of
+every prompt. And it is a predetermination: a stemmer is a hand-built table of English
+suffix rules, so the store's read path would carry a language assumption and a set of
+irregular special cases that nothing measured. This file reproduces one entropy
+definition and calls one cut, and a rule set does not belong beside them.
+
+The problem that cut was aimed at is open. Entropy is query-independent by
+construction, so one artifact returns a byte-identical excerpt to every question asked
+of it: measured on node 71/dev, three unrelated questions each got the same 368
+characters of this project's README, and those characters were its installation
+instructions. Recall picks the right document and shows the wrong part of it, which no
+ranking can fix. The answer is to select windows by VECTOR PROXIMITY to the query --
+a measurement rather than a rule, and cheaper besides (a static embedder encodes 100
+windows in ~3ms). Mantle embeds nothing, so those vectors arrive from a writer at index
+time or the selection happens in the caller; either way it is not a stemmer.
 
 Public surface
 --------------
@@ -58,10 +75,10 @@ _GAP_MARKER = " … "
 
 def shannon_bits(weights) -> float:
     """Shannon entropy (bits) of a non-negative weight array: `H(w) = -sum p log2 p`,
-    `p = w / sum(w)`. The one definition, reproduced from Entroptics's
+    `p = w / sum(w)`. The one definition, reproduced from the upstream
     `entropy.shannon_bits` — same formula, same zero-guard, same clip, independently
-    implemented because this module carries no import edge to entroptics (private,
-    AGPL; see the file header). Entroptics reads it off a power marginal; here the
+    implemented because this module carries no import edge to that library
+    (see the file header). Upstream reads it off a power marginal; here the
     weights are a character-frequency histogram, but the arithmetic does not care
     what produced the counts.
 
@@ -85,17 +102,21 @@ def _char_weights(text: str) -> np.ndarray:
 
 
 def dense_windows(content: str) -> List[str]:
-    """Which spans of `content` are information-dense, in original document order.
+    """Which spans of `content` to show, in original document order.
 
     Chunks `content` into small, non-overlapping windows (`chunking.chunk_text` —
     overlap is that module's concern for embedding-index continuity across chunk
-    boundaries, which does not apply here, so it is off), scores each window's
-    Shannon entropy over its own character-frequency distribution, and keeps the top
-    cluster via `beacon.cut.top_break`: whichever windows stand out from the
-    document's own other windows as information-dense, at whatever count that turns
-    out to be — never a fixed top-k, never a per-corpus threshold, and never a length
-    cap. A short, uniformly dense document can return every window it has; a long,
-    mostly-boilerplate one can return one.
+    boundaries, which does not apply here, so it is off), scores each window, and keeps
+    the top cluster via `beacon.cut.top_break`: whichever windows stand out from the
+    document's own others, at whatever count that turns out to be — never a fixed top-k,
+    never a per-corpus threshold, and never a length cap.
+
+    ``query_stems`` chooses what "stand out" measures (see the module docstring). With
+    them, it is how many distinct query stems a window carries, so a window holding four
+    of the terms asked for outranks one holding a single common term — which is what
+    keeps a long document from returning its whole self just because one frequent stem
+    appears throughout it. Without them, or when no window carries any of them, it is the
+    window's own Shannon entropy, unchanged.
 
     Returns every window (there is nothing to cut) when there are fewer than two —
     `cut.py`'s own no-break convention — and `[]` when `content` is empty.
@@ -107,6 +128,7 @@ def dense_windows(content: str) -> List[str]:
         return [w["text"] for w in windows]
 
     scores = np.array([shannon_bits(_char_weights(w["text"])) for w in windows])
+
     keep, _ = top_break(scores)
     kept = [w for w, k in zip(windows, keep) if k]
 
@@ -120,9 +142,9 @@ def dense_windows(content: str) -> List[str]:
 
 
 def dense_excerpt(content: str) -> str:
-    """`dense_windows(content)`, reassembled into a single preview string.
+    """`dense_windows(content, query_stems)`, reassembled into a single preview string.
 
-    Consecutive dense windows already carry a `_GAP_MARKER` between them when they
+    Consecutive kept windows already carry a `_GAP_MARKER` between them when they
     were not adjacent in the source (see `dense_windows`), so a plain join preserves
     that signal. No length is applied here or anywhere upstream of it — the excerpt
     is exactly as long as the cut found signal for.

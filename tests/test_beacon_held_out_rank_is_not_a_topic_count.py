@@ -338,7 +338,7 @@ def test_the_read_is_stable_with_corpus_size_ON_THE_GENERATOR_ONLY():
     in this module's docstring.
 
     The generator plants topic as the only structure, so it cannot exhibit the failure or
-    falsify the criterion — which is how ARCHITECTURE-TARGET.md §7 came to report exact rank
+    falsify the criterion — which is how agience-pharos/genesis/ARCHITECTURE-TARGET.md §7 came to report exact rank
     recovery for a rule that does not have it. Pinned here so a passing synthetic suite is not
     read as validation, including the tests above it, which are bug-checks and controls, not
     evidence that the criterion works on real data.

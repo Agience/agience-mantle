@@ -56,9 +56,17 @@ import numpy as np
 # ── the surface ─────────────────────────────────────────────────────────────
 # `beacon.cut.select` is the one entry point Mantle itself takes (`search/mantle/engine.py`,
 # lazily, at the moment a result set has to stop). `signal_rank` and `DEFAULT_FAR` are exported
-# for callers outside this repo. `occupancy_fraction` and `whiten` are called from `cut.py`;
-# `johnstone` and `tw1_quantile` are called from `instrument.py` and `proximity.py`. `tw1_sf`
-# has no external caller.
+# for callers outside this repo. `occupancy_fraction` is called from `cut.py`; `johnstone` and
+# `tw1_quantile` are called from `instrument.py`. `whiten` and `tw1_sf` have no caller outside
+# this module: `whiten` is used here at the floor computation and by `tests/test_beacon_live_width.py`
+# (`instrument.py`'s `_whiten` is a separate private helper, not this one), and `tw1_sf` has none
+# at all.
+#
+# CORRECTED 2026-08-25, and the correction is the point. This comment previously said `whiten`
+# was called from `cut.py` and that `proximity.py` called `johnstone`/`tw1_quantile`. Measured:
+# `cut.py` does not reference `whiten`, and `beacon/proximity.py` no longer exists in this repo —
+# it moved upstream, to the instrument's own package. A note about who calls what goes stale
+# silently, because nothing fails when a caller leaves.
 #
 # The export list is exactly the beacon cut and nothing else; the rest remain importable by
 # path for tests inside this package, but they are not part of the contract and must not be
@@ -259,6 +267,30 @@ def live_width(A: np.ndarray) -> int:
     return max(1, int(np.count_nonzero(np.any(A != 0.0, axis=0))))
 
 
+def _live_view(A: np.ndarray) -> np.ndarray:
+    """`A` restricted to the rows and columns that carry anything — dead lines DROPPED, not zeroed.
+
+    A dead channel is not a measurement of zero; it is the absence of a measurement, and the two
+    must not read the same. Zeroing keeps it in every shape the read is sized by — the `F` the
+    null is drawn at, the `n` an occupancy is a fraction of — so a frame stored wider than it was
+    measured reads differently from the same frame stored tight. Dropping removes it from the
+    shape as well as the energy, which is the only handling that leaves the read invariant to how
+    the caller happened to lay the frame out.
+
+    Rows are dropped on the same rule as columns: an all-zero row is an observation that was not
+    taken, and it inflates `N` in exactly the way a dead column inflates `F`.
+
+    A frame with nothing live returns empty rather than a fabricated line. Callers report that
+    through `degraded`; they must not receive a shape that implies a measurement."""
+    if A.ndim != 2 or A.size == 0:
+        return A
+    live_r = np.any(A != 0.0, axis=1)
+    live_c = np.any(A != 0.0, axis=0)
+    if live_r.all() and live_c.all():
+        return A
+    return A[np.ix_(live_r, live_c)]
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Per-channel robust whitening — what makes the noise floor a clean reference
 # ═══════════════════════════════════════════════════════════════════════════
@@ -386,7 +418,7 @@ def _tw1_core(M, far: float = DEFAULT_FAR) -> _TW1Core:
     # sized by. See `live_width` for why counting dead columns biases the floor in two
     # opposing directions at once.
     live_channels = int(np.count_nonzero(np.any(A != 0.0, axis=0)))
-    N, F = int(A.shape[0]), max(1, live_channels)
+    N, F = int(A.shape[0]), live_width(A)
     hazard = live_channels <= 1
     if min(N, F) < 2:                     # genuinely degenerate
         return _TW1Core(A=A, N=N, F=F, live_channels=live_channels, degraded=hazard,
@@ -435,11 +467,11 @@ def signal_rank(M, *, far: float = DEFAULT_FAR) -> "RankResult":
 # Gaussian model, so it needs no bulk assumption and collapses when the structure does.
 #
 # The substitute is not a new mechanism: a permutation null is the shuffled matrix, the
-# same instrument entroptics already uses (`null_providers.shuffle_in_time`: "shuffle each
+# same instrument the upstream library uses (`null_providers.shuffle_in_time`: "shuffle each
 # column independently along the ordered axis, destroying ordered and cross-channel
 # structure while preserving every channel's own marginal"). This function reproduces
 # that shuffle, argsort trick included, written numpy-only because beacon is the
-# dependency-free embodiment and does not import beam or entroptics — so the two
+# dependency-free embodiment and imports no spectral library — so the two
 # embodiments draw from the same null.
 #
 # `signal_rank` keeps its own job: it counts singular values above an i.i.d. noise floor,
@@ -477,7 +509,7 @@ def _column_shuffle(A: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     and destroys every cross-row relationship — which is what a topic, a shared cause, or any
     other correlation among the rows lives in.
 
-    One `argsort` draws all F independent permutations at once; this is entroptics'
+    One `argsort` draws all F independent permutations at once; this is the upstream
     `shuffle_in_time` verbatim in mechanism, so the two embodiments sample the same null."""
     n, F = int(A.shape[0]), int(A.shape[1])
     idx = np.argsort(rng.random((n, F)), axis=0)
@@ -584,8 +616,21 @@ def occupancy_fraction(M) -> float:
 
     Distinct from `signal_rank`, and both are wanted: occupancy is a smooth measure of how
     spread the energy is on a heteroscedastic matrix, signal rank a hard count of how much
-    of it clears noise."""
-    A = _as_matrix(M)
+    of it clears noise.
+
+    Dead lines are dropped, not counted. A channel that is identically zero carries no energy,
+    so it contributes no singular value — but it still contributes to `n`, the count of modes
+    AVAILABLE. Left in, it depresses the ratio, and a frame reads as more coherent purely
+    because it was stored at a wider stride than it was measured at. That is the same bias
+    `live_width` describes for the floor, arriving here through the denominator instead.
+
+    This is also what makes the read agree with the aperture's `phi`, which restricts to its
+    own live view before decomposing. Before the drop the two returned different numbers on any
+    frame with a dead channel, silently, and this one feeds `derive_heads` -> the head count ->
+    the cut."""
+    A = _live_view(_as_matrix(M))
+    if A.size == 0:
+        return 0.0
     sv = np.linalg.svd(A, compute_uv=False)
     n = int(sv.shape[0])
     if n == 0:

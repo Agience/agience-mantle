@@ -31,7 +31,7 @@ a word the resolver cannot resolve, and that gap is exactly the class of bug bei
 `STANDARD_FIELDS` was such a list, read by nothing, naming `state`, a field the retrieval path
 refuses.
 
-Anything else keeps its colon and stays a term, so `https://example.com`, `3:30`, `C:\\Users\\john`
+Anything else keeps its colon and stays a term, so `https://example.com`, `3:30`, `C:\\Users\\example`
 and `16:9` are ordinary searches rather than 400s. The cost is that a typo — `titel:foo` — is a
 search term that finds nothing instead of an error naming it; see `field_filters` for why that
 trade is taken and why there is no did-you-mean here.

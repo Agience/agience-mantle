@@ -8,7 +8,7 @@ the wire, so it is cheap and leaks nothing. Deeper federation (op.mesh.search ac
 on the same peer list.
 
 Peers are configured out-of-band, never hardcoded:
-    EMBER_PEERS = "http://192.168.4.45:8091,http://…"   # comma-separated peer base URLs
+    EMBER_PEERS = "http://<peer-host>:8091,http://…"   # comma-separated peer base URLs
 """
 from __future__ import annotations
 
@@ -238,10 +238,40 @@ def pull_from_peers(store, *, max_pages: int = 40, page: int = 25, with_content:
                     continue
                 b64 = item.get("content_b64")
                 if b64 and store.content is not None and store.keys_dir is not None:
-                    try:
-                        C.put_content(store.content, store.keys_dir, base64.b64decode(b64))
-                    except Exception:
-                        pass
+                    # There are two content-store shapes with incompatible `put` contracts:
+                    #
+                    #   FsContentStore.put(ref, ciphertext)                     — the caller encrypts
+                    #   TieredContentStore.put(ref, plaintext, *, collection)   — the store encrypts
+                    #
+                    # `shard.content.put_content` handles both: it takes a `collection` and passes
+                    # plaintext to the stores that scope, so this call works against a real node.
+                    # Federated content goes into the artifact's own collection — the doc already
+                    # carries it, and it is the only answer that keeps a pulled body reachable by
+                    # exactly the grants its metadata says it should be.
+                    #
+                    # A doc with no `collection_id` is skipped, not defaulted: `put_content` refuses
+                    # a scoping store with no collection rather than inventing one, and inventing one
+                    # here would be the same authorization-by-accident a layer up. The artifact still
+                    # imports; its body does not, which is the honest half-state.
+                    #
+                    # And the `pass` is still not a `raise`: a peer with no content tier at all is a
+                    # legal node shape (`content_handle` returns None for one), so a failure to store
+                    # a body must not fail the whole pull.
+                    #
+                    # `pull_from_peers` has no callers in `src/` today, which is the only reason a
+                    # regression here would surface as a note rather than an incident — it stops
+                    # being latent the moment federation is wired, which is now one config away since
+                    # the mesh daemon became startable (`build/mantle/docker-compose.yml`, profile
+                    # `mesh`). The same class of defect sits at `oci/store.py::_put`, where it is at
+                    # least loud; `agience-cloud/build/mantle/oci_ingest.py` refuses up front and
+                    # names it.
+                    _coll = doc.get("collection_id") or ""
+                    if _coll:
+                        try:
+                            C.put_content(store.content, store.keys_dir,
+                                          base64.b64decode(b64), collection=_coll)
+                        except Exception:
+                            pass
                 docs.append(doc)
             if docs:
                 store.artifacts.put_many(docs, batch=100)

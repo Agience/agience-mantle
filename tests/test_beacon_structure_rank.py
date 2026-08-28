@@ -76,7 +76,7 @@ def structure_rank(M, *, far: float = DEFAULT_FAR, draws: int | None = None,
 
 
 # ── the corpus generator ────────────────────────────────────────────────────────────────
-# Same shape as the one behind ARCHITECTURE-TARGET.md §7 and SEMANTIC-PROBE.md: Zipf-sampled
+# Same shape as the one behind agience-pharos/genesis/ARCHITECTURE-TARGET.md §7 and SEMANTIC-PROBE.md: Zipf-sampled
 # topic vocabularies over a Zipf-sampled shared pool, so the only structure planted is topic
 # membership. Reproduced here rather than imported because the probe scripts live in `_scratch`
 # and a test may not depend on a scratch directory.

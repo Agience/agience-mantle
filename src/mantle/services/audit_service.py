@@ -213,6 +213,8 @@ def get_artifact_access_log(
     limit: int = 100,
     offset: int = 0,
     result: Optional[str] = None,     # "allowed" | "denied"
+    since: Optional[str] = None,      # inclusive ISO-8601 lower bound on `ts`
+    until: Optional[str] = None,      # inclusive ISO-8601 upper bound on `ts`
 ) -> list:
     """Access history witnessing an artifact, newest first.
 
@@ -222,7 +224,8 @@ def get_artifact_access_log(
     from mantle.db import audit as _lattice_audit
     try:
         return _lattice_audit.access_log_of(
-            db.conn, artifact_id, limit=limit, offset=offset, result=result)
+            db.conn, artifact_id, limit=limit, offset=offset, result=result,
+            since=since, until=until)
     except Exception:
         logger.warning("access-log query failed for %s", artifact_id, exc_info=True)
         return []

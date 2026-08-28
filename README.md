@@ -11,10 +11,14 @@ Mantle is the lattice the whole universe persists in: the memory of the Agience 
 
 Mantle **holds** that data; it does not back it up. There is no backup, snapshot, restore or corruption-detection machinery in this repository. Durability is an operator responsibility, and [Backing a node up](#backing-a-node-up) is the procedure — a runbook, not a feature.
 
-Mantle holds knowledge so that it can be trusted by people who weren't there when it was made. Every artifact carries its identity, version history, and provenance inside itself — audit is the data structure. Search runs over an encrypted lexical index (blind-token MANTLE-SSE), and access control is enforced **cryptographically**: each cell of the index is encrypted under a per-cell key derived from the owner's master key; authorization is computed as reachability in a typed graph (the *light cone*); and the identifier the traversal must reach is, by construction, the identifier that selects the keys. If you don't hold the grant, the key is mathematically underivable. Revocation is a single grant edit — no re-encryption, no key rotation.
+Mantle holds knowledge so that it can be trusted by people who weren't there when it was made. Every artifact carries its identity, version history, and provenance inside itself — audit is the data structure, for everything written through the system; a bulk import supplies no provenance and gets none. Search runs over an encrypted lexical index — blind-token MANTLE-SSE, covering **5.9%** of our reference corpus today and growing, with the remainder served by a plaintext lexical index — and access control is enforced **cryptographically**: each cell of the index is encrypted under a per-cell key derived from the owner's master key, and authorization is computed as reachability in a typed graph (the *light cone*).
 
-*Storage gets ciphertext. Grants are keys, not metadata — access is enforced cryptographically,
-not by an ACL filter applied after the fact.*
+**Reachability decides which keys are issued — it does not derive them.** A grant is not a rule the storage layer chooses to honour; it is what decides whether a key is handed out at all. The cell key itself is derived on demand and never persisted, so there is nothing at rest to take, and one piece of code decides both what a search may touch and what key is issued — so the two cannot disagree silently. Revocation is a single grant edit — no re-encryption, no key rotation — effective within the authorization cache's window, 30 seconds by default and disableable outright where that matters.
+
+*Grants are keys, not metadata — access is enforced cryptographically, not by an ACL filter applied
+after the fact.*
+
+**What is encrypted, and what is not.** Content is encrypted per principal and bound cryptographically to the collection it was written for; on a live store, every content object measured is encrypted at rest, in fact wrapped twice. What the store keeps in the clear is what it must read to *find* things: the offer text the lexical index reads, and the identifiers in the posting store. The blind-token index exists to close exactly that, and covers **5.9%** of our reference corpus today — the rest is served by a plaintext lexical index. That number is small and it is the real one.
 
 Mantle is one of the instruments of the Agience system. This repository is the **production Mantle service**.
 
@@ -28,7 +32,7 @@ Mantle is one of the instruments of the Agience system. This repository is the *
 | `tests/e2e/` | Blackbox HTTP end-to-end suite — drives a live stack over the wire. See [tests/e2e/README.md](tests/e2e/README.md). |
 | `.env.example` | Config template — copy to `.env`. Only `MANTLE_LATTICE_PATH` and `KEYS_DIR` are set outright; everything else is commented out, so an untouched copy runs on defaults. |
 
-*MinIO lives in **agience-bundle** alone, as the local S3 edge for content and SSE cells.*
+*MinIO lives in **agience-observe** alone, as the local S3 edge for content and SSE cells.*
 
 ### Subsystems under `src/mantle/`
 
@@ -55,7 +59,7 @@ Mantle is one of the instruments of the Agience system. This repository is the *
 
 **Mantle IS the database.** The store is one SQLite file (`MANTLE_LATTICE_PATH`, schema created on open) plus a filesystem CAS, opened in-process — zero external database processes to provision.
 
-### ⚠ Prerequisite: a sibling `agience-prism` checkout
+### Prerequisite: a sibling `agience-prism` checkout
 
 `[service]` (and `[semantic]`, and `[dev]`) require **`agience-prism-py`**, which is not on PyPI. Every
 delivery path resolves it from a sibling checkout, so clone it beside this repo first — the
@@ -112,7 +116,7 @@ AGIENCE_BASE_DIR=$PWD KEYS_DIR=./.data/keys MANTLE_LATTICE_PATH=./.data/mantle.d
     mantle-serve --port 8081
 ```
 
-⚠ **Set `AGIENCE_BASE_DIR` on a pip-installed node.** It is the root every derived default hangs
+**Set `AGIENCE_BASE_DIR` on a pip-installed node.** It is the root every derived default hangs
 off — the SSE index (`.data/mantle-sse`), the encrypted cells (`.data/mantle-cells`), the embeddings
 cache (`.data/mantle/`), `KEYS_DIR` and `MANTLE_LATTICE_PATH`. Unset, an installed node derives it
 from **the directory you start it in**, because the alternative — the directory the package was
@@ -246,12 +250,12 @@ seeded AnchorSet ([below](#-semantic-recall-is-inert-until-you-seed-an-anchorset
 because `name` and `title` are different fields: `title` comes from the `context` JSON, which this
 call did not send.
 
-⚠ **`KEYS_DIR` is the root credential of a standalone node.** `mantle-token` does not create that
+**`KEYS_DIR` is the root credential of a standalone node.** `mantle-token` does not create that
 exposure, it names it: anyone who can read that directory can already mint this token by hand, and
 read access to it is full access to the store — bounded by no grant, no revocation and no expiry.
 Back it up separately and under different custody, as [Backing a node up](#backing-a-node-up) says.
 
-⚠ **There is no OAuth flow to complete here.** A standalone Mantle serves exactly one document of
+**There is no OAuth flow to complete here.** A standalone Mantle serves exactly one document of
 the OAuth surface — `/.well-known/oauth-protected-resource` — and none of the endpoints: no
 `/.well-known/oauth-authorization-server`, no `/authorize`, no `/token`, no dynamic client
 registration. A standards-compliant MCP OAuth flow therefore **cannot** complete against it, and the
@@ -271,17 +275,17 @@ docker compose up
 ```
 
 `docker-compose.yml` in this repo runs mantle alone against a bind-mounted `./.data`. The full
-platform stack — Origin + Mantle + MinIO — lives in **agience-bundle**:
+platform stack — Origin + Mantle + MinIO — lives in **agience-observe**:
 
 ```bash
-cd ../agience-bundle
+cd ../agience-observe
 docker compose --env-file ../agience-origin/.env -f docker-compose.local.yml up -d --build
 ```
 
 Mantle boots as a pure database layer with an empty type registry. An
 application on top (Agience/Origin) provisions data via Mantle's API.
 
-### ⚠ Semantic recall is inert until you seed an AnchorSet
+### Semantic recall is inert until you seed an AnchorSet
 
 **A node you just installed answers `POST /artifacts/recall` from the lexical arm only.** Both
 arms are wired and both have somewhere to write — the encrypted vector cells work on local disk
@@ -450,7 +454,7 @@ Everything is an artifact, so most of what follows is a `content_type` rather th
   | Not a filter at all | any other word — it searches as an ordinary term |
 
   **`word:value` is a filter only when `word` is a field on one of those two rows**, so `https://example.com`,
-  `meeting at 3:30`, `C:\Users\john` and `ratio 16:9` are ordinary searches: a colon in a token
+  `meeting at 3:30`, `C:\Users\example` and `ratio 16:9` are ordinary searches: a colon in a token
   the field list does not name is just a character in that token, and it reaches retrieval
   unquoted and unchanged. The parser holds no field list of its own — it asks
   `search/field_filters.is_filter_field`, the same roster the resolver resolves against, so the
@@ -498,7 +502,7 @@ If a contribution weakens any of these, it will not be merged — see [CONTRIBUT
 
 ## Backing a node up
 
-⚠ **This section is a runbook, not a feature.** Mantle ships no backup, snapshot, restore or
+**This section is a runbook rather than a feature.** Mantle ships no backup, snapshot, restore or
 corruption-detection code — nothing here runs on a schedule, nothing verifies a copy, and nothing
 notices if you never make one. What follows is the procedure an operator runs with the tools their
 platform already has. It is written down because the store is a file and a directory, so the
@@ -509,7 +513,7 @@ A node is **four** things, and a backup missing any one of them does not restore
 | Part | Where | Notes |
 |---|---|---|
 | The lattice | `MANTLE_LATTICE_PATH` | One SQLite file, in WAL mode — so it is really three files (`.db`, `-wal`, `-shm`). |
-| Key material | `KEYS_DIR` | ⚠ **Without this the rest is unreadable ciphertext.** See below. |
+| Key material | `KEYS_DIR` | **Without this the rest is unreadable ciphertext.** See below. |
 | Content | The local CAS under `AGIENCE_BASE_DIR/.data`, and/or the content bucket | Whichever tiers this node uses — see `CONTENT_*` in `.env.example`. |
 | The indexes | `MANTLE_SSE_DIR`, `MANTLE_CELL_DIR` | Derived from the lattice, and a full rebuild is measured in days-to-weeks under S3 write contention (`main.py`), so treat them as data rather than as cache. |
 
@@ -545,7 +549,12 @@ Security issues → **connect@agience.ai** (do not open a public issue).
 
 ## License
 
-**Apache License 2.0.** See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+**Apache License 2.0.** See [LICENSE](LICENSE) and [NOTICE](NOTICE). Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
+
+**Trademarks.** "Agience" and the Agience logo are trademarks of Ikailo Inc. Apache-2.0 §6 licenses
+copyright and patent, **not** the marks — take the code, build on it, ship it; call your product
+your own name. Worth stating on a permissive repository precisely because permissive is otherwise
+read as "everything is granted".
 
 ## Star History
 
