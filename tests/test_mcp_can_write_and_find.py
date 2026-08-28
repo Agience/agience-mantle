@@ -27,7 +27,7 @@ from mantle.services.dependencies import AuthContext, get_auth
 # The corpus, the light cone and the withheld artifact are imported rather than rebuilt: the
 # claim is that the OTHER DOOR answers the same way, and a second corpus would only prove that a
 # second corpus behaves. `_live_anchorset` is autouse in its own module and stays autouse here.
-from tests.test_field_filters_narrow_recall import (  # noqa: F401 - `stack`/`_live_anchorset` are fixtures
+from .test_field_filters_narrow_recall import (  # noqa: F401 - `stack`/`_live_anchorset` are fixtures
     ALICE,
     AUTHORIZED,
     PDF,
@@ -149,7 +149,25 @@ class TestTheToolsUseTheApisOwnPaths:
         assert create.called, "create_artifact did not reach the service POST /artifacts uses"
         assert create.call_args.kwargs["user_id"] == "user-123", "with the caller's own principal"
         assert create.call_args.kwargs["content"] == "a conversation"
-        assert _tool(r)["structuredContent"] == {"id": "art-new", "state": "committed"}
+        #: the create response is a DTO with a FIXED KEY SET —
+        # every key present, `null` when unset. This asserted an EXACT two-key dict, which made
+        # the MCP tool precisely the client the ruling warns about: *"clients keying on absence
+        # rather than `null` must change."* It is the first one found, and it was found by being
+        # red rather than by anybody looking.
+        #
+        # Re-aimed, not relaxed. What this test is about is that an MCP write and an HTTP write
+        # are the SAME write — so it still pins the values that came back from the service, and now
+        # also pins that the shape is the fixed set rather than whatever the entity happened to
+        # carry.
+        structured = _tool(r)["structuredContent"]
+        assert structured["id"] == "art-new"
+        assert structured["state"] == "committed"
+
+        from mantle.routers.artifacts_router import ArtifactResponse
+
+        assert set(structured) == set(ArtifactResponse.model_fields), (
+            "the MCP tool no longer returns the declared create shape: %s"
+            % sorted(set(structured) ^ set(ArtifactResponse.model_fields)))
 
     async def test_a_container_create_is_authorized_before_anything_is_written(self, client):
         """Filing into a collection needs `create` on it, checked with the caller's own
@@ -252,14 +270,28 @@ class TestARefusalReachesTheModelIntact:
     @patch("mantle.search.mantle.wiring.build_sse_search_accessor")
     async def test_a_caller_sending_query_instead_of_query_text_is_told_the_name(
             self, builder, client):
-        """The mistake the schema exists to prevent, and what it costs when a client makes it
-        anyway: unknown fields are ignored, so the recall has nothing to search on. The message
-        names the field that would have worked."""
+        """The mistake the schema exists to prevent.
+
+        Every tool schema declares `additionalProperties: false`. Unread, it lets `query` be dropped
+        so the recall runs with no query at all, and what comes back is a tool error saying
+        "query_text or vector is required" — true about the request that arrived, and baffling to a
+        caller who believed they had sent one, with the name of the field that would have worked
+        appearing only because the downstream message happens to mention it.
+
+        `_schema_violation` reads the declaration, so the typo is refused up front and named. It
+        is `INVALID_PARAMS` rather than a tool error for the same reason a `ValidationError` beside it
+        is: nothing was invoked, so there is no tool outcome to report — the message never reached a
+        tool. The property that mattered is kept and strengthened: the reply names the key that was
+        wrong AND the keys that exist.
+        """
         builder.return_value = MagicMock()
         r = await client.post("/mcp", json=_call("recall", {"query": "budget"}))
-        tool = _tool(r)
-        assert tool["isError"] is True
-        assert "query_text" in tool["content"][0]["text"]
+        body = r.json()
+        assert "error" in body, body
+        assert body["error"]["code"] == -32602
+        message = body["error"]["message"]
+        assert "query" in message, "the key the caller got wrong is not named"
+        assert "query_text" in message, "the key that would have worked is not named"
 
     async def test_an_unconfigured_node_says_so_rather_than_failing_blankly(self, client):
         """503, not 400: nothing about the request is wrong, and the message points at the
@@ -356,7 +388,7 @@ class TestAToolDoesNotWidenTheLightCone:
         not an absent one, so the empty answers above are custody and not vacuity."""
         assert SECRET not in AUTHORIZED
         from mantle.search.mantle.oracle import KeyPurpose, KeyRequest
-        from tests.test_field_filters_narrow_recall import CELL_PRINCIPAL, COLLECTION
+        from .test_field_filters_narrow_recall import CELL_PRINCIPAL, COLLECTION
 
         _act(CELL_PRINCIPAL, "principal")
         lookup = stack["narrower"].lookup_for(

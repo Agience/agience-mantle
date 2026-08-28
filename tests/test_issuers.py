@@ -163,9 +163,24 @@ class TestAdminCreateRevoke:
                 issuers.create_issuer_artifact(object(), issuer="x", authorized_by="a")
 
     def test_create_fails_without_system_principal(self):
+        """A missing system principal must fail closed rather than fabricate an owner.
+
+        Asserts the specific type now, not `RuntimeError` [P-9, 2026-08-26].
+
+        `create_issuer_artifact` used to raise a bare `RuntimeError` here, and `system_router`
+        caught `RuntimeError` and returned `str(exc)` as a 503 — correct for THIS raise, whose
+        message is curated, and wrong for every other `RuntimeError` the call stack can produce,
+        whose text would have gone straight into a response body.
+
+        `SystemPrincipalUnavailable` already existed for exactly this condition, and its own
+        docstring names this module: *"a fabricated system identity would acquire whatever grants
+        happened to match it, which is the failure mode `issuers.py` already fails closed against."*
+        The bare `RuntimeError` was the drift; this is not a new contract, it is the intended one.
+        """
         from mantle.services import issuers
+        from mantle.services.acting_principal import SystemPrincipalUnavailable
         with patch("mantle.services.peer_signing.get_system_principal_id", return_value=None):
-            with pytest.raises(RuntimeError):
+            with pytest.raises(SystemPrincipalUnavailable):
                 issuers.create_issuer_artifact(
                     object(), issuer="x", authorized_by="a", jwks={"keys": []},
                     audience="a")  # valid input → reaches the system-principal check

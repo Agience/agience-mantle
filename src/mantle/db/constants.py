@@ -48,7 +48,7 @@ CRUDEASIO = ("create", "read", "update", "delete",
 
 # ── artifact lineage state ───────────────────────────────────────────────────
 #
-# THE ONE ANSWER TO "WHAT STATE IS A DOC WITH NO `state` FIELD IN".
+# The one answer to "what state is a doc with no `state` field in".
 #
 # `state` partitions the search index into three separately-keyed encrypted trees, one per state,
 # so this is not a stylistic default: two readers that answer it differently move an artifact

@@ -101,7 +101,7 @@ from mantle.db.lattice_api import typed_method as _typed                        
 
 
 def _backfill_page(artifacts, after_id: str, n: int):
-    """One page of the one-shot id backfill: `WHERE id > :cur ORDER BY id LIMIT :n`.
+    """One page of the one-shot id backfill: `WHERE id >:cur ORDER BY id LIMIT:n`.
 
     **Returns `(rows, ok)`, and `ok` is the entire point of this function existing.**
 
@@ -123,8 +123,8 @@ def _backfill_page(artifacts, after_id: str, n: int):
 
 
 def _seq_page(artifacts, after_seq: int, n: int):
-    """One page of the primary walk under `(_origin, _seq)`: `WHERE _origin = :me AND _seq > :cur
-    ORDER BY _seq LIMIT :n`. Returns `(rows, ok)`.
+    """One page of the primary walk under `(_origin, _seq)`: `WHERE _origin =:me AND _seq >:cur
+    ORDER BY _seq LIMIT:n`. Returns `(rows, ok)`.
 
     `_seq` is allocated from the store, one value per write, gap-free and injective, so there are
     no duplicate groups to drain and a strict `>` is simply correct. It is allocated inside the
@@ -214,7 +214,7 @@ def promote_local_content(store, *, max_refs: int = 2000, page: int = 200,
     # O(offset) and this cursor grows monotonically into the millions, so every drain would pay
     # that cost; `content_ref IS NOT NULL` also cannot be index-served (LSM skips nulls), so that
     # shape forces a full scan under every SKIP.
-    # `WHERE id > :cur ORDER BY id` rides the id unique index and stays flat regardless of depth
+    # `WHERE id >:cur ORDER BY id` rides the id unique index and stays flat regardless of depth
     # (~743ms at depth 5M). content_ref is filtered in Python: adding it to the WHERE flips the
     # planner off the id index.
     last_id = str(cur.get("last_id", "") or "")
@@ -350,7 +350,13 @@ def promote_local_content(store, *, max_refs: int = 2000, page: int = 200,
         "exhausted": bool(exhausted and backfill_done and not errors),
         "exhausted_at": (__import__("time").time()
                          if (exhausted and backfill_done and not errors) else cur.get("exhausted_at")),
-        "content": "local content-cache -> OVH promote cursor", "provenance": genesis.P_HUMAN,
+        # `offer`, not `content` — corrected 2026-08-26. A constant label describing what this
+        # cursor IS is a title, and `offer` is the one naming field [John, 2026-08-25]. `content`
+        # is what `artifacts_holding_inline_plaintext` counts, pinned at 0, so a fixed label parked
+        # there is a row of that population for no benefit — nothing reads this string back.
+        # 0 rows of this content-type exist on 71/home, so this corrects a latent path before it
+        # first runs rather than repairing anything.
+        "offer": "local content-cache -> OVH promote cursor", "provenance": genesis.P_HUMAN,
         "cited_from": genesis.CITE_GENESIS, "updated": genesis._now()})
     # `errors` is reported, never swallowed: a caller must be able to tell "nothing to
     # promote here" from "every promotion failed" apart.

@@ -55,6 +55,20 @@ _SSE_KEY_BYTES = 32
 # ---------------------------------------------------------------------------
 
 def _hmac_hex(key: bytes, message: bytes) -> str:
+    """One blind token's HMAC.
+
+    One token per call, because the batch form measures slower end to end. `hmac.new(key, msg)`
+    rebuilds the key schedule on every call, and one prepared `hmac.new(key)` copied per message is
+    1.6x faster in isolation (11.7 ms -> 7.5 ms over 4,800 HMACs). Wired into
+    `narrowing._owner_ids` as a per-owner precompute it makes the whole search worse: 1-term
+    46 -> 60 ms, 3-term 48 -> 63 ms. Deriving every (term x field) pair up front builds a list and a
+    dict per owner — 121 of them per recall — and forfeits the loop's early exits, which costs more
+    than the key schedule it saves.
+
+    The micro-benchmark is real and the integrated result is the opposite. Only the second one
+    counts, and this is the second time in this subsystem that a locally-obvious optimisation lost
+    to the thing it was embedded in — see the thread-pool note in `posting.PostingStore`.
+    """
     return hmac.new(key, message, sha256).hexdigest()
 
 

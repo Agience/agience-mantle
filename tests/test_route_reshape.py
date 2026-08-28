@@ -64,7 +64,7 @@ def test_the_reshaped_route_is_served(method, path):
 
 
 # ---------------------------------------------------------------------------
-# What must no longer answer
+# What must not answer
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("prefix", ["/artifacts/search", "/issuers", "/platform", "/servers"])
@@ -76,9 +76,9 @@ def test_the_old_path_is_gone_entirely(prefix):
 
 
 def test_the_retired_routers_are_off_disk():
-    """A router module that no longer mounts anything is a claim about the API that is not
-    true — `test_every_router_is_mounted` catches the unmounted case, this catches the
-    leftover file."""
+    """A router module that mounts nothing is a claim about the API that is not true.
+    `test_every_router_is_mounted` catches the unmounted case; this catches the leftover
+    file."""
     import pathlib
 
     routers = pathlib.Path(__file__).resolve().parents[1] / "src" / "mantle" / "routers"

@@ -9,12 +9,12 @@ and its meaning.
 
 What this file pins that its neighbours do not:
 
-- `test_blind_token_narrowing.py` proves the narrowing composes safely AT THE RESOLVER. This
-  proves the same property where a CALLER observes it: through `MantleSseSearchAccessor`,
+- `test_blind_token_narrowing.py` proves the narrowing composes safely at the resolver. This
+  proves the same property where a caller observes it: through `MantleSseSearchAccessor`,
   over the real encrypted indexes, in the response body.
 - `test_field_filters_narrow_recall.py` proves a `field:value` filter narrows. This proves the
-  query's TERMS narrow, which is the arm that changed.
-- The TEXT-ONLY path: a recall that narrowed to a real set with nothing to rank it. It is an
+  query's terms narrow, which is the arm that changed.
+- The text-only path: a recall that narrowed to a real set with nothing to rank it. It is an
   ordinary request — a shell script or a webhook that cannot embed still searches — so it
   returns the set most-recently-updated first rather than a 400 or an arbitrary order.
 - The beacon cut is still the cut, and it is still taken inside the arm that holds a vector
@@ -24,6 +24,12 @@ The stack is the production one. Only the lattice and the light cone are doubles
 indexes are real, the oracle is real, and the corpus is built so that similarity cannot be
 doing the selecting — one query direction, near-identical document vectors — which means any
 narrowing seen here is the terms' doing.
+
+The one deliberate exception is `TestTheBeaconCutIsStillTheCut`, which needs BOTH geometries.
+Identical document vectors make a tied plateau, and since 2026-08-23 `beacon.cut._tie_tol()`
+declines to break a plateau — correctly: the drop it would cut at is round-off. So the cut is
+watched on the plateau (kept whole, still bounded by the narrowing) and again on a corpus with
+a genuine break (`_graded_doc_vecs`), where it must land on that break.
 """
 
 from __future__ import annotations
@@ -39,7 +45,7 @@ from cryptography.fernet import Fernet
 from mantle.search.mantle import MantleIndexer, MantleQueryEngine, OracleService
 from mantle.search.mantle.engine import CUT_NONE
 from mantle.search.mantle.oracle import FernetMasterKeyStore, KeyPurpose, KeyRequest
-from mantle.search.mantle.sse.file_stores import FilePostingStore
+from mantle.search.mantle.sse.sqlite_stores import SqlitePostingStore
 from mantle.search.mantle.sse.indexer import SseIndexer
 from mantle.search.mantle.sse.narrowing import TokenNarrower
 from mantle.search.mantle.sse.router_accessor import MantleSseSearchAccessor
@@ -156,12 +162,35 @@ class _FakeStoreDB:
         self.graph = _FakeGraph()
 
 
+class _GrantedResource:
+    """A grant as `mask_of` reads one: a resource, an effect, and the action flags."""
+
+    def __init__(self, resource_id):
+        self.resource_id = resource_id
+        self.effect = "allow"
+        for _a in ("create", "read", "update", "delete", "evict", "invoke", "add", "share",
+                   "admin"):
+            setattr(self, "can_" + _a, True)
+
+
 class _FakeLightCone:
     def __init__(self, authorized: set) -> None:
         self._authorized = set(authorized)
 
     def resolve(self, principal_id, action="read", *, principal_type="user") -> set:
         return set(self._authorized) if principal_id == ALICE else set()
+
+    def _grants_for(self, principal_id: str, principal_type: str = "user"):
+        """The same reach this double already describes, expressed as grants.
+
+        `resolve_authorized_scope` authorizes each candidate by walking up from it and testing the
+        resources on the way against the caller's grants, so a double saying "these ids are
+        authorized" says it by granting them — each id its own granted resource, which is what an
+        artifact-scoped grant looks like. Derived from `resolve` rather than restated, so whatever
+        that method gates on carries here too.
+        """
+        return [_GrantedResource(a) for a in self.resolve(principal_id,
+                                                          principal_type=principal_type)]
 
 
 @pytest.fixture(autouse=True)
@@ -191,6 +220,30 @@ QUERY_VEC = _vec(11)
 _DOC_VECS = {a: _vec(11) for a in _TEXT}
 
 
+def _graded_doc_vecs() -> dict:
+    """A corpus whose vector spectrum carries a GENUINE break: one artifact on the query
+    direction, the rest off it.
+
+    `_DOC_VECS` above is deliberately the opposite — every document is the same vector, so the
+    salience spectrum the cut reads is a tied plateau. That is the right corpus for every
+    narrowing test in this file (similarity cannot be doing the selecting if similarity is
+    constant), and it is exactly the corpus on which `beacon.cut._tie_tol` now declines to cut.
+    A test that wants to watch the cut DECIDE therefore has to hand it a spectrum with
+    something to decide about; this is that corpus.
+
+    `NEW` is the query direction itself. `MID` and `OLD` are drawn off it and carry only a
+    trace of it, so the per-item signal power lands well clear of theirs and the largest
+    relative gap falls between the one and the two. Fixed seeds: the break is a property of
+    these vectors, not of a draw.
+    """
+    rng = np.random.default_rng(4242)
+    off = {a: rng.standard_normal(DIM) for a in _TEXT}
+    q = np.asarray(QUERY_VEC, dtype=np.float64)
+    vecs = {a: (0.02 * q + off[a]).tolist() for a in _TEXT}
+    vecs[NEW] = list(QUERY_VEC)
+    return vecs
+
+
 class _NoVector:
     """An embedder whose answer is a vector by type and not by content.
 
@@ -204,14 +257,18 @@ class _NoVector:
         return [[] for _ in texts]
 
 
-@pytest.fixture
-def stack(tmp_path):
+def _build_stack(root: str, doc_vecs: dict) -> dict:
+    """The production stack over `_TEXT`, with `doc_vecs` as the per-artifact embeddings.
+
+    Split out of the `stack` fixture so a test can index the SAME corpus under a different
+    vector geometry (see `_graded_doc_vecs`) without duplicating the indexing. `root` is a
+    per-stack directory: two `SqlitePostingStore`s must not share a file.
+    """
     oracle = OracleService(
         FernetMasterKeyStore(Fernet(Fernet.generate_key())),
         grant_verifier=_AliceHoldsTheCollectionKey(),
     )
-    root = os.path.join(str(tmp_path), "sse-index")
-    postings = FilePostingStore(root, prefix="mantle-sse")
+    postings = SqlitePostingStore(os.path.join(root, "mantle-sse.db"))
     cells = InMemoryCellStore()
 
     sse_indexer = SseIndexer(oracle, postings)
@@ -224,7 +281,7 @@ def stack(tmp_path):
         vec_indexer.index_artifact(
             CELL_PRINCIPAL, COLLECTION,
             [{"artifact_id": artifact_id, "chunk_id": 0,
-              "embedding": _DOC_VECS[artifact_id], "text": _TEXT[artifact_id]}],
+              "embedding": doc_vecs[artifact_id], "text": _TEXT[artifact_id]}],
             _write_request(),
         )
     return {
@@ -233,6 +290,12 @@ def stack(tmp_path):
         "narrower": TokenNarrower(oracle, postings),
         "cells": cells,
     }
+
+
+@pytest.fixture
+def stack(tmp_path):
+    """The tied-plateau corpus — the default for this file. See `_DOC_VECS`."""
+    return _build_stack(os.path.join(str(tmp_path), "sse-index"), _DOC_VECS)
 
 
 def _reach(stack, text: str, request) -> set:
@@ -310,7 +373,7 @@ class TestTheTermsNarrowTheRecall:
 
 
 # ---------------------------------------------------------------------------
-# THE SECURITY PROPERTY, where a caller observes it
+# The security property, where a caller observes it
 # ---------------------------------------------------------------------------
 
 class TestNarrowingOnlyEverNarrows:
@@ -374,9 +437,9 @@ class TestTextOnlyRecallIsAnOrdinaryRequest:
     That is not an error and not an empty result: the caller asked a real question and got a
     real set, and the narrowing that produced it already knows how much of the query each
     member matched. So the order is that — most of the query first — with recency beneath it.
-    `ordering` says `"coverage"` and each `score` is the INTEGER COUNT of query stems matched.
+    `ordering` says `"coverage"` and each `score` is the integer count of query stems matched.
 
-    A ONE-STEM QUERY IS EXACTLY RECENCY ORDER, which is what `TERM` is here: every survivor
+    A one-stem query is exactly recency order, which is what `TERM` is here: every survivor
     scores 1 and the tiebreak is the whole ordering. That is the degeneracy stated as a test
     rather than as a claim.
     """
@@ -482,11 +545,11 @@ class TestSortIsRead:
 # ---------------------------------------------------------------------------
 
 class TestTheBeaconCutIsStillTheCut:
-    """Where a ranked result set STOPS is still read off its own spectrum, inside the one arm
+    """Where a ranked result set stops is still read off its own spectrum, inside the one arm
     that holds a vector per candidate.
 
     It could not move: `beacon.cut.select` reads `(item_embs, query_emb)`, and the narrowing
-    has no vectors at all — it has a set. Removing fusion removed the thing the cut was NOT
+    has no vectors at all — it has a set. Removing fusion removed the thing the cut was not
     allowed to be pointed at (an RRF spectrum, whose gaps are manufactured by `k`), and left
     the cut exactly where it was.
     """
@@ -507,18 +570,72 @@ class TestTheBeaconCutIsStillTheCut:
         assert spy.call_count == 1, "the ranked path must take the cut, once"
         assert result.ordering == "semantic"
 
-    def test_the_cut_is_what_bounds_the_ranked_set(self, stack):
-        """Measured against the same ranking with the cut turned off. Over three
-        near-identical vectors the cut legitimately stops early; `MANTLE_SEARCH_CUT=none`
-        returns the whole scored horizon. A difference proves the cut decided membership."""
-        uncut = MantleQueryEngine(stack["oracle"], stack["cells"], cut=CUT_NONE)
-        with_cut = _accessor(stack).search(_query(TERM))
-        without_cut = _accessor(stack, ranker=uncut).search(_query(TERM))
+    def test_the_cut_is_what_bounds_the_ranked_set(self, tmp_path):
+        """Measured against the same ranking with the cut turned off, over a corpus whose
+        vector spectrum HAS a break. `MANTLE_SEARCH_CUT=none` returns the whole scored
+        horizon; a difference proves the cut, and not the horizon, decided membership.
+
+        The premise changed 2026-08-23, deliberately, and this is the whole of the change. Over
+        `stack` — the file's default corpus, where every document is the same vector — the old
+        premise was "over three near-identical vectors the cut legitimately stops early", which
+        is false by design: `beacon.cut._tie_tol()` derives the round-off width of the
+        arithmetic that produced the salience values (`2 · n · eps`, off the array's own dtype)
+        and treats any consecutive ratio inside it as no break, so a tied plateau is kept whole.
+        Without `_tie_tol()`, `argmax` over ratios that are all exactly 1 lands on index 0 and
+        cuts three identical documents down to one arbitrary member while reporting a gap of
+        `1.000` — a cut, and in the same breath the news that nothing was found to cut at.
+        Keeping the plateau is the correct answer, so the corpus moved to this test instead.
+
+        What is guarded is unchanged: the cut is what bounds the ranked set. So the break is
+        now real — `_graded_doc_vecs` puts one artifact on the query direction and the others
+        off it — and the cut is required to land on it. `test_a_tied_plateau_is_kept_whole_and
+        _is_still_bounded` below holds the other half over the plateau corpus, so neither
+        answer can quietly become the other.
+        """
+        graded = _build_stack(os.path.join(str(tmp_path), "graded-index"), _graded_doc_vecs())
+        uncut = MantleQueryEngine(graded["oracle"], graded["cells"], cut=CUT_NONE)
+        with_cut = _accessor(graded).search(_query(TERM))
+        without_cut = _accessor(graded, ranker=uncut).search(_query(TERM))
 
         assert _ids(without_cut) == AUTHORIZED
         assert _ids(with_cut) <= _ids(without_cut)
         assert len(with_cut.hits) < len(without_cut.hits), (
             "the cut must be deciding where this ranking stops, or it is not on the path"
+        )
+        # Not merely "fewer": the cut has to land ON the break, which over this corpus is
+        # between the one document on the query direction and the two off it. A cut that
+        # stopped anywhere else would still be shorter than the horizon and would still pass
+        # the assertion above.
+        assert _ids(with_cut) == {NEW}, (
+            "the cut must stop at the break in the spectrum, not merely somewhere short of "
+            "the horizon"
+        )
+
+    def test_a_tied_plateau_is_kept_whole_and_is_still_bounded(self, stack):
+        """The other half of the same invariant, over the file's default corpus — every
+        document the same vector, so the salience spectrum is a tied plateau.
+
+        `beacon.cut._tie_tol()` (2026-08-23) makes the cut decline to break a plateau: there is
+        no drop that clears the round-off of the arithmetic that produced the values, so the
+        whole set is kept and the reported gap is `1.0` — the read ran and found no break. That
+        is still the cut bounding the set, and the bound is still not the horizon: what comes
+        back is exactly what the terms admitted and exactly what the uncut ranking scored, with
+        nothing added and no arbitrary member dropped.
+
+        This is the regression that `_tie_tol()` exists for. Before it, this same corpus came
+        back as one artifact of three, chosen by `argsort` order.
+        """
+        uncut = MantleQueryEngine(stack["oracle"], stack["cells"], cut=CUT_NONE)
+        with_cut = _accessor(stack).search(_query(TERM))
+        without_cut = _accessor(stack, ranker=uncut).search(_query(TERM))
+
+        assert _ids(without_cut) == AUTHORIZED
+        assert _ids(with_cut) == AUTHORIZED, (
+            "a tied plateau has no break to cut at; the cut must keep it whole rather than "
+            "keep one arbitrary member of it"
+        )
+        assert _ids(with_cut) <= _ids(without_cut) <= AUTHORIZED, (
+            "the cut is still a refinement bounded by the narrowing, never a widening"
         )
 
     def test_the_cut_never_widens_past_the_narrowing(self, stack):

@@ -4,7 +4,7 @@ Coverage:
 
 - index_artifact: basic indexing produces posting lists and a manifest for the artifact.
 - Field analysis: empty fields are skipped, unknown fields are ignored.
-- Entry shape: THREE KEYS AND NO MORE — `artifact_id`, `collection_id`, `field`. `tf`, `dl`
+- Entry shape: three keys and no more — `artifact_id`, `collection_id`, `field`. `tf`, `dl`
   and `positions` were BM25's inputs and there is no BM25; a membership index records that a
   term is present, and a repeated term is present once.
 - Exact tokens: each unique stemmed term in each field produces one blind token + one entry.
@@ -17,7 +17,7 @@ Coverage:
 - Multi-artifact in same posting list: posting list grows, removal affects only the target.
 - At-rest leakage: plaintext term/field strings absent from blobs.
 - Multi-collection same artifact: separate (artifact, collection) entries per posting list.
-- SLOT BINDING, END TO END — that the AAD the READER builds is the one the writer used, that
+- Slot binding, end to end — that the AAD the READER builds is the one the writer used, that
   a pre-binding corpus still answers, and that it binds on its next write. Those three lived
   beside the BM25 query engine and are the only end-to-end coverage of a property that
   outlived it; they read through `TokenNarrower` now, which is the reader that remains.
@@ -80,21 +80,38 @@ def owner_key(oracle: OracleService) -> bytes:
 # ---------------------------------------------------------------------------
 
 
-# The readers below pass the same slot AAD the indexer writes with — a blob written
-# bound does not open unbound (`test_sse_posting.TestSlotBinding`), so a helper that
-# omitted it would fail on every blob the indexer produces. `allow_unbound=False`
-# throughout: these read blobs THIS test just wrote, so they must be bound, and the
-# dual-read fallback would hide a writer that quietly stopped binding.
+# The readers below pass the same AAD the indexer writes with — a blob written bound does not open
+# unbound (`test_sse_posting.TestSlotBinding`), so a helper that omitted it would fail on every blob
+# the indexer produces. `allow_unbound=False` throughout: these read blobs THIS test just wrote, so
+# they must be bound, and the dual-read fallback would hide a writer that quietly stopped binding.
+#
+# A slot is a set of per-entry blobs rather than one blob holding a list. `SseIndexer` writes through
+# `add_entry`, so adding an artifact to a term costs one sealed write instead of decrypting, scanning
+# and re-encrypting every entry already there. This helper hides the packing from the assertions
+# below, which are about what ends up indexed rather than how it is stored — and it
+# builds each entry's AAD from the identity the store returns alongside it, which is what makes the
+# per-entry binding enforced rather than merely written.
 def _read_posting(
     posting_store: InMemoryPostingStore,
     owner_key: bytes,
     principal_id: str,
     blind_token_str: str,
 ) -> list[dict]:
+    key = posting.derive_posting_key(owner_key, blind_token_str)
+    entries = [
+        posting.unpack_entry(
+            blob, key,
+            aad=posting.entry_aad(principal_id, blind_token_str, artifact_id, collection_id),
+            allow_unbound=False)
+        for artifact_id, collection_id, blob in posting_store.get_entries(
+            principal_id, blind_token_str)
+    ]
+    if entries:
+        return entries
+    # A legacy whole-slot blob, for the tests that plant one deliberately.
     blob = posting_store.get_posting(principal_id, blind_token_str)
     if blob is None:
         return []
-    key = posting.derive_posting_key(owner_key, blind_token_str)
     return posting.unpack_posting(
         blob, key, aad=posting.posting_aad(principal_id, blind_token_str),
         allow_unbound=False)
@@ -186,9 +203,9 @@ class TestIndexArtifactBasic:
 
 
 class TestEntryShape:
-    #: Every key a posting entry may carry. The list is spelled out rather than derived so
-    #: that re-adding `tf`, `dl` or `positions` — the BM25 inputs this index no longer has a
-    #: consumer for — fails here rather than growing the wire format silently.
+    #: Every key a posting entry may carry. The list is spelled out rather than derived so that
+    #: adding `tf`, `dl` or `positions` — the BM25 inputs this index has no consumer for — fails
+    #: here rather than growing the wire format silently.
     KEYS = {"artifact_id", "collection_id", "field"}
 
     def test_an_entry_carries_three_keys_and_no_more(
@@ -245,48 +262,58 @@ class TestEntryShape:
 
 
 class TestPrefixTokens:
-    def test_prefix_tokens_emitted_for_title(
+    def test_no_prefix_token_is_written_for_any_field(
         self, indexer, posting_store, owner_key,
     ):
-        indexer.index_artifact(
-            "owner-A", "col-1", "art-1", {"title": "encryption"},
-        self_request("owner-A", "update"))
-        from mantle.search.mantle.sse.tokenizer import tokenize
-        stem = tokenize("encryption")[0]
-        # px3 (3 chars) — should exist if stem >= 3 chars.
-        for n in bt.PREFIX_LENGTHS:
-            if len(stem) >= n:
-                tok = bt.prefix_blind_token(
-                    owner_key, bt.FIELD_TITLE, stem[:n], n,
-                )
-                entries = _read_posting(
-                    posting_store, owner_key, "owner-A", tok,
-                )
-                assert len(entries) == 1, (
-                    f"missing prefix-{n} posting for stem={stem!r}"
-                )
+        """px3/px4/px5 are NOT written — for title and tags either, which once had them.
 
-    def test_terms_sharing_a_prefix_produce_one_entry(
-        self, indexer, posting_store, owner_key,
-    ):
-        """"artifact artisan" both start with "arti", and the prefix posting says so once.
+        They were generated at index time and READ BY NOTHING: `narrowing` issues only exact-term
+        lookups. That made them a permanent write cost — one to three extra HMACs and store writes
+        per term per field — paid to an index no query names.
 
-        It used to sum their frequencies and union their positions into one entry. There is
-        nothing to sum: an artifact either carries a term beginning `arti` or it does not.
+        This asserts the removal directly rather than by the absence of the old tests, because
+        "nobody wrote a test" and "the behaviour is gone" look identical in a suite otherwise.
+
+        `blind_tokens.prefix_blind_token` deliberately still EXISTS and is still correct — a
+        future prefix reader turns this back on in one place. What must not come back on its own
+        is the unconditional write.
         """
         indexer.index_artifact(
             "owner-A", "col-1", "art-1",
-            {"title": "artifact artisan"},
-        self_request("owner-A", "update"))
+            {"title": "encryption", "tags": "artifact artisan"},
+            self_request("owner-A", "update"))
+
         from mantle.search.mantle.sse.tokenizer import tokenize
-        stems = tokenize("artifact artisan")
-        prefix = "arti"
-        assert all(s.startswith(prefix) for s in stems)
-        tok = bt.prefix_blind_token(owner_key, bt.FIELD_TITLE, prefix, 4)
-        entries = _read_posting(posting_store, owner_key, "owner-A", tok)
-        assert entries == [
+        for field, text in ((bt.FIELD_TITLE, "encryption"), (bt.FIELD_TAGS, "artifact artisan")):
+            for stem in tokenize(text):
+                for n in bt.PREFIX_LENGTHS:
+                    if len(stem) < n:
+                        continue
+                    tok = bt.prefix_blind_token(owner_key, field, stem[:n], n)
+                    entries = _read_posting(posting_store, owner_key, "owner-A", tok)
+                    assert entries == [], (
+                        f"a px{n} posting was written for stem={stem!r} on field={field!r}. "
+                        "Prefix tokens are write-only — nothing reads them — so writing one is "
+                        "pure write amplification on the hot index path."
+                    )
+
+    def test_the_exact_term_is_still_written(
+        self, indexer, posting_store, owner_key,
+    ):
+        """Control for the test above: prove the indexer ran and wrote something.
+
+        Without this, a broken fixture that indexed nothing at all would satisfy
+        "no prefix tokens were written" perfectly.
+        """
+        indexer.index_artifact(
+            "owner-A", "col-1", "art-1", {"title": "encryption"},
+            self_request("owner-A", "update"))
+        from mantle.search.mantle.sse.tokenizer import tokenize
+        stem = tokenize("encryption")[0]
+        tok = bt.blind_token(owner_key, bt.FIELD_TITLE, stem)
+        assert _read_posting(posting_store, owner_key, "owner-A", tok) == [
             {"artifact_id": "art-1", "collection_id": "col-1", "field": "title"},
-        ]
+        ], "the exact-term posting is missing — the indexer did not run"
 
     def test_prefix_tokens_not_emitted_for_description(
         self, indexer, posting_store, owner_key,
@@ -569,9 +596,8 @@ class TestAtRestLeakage:
 # each other says nothing about the indexer and the reader agreeing with each other, and a
 # mismatch there breaks every recall rather than any one blob.
 #
-# These read through the NARROWER because it is the reader that exists. They previously
-# read through the BM25 query engine, and the stats blob was a third blob kind they checked;
-# neither of those is here to check.
+# These read through the narrower, because it is the reader that exists: there is no BM25 query
+# engine and no stats blob in this index.
 # ---------------------------------------------------------------------------
 
 
@@ -636,15 +662,22 @@ class TestSlotBindingIsWired:
         _seed_corpus(indexer)
         owner_key = self._owner_key(oracle)
 
-        # --- posting list -------------------------------------------------
+        # --- posting entries ----------------------------------------------
+        # The binding is per entry, which binds more than a slot-level one can:
+        # `(principal, token, artifact, collection)` rather than `(principal, token)`. A whole-slot
+        # blob holds every collection's entries, so collection separation there can only be a
+        # plaintext post-filter; an entry is one pair, so both go in.
         tok = self._title_token(owner_key, "encryption")
-        blob = posting_store.get_posting("owner-A", tok)
-        assert blob is not None, "nothing indexed — the assertions below would be vacuous"
+        found = posting_store.get_entries("owner-A", tok)
+        assert found, "nothing indexed — the assertions below would be vacuous"
         pkey = posting.derive_posting_key(owner_key, tok)
-        with pytest.raises(posting.PostingTampered):
-            posting.unpack_posting(blob, pkey)                    # unbound read refused
-        assert posting.unpack_posting(
-            blob, pkey, aad=posting.posting_aad("owner-A", tok), allow_unbound=False)
+        for artifact_id, collection_id, blob in found:
+            with pytest.raises(posting.PostingTampered):
+                posting.unpack_entry(blob, pkey)               # unbound read refused
+            assert posting.unpack_entry(
+                blob, pkey,
+                aad=posting.entry_aad("owner-A", tok, artifact_id, collection_id),
+                allow_unbound=False)
 
         # --- manifest -----------------------------------------------------
         mblob = posting_store.get_manifest("owner-A", "art-1")
@@ -672,6 +705,11 @@ class TestSlotBindingIsWired:
             b"sse-posting-aad-v1:7:owner-A:" + tok.encode()
         assert posting.manifest_aad("owner-A", "art-1") == \
             b"sse-manifest-aad-v1:7:owner-A:art-1"
+        # Every component length-prefixed, so no two different tuples can encode alike — four
+        # parts here, two of them caller-supplied ids that may contain any character.
+        assert posting.entry_aad("owner-A", tok, "art-1", "col-1") == \
+            b"sse-entry-aad-v1:7:owner-A:" + b"%d:" % len(tok) + tok.encode() + \
+            b":5:art-1:5:col-1"
 
     def test_right_key_wrong_aad_raises_before_deserialization(
         self, monkeypatch, oracle, posting_store, indexer,
@@ -686,21 +724,27 @@ class TestSlotBindingIsWired:
         owner_key = self._owner_key(oracle)
         tok = self._title_token(owner_key, "encryption")
         other_tok = self._title_token(owner_key, "library")
-        blob = posting_store.get_posting("owner-A", tok)
+        artifact_id, collection_id, blob = posting_store.get_entries("owner-A", tok)[0]
         pkey = posting.derive_posting_key(owner_key, tok)
 
         def _landmine(_plaintext):
             raise AssertionError("deserialize_entries reached on an unauthenticated blob")
 
         monkeypatch.setattr(posting, "deserialize_entries", _landmine)
-        for wrong in (posting.posting_aad("owner-B", tok),         # another principal
-                      posting.posting_aad("owner-A", other_tok)):  # another slot
+        # Each wrong AAD moves the entry exactly one hop: to another principal, another slot,
+        # another artifact, another collection. The last two are the ones a slot-level binding
+        # cannot express at all, leaving an entry re-filed under a collection its owner never put
+        # it in to a plaintext post-filter on the read path.
+        for wrong in (posting.entry_aad("owner-B", tok, artifact_id, collection_id),
+                      posting.entry_aad("owner-A", other_tok, artifact_id, collection_id),
+                      posting.entry_aad("owner-A", tok, "art-999", collection_id),
+                      posting.entry_aad("owner-A", tok, artifact_id, "col-999")):
             # Both with the dual-read left ON — the production default. A blob that IS
             # bound does not fall back to the unbound form: the fallback is not a hole.
             with pytest.raises(posting.PostingTampered):
-                posting.unpack_posting(blob, pkey, aad=wrong)
+                posting.unpack_entry(blob, pkey, aad=wrong)
             with pytest.raises(posting.PostingTampered):
-                posting.unpack_posting(blob, pkey, aad=wrong, allow_unbound=False)
+                posting.unpack_entry(blob, pkey, aad=wrong, allow_unbound=False)
 
     def test_a_legacy_unbound_corpus_still_opens_through_the_read_path(
         self, oracle, posting_store, indexer, narrower,
@@ -719,12 +763,20 @@ class TestSlotBindingIsWired:
         expected = _narrow(narrower, "encryption library", scope)
         assert expected, "the corpus answered nothing — the comparison would be vacuous"
 
-        # Rewrite the whole corpus in the old wire form, in place.
-        for token in posting_store.list_tokens_for_owner("owner-A"):
+        # Rewrite the whole corpus in the old wire form, in place: one UNBOUND whole-slot blob
+        # per token, with the per-entry rows removed. That is exactly what an index written
+        # before either change looks like — pre-binding AND pre-entry-layout — so this proves
+        # both dual-reads at once.
+        for token in list(posting_store.list_tokens_for_owner("owner-A")):
             pkey = posting.derive_posting_key(owner_key, token)
-            entries = posting.unpack_posting(
-                posting_store.get_posting("owner-A", token), pkey,
-                aad=posting.posting_aad("owner-A", token))
+            entries = [
+                posting.unpack_entry(
+                    blob, pkey,
+                    aad=posting.entry_aad("owner-A", token, aid, cid))
+                for aid, cid, blob in posting_store.get_entries("owner-A", token)
+            ]
+            for aid, cid, _blob in list(posting_store.get_entries("owner-A", token)):
+                posting_store.delete_entry("owner-A", token, aid, cid)
             posting_store.put_posting("owner-A", token, _legacy_unbound_blob(
                 posting.serialize_entries(entries), pkey))
 
@@ -780,15 +832,20 @@ class TestSlotBindingIsWired:
         assert posting.unpack_manifest(
             posting_store.get_manifest("owner-A", "art-1"), mkey, aad=aad) == sorted(tokens)
 
-    def test_a_legacy_blob_binds_on_its_next_write(
+    def test_a_legacy_whole_slot_blob_converts_on_its_next_write(
         self, oracle, posting_store, indexer,
     ):
-        """The migration is the write path, not a script.
+        """The migration is the write path, not a script — and now it migrates TWO things.
 
-        An unbound posting list is planted, the artifact is re-indexed, and the blob that
-        comes back out must no longer open unbound. This is what eventually makes
-        `allow_unbound=False` reachable — and why flipping it now would be wrong: the
-        corpus migrates one blob at a time, as each is next written.
+        A legacy slot is planted: one UNBOUND whole-slot blob, no per-entry rows. Re-indexing the
+        artifact must (a) absorb it into per-entry rows, (b) bind each of those to its own
+        `(principal, token, artifact, collection)`, and (c) delete the blob so the slot has one
+        representation again.
+
+        There is no migration script for this, and there cannot be one. Splitting a legacy blob
+        requires the owner's SSE key, which no store holds and which a blob-copying pass like
+        `mantle.system.manage_sse_index` has no way to obtain. Conversion happens where the keys
+        already are: here, on the next write, as AAD binding does.
         """
         indexer.index_artifact("owner-A", "col-1", "art-1", {"title": "encryption"},
                                self_request("owner-A", "update"))
@@ -796,19 +853,38 @@ class TestSlotBindingIsWired:
         tok = self._title_token(owner_key, "encryption")
         pkey = posting.derive_posting_key(owner_key, tok)
 
-        entries = posting.unpack_posting(
-            posting_store.get_posting("owner-A", tok), pkey,
-            aad=posting.posting_aad("owner-A", tok))
+        entries = [
+            posting.unpack_entry(blob, pkey,
+                                 aad=posting.entry_aad("owner-A", tok, aid, cid))
+            for aid, cid, blob in posting_store.get_entries("owner-A", tok)
+        ]
+        for aid, cid, _blob in list(posting_store.get_entries("owner-A", tok)):
+            posting_store.delete_entry("owner-A", tok, aid, cid)
         posting_store.put_posting("owner-A", tok, _legacy_unbound_blob(
             posting.serialize_entries(entries), pkey))
+        assert posting_store.get_entries("owner-A", tok) == [], "the slot must start legacy-only"
 
-        # Re-index: read-modify-write over the legacy blob (the dual-read opens it)...
+        # Re-index: absorb the legacy blob (the dual-read opens it), write entries, drop it.
         indexer.index_artifact("owner-A", "col-1", "art-1", {"title": "encryption"},
                                self_request("owner-A", "update"))
 
-        rewritten = posting_store.get_posting("owner-A", tok)
-        with pytest.raises(posting.PostingTampered):
-            posting.unpack_posting(rewritten, pkey)          # ...and puts it back BOUND
-        assert posting.unpack_posting(
-            rewritten, pkey, aad=posting.posting_aad("owner-A", tok),
-            allow_unbound=False) == entries
+        assert posting_store.get_posting("owner-A", tok) is None, (
+            "the legacy blob survived its own conversion — the slot now has two representations "
+            "and the reader prefers the entries, so the blob is unreachable garbage"
+        )
+        converted = posting_store.get_entries("owner-A", tok)
+        assert converted, "the conversion produced no entries"
+        for aid, cid, blob in converted:
+            with pytest.raises(posting.PostingTampered):
+                posting.unpack_entry(blob, pkey)             # ...bound, not merely rewritten
+            assert posting.unpack_entry(
+                blob, pkey, aad=posting.entry_aad("owner-A", tok, aid, cid),
+                allow_unbound=False)
+        assert sorted(
+            posting.unpack_entry(
+                blob, pkey, aad=posting.entry_aad("owner-A", tok, aid, cid),
+                allow_unbound=False)["artifact_id"]
+            for aid, cid, blob in converted
+        ) == sorted(e["artifact_id"] for e in entries), (
+            "the conversion changed which artifacts the slot reaches"
+        )

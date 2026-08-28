@@ -27,19 +27,18 @@ from mantle.services import peer_signing
 
 logger = logging.getLogger(__name__)
 
-#: How long to wait for the TCP connect itself — FOR THE WHOLE PROBE, not per address. A peer
+#: How long to wait for the TCP connect itself — for the whole probe, not per address. A peer
 #: that is not listening refuses or drops immediately on a LAN or loopback; the multi-second
 #: default is a budget for a peer that IS there and slow, and spending it on a peer that is
 #: absent is the entire cost of running standalone. Separate from the read budget below, which
 #: a reachable Origin legitimately uses.
 #:
-#: ⚠ THIS IS THE BUDGET FOR THE PROBE, AND `_connect_timeout()` IS WHAT MAKES THAT TRUE.
-#: httpcore hands the value to `socket.create_connection`, which applies it to EACH address
-#: `getaddrinfo` returns and moves to the next one when it expires. `localhost` — the default
-#: ORIGIN_URI's host — resolves to both ::1 and 127.0.0.1, so a name with two records cost
-#: twice this, and a name with more cost more. MEASURED on a node with no Origin listening:
-#: 1.00s of connect for a value that reads as 0.5, from the two loopback records alone; the
-#: cost is per RECORD, so it is set by DNS rather than by anything stated here.
+#: This is the budget for the probe, and `_connect_timeout()` is what makes that true. httpcore
+#: hands the value to `socket.create_connection`, which applies it to each address `getaddrinfo`
+#: returns and moves to the next one when it expires. `localhost` — the default ORIGIN_URI's host —
+#: resolves to both ::1 and 127.0.0.1, so a name with two records costs twice this and a name with
+#: more costs more: on a node with no Origin listening, 1.00s of connect for a value that reads as
+#: 0.5, from the two loopback records alone. The raw cost is per record, so DNS sets it.
 _CONNECT_TIMEOUT_SECONDS = 0.5
 
 #: The rest of the request budget once a connection exists.

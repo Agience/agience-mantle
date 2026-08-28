@@ -31,13 +31,34 @@ class ContentKeyMissing(RuntimeError):
     can swallow "this one blob is unreadable" without also swallowing "this node has no key"."""
 
 
+class ContentStillSealed(RuntimeError):
+    """The bytes came back as an unopened MEC1 envelope — a CUSTODY fault, not empty content.
+
+    Content is sealed under its collection's origin root (`doc_boundary.content_key_principal`),
+    so opening it needs an acting principal holding a read grant. A caller without one used to
+    receive the envelope itself, which `.decode("utf-8", "ignore")` then turned into a lossy
+    pseudo-string: measured 2026-08-27, 154,865 bytes of AES-GCM ciphertext arrived 69% printable
+    and nothing raised.
+
+    That return value is worse than an error because it is INDISTINGUISHABLE FROM AN EMPTY
+    DOCUMENT. Downstream, `sage/describe` found no terms in it, took its documented
+    always-terminating fallback (`lemmas = [... or "document"]`), and `describe_dark` — which skips
+    anything that already has lemmas — never revisited it. 874 capture artifacts carry the literal
+    `['document']` and 473 carry `['module']`: bodies nobody could read, recorded as bodies nobody
+    needed to read. `_split`'s own docstring records fixing the same SHAPE once before, when a path
+    line made `ast.parse` fail and the file was "still keyed from its stem, so `describe_dark`
+    skips it forever with no error at any layer."
+
+    So a caller that cannot open the envelope is told so."""
+
+
 class ContentIntegrityError(RuntimeError):
     """The blob decrypted but does not hash to the ref it was fetched under.
 
-    Fernet authenticates the CIPHERTEXT under the node's content key; it does not — and with no
+    Fernet authenticates the ciphertext under the node's content key; it does not — and with no
     AAD parameter cannot — bind the blob to its content address. So a ciphertext moved between two
     refs in the store, or served for the wrong ref by a mirror, decrypts cleanly and returns the
-    WRONG CONTENT under the right name. `cas/<sha256(plaintext)>` is the address, so re-hashing the
+    wrong content under the right name. `cas/<sha256(plaintext)>` is the address, so re-hashing the
     plaintext is the binding Fernet can't express, and it is checked rather than assumed — the same
     verify-on-read contract `db/content_cache.py` already holds itself to.
 
@@ -116,14 +137,74 @@ def content_ref(plaintext: bytes) -> str:
     return CAS_PREFIX + hashlib.sha256(plaintext).hexdigest()
 
 
-def put_content(content_store, keys_dir, data: bytes) -> Tuple[str, int]:
-    """Encrypt + store content-addressed in the content store. Returns (content_ref, size).
-    Idempotent: identical content is written once."""
+def _put_wants_collection(content_store) -> bool:
+    """Does this store's `put` require a `collection`? Answers for both content-store shapes.
+
+    There are two, with incompatible contracts:
+
+        FsContentStore.put(ref, ciphertext)                     — the caller encrypts, no scope
+        TieredContentStore.put(ref, plaintext, *, collection)   — the store encrypts, and scopes
+
+    `db.backend.content_handle()` — what a deployed node has — returns the second, so a caller
+    built against the first shape raises `TypeError: put() missing 1 required keyword-only
+    argument: 'collection'`, and passing ciphertext once that is satisfied would double-encrypt.
+
+    Detected from the signature rather than by an isinstance check: the store is injected (the
+    platform is a function argument), so this file must not know the concrete classes. A store that
+    grows the parameter later is handled without editing this function.
+    """
+    try:
+        import inspect
+        params = inspect.signature(content_store.put).parameters
+    except (TypeError, ValueError, AttributeError):
+        return False
+    p = params.get("collection")
+    return p is not None and p.default is p.empty
+
+
+def put_content(content_store, keys_dir, data: bytes, *, collection: str | None = None) -> Tuple[str, int]:
+    """Store content-addressed in the content store. Returns (content_ref, size).
+
+    Idempotent: identical content is written once.
+
+    `collection` is required by the stores that take it: `mantle/oci/__init__.py` states the
+    mapping — repository is a collection — and this is where it is supplied: an image's blobs name
+    their repository, federated bodies name the artifact's own collection.
+
+    It is not a storage scope. `FileContentCache.path_of` derives the object path from the ref
+    alone; per-collection keying is deliberately unused for writes, because addressing objects
+    globally while keying them per collection would let one shared ref overwrite another root's
+    copy. The parameter selects the legacy per-collection key on read, for objects predating the
+    shared-key scheme — passing the true value is correct and matters for those, but it does not
+    partition storage and is not authorization.
+
+    The encryption side flips with it, which a signature change alone would miss: a scoping store
+    takes plaintext and encrypts internally, so handing it ciphertext would encrypt twice and store
+    something that never decrypts to its own ref. `FileContentCache.put` additionally verifies
+    `sha256(plaintext)` against the ref — a check that only means anything when it really is given
+    plaintext.
+
+    Refused, not defaulted, when a scoping store is handed no collection: a plausible default
+    ("public", the node id) is an authorization decision made by accident, and the cost lands on a
+    reader who is later surprised by what a grant reaches.
+    """
     ref = content_ref(data)
-    if not content_store.exists(ref):
-        # The ONLY caller allowed to bootstrap: a write on a provisioned node may
-        # legitimately mint the first key. Still refuses if the keys dir is absent.
-        content_store.put(ref, _content_key(keys_dir, create=True).encrypt(data))
+    if content_store.exists(ref):
+        return ref, len(data)
+
+    if _put_wants_collection(content_store):
+        if not collection:
+            raise ValueError(
+                "this content store scopes writes by collection and none was given for %s. "
+                "Pass the repository (for an image or a git object) or the artifact's own "
+                "collection_id (for federated content) — guessing one here would be an "
+                "authorization decision taken by accident." % ref)
+        content_store.put(ref, data, collection=collection)
+        return ref, len(data)
+
+    # The caller-encrypts shape. The ONLY caller allowed to bootstrap: a write on a provisioned node
+    # may legitimately mint the first key. Still refuses if the keys dir is absent.
+    content_store.put(ref, _content_key(keys_dir, create=True).encrypt(data))
     return ref, len(data)
 
 
@@ -147,14 +228,50 @@ def _verify_ref(ref: str, plaintext: bytes) -> bytes:
     return plaintext
 
 
-def get_content(content_store, keys_dir, ref: str) -> bytes:
-    """Fetch + decrypt content by ref, then VERIFY it against that ref.
+def _get_wants_collection(content_store) -> bool:
+    """The read-side twin of `_put_wants_collection`. Same two shapes, same reason.
+
+        FsContentStore.get(ref) -> CIPHERTEXT          — the caller decrypts
+        TieredContentStore.get(ref, *, collection) -> PLAINTEXT
+
+    This asymmetry means the write side alone is not enough: a caller that writes through the
+    scoping store's `put` and then reads back what it just wrote — including `routers/oci_router`
+    serving a blob from a real node — needs the same collection-aware detection here, or it raises
+    `TypeError: get() missing 1 required keyword-only argument: 'collection'`, a 500 on every pull.
+    """
+    try:
+        import inspect
+        params = inspect.signature(content_store.get).parameters
+    except (TypeError, ValueError, AttributeError):
+        return False
+    p = params.get("collection")
+    return p is not None and p.default is p.empty
+
+
+def get_content(content_store, keys_dir, ref: str, *, collection: str | None = None) -> bytes:
+    """Fetch content by ref and VERIFY it against that ref.
 
     Fernet gives no AAD parameter, so the ciphertext cannot be cryptographically bound to its
     address the way `cell.py` and `content_cache.py` bind theirs. The content address is the
-    binding available here, and re-hashing after decrypt is what enforces it — the check is a pure
-    addition, it changes no stored byte, and it is the difference between "authentic" and
-    "authentic AND the content this ref names"."""
+    binding available here, and re-hashing is what enforces it — the check is a pure addition, it
+    changes no stored byte, and it is the difference between "authentic" and "authentic AND the
+    content this ref names".
+
+    Two store shapes, and the verify is the one thing both paths share. A scoping
+    store returns plaintext and needs the collection; the caller-decrypts store returns ciphertext.
+    Decrypting what is already plaintext would fail as an InvalidToken and read as a key problem,
+    so the branch is on the store's contract rather than on a guess about the bytes. `_verify_ref`
+    runs either way — it is the check that makes a read mean "this ref's content" rather than
+    "something the store handed back".
+    """
+    if _get_wants_collection(content_store):
+        if not collection:
+            raise ValueError(
+                "this content store scopes reads by collection and none was given for %s. "
+                "Pass the repository (for an image or a git object) or the artifact's own "
+                "collection_id — guessing one here would read from a scope the caller never "
+                "named." % ref)
+        return _verify_ref(ref, content_store.get(ref, collection=collection))
     return _verify_ref(ref, _content_key(keys_dir).decrypt(content_store.get(ref)))
 
 
@@ -163,17 +280,20 @@ def resolve_text(store_bundle, artifact: dict) -> str:
     `content` (legacy / small artifacts like WordNet defs). Never truncated."""
     ref = artifact.get("content_ref")
     content = store_bundle.content
-    # ONE PATH on the lattice backend: the tiered read seam (mantle `TieredContentStore`) — local
+    # One path on the lattice backend: the tiered read seam (mantle `TieredContentStore`) — local
     # FileContentCache first, then the S3/CDN mirror with sha256 verify-on-pull. The tier is built
     # unconditionally whenever the store's content is the lattice cache (local-only when
     # air-gapped), so there is no separate FileContentCache branch: the tier already tried the
-    # local cache internally, and on ANY tier failure the only remaining fallback is inline
+    # local cache internally, and on any tier failure the only remaining fallback is inline
     # `content` (never a wrong key). `ContentKeyMissing` propagates — a node-wide configuration
     # fault must not read as an empty artifact.
     tier = getattr(store_bundle, "content_tier", None)
     if ref and tier is not None:
         try:
-            return tier.get(ref, collection=artifact.get("collection_id")).decode("utf-8", "ignore")
+            return _as_text(tier.get(ref, collection=artifact.get("collection_id")),
+                            ref, artifact)
+        except ContentStillSealed:
+            raise
         except Exception as e:
             if type(e).__name__ == "ContentKeyMissing":
                 raise
@@ -183,12 +303,33 @@ def resolve_text(store_bundle, artifact: dict) -> str:
         # content.key) on a shard with no migrated cas/ cache yet. The one legacy read left;
         # it folds into the tier when the write path moves onto it.
         try:
-            return get_content(content, store_bundle.keys_dir, ref).decode("utf-8", "ignore")
-        except ContentKeyMissing:
+            return _as_text(get_content(content, store_bundle.keys_dir, ref), ref, artifact)
+        except (ContentKeyMissing, ContentStillSealed):
             raise
         except Exception:
             pass
     return artifact.get("content") or ""
+
+
+def _as_text(blob, ref, artifact) -> str:
+    """Bytes to text — but an unopened envelope is a custody fault, not a document.
+
+    `ignore` is doing a second, legitimate job that this keeps: genuine content is not always
+    clean UTF-8, and a stray byte must not fail a read. What changes is only the sealed case,
+    which `content_crypto.is_encrypted` identifies by the MEC1 magic rather than by guessing at
+    how printable the bytes look."""
+    if isinstance(blob, (bytes, bytearray)):
+        from mantle.services import content_crypto
+        if content_crypto.is_encrypted(blob):
+            raise ContentStillSealed(
+                "content at %r (artifact %r) is still sealed: opening it needs an acting "
+                "principal holding a read grant on its collection's origin root. Background work "
+                "must declare one — `op.describe.*` is an OPERATOR, so INVOKE it as one rather "
+                "than calling it as a bare function. Do NOT escalate to the system principal: "
+                "that authorizes a user's content as the platform (see ember/custody.py)."
+                % (ref, artifact.get("id")))
+        return blob.decode("utf-8", "ignore")
+    return blob if isinstance(blob, str) else ""
 
 
 # One clean sentence of an article's own text — the `summary` the type template projects. NOT a

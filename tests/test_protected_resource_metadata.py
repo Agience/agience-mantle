@@ -84,12 +84,11 @@ def test_no_issuer_configured_yields_an_empty_list(monkeypatch):
 # ---------------------------------------------------------------------------
 # Declared, or merely defaulted
 # ---------------------------------------------------------------------------
-# ⚠ BEHAVIOUR CHANGE. A standalone node — no `ORIGIN_URI`, no `AUTHORITY_ISSUER`, no stored row —
-# used to publish `authorization_servers: ["http://localhost:8080"]`, because `ORIGIN_URI`'s
-# Phase-1 default is non-empty and the fallback read non-empty as declared. It now publishes no
-# such key. An MCP client that acted on the old document dialled
-# `http://localhost:8080/.well-known/oauth-authorization-server`, found nothing, and died at the
-# one step whose purpose was to tell it where to go; the absent key is at least actionable.
+# A standalone node — no `ORIGIN_URI`, no `AUTHORITY_ISSUER`, no stored row — publishes no
+# `authorization_servers` key. `ORIGIN_URI`'s Phase-1 default is non-empty, so a fallback that read
+# non-empty as declared would publish `["http://localhost:8080"]`, and an MCP client acting on that
+# dials `http://localhost:8080/.well-known/oauth-authorization-server`, finds nothing, and dies at
+# the one step whose purpose is to tell it where to go. An absent key is actionable.
 
 def test_a_standalone_node_advertises_NO_authorization_server(monkeypatch):
     """The default install: nothing set. The Phase-1 default is a developer convenience, not a

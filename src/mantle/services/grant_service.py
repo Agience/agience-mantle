@@ -32,8 +32,8 @@ from mantle.db.backend import (
     get_active_grants_for_grantee,
     get_active_grants_for_principal_resource,
 )
-from mantle.attenuation import ACTIONS, FLAG_OF
-from mantle.entities.grant import Grant as GrantEntity, mask_of
+from mantle.attenuation import ACTIONS, FLAG_OF, Mask
+from mantle.entities.grant import grant_is_deny, Grant as GrantEntity, mask_of
 from mantle.services.grant_key_service import hash_token
 
 logger = logging.getLogger(__name__)
@@ -76,10 +76,10 @@ def user_has_any_action(db: Database, user_id: str, resource_id: str, *actions: 
     effect-blind) is the right question on the deny pass and `allows` (bit AND effect) on the
     allow pass.
 
-    This read used to be `getattr(g, flag, False)` over the raw flag names, with no effect check
-    at all — so a **deny** grant carrying `can_share`/`can_admin` conferred sharing and grant
-    administration, which is audit S1 in the share/admin path. The flags are now named by their
-    CRUDEASIO action and resolved through `mask_of`, the one operator, so the bit and the effect
+    Read as `getattr(g, flag, False)` over the raw flag names, with no effect check, a **deny**
+    grant carrying `can_share`/`can_admin` confers sharing and grant administrationin
+    the share/admin path. The flags are named by their CRUDEASIO action and resolved through
+    `mask_of`, the one operator, so the bit and the effect
     can never again be answered separately.
     """
     if not user_id:
@@ -160,6 +160,68 @@ def effective_flags(db: Database, user_id: str, resource_id: str) -> Dict[str, b
     for action in held:
         out[FLAG_OF[action]] = True
     return out
+
+
+def clamp_to_issuer(db: Database, *, issuer_id: str, resource_id: str,
+                    requested: Dict[str, bool]) -> Dict[str, bool]:
+    """Narrow *requested* to what *issuer_id* actually holds on *resource_id*.
+
+    Nobody grants what they do not hold. Attenuation is the whole authority model — a grant
+    composes down the lattice and never up — but the operator governs only authority already in the
+    graph. Minting is where new authority enters, so it is checked here; unchecked, `can_admin` is a
+    universal solvent, the only right needed to mint every other
+    right, for yourself or anyone else.
+
+    `_require_admin` is not that check. It asks whether the caller may manage grants here, which is
+    a question about the ISSUER'S standing, not about the SIZE of what they are handing out. Both
+    are needed, and only the first was being asked.
+
+    This is the same clamp `create_invite` has always applied, lifted out so the direct path and
+    the grant-key paths cannot drift from it. It is deliberately a meet against `effective_flags`
+    — allow grants joined, deny grants subtracted after — so a deny on the issuer narrows what the
+    issuer can pass on, which is the property that makes deny worth writing down at all.
+
+    Flags absent from *requested* stay absent; a caller asking for nothing still gets nothing.
+    """
+    # THE OPERATOR, not a hand-written intersection. `Mask.__and__` is the meet the whole
+    # authority model is defined by; a dict comprehension that happens to compute the same thing
+    # is a second implementation that can drift, which is the defect
+    # `test_attenuation_is_single_sourced` names.
+    held = Mask.from_flags(effective_flags(db, issuer_id, resource_id))
+    allowed = (Mask.from_flags(requested) & held).to_flags()
+    # Narrowed back to what was actually asked for: `to_flags()` emits all nine, and feeding a
+    # flag the caller never mentioned into a `Grant` is how the constructor's `can_read=True`
+    # default silently widens.
+    granted = {f: allowed[f] for f in requested}
+    dropped = sorted(f for f, v in requested.items() if v and not allowed[f])
+    if dropped:
+        logger.warning(
+            "grant on %s by %s requested %s but the issuer does not hold %s — clamped",
+            resource_id, issuer_id, sorted(f for f, v in requested.items() if v),
+            ", ".join(dropped),
+        )
+    return granted
+
+
+def clamp_grant_to_issuer(db: Database, grant: GrantEntity, issuer_id: str) -> GrantEntity:
+    """Narrow *grant*'s CRUDEASIO bits to what *issuer_id* holds on its resource, in place.
+
+    The entity form of :func:`clamp_to_issuer`, and the one the routers use: it takes the grant
+    the caller asked for and returns the grant they are entitled to mint. Working on the entity
+    rather than on a flag dict keeps the bits inside `mask_of` / `Mask.to_flags` end to end, so
+    no caller has to read a `can_*` field to make an authority decision.
+
+    A deny grant is returned untouched. Its bits name what it FORBIDS, so meeting them with the
+    issuer's held authority would narrow a prohibition — an issuer holding little could then only
+    deny little, which is backwards. Nothing in the product mints deny grants today
+    (`CreateGrantRequest` has no `effect` field); this is here so that stays true if one does.
+    """
+    if grant_is_deny(grant):
+        return grant
+    held = Mask.from_flags(effective_flags(db, issuer_id, grant.resource_id))
+    for flag, value in (mask_of(grant) & held).to_flags().items():
+        setattr(grant, flag, value)
+    return grant
 
 
 def create_invite(
@@ -404,11 +466,10 @@ def get_invite_details(db: Database, raw_token: str, user_id: str,
                        claimant_email: str = "") -> Optional[dict]:
     """Full invite details after verifying caller identity. None if invalid.
 
-    ``claimant_email`` must be a VERIFIED address (the caller names that gate — see
-    `_verify_target_match`). It was previously read as a free variable that no scope defined, so
-    every targeted invite raised `NameError` here and the endpoint answered 500 instead of
-    either the details or the mismatch. Defaulting to `""` keeps the existing single caller
-    working and takes the Origin-lookup branch, which reads a verified address off the person
+    ``claimant_email`` must be a verified address (the caller names that gate — see
+    `_verify_target_match`). It is a parameter rather than a free variable, and defaulting to `""`
+    keeps the single caller working and takes the Origin-lookup branch, which reads a verified
+    address off the person
     record rather than trusting anything the request supplied.
     """
     try:

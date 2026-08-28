@@ -3,7 +3,7 @@
 # ⭐ ONE SERVICE, BECAUSE MANTLE IS ONE SERVICE. The store is a SQLite file plus a filesystem CAS
 # opened in-process: there is no database container to provision, no cache, no queue. A compose
 # file that invented companions would be describing a different product. The full platform stack
-# — Origin for identity, MinIO as the local S3 edge — lives in `agience-bundle`, and this file is
+# — Origin for identity, MinIO as the local S3 edge — lives in `agience-observe`, and this file is
 # deliberately not that.
 #
 # ⚠ TWO THINGS MUST EXIST BEFORE `up`:

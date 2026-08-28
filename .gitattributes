@@ -1,6 +1,27 @@
 # Auto-detect text files and perform LF normalization
 * text=auto
 
+# ⛔ CONTENT-ADDRESSED BLOBS ARE NEVER NORMALISED. THE FILE'S NAME IS THE HASH OF ITS BYTES.
+#
+# `* text=auto` above asks git to GUESS whether a file is text, and for a blob under
+# `blobs/sha256/<hex>` it guesses wrong in the one way that matters: an OCI manifest or config blob
+# is JSON, carries no NUL, and is therefore treated as text and line-ending-converted on checkout.
+# 476 bytes become 491, the content no longer hashes to the name it is stored under, and
+# `mantle.oci.layout` refuses it — correctly, because verifying content against its ref is the whole
+# contract of the store.
+#
+# ⚠ THIS IS INVISIBLE ON THE MACHINE THAT COMMITTED IT AND FATAL EVERYWHERE ELSE. The blobs in the
+# git objects are byte-correct (measured 2026-08-23: all three hash to their own names). The damage
+# happens at CHECKOUT, so the working tree that captured the fixture keeps passing forever while
+# every FRESH CLONE fails — which is precisely every CI runner. It was found by the first sovereign
+# cycle in 25 days: five green tests here, five red in `_ci-work`, same commit.
+#
+# `-text` disables all conversion in both directions; `-diff` stops git rendering the bytes as text
+# in a diff. Applied to the tree rather than to one file, because the next captured layout will have
+# different names by construction — the names ARE hashes, so an allowlist of them cannot be written
+# in advance.
+tests/fixtures/oci-layout-real/blobs/** -text -diff
+
 # Force LF for shell scripts (critical for Docker containers)
 *.sh text eol=lf
 *.bash text eol=lf

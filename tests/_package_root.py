@@ -6,7 +6,7 @@ own — a single source keeps `conftest.py`'s skip gate and each test's own path
 Resolution order, deliberately defaulting to an absent path so nothing changes by accident:
   1. `MANTLE_PACKAGE_ROOT` if set — the reproducible override;
   2. `agience-mantle/package` — the in-repo location, normally absent;
-  3. never guessed from a sibling repo silently. A caller that wants the bundle tree names it.
+  3. never guessed from a sibling repo silently. A caller that wants the observe package tree names it.
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ def package_root() -> Path:
 
 
 # The tree is split across two repos:
-#   · seeds → `agience-bundle/package/seeds`
+#   · seeds → `agience-observe/package/seeds`
 #   · types → `agience-crystal/src/types`
 # Deriving both from a single `package_root()` cannot locate them, since no common parent
 # contains both.
@@ -36,8 +36,8 @@ def package_root() -> Path:
 # checkout; a standalone `agience-mantle` checkout finds nothing and skips cleanly, which is what
 # the standalone-installable claim requires.
 #
-#     MANTLE_SEEDS_ROOT=<genesis>/agience-bundle/package/seeds \
-#     MANTLE_TYPES_ROOT=<genesis>/agience-crystal/src/types \
+#     MANTLE_SEEDS_ROOT=<workspace>/agience-observe/package/seeds \
+#     MANTLE_TYPES_ROOT=<workspace>/agience-crystal/src/types \
 #     python -m pytest -q tests
 
 #: Sibling locations, used only when a full workspace checkout is present. A standalone
@@ -45,7 +45,7 @@ def package_root() -> Path:
 #: tree-dependent tests skip cleanly — the behaviour the standalone-installable claim needs. This
 #: module is the only place that names a sibling repo; every caller asks it rather than guessing.
 _WORKSPACE = _MANTLE_REPO.parent
-_SIBLING_SEEDS = _WORKSPACE / "agience-bundle" / "package" / "seeds"
+_SIBLING_SEEDS = _WORKSPACE / "agience-observe" / "package" / "seeds"
 _SIBLING_TYPES = _WORKSPACE / "agience-crystal" / "src" / "types"
 
 

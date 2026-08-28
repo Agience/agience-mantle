@@ -4,12 +4,12 @@
 
 """A collection's frame, and the proximity digest taken off it.
 
-The frame is what a Marchenko-Pastur spectral-proximity read (`entroptics.proximity`, or any
+The frame is what a Marchenko-Pastur spectral-proximity read (the spectral-proximity instrument, or any
 instrument sharing its shape) reads: **rows are the collection's artifacts, columns are terms,
 cells are raw term counts.** Nothing else — no weighting, no normalisation, no vocabulary cut.
 This module builds it from the tokenizer Mantle already runs at index time, and says when the
 read has to be taken again. It does not take the read itself: mantle carries no proximity
-instrument of its own (mantle never imports entroptics — the two-tier boundary beacon's own
+instrument of its own (mantle imports no spectral library — the two-tier boundary beacon's own
 modules hold), so :func:`digest_frame` takes one as an argument, the same injected-embodiment
 seam `prism.instrument` uses elsewhere in this codebase.
 
@@ -47,7 +47,7 @@ What a row is
 -------------
 A row is a member the lexical arm would index: one that tokenizes to at least one stem. A
 member with no analyzable text is not a zero row, because a zero row is not free —
-``entroptics.proximity.common_prefix``'s own reasoning measures what appending zero rows costs
+``<probe>.common_prefix``'s own reasoning measures what appending zero rows costs
 (they drag the median row energy, hence ``sigma^2``, hence every mode) and concludes that
 padding a frame is not a no-op. The lexical arm already draws this line at
 ``pipeline_unified._sse_index_artifact`` (``if not fields: return ARM_SKIPPED``); this draws
@@ -224,7 +224,7 @@ class CollectionDigest:
 
     ``read`` is kept at FULL length. The Marchenko-Pastur deviation is dense — measured 64 of
     64 nonzero modes on 60 of 60 corpus frames — so the trailing-zero truncation the clipped
-    excess allowed is not available, and ``entroptics.proximity.common_prefix`` compares two
+    excess allowed is not available, and ``<probe>.common_prefix`` compares two
     records on the shorter one's length rather than padding either.
 
     ``rows`` is redundant with ``len(read)`` whenever ``D >= N`` (measured on 38 of 38 real
@@ -331,10 +331,10 @@ def digest_frame(frame: CollectionFrame, *, read, engine_id: str,
     """Take a proximity read off a frame, or refuse.
 
     ``read`` and ``engine_id`` name the proximity instrument to read with. This module carries
-    none of its own: mantle never imports entroptics (the same two-tier boundary beacon's own
+    none of its own: mantle imports no spectral library (the same two-tier boundary beacon's own
     modules hold), so the instrument is injected, the same seam ``prism.instrument`` uses
-    elsewhere in this codebase. Pass ``read=entroptics.proximity.mp_deviation,
-    engine_id=entroptics.proximity.ENGINE_ID_PROXIMITY`` (or any instrument sharing that
+    elsewhere in this codebase. Pass ``read=<probe>.mp_deviation,
+    engine_id=<probe>.ENGINE_ID_PROXIMITY`` (or any instrument sharing that
     shape — a callable frame -> array of per-mode deviations).
 
     Refuses with ``NO_RESOLVED_DIRECTION`` when the read is identically zero — see the module
@@ -451,7 +451,7 @@ def dumps_digest(digest: CollectionDigest) -> bytes:
             "columns": digest.columns,
             "read": list(digest.read),
         },
-        sort_keys=True, separators=(",", ":"),
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
     ).encode("utf-8")
 
 

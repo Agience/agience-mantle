@@ -3,11 +3,14 @@
 A settings module must not require another service's source tree to import: the README's claim
 that "Mantle IS the database" — one SQLite file plus a filesystem CAS, opened in-process, nothing
 external to provision — depends on this module resolving on its own. `agience-prism` is the one
-declared cross-package edge (`[project.optional-dependencies].service`), imported in ~28 modules.
+declared cross-package edge (`[project.optional-dependencies].service`), imported in 24 modules
+(AST-measured 2026-08-26; 13 of the 36 import statements are at module scope, none of them reached
+by `import mantle` — THIS module defers its own prism import into `load_settings_from_db`).
 """
 from __future__ import annotations
 
 import json as _json
+import logging
 import os
 import site as _site
 import sys as _sys
@@ -16,6 +19,9 @@ import uuid as _uuid
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlparse as _urlparse, urlunparse as _urlunparse
+
+#: Module logger, read by `_announce_ignored_env`.
+_log = logging.getLogger(__name__)
 
 try:                                    # python-dotenv is optional at import time
     from dotenv import load_dotenv as _load_dotenv
@@ -36,6 +42,105 @@ def _origin_only(uri: str) -> str:
 _MANTLE_ROOT = Path(__file__).resolve().parent.parent      # …/src
 
 
+#: Environment variables this module reads AT IMPORT, into module-level constants.
+#:
+#: A `.env` naming any of these has no effect. `load_env` is called from `main.py` after this
+#: module has been imported, so by the time a `.env` reaches `os.environ` the constants below have
+#: already taken their values from the shell. The `.env` line is read, stored, and never
+#: consulted — the operator sees a file that looks like configuration and is not.
+#:
+#: Ten variables, derived by walking this module's own module-level `os.getenv` calls rather than
+#: counted by hand. `test_env_ignored_keys_are_announced.py` re-derives the set from the AST and
+#: fails if this tuple drifts from it, so a new import-bound constant cannot quietly rejoin the
+#: silent group.
+#:
+#: The remedy for an operator is what the warning says: pass identity config as real environment
+#: variables.
+_BOUND_AT_IMPORT = (
+    "AGIENCE_BASE_DIR",
+    "AGIENCE_OPERATOR_ID",
+    "AGIENCE_TRUSTED_ISSUERS",
+    "AUTHORITY_ISSUER",
+    "FACET_URI",
+    "KEYS_DIR",
+    "MANTLE_OIDC_CLIENT_ID",
+    "MANTLE_OIDC_SCOPE",
+    "MANTLE_URI",
+    "ORIGIN_URI",
+)
+
+
+def _rebound_from_env() -> frozenset:
+    """Of `_BOUND_AT_IMPORT`, the names `load_settings_from_db()` does re-read from the environment.
+
+    `AUTHORITY_ISSUER`, `ORIGIN_URI` and `FACET_URI` all follow a late `.env`: `main.py` calls
+    `load_settings_from_db()` at :269 and `_SETTING_MAP` re-reads the environment there
+    ("environment overrides the DB — operator .env wins"), while `AUTHORITY_ISSUER` is re-derived
+    on the last line of that function. Naming a variable as import-bound when it is not would tell
+    an operator that a working `.env` line does nothing — for `AUTHORITY_ISSUER`, the single most
+    consequential identity value, that would be the damaging direction to be wrong in.
+
+    Derived, never typed — the same rule `_BOUND_AT_IMPORT` follows. Two sources, because there are
+    two mechanisms: `_SETTING_MAP` (whose loop calls `os.getenv(var_name)`) and any literal
+    `os.getenv("X")` inside `load_settings_from_db` itself. A hand-written list here would drift the
+    day someone adds a setting, and it would drift silently toward claiming a working line is dead.
+    """
+    names = {var for var, _ in _SETTING_MAP.values()}
+    try:
+        import ast as _ast
+        import inspect as _inspect
+        tree = _ast.parse(_inspect.getsource(load_settings_from_db).lstrip())
+        for node in _ast.walk(tree):
+            if (isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute)
+                    and node.func.attr == "getenv" and node.args
+                    and isinstance(node.args[0], _ast.Constant)
+                    and isinstance(node.args[0].value, str)):
+                names.add(node.args[0].value)
+    except (OSError, TypeError, SyntaxError):
+        # Source may be unavailable (frozen, zipped). Fail toward the OLD behaviour -- warn about
+        # more rather than fewer. Over-warning is a nuisance; under-warning hides a dead `.env` line.
+        pass
+    return frozenset(names)
+
+
+def _truly_ignored() -> frozenset:
+    """`_BOUND_AT_IMPORT` minus everything the rebind recovers. What a `.env` genuinely cannot set."""
+    return frozenset(_BOUND_AT_IMPORT) - _rebound_from_env()
+
+
+def _announce_ignored_env(path) -> list:
+    """Names in this `.env` that were already bound at import. Returns them; logs if any.
+
+    Reads the file directly rather than diffing `os.environ`: `load_dotenv(override=False)` does
+    not report what it skipped, and a variable also present in the shell is indistinguishable
+    afterwards. The parse is deliberately minimal — `KEY=value`, ignoring blanks, comments and
+    `export ` — because the only thing needed is the KEY, and a fuller parser here would be a second
+    implementation of dotenv.
+    """
+    try:
+        keys = set()
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key = line.split("=", 1)[0].strip()
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
+            if key:
+                keys.add(key)
+    except Exception:
+        return []
+
+    ignored = sorted(keys & _truly_ignored())
+    if ignored:
+        _log.warning(
+            "%s declares %s, which this process has ALREADY bound at import and will not re-read. "
+            "Those lines have no effect. Pass them as real environment variables (the shell, the "
+            "container, or the unit file) instead.",
+            path, ", ".join(ignored))
+    return ignored
+
+
 def load_env(base_dir: Optional[Path] = None) -> Optional[Path]:
     """Load mantle's `.env` — CALLED EXPLICITLY from `main.py`, never at import.
 
@@ -51,6 +156,9 @@ def load_env(base_dir: Optional[Path] = None) -> Optional[Path]:
     for candidate in (root / ".env", root.parent / ".env"):
         if candidate.is_file():
             _load_dotenv(candidate, override=False)
+            # Say so when the file names something this module already bound. Silence here is what
+            # made a `.env` look like configuration when it was not — see `_BOUND_AT_IMPORT`.
+            _announce_ignored_env(candidate)
             return candidate
     return None
 
@@ -110,7 +218,7 @@ def _derive_base_dir(root: Path) -> Path:
     """Where this node's data goes when `AGIENCE_BASE_DIR` says nothing. `root` is the directory
     the `mantle` package sits in — `<repo>/src` in a checkout.
 
-    THE QUESTION IS NOT "WHICH INSTALL SHAPE" BUT "IS THIS DIRECTORY MINE TO WRITE IN". Four
+    The question is not which install shape, but whether this directory is mine to write in. Four
     shapes reach this line and only one of them owns a writable tree next to the source:
 
     * a **checkout** (and a **PEP 660 editable install**, which is the same thing seen through a
@@ -118,12 +226,12 @@ def _derive_base_dir(root: Path) -> Path:
       working tree, and the derived default is where a developer already expects `.data/` to be;
     * a **plain wheel install**: `root` is `<venv>/Lib/site-packages`, which belongs to the package
       manager. `MANTLE_SSE_DIR`, `MANTLE_CELL_DIR` and the embeddings cache defaulting in there put
-      a node's INDEXES — data, not cache; a full rebuild is measured in days-to-weeks — inside a
+      a node's indexes — data, not cache, with a full rebuild measured in days-to-weeks — inside a
       directory the next `pip install --upgrade` rewrites;
     * a **zip import**: there is no directory behind `__file__` at all, so nothing can be written
       beside it;
     * a **frozen build**: `__file__` is inside a bundle that PyInstaller unpacks to a temp
-      directory and DELETES on exit — the one place worse than site-packages.
+      directory and deletes on exit — the one place worse than site-packages.
 
     So the three that do not own a tree fall back to the working directory, which is a place the
     person who started the node chose. That is a weaker guarantee than an absolute install root —
@@ -154,16 +262,16 @@ BASE_DIR = (
 )
 KEYS_DIR = Path(os.getenv("KEYS_DIR", str(BASE_DIR / ".data" / "keys")))
 
-#: THE STORE'S DEFAULT LOCATION — the one SQLite file that IS the lattice, when
+#: The store's default location — the one SQLite file that is the lattice, when
 #: `MANTLE_LATTICE_PATH` is unset. Absolute, and derived from `BASE_DIR` exactly as `KEYS_DIR`
 #: above, the embeddings cache (`.data/mantle/`) and the SSE index (`.data/mantle-sse`,
 #: `search/mantle/wiring.py`) are. Everything this node writes therefore lands under one `.data/`
 #: directory, which is what `.gitignore` and `.dockerignore` exclude as a unit.
 #:
-#: A BARE RELATIVE NAME WOULD RESOLVE AGAINST THE WORKING DIRECTORY EACH TIME IT WAS READ, so the
+#: A bare relative name would resolve against the working directory each time it was read, so the
 #: same node would open a different store depending on where it was started from — and come up
 #: healthy serving an empty universe. This is absolute: `BASE_DIR` is fixed once at import, and on
-#: an installed node that fixes it to the working directory the node was STARTED in rather than to
+#: an installed node that fixes it to the working directory the node was started in rather than to
 #: `site-packages` (see `_derive_base_dir`). An explicit `MANTLE_LATTICE_PATH` still wins, and a
 #: relative one still resolves as the caller wrote it; this is only what happens when nobody says.
 #:
@@ -303,7 +411,7 @@ _SETTINGS_PROVIDER: Optional[Callable[[str], Optional[str]]] = None
 
 #: setting key -> (module variable, converter). Mantle's slice only — see the module docstring.
 #:
-#: THE DEFAULT FOR EVERY VARIABLE NAMED HERE LIVES ABOVE, IN PHASE 1, AND NOWHERE ELSE.
+#: The default for every variable named here lives above, in Phase 1, and nowhere else.
 #: `services/platform_settings_service.DEFAULTS` mirrors these Phase-1 values by reading the
 #: module attribute, so the store cannot answer with a default of its own invention.
 #:
@@ -442,14 +550,14 @@ def authority_is_declared() -> bool:
 
 
 def declared_public_uri() -> str:
-    """Where this node SAYS it answers, or "" when nobody has said. Trailing slash stripped.
+    """Where this node says it answers, or "" when nobody has said. Trailing slash stripped.
 
     The same distinction `authority_is_declared()` draws, drawn the same way and for the same
     reason: `MANTLE_URI`'s Phase-1 default is `http://localhost:8081`, a developer default rather
     than a statement about where this node answers, and a consumer that treats it as a declaration
     hands an IdP a redirect to localhost from a production host.
 
-    WHAT DECIDES IS WHETHER IT WAS SAID, NOT WHAT IT SAYS. Rejecting the value `http://localhost…`
+    What decides is whether it was said, not what it says. Rejecting the value `http://localhost…`
     is the reading that cannot be argued with: a node that genuinely answers on localhost — a
     laptop, a sidecar, a `docker run -p 8081:8081` — has no way to say so, because the only
     sentence that is true of it is the one being refused. `MANTLE_URI=http://localhost:8081` set on
@@ -483,17 +591,17 @@ def authorization_servers() -> list:
     otherwise the platform authority. Order is load-bearing: index 0 is the one a browser is sent
     to, and a browser can be sent to exactly one provider.
 
-    THE FALLBACK REQUIRES AN EXPLICIT VALUE, not merely a non-empty one. `ORIGIN_URI`'s Phase-1
+    The fallback requires an explicit value, not merely a non-empty one. `ORIGIN_URI`'s Phase-1
     default is `http://localhost:8080` — a developer default, not a statement that an authorization
     server answers there — and `AUTHORITY_ISSUER` derives from it, so a standalone node with no
-    Origin used to publish `authorization_servers: ["http://localhost:8080"]` in its RFC 9728
-    metadata and send its sign-in button to the same place. An MCP client that reads that document
-    dials `http://localhost:8080/.well-known/oauth-authorization-server`, gets nothing, and the flow
-    dies at the one step whose whole purpose was to tell it where to go. Advertising a server that
-    is not there is worse than advertising none: the empty answer is actionable and the wrong one
-    is not. `declared_public_uri()` above draws the same line for `MANTLE_URI`, for the same reason
-    and in the same words — with the same rule, too: what decides is whether an operator SAID it,
-    not what the value happens to be.
+    Origin configured must not publish `authorization_servers: ["http://localhost:8080"]` in its
+    RFC 9728 metadata and send its sign-in button to the same place: an MCP client that reads that
+    document would dial `http://localhost:8080/.well-known/oauth-authorization-server`, get
+    nothing, and the flow would die at the one step whose whole purpose was to tell it where to go.
+    Advertising a server that is not there is worse than advertising none, because the empty answer
+    is actionable and the wrong one is not. `declared_public_uri()` above draws the same line for
+    `MANTLE_URI`, for the same reason and by the same rule: what decides is whether an operator
+    said it, not what the value happens to be.
 
     So a standalone node now names no authorization server, and `main.py` omits the key entirely
     rather than publishing an empty list. That IS the true state of such a node: it serves

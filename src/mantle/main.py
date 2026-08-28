@@ -45,9 +45,16 @@ Everything below the ``lifespan`` definition is wiring, in source order: the ``F
 then the ``HTTPException`` and unhandled-exception handlers (which also attach the RFC 9728
 ``WWW-Authenticate`` challenge to every 401), CORS, security headers, the per-client rate
 limiter, and then the routers — ``artifacts``, ``events``,
-``grants``, ``system``, ``mcp``. Those five are the whole mounted surface;
-``tests/test_every_router_is_mounted.py`` holds it that way, and
-``tests/test_route_reshape.py`` pins the paths.
+``grants``, ``system``, ``mcp``, and, added 2026-08-23, ``oci`` (``/v2``) and ``git`` (``/git``).
+Those seven are the whole mounted surface; ``tests/test_every_router_is_mounted.py`` holds it that
+way, and ``tests/test_route_reshape.py`` pins the paths.
+
+The last two are the **sovereign code plane**: the node serving what it runs. ``/v2`` is an OCI
+registry over the CAS the store already is — "the registry IS the lattice", read-only and by digest,
+which is what ``deploy/release.sh`` stage 4 ingests into. ``/git`` serves the INSTRUMENTS (prism,
+crystal, mantle) read-only over smart HTTP, and is **off unless ``MANTLE_GIT_ROOT`` is set**.
+Neither offers a write surface; push and image upload are separate acts with their own
+authorization, and each router says so where a route would otherwise have been.
 """
 
 import os
@@ -82,6 +89,8 @@ from mantle.routers.events_router import router as events_router  # noqa: E402
 from mantle.routers.grants_router import router as grants_router  # noqa: E402
 from mantle.routers.system_router import router as system_router  # noqa: E402
 from mantle.routers.mcp_router import mcp_router  # noqa: E402
+from mantle.routers.oci_router import router as oci_router  # noqa: E402
+from mantle.routers.git_router import router as git_router  # noqa: E402
 # beacon_router, internal_personas_router, and stream_router are not mounted here — they are not
 # database-layer surface; they belong to Agience/Origin or the persona services.
 # events_router is the outbound data-change stream (WS /events).
@@ -119,13 +128,36 @@ logging.getLogger("httpx._client").setLevel(logging.ERROR)
 # ----------------------------
 BUILD_INFO_PATH = os.getenv("BUILD_INFO_PATH", "/app/build_info.json")
 
+def _parse_components(raw: str) -> dict:
+    """`"a=sha,b=sha"` -> `{"a": "sha", "b": "sha"}`. Never raises.
+
+    A build ARG is a string, so the revision set arrives flat and is widened here — once, in the one
+    place that reads the stamp. Malformed pairs are DROPPED rather than guessed at: a component this
+    node cannot name a revision for must be absent from the attestation, because a wrong sha is
+    worse than a missing one. An unstamped older image yields `{}`, which the source offer reports
+    as "this build did not say" rather than as "there is nothing in it".
+    """
+    out = {}
+    for pair in (raw or "").split(","):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        name, _, rev = pair.partition("=")
+        name, rev = name.strip(), rev.strip()
+        if name and rev:
+            out[name] = rev
+    return out
+
+
 def _load_build_info():
     for candidate in [BUILD_INFO_PATH, str(Path(__file__).resolve().parent.parent / "build_info.json")]:
         try:
-            return json.loads(Path(candidate).read_text(encoding="utf-8"))
+            info = json.loads(Path(candidate).read_text(encoding="utf-8"))
         except Exception:
             continue
-    return {"version": "", "build_time": ""}
+        info["components"] = _parse_components(info.get("components") or "")
+        return info
+    return {"version": "", "build_time": "", "components": {}}
 
 BUILD_INFO = _load_build_info()
 
@@ -174,11 +206,20 @@ async def lifespan(app: FastAPI):
     # `AUTHORITY_ISSUER` outranks the `ORIGIN_URI` fallback. A shell that sets only `ORIGIN_URI`
     # therefore does not displace an `AUTHORITY_ISSUER` already carried in `.env` — partially
     # overriding a precedence chain produces a blend of configurations that neither side wrote.
-    logger.info(
-        "Identity resolved: AUTHORITY_ISSUER=%s (tokens must carry this as both iss and aud) "
-        "ORIGIN_URI=%s MANTLE_URI=%s",
-        config.AUTHORITY_ISSUER, config.ORIGIN_URI, getattr(config, "MANTLE_URI", "<unset>"),
-    )
+    #
+    # Logging the resolved identity happens after the rebind below, not here, and that placement
+    # matters: `config.AUTHORITY_ISSUER` binds at import, and `load_env` above only mutates
+    # `os.environ` — the rebind is `config.load_settings_from_db()`, ~46 lines below. Logging before
+    # that rebind would report whatever the constant was at import (`http://localhost:8080` with
+    # nothing set) even on a node configured through `.env`, while the node goes on to run against
+    # the real issuer — worse than no log, since this is the one place an operator looks to confirm
+    # which identity a node came up on, and a wrong value here sends someone hunting a `.env` that
+    # was in fact loaded correctly.
+    #
+    # Measured: import with nothing set gives `http://localhost:8080`; setting `AUTHORITY_ISSUER`
+    # afterwards does not move the constant; injecting the settings provider and calling
+    # `load_settings_from_db()` moves it to the real value. See "Identity resolved" below, which sits
+    # immediately after that rebind.
 
     # ------------------------------------------------------------------
     # Phase 0: Initialize all key material (filesystem)
@@ -224,6 +265,17 @@ async def lifespan(app: FastAPI):
     # settings getter down rather than the core importing the app's settings service directly.
     config.set_settings_provider(platform_settings.get)
     config.load_settings_from_db()
+
+    # This is the one place this can be true: `load_settings_from_db` is what rebinds the config
+    # module from the environment and the stored settings, so this is the first moment the node's
+    # identity is actually resolved. Logged from `config.*` rather than from `os.getenv`
+    # deliberately: the environment is one of the inputs, and what an operator needs is the resolved
+    # answer the verifier will use — `iss` and `aud` are checked against exactly these values.
+    logger.info(
+        "Identity resolved: AUTHORITY_ISSUER=%s (tokens must carry this as both iss and aud) "
+        "ORIGIN_URI=%s MANTLE_URI=%s",
+        config.AUTHORITY_ISSUER, config.ORIGIN_URI, getattr(config, "MANTLE_URI", "<unset>"),
+    )
 
     # Re-initialize edge S3 clients now that config.CONTENT_URI is set from DB,
     # then eagerly ensure the content bucket exists.
@@ -441,6 +493,59 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to stop mirror drain: {e}")
     shutdown_search()
 
+    # Reclaiming the write-ahead log on the way out, last, deliberately: every writer above has
+    # been stopped by this point (index worker, audit worker, mirror drain, search), and a
+    # checkpoint cannot pass an active reader's snapshot — so this is the one moment in the
+    # process's life when a TRUNCATE checkpoint can actually reset the file.
+    #
+    # The measurement this exists for: on node 71 `lattice.db-wal` reached 30.4 GiB against a
+    # 9.58 GiB database, and one query measured >45 s cold against 6.28 s warm. `schema.PRAGMAS`
+    # sets `wal_autocheckpoint=2000`, but that only bounds growth — autocheckpoint runs passive
+    # checkpoints, which reuse the WAL from its start and leave the file at its high-water mark
+    # for ever. Only a TRUNCATE checkpoint resets it.
+    #
+    # What this adds, precisely, is not the reclaim itself: SQLite already checkpoints and deletes
+    # the WAL when the last connection to a database closes, so a node that is the sole holder
+    # reclaims on exit with or without this block. What it adds is the case that actually happens:
+    # node 71 is read by `mantle` and `ember`, so neither process's exit is the last close, the
+    # automatic path never fires, and the WAL survives every restart. This block cannot fix that
+    # either — with another reader holding a snapshot TRUNCATE returns busy=1 and moves nothing —
+    # but it makes that visible, where it would otherwise stay missing while the file grows to
+    # 30 GiB with nobody told. Verified 2026-08-25 by holding a second connection open: 470 of 470
+    # pages folded, 0 bytes reclaimed, busy=1. Reclaiming it needs the readers stopped, and that is
+    # `mantle-wal-checkpoint`.
+    #
+    # Not on the write path, and that is the decision: `agience-ember`'s `genesis.py` checkpoints
+    # every N bulk batches, but ember is a one-shot ingest with no concurrent readers. Mantle's
+    # `graph.add_edges` also serves single-edge request writes (`db/edge.py::add_edge` calls it
+    # with a one-element list), so the same pattern here would put a blocking TRUNCATE inside live
+    # request handling, where it would mostly return busy=1 anyway. Reclaiming without a restart is
+    # `mantle-wal-checkpoint`, run by a human in a quiet moment.
+    #
+    # Fail-soft, and it must stay that way: this is the last thing a dying process does, and an
+    # exception here would mask whatever actually brought it down.
+    try:
+        from mantle.db.backend import store_handle
+        from mantle.db.schema import wal_checkpoint
+
+        _db = store_handle().artifacts.db
+        _wal = _db.path + "-wal"
+        _before = os.path.getsize(_wal) if os.path.exists(_wal) else 0
+        _busy, _pages, _done = wal_checkpoint(_db.conn, "TRUNCATE")
+        _after = os.path.getsize(_wal) if os.path.exists(_wal) else 0
+        if _busy:
+            # SQLite reports a blocked checkpoint by RETURNING busy=1, never by raising. Logging
+            # this as success is exactly how a WAL grows to 30 GiB with nobody told.
+            logger.warning(
+                "WAL checkpoint on shutdown returned busy=1 — a reader still held a snapshot, so "
+                "%d of %d log pages were folded and the file was not reset (wal %d bytes). Run "
+                "`mantle-wal-checkpoint` with the readers stopped.", _done, _pages, _after)
+        else:
+            logger.info("WAL checkpoint on shutdown: %d pages, wal %d -> %d bytes",
+                        _done, _before, _after)
+    except Exception as e:
+        logger.warning("WAL checkpoint on shutdown skipped: %s", e)
+
 # ----------------------------
 # Create app
 # ----------------------------
@@ -547,7 +652,7 @@ def oauth_protected_resource(request: Request):
     verification stays with `services/oidc.py` against the issuer's own JWKS. A node that published
     a friendly issuer here would not thereby trust it.
 
-    ⚠ ON A STANDALONE NODE THIS DOCUMENT IS THE WHOLE OAUTH SURFACE, and it names no authorization
+    On a standalone node this document is the whole OAuth surface, and it names no authorization
     server. There is no `/.well-known/oauth-authorization-server`, no `/authorize`, no `/token`, and
     no dynamic client registration anywhere in this app — the endpoints named in
     `services/dependencies.oauth2_scheme` are Origin's, on another host. A standards-compliant MCP
@@ -674,16 +779,16 @@ async def _security_headers(request: Request, call_next):
 # whole surface (incl. API-key verification) from floods / credential-stuffing. Set
 # AGIENCE_RATE_LIMIT_PER_MIN=0 to disable.
 #
-# ⚠ THE CLIENT IS THE SOCKET PEER UNLESS A TRUSTED PROXY SAYS OTHERWISE. `X-Forwarded-For`
-# is a request header, so the caller writes it. Reading it from any peer gives every caller
-# a private bucket for the asking — a different value per request is a different window, and
-# a limiter that can be opted out of by naming yourself differently is not a limiter. The
+# The client is the socket peer unless a trusted proxy says otherwise. `X-Forwarded-For` is a
+# request header, so the caller writes it, and reading it from any peer gives every caller a
+# private bucket for the asking: a different value per request is a different window, and a
+# limiter that can be opted out of by naming yourself differently is not a limiter. The
 # same value was also a permanent key in the store below, so the bypass and the memory-growth
 # path were one bug: an unauthenticated caller chose both how much it was allowed to send and
 # how much the process remembered about it.
 #
 # AGIENCE_TRUSTED_PROXIES names the peers whose word about the client is worth taking, as
-# addresses or CIDR blocks. UNSET MEANS TAKE NOBODY'S — a node with no edge in front of it
+# addresses or CIDR blocks. Unset means take nobody's — a node with no edge in front of it
 # must not be talked out of the address it can actually see. The failure direction of getting
 # this wrong is deliberate: an edge that is not listed makes every client share the edge's one
 # address, so the limiter over-counts and refuses traffic, rather than under-counting and
@@ -718,7 +823,7 @@ def _parse_trusted_proxies(raw: str) -> tuple:
 
 _RL_TRUSTED_PROXIES = _parse_trusted_proxies(os.getenv("AGIENCE_TRUSTED_PROXIES", ""))
 
-#: One sliding window per client, ORDERED BY LAST TOUCH — an `OrderedDict`, not a `dict`, and
+#: One sliding window per client, ordered by last touch — an `OrderedDict`, not a `dict`, and
 #: that is what bounds it. See `_rl_evict_expired`.
 _RL_HITS: "OrderedDict[str, deque]" = OrderedDict()
 
@@ -738,9 +843,9 @@ def _rate_limit_client(request: Request) -> str:
     """The identity the sliding window is kept against.
 
     The socket peer, unless the socket peer is a configured trusted proxy — in which case the
-    RIGHT-MOST address in `X-Forwarded-For` that is not itself a trusted proxy, which is the
-    last hop the trusted chain actually observed. Reading the LEFT-most entry instead stays
-    spoofable even behind a real edge: a proxy APPENDS, so whatever the client sent arrives
+    right-most address in `X-Forwarded-For` that is not itself a trusted proxy, which is the
+    last hop the trusted chain actually observed. Reading the left-most entry instead stays
+    spoofable even behind a real edge: a proxy appends, so whatever the client sent arrives
     ahead of what the proxy added, and the left-most entry is the client's own claim about
     itself. Walking from the right and stopping at the first hop no trusted proxy vouched for
     is the only part of the header a trusted peer's presence actually attests to.
@@ -767,18 +872,18 @@ def _rate_limit_client(request: Request) -> str:
 def _rl_evict_expired(cutoff: float) -> None:
     """Drop every window whose newest hit has aged out. This is what bounds the store.
 
-    `_RL_HITS` is ordered by last touch, so the dead entries are a PREFIX of it: an entry
+    `_RL_HITS` is ordered by last touch, so the dead entries are a prefix of it: an entry
     further along was touched more recently by definition, so the first live entry ends the
     sweep. Popping from the front is therefore exact and O(1) amortized — each key is created
     once and dropped once — with no periodic scan and no cap to tune.
 
-    THE BOUND IS DERIVED, NOT CHOSEN. What survives is one entry per client seen within the
+    The bound is derived, not chosen: what survives is one entry per client seen within the
     last `_RL_WINDOW_S`, so the store holds at most as many entries as this process accepted
     requests in a window, and it drains to nothing on its own when traffic stops. The number
-    of timestamps inside them is bounded the same way and by `_RL_MAX` per client. Before
-    this, a key was created and never removed: the store's size was the number of distinct
-    client identities the process had EVER seen, which — with the header trusted from any peer
-    — was the number of requests an anonymous caller cared to send.
+    of timestamps inside them is bounded the same way and by `_RL_MAX` per client. Without this
+    eviction, a key is created and never removed, so the store's size becomes the number of
+    distinct client identities the process has ever seen — which, with the header trusted from
+    any peer, is the number of requests an anonymous caller cares to send.
     """
     while _RL_HITS:
         dq = next(iter(_RL_HITS.values()))
@@ -830,6 +935,16 @@ app.include_router(events_router)
 app.include_router(grants_router)
 app.include_router(system_router)
 app.include_router(mcp_router)
+# `/v2` — the OCI distribution surface, read-only and by digest. The registry IS the lattice: an
+# image is a collection, a blob is content, and the address is the same number. This is what closes
+# `deploy/release.sh` stage 4's warning about itself ("the sovereign copy lands with the /v2 router;
+# until then the mirror is the original"). Mounted last among the routers because it is the newest
+# and its prefix collides with nothing above it.
+app.include_router(oci_router)
+# `/git` — read-only smart HTTP over the INSTRUMENTS (prism, crystal, mantle), off unless
+# MANTLE_GIT_ROOT is set. A node serving its own source; see the router for why the served set is
+# an allowlist rather than a directory listing, and for what this is not yet (lattice-native).
+app.include_router(git_router)
 
 # ----------------------------
 # `/mcp` above is Mantle's own database-layer MCP surface: the whole of it, addressed
@@ -957,11 +1072,10 @@ def _work_pool_status() -> dict:
     every row it counts is an `op.content.mirror` task and there is no second population folded
     into the number.
 
-    That is a property of the NAME, not of a filter, which is what makes it free. An
-    operator-exact count used to be declined here on cost: while these tasks shared
-    `application/vnd.agience.task+json` with every other operator's, narrowing to one operator
-    meant walking a status bucket on `operator`, a column and not a counter — and the bucket to
-    walk was the pending one, unbounded precisely when the number is interesting. Naming the pool
+    That is a property of the name rather than of a filter, which is what makes it free. Under a
+    shared `application/vnd.agience.task+json`, an operator-exact count costs a walk of a status
+    bucket on `operator` — a column and not a counter — and the bucket to walk is the pending one,
+    unbounded precisely when the number is interesting. Naming the pool
     for the work dissolved that: the counter is already the answer, so `/status` still costs five
     O(1) reads and now means one operator's backlog rather than a pool's. `operator` is reported
     alongside the type so the reading is on the response and not only here.
@@ -1001,7 +1115,100 @@ def check_backend_status():
 def version():
     return {
         "version": BUILD_INFO.get("version") or "",
-        "build_time": BUILD_INFO.get("build_time") or ""
+        "build_time": BUILD_INFO.get("build_time") or "",
+        # Every repo that went into this image, not only mantle's. `/version` is the cheap read;
+        # `/.well-known/agience-source` is the same facts joined to where the source can be had.
+        "components": BUILD_INFO.get("components") or {},
+    }
+
+
+#: What each component is licensed under. Measured from the LICENSE files 2026-08-24, not assumed —
+#: the workspace's own DEPLOYMENT-STRATEGY once listed this set wrongly, and the difference decides
+#: who owes a source offer to whom.
+#:
+#: mantle is **Apache-2.0**, not AGPL. That is worth stating because it is the intuitive mistake:
+#: mantle is "the platform" by role and an instrument by licence, so serving `mantle.agience.ai`
+#: carries no network-copyleft obligation. The AGPL-3.0-only repos are origin, chorus, ember and
+#: observe — of which only **origin** is publicly served today.
+COMPONENT_LICENSES = {
+    "agience-mantle": "Apache-2.0",
+    "agience-prism-py": "Apache-2.0",
+    "agience-crystal": "Apache-2.0",
+    "agience-origin": "AGPL-3.0-only",
+    "agience-chorus": "AGPL-3.0-only",
+    "agience-ember": "AGPL-3.0-only",
+    "agience-observe": "AGPL-3.0-only",
+}
+
+
+@app.get("/.well-known/agience-source", include_in_schema=False)
+def agience_source(request: Request):
+    """What this instance is running, and where to get the source of it — verifiably.
+
+    The point is the join: a `/git` clone on its own proves nothing about the box, since it is
+    source a node happens to hold. This endpoint publishes the revision the running image was built
+    from, per component, so the two can be checked against each other:
+
+        git clone https://<this-host>/git/prism && git -C prism cat-file -e <revision>^{commit}
+
+    If the commit is present, the clone provably contains the exact code this instance is running.
+    That is a stronger claim than any `curl | sh` from a CDN can make, and it needs no signature —
+    a git object id is already a hash of the content, exactly as an OCI digest is.
+
+    It is an attestation of the build, not of the process: it says what the image was built from,
+    and it does not prove the running process is unmodified — nothing served over HTTP by that
+    same process could. A node that lies about its own revision is not caught here; the check that
+    catches that is the deploy's, comparing the running image digest against the one the repo
+    records (`mantle_verify`), made by an operator outside the box. Said plainly rather than left
+    to be assumed, because "attestation" is a word that invites the stronger reading.
+
+    And `served_here: false` is a real answer: a component in the image whose source this node
+    does not carry is listed with no URL rather than omitted — an omission would read as "there is
+    nothing else in this image", which is the one thing this document must not imply.
+    """
+    from mantle.routers.git_router import SERVED, served_name_for_repo, _root
+
+    base = str(request.base_url).rstrip("/")
+    git_on = _root() is not None
+    components = BUILD_INFO.get("components") or {}
+
+    out = []
+    for repo, revision in sorted(components.items()):
+        name = served_name_for_repo(repo)
+        served = bool(name) and git_on
+        entry = {
+            "repo": repo,
+            "revision": revision,
+            "license": COMPONENT_LICENSES.get(repo, "unknown"),
+            "served_here": served,
+        }
+        if served:
+            entry["source_url"] = "%s/git/%s" % (base, name)
+            entry["verify"] = (
+                "git clone %s/git/%s && git -C %s cat-file -e %s^{commit}"
+                % (base, name, name, revision))
+        else:
+            entry["note"] = ("this node does not serve this component's source"
+                             + ("" if git_on else " (its git surface is off)"))
+        out.append(entry)
+
+    return {
+        "node": os.getenv("MANTLE_ORIGIN") or os.getenv("EMBER_NODE_ID") or "",
+        "build_time": BUILD_INFO.get("build_time") or "",
+        "git_surface": "on" if git_on else "off",
+        "components": out,
+        # The offer exists for whoever runs this, not for the person who wrote it. AGPL-3.0 §13
+        # binds licensees: a copyright holder running their own AGPL code owes nothing to itself.
+        # The obligation lands on a third party who modifies an AGPL component and lets users
+        # interact with it over a network — which is precisely the "clone it and run your own node"
+        # story this surface exists to enable. So the mechanism ships with the node rather than
+        # being left for each operator to build, and this field is what a downstream operator points
+        # their users at.
+        "agpl_notice": (
+            "Components marked AGPL-3.0-only carry a network-interaction requirement (AGPL-3.0 "
+            "§13): an operator who MODIFIES one and offers it to users over a network must offer "
+            "those users the corresponding source. Components marked Apache-2.0 carry no such "
+            "requirement. This endpoint is the offer for whatever this node serves."),
     }
 
 # ----------------------------

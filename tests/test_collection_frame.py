@@ -6,10 +6,9 @@
 
 `search/ingest/collection_frame.py` turns a collection's members into the object a proximity
 instrument reads — rows are artifacts, columns are terms, cells are raw term counts — and
-decides three things this file holds it to. The instrument itself (`entroptics.proximity`,
-tested in `agience-entroptics`'s own suite) is injected via `read=`/`engine_id=`; this file
-uses a minimal local stand-in (`_read`/`_ENGINE_ID`, defined below) since mantle never imports
-entroptics.
+decides three things this file holds it to. The instrument itself is injected via
+`read=`/`engine_id=` and tested in its own suite; this file uses a minimal local stand-in
+(`_read`/`_ENGINE_ID`, defined below), since mantle imports no spectral library.
 
 1. **The frame is the collection.** Its columns are the stems the SSE arm indexes, produced
    by the tokenizer the SSE arm runs, so a digest describes the same corpus the index does.
@@ -29,10 +28,10 @@ entroptics.
    them) and the cost one (`k = rows` is the unique amortisation that returns the per-write
    cost to the order of the write).
 
-The AST guard against a swept constant landing in `build_frame`/`digest_frame` is carried
-forward (`test_no_size_cap_appears_anywhere_in_the_builder`, `test_no_...` on the narrowing
-beside it). The equivalent guard on the proximity instrument's own math now lives in
-`agience-entroptics`'s test suite, since that module is no longer reachable from this repo.
+The AST guard against a swept constant landing in `build_frame`/`digest_frame` is here
+(`test_no_size_cap_appears_anywhere_in_the_builder`, `test_no_...` on the narrowing beside it).
+The equivalent guard on the proximity instrument's own math lives in its own test suite,
+because that module is not reachable from this repo.
 """
 from __future__ import annotations
 
@@ -52,8 +51,8 @@ FRAME_MODULE = Path(CF.__file__)
 NARROW_MODULE = Path(CP.__file__)
 
 #: `digest_frame`/`digest_collection` take a proximity instrument as an injected `read` +
-#: `engine_id` pair now — mantle never imports entroptics, so the real instrument
-#: (`entroptics.proximity.mp_deviation`) lives in and is tested by `agience-entroptics`'s own
+#: `engine_id` pair now — mantle imports no spectral library, so the real instrument
+#: (`<probe>.mp_deviation`) lives in and is tested by its own
 #: suite. This file is about the plumbing `collection_frame.py` builds around an injected
 #: instrument (determinism, refusal, storage), not the instrument's own math, so a minimal but
 #: real stand-in — centre, then the plain singular spectrum — is enough: it is deterministic,
@@ -236,10 +235,10 @@ def test_a_near_silent_frame_is_kept_because_it_is_not_silent():
 
     Members with identical text centre to the zero matrix. `_read` (the bare singular
     spectrum) genuinely reads that as `[0.0, ...]` and would be refused — correct for a read
-    with no floor of its own. `entroptics.proximity.mp_deviation`'s actual behaviour is
+    with no floor of its own. `<probe>.mp_deviation`'s actual behaviour is
     different: it is `s_k - s_MP(k)`, and the Marchenko-Pastur prediction `s_MP(k)` is not
     identically zero even when the observed spectrum is, so the real instrument reads a small
-    nonzero energy there and the collection is kept (see entroptics' own test suite for that
+    nonzero energy there and the collection is kept (see the instrument's own test suite for that
     property). What this file can test is the plumbing: `digest_frame`/`digest_collection`
     pass whatever the injected read reports straight through, with no floor of their own —
     proven here with a stand-in read that has exactly that "not identically zero" shape."""
@@ -592,9 +591,7 @@ def test_the_narrowing_carries_no_constant_either():
     )
 
 
-# The AST guard against a swept constant landing in the proximity read itself used to be
-# re-run here too ("so a change made 'for the collection path' cannot land in `proximity.py`
-# without this file failing too"). That module now lives in `agience-entroptics`
-# (`src/entroptics/proximity.py`), reachable from mantle only through the `read=`/`engine_id=`
-# seam `digest_frame`/`digest_collection` take — so a change to it is no longer something this
-# repo's test suite can see, and the guard belongs in entroptics' own suite instead.
+# The AST guard against a swept constant landing in the proximity read itself lives in
+# the instrument's own repository rather than here. That module is reachable
+# from mantle only through the `read=`/`engine_id=` seam `digest_frame`/`digest_collection` take,
+# so a change to it is not something this repo's test suite can see.

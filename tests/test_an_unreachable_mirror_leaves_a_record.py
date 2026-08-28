@@ -1,4 +1,4 @@
-"""`PUT /artifacts/{id}/content` when the object store is CONFIGURED BUT UNREACHABLE.
+"""`PUT /artifacts/{id}/content` when the object store is configured but unreachable.
 
 `test_content_route_needs_no_object_store.py` holds the two ends of that route's tier: a node with
 no object store (local is the store, complete and quiet) and a node whose mirror works. This file

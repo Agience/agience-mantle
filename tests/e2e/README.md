@@ -28,8 +28,8 @@ It exercises the full matrix the platform is meant to guarantee:
 ## Running it
 
 The suite needs a **live stack**, and the compose stack that provides it lives in the sibling
-**`agience-bundle`** repo — Origin, Mantle, MinIO and the init container that writes the keyset
-and the single-use bootstrap token. From `agience-bundle/`:
+**`agience-observe`** repo — Origin, Mantle, MinIO and the init container that writes the keyset
+and the single-use bootstrap token. From `agience-observe/`:
 
 ```bash
 # fresh stack (bootstrap available). Search is lexical BM25/SSE.
@@ -67,7 +67,7 @@ E2E_LAZY_INDEX=1 pytest -m lazy
 | `E2E_ORIGIN_URL` | `http://localhost:8080` | Origin base URL |
 | `E2E_MANTLE_URL` | `http://localhost:8081` | Mantle base URL |
 | `E2E_AUTHORITY_ISSUER` | `http://origin:8080` | `aud` on Origin user tokens |
-| `E2E_DATA_DIR` | `<workspace>/agience-bundle/.data-local` | where to read `keys/bootstrap.token` — the bundle stack's `LOCAL_DATA` root |
+| `E2E_DATA_DIR` | `<workspace>/agience-observe/.data-local` | where to read `keys/bootstrap.token` — the observe stack's `LOCAL_DATA` root |
 | `E2E_BOOTSTRAP_TOKEN` | — | supply the token directly (remote stack) |
 | `E2E_LAZY_INDEX` | off | enable `-m lazy` assertions |
 | `E2E_HTTP_TIMEOUT` | `15` | per-request timeout, in seconds |
@@ -114,7 +114,7 @@ operator named by `AGIENCE_OPERATOR_ID`. The single remaining Mantle→Origin ca
 ## Notes / limits
 
 - **Reset:** the operator identity is deterministic, so reruns against a live
-  stack are idempotent; for a clean slate wipe `agience-bundle/.data-local` and
+  stack are idempotent; for a clean slate wipe `agience-observe/.data-local` and
   rebuild. Every user/collection is uniquely suffixed, so tests stay isolated.
 - **Search backend:** the lattice + MinIO must be up or `POST /artifacts/recall` answers
   503, which the suite treats as a skip. There is no plaintext fallback index to degrade

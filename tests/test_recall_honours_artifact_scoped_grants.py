@@ -45,7 +45,7 @@ from cryptography.fernet import Fernet
 from mantle.search.mantle import MantleIndexer, MantleQueryEngine, OracleService
 from mantle.search.mantle.oracle import FernetMasterKeyStore, KeyPurpose, KeyRequest
 from mantle.search.mantle.sse.indexer import SseIndexer
-from mantle.search.mantle.sse.file_stores import FilePostingStore
+from mantle.search.mantle.sse.sqlite_stores import SqlitePostingStore
 from mantle.search.mantle.sse.narrowing import TokenNarrower
 #: Only the pre-existing surface is imported at module scope, on purpose: the
 #: escalation below is expressed entirely in terms of `POST /artifacts/recall`'s
@@ -167,6 +167,17 @@ class _FakeStoreDB:
         self.graph = _FakeGraph()
 
 
+class _GrantedResource:
+    """A grant as `mask_of` reads one: a resource, an effect, and the action flags."""
+
+    def __init__(self, resource_id):
+        self.resource_id = resource_id
+        self.effect = "allow"
+        for _a in ("create", "read", "update", "delete", "evict", "invoke", "add", "share",
+                   "admin"):
+            setattr(self, "can_" + _a, True)
+
+
 class _FakeLightCone:
     """Returns the id set the real resolver would return for a given grant shape.
 
@@ -183,6 +194,19 @@ class _FakeLightCone:
 
     def resolve(self, principal_id, action="read", *, principal_type="user") -> set:
         return set(self._authorized) if principal_id == ALICE else set()
+
+    def _grants_for(self, principal_id: str, principal_type: str = "user"):
+        """The same reach, expressed as grants.
+
+        `resolve_authorized_scope` authorizes each candidate by walking up from it and testing the
+        resources on the way, so a double saying "these ids are authorized" says it by granting
+        them. Both shapes this file exercises survive that translation intact: the artifact-scoped
+        set grants only `art-shared`, whose CUSTODY still widens to `col-bob` because keys are
+        derived per collection — which is the escalation this file exists to pin — while the
+        artifact meet still admits `art-shared` alone.
+        """
+        return [_GrantedResource(a) for a in self.resolve(principal_id,
+                                                          principal_type=principal_type)]
 
 
 ARTIFACT_SCOPED = {SHARED}
@@ -230,7 +254,7 @@ def stack(tmp_path):
         grant_verifier=_OracleAsTheLightConeWouldDecide(),
     )
     root = os.path.join(str(tmp_path), "sse-index")
-    postings = FilePostingStore(root, prefix="mantle-sse")
+    postings = SqlitePostingStore(os.path.join(root, "mantle-sse.db"))
     cells = InMemoryCellStore()
 
     sse_indexer = SseIndexer(oracle, postings)

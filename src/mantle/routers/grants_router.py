@@ -8,11 +8,14 @@ grants is decided by `services.grant_service` (creator OR can_admin/can_share).
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Annotated, List, Optional
 
+#: Imported at module scope so `/my-access` can publish the same derived `action` enum that
+#: `/artifacts/visible` does. `attenuation` is stdlib-only, so there is no cycle to defer around.
+from mantle.attenuation import ACTIONS
 from mantle.db.store import Database
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Path
+from pydantic import BaseModel, Field
 
 from mantle.services.dependencies import get_store_db, get_auth, AuthContext, offload_sync
 from mantle.db.backend import (
@@ -21,10 +24,70 @@ from mantle.db.backend import (
     update_grant,
 )
 from mantle.entities.grant import Grant as GrantEntity
+from mantle.api.errors import ERROR_DESCRIPTIONS
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/grants", tags=["Grants"])
+
+
+#: `responses=` for one route. Declaration only, no runtime effect.
+#:
+#: Declaring only `422` when the handlers raise 400, 401, 403, 404 and 410 would leave a
+#: generated client a case for validation failure and nothing else — including no branch for
+#: `410 Gone` on a claimed or expired invite, which is the one answer on this surface a person
+#: actually needs to be shown.
+#:
+#: Each set is derived from its handler by AST — the `HTTPException` codes reachable from
+#: it — never typed from the table, with one subtraction: the four explicit `500`s are
+#: not declared, because they are unreachable. `update_grant` always returns
+#: the entity and `GrantEntity` defines no `__bool__`, so `if not update_grant(...)` is dead
+#: in all four. Declaring a code a handler cannot produce tells every client to write a branch
+#: it will never enter — the same defect as omitting one, pointed the other way.
+#:
+#: The prose lives in `mantle/api/errors.py`, shared with `/artifacts`. Two homes for what a
+#: `404` means is what that module exists to prevent.
+#: What each path id names on this surface — measured 2026-08-26, because all eight were bare
+#: `str` with no description while every query parameter had one.
+#:
+#: The three are not interchangeable, and `grant_id` is the one that surprises: it accepts a
+#: user grant, a grant key, or a bundle member. The router says so where it matters — "this path
+#: reaches a grant key (`DELETE /grants/{id}` matches a key's own id) and a bundle member as
+#: readily as a user grant" — and a caller reading only the parameter name would not guess it.
+_GRANT_PARAM = (
+    "The grant to act on. ⚠ Accepts THREE kinds of id: an ordinary user grant, a grant KEY, or a "
+    "bundle MEMBER — revocation reaches all three by the same path. So a `404` here "
+    "means 'no grant, key or member with this id that you may see', not 'not a grant'."
+)
+_KEY_PARAM = (
+    "The grant KEY — the shareable credential itself, not the grant it was minted from and not a "
+    "member hanging off it."
+)
+_MEMBER_PARAM = (
+    "The member WITHIN the key named by `key_id`. ⚠ Removing a member is a soft revoke and leaves "
+    "the row in place: the bundle it hangs off is what stops resolving, so the member is left "
+    "where it is rather than deleted."
+)
+
+
+def _errors(*codes: int, ok: Optional[type] = None, ok_code: int = 200) -> dict:
+    #: `ok=` documents the success body. Deliberately `responses={200:
+    #: {"model": …}}` and not `response_model=`, following the `/artifacts` P-1 decision the
+    #: audit points at: `response_model` filters, so a handler that returns a field the model
+    #: has not caught up with would silently stop sending it. Under-describing a response is a
+    #: documentation bug; silently truncating one is data loss whose symptom is a missing key
+    #: nobody can trace.
+    out = {c: {"description": ERROR_DESCRIPTIONS[c]} for c in codes}
+    #: `ok_code`, because four of these routes answer `201` and not `200`. Declaring the body
+    #: under `200` on a `status_code=201` route documents a response the route never sends and
+    #: leaves the one it does send undeclared — the defect wearing a disguise. The success
+    #: ratchet carries the same warning from an earlier sweep that measured 12 here instead of
+    #: 16 by looking only at `200`.
+    if ok is not None:
+        out[ok_code] = {"model": ok}
+    return out
+
+
 
 
 # =============================================================================
@@ -73,6 +136,166 @@ def _now_iso() -> str:
 #: (a bearer token for `grant_key`, a claim token for `invite`). Serializing one would
 #: publish the stored form of a live credential to anyone who can list grants.
 _SECRET_GRANTEE_TYPES = {GrantEntity.GRANTEE_GRANT_KEY, GrantEntity.GRANTEE_INVITE}
+
+
+class GrantResponse(BaseModel):
+    """A grant as this API returns it.
+
+    ALL 16 OPERATIONS DECLARED AN EMPTY SUCCESS SCHEMA, so a generated client got `any` for
+    every response on this surface and could not name one key it would be handed. That is the same
+    defect `/artifacts` fixed as P-1, and the reasoning transfers whole.
+
+    DECLARED, NOT ENFORCED — `responses={200: {"model": …}}`, never `response_model=`. The latter
+    FILTERS: the day a handler returns a field this model has not caught up with, that field
+    silently stops reaching clients. A response that is under-described is a documentation bug; one
+    that is silently truncated is a data-loss bug whose symptom is a missing key nobody can trace.
+
+    The key set is DERIVED from `Grant.__init__`, checked against a live `to_dict` — 37 fields,
+    and the generator asserts the two agree rather than trusting either. `_grant_response` returns
+    `to_dict()` whole, so declaring a SUBSET would have documented a smaller response than the one
+    actually sent, which is the failure this is meant to end.
+
+    Every field is Optional in the SCHEMA and that is deliberate: it describes what a client may
+    receive, and a grant mid-lifecycle genuinely has `null` in most of the timestamp and
+    `*_requires_identity` slots. Optionality here is not laxity — it is the honest shape.
+    """
+
+    accepted_at: Optional[str] = None
+    accepted_by: Optional[str] = None
+    can_add: Optional[bool] = None
+    can_admin: Optional[bool] = None
+    can_create: Optional[bool] = None
+    can_delete: Optional[bool] = None
+    can_evict: Optional[bool] = None
+    can_invoke: Optional[bool] = None
+    can_read: Optional[bool] = None
+    can_share: Optional[bool] = None
+    can_update: Optional[bool] = None
+    claims_count: Optional[int] = Field(
+        None,
+        description="How many times an invite has been claimed, against `max_claims`.",
+    )
+    created_time: Optional[str] = None
+    effect: Optional[str] = Field(
+        None,
+        description="`allow` or `deny`. A deny wins over any allow on the same verb.",
+    )
+    expires_at: Optional[str] = Field(
+        None,
+        description="ISO-8601, or `null` for a grant that does not expire on its own.",
+    )
+    granted_at: Optional[str] = None
+    granted_by: Optional[str] = None
+    grantee_id: Optional[str] = Field(
+        None,
+        description="Who the grant is for. ⛔ `null` for a grant key or an invite: those hold a "
+                    "TOKEN HASH here and the router redacts it, so a `null` on those two "
+                    "grantee types means WITHHELD, not absent.",
+    )
+    grantee_type: Optional[str] = None
+    id: Optional[str] = None
+    invoke_requires_identity: Optional[bool] = None
+    key_hint: Optional[str] = Field(
+        None,
+        description="A non-secret fragment for recognising a grant key. Never the key.",
+    )
+    last_used_at: Optional[str] = None
+    max_claims: Optional[int] = None
+    modified_time: Optional[str] = None
+    name: Optional[str] = None
+    notes: Optional[str] = None
+    read_requires_identity: Optional[bool] = None
+    requires_identity: Optional[bool] = None
+    requires_nonce: Optional[bool] = None
+    resource_id: Optional[str] = None
+    revoked_at: Optional[str] = None
+    revoked_by: Optional[str] = None
+    state: Optional[str] = Field(
+        None,
+        description="Lifecycle: active, revoked, expired or pending acceptance.",
+    )
+    target_entity: Optional[str] = None
+    target_entity_type: Optional[str] = None
+    write_requires_identity: Optional[bool] = None
+
+
+class GrantWithClaimResponse(GrantResponse):
+    """A freshly created INVITE — the grant, plus the one-time claim material.
+
+    `claim_token` and `claim_url` are returned EXACTLY ONCE, on creation. They are not stored in
+    retrievable form and no read path returns them, which is why they are a separate model rather
+    than nullable fields on `GrantResponse`: a schema that offered them on every grant would invite
+    a client to look for them on a read and find `null` for ever."""
+
+    claim_token: Optional[str] = Field(None, description="The invite secret. Shown once.")
+    claim_url: Optional[str] = Field(None, description="The link a person follows to claim it.")
+
+
+class GrantKeyResponse(GrantResponse):
+    """A grant key and the members it bundles."""
+
+    members: List[GrantResponse] = Field(
+        default_factory=list,
+        description="The grants this key bundles. Empty for a key that bundles none.")
+
+
+class GrantKeyCreatedResponse(GrantKeyResponse):
+    """A grant key at creation — the only response that carries the key itself.
+
+    Separate from `GrantKeyResponse` on purpose. The secret exists in the response to exactly
+    one request and is never retrievable again; declaring it on the read model would document a
+    field that is always `null` there, which teaches a client to check for something it can never
+    be given."""
+
+    key: Optional[str] = Field(
+        None, description="The grant key. Returned once, at creation, and never again.")
+
+
+class RevokedResponse(BaseModel):
+    """What a revoke answers: the thing acted on, and the state it is now in."""
+
+    id: Optional[str] = Field(None, description="The grant or key that was revoked.")
+    state: Optional[str] = Field(None, description="Its lifecycle state after the call.")
+
+
+class MyAccessResponse(BaseModel):
+    """Whether this caller may perform one action on one resource.
+
+    Answers a stranger too — see the note on the route. `allowed: false` is a real answer, not a
+    refusal, which is why this operation declares no errors."""
+
+    resource_id: Optional[str] = Field(None, description="The resource asked about, echoed back.")
+    action: Optional[str] = Field(None, description="The CRUDEASIO verb asked about, echoed back.")
+    allowed: Optional[bool] = Field(None, description="Whether this principal may do it.")
+
+
+class InviteContextResponse(BaseModel):
+    """The little a stranger holding an invite link may be told BEFORE authenticating.
+
+    Deliberately thin. It says whether the link is live and what KIND of thing it points at,
+    never what or whose — anything more would make an unauthenticated endpoint a lookup."""
+
+    valid: Optional[bool] = Field(None, description="Whether the invite is still claimable.")
+    has_target: Optional[bool] = Field(None, description="Whether it names a specific target.")
+    target_type: Optional[str] = Field(None, description="The KIND of target, never its id.")
+
+
+class InviteDetailsResponse(BaseModel):
+    """What an AUTHENTICATED caller may learn about an invite.
+
+    TWO BRANCHES, and the fields differ between them — which is why every field is optional and
+    the shape is documented rather than enforced. A caller whose identity does not match the
+    invite gets `{valid, identity_mismatch}` and none of the descriptive fields: telling them who
+    granted what would answer, for someone the invite was not for, the question the invite exists
+    to answer for someone it was."""
+
+    valid: Optional[bool] = Field(None, description="Whether the invite is still claimable.")
+    identity_mismatch: Optional[bool] = Field(
+        None, description="Set when the invite is bound to a different identity than the caller.")
+    granted_by: Optional[str] = Field(None, description="Who issued it. Absent on a mismatch.")
+    name: Optional[str] = Field(None, description="Its name, if it has one. Absent on a mismatch.")
+    resource_id: Optional[str] = Field(
+        None, description="What it grants on. Absent on a mismatch.")
 
 
 def _grant_response(grant: GrantEntity) -> dict:
@@ -146,7 +369,9 @@ def _require_share_or_admin(auth: AuthContext, resource_id: str, store_db: Datab
 # Endpoints
 # =============================================================================
 
-@router.get("/invite-context")
+@router.get("/invite-context",
+    responses=_errors(404, ok=InviteContextResponse),
+)
 async def get_invite_context_endpoint(
     token: str = Query(..., description="Raw invite claim token"),
     store_db: Database = Depends(get_store_db),
@@ -159,7 +384,9 @@ async def get_invite_context_endpoint(
     return ctx
 
 
-@router.get("/invite-details")
+@router.get("/invite-details",
+    responses=_errors(401, 404, ok=InviteDetailsResponse),
+)
 async def get_invite_details_endpoint(
     token: str = Query(..., description="Raw invite claim token"),
     auth: AuthContext = Depends(get_auth),
@@ -175,7 +402,9 @@ async def get_invite_details_endpoint(
     return details
 
 
-@router.get("/mine-sent")
+@router.get("/mine-sent",
+    responses=_errors(401, ok=List[GrantResponse]),
+)
 async def list_invites_sent_endpoint(
     include_revoked: bool = Query(False, description="Include revoked / exhausted invites."),
     auth: AuthContext = Depends(get_auth),
@@ -192,7 +421,9 @@ async def list_invites_sent_endpoint(
     return [_grant_response(g) for g in grants]
 
 
-@router.post("/claim", status_code=status.HTTP_201_CREATED)
+@router.post("/claim", status_code=status.HTTP_201_CREATED,
+    responses=_errors(401, 403, 404, 410, ok=GrantResponse, ok_code=201),
+)
 async def claim_invite_endpoint(
     body: ClaimInviteRequest,
     auth: AuthContext = Depends(get_auth),
@@ -225,7 +456,9 @@ async def claim_invite_endpoint(
     return _grant_response(created)
 
 
-@router.get("")
+@router.get("",
+    responses=_errors(401, ok=List[GrantResponse]),
+)
 async def list_grants_endpoint(
     resource_id: str = Query(..., description="Resource ID to list grants for"),
     auth: AuthContext = Depends(get_auth),
@@ -240,10 +473,32 @@ async def list_grants_endpoint(
     return [_grant_response(g) for g in grants]
 
 
-@router.get("/my-access")
+#: No `responses=` here, and that is the measured answer, and it asks
+#: in as many words that this asymmetry is never "tidied up by someone matching it to its
+#: fifteen siblings". This is that note.
+#:
+#: It raises nothing. The missing auth guard is load-bearing rather than forgotten: a
+#: request with no credentials becomes an anonymous principal and is answered by the access
+#: rules — "may this principal do this?" is a question a stranger is entitled to ask about
+#: itself, and the honest answer is `false`, not `401`. Declaring a 401 here would advertise
+#: a refusal this endpoint deliberately does not make.
+@router.get("/my-access",
+    #: Success only — no error codes, and that is C-3's measured answer, not an omission.
+    responses=_errors(ok=MyAccessResponse),
+)
 async def my_access_endpoint(
     resource_id: str = Query(..., description="Resource to evaluate"),
-    action: str = Query(..., description="CRUDEASIO action to evaluate (read/update/invoke/…)"),
+    action: str = Query(
+        ...,
+        #: Was "(read/update/invoke/…)" — three of the nine, with an ellipsis for the rest.
+        #: `check_access` rejects anything outside `ACTIONS` with `400 Unknown action`, so an
+        #: unpublished vocabulary is a 400 the caller could not have avoided. Derived, never typed.
+        description=(
+            "CRUDEASIO action to evaluate. Permitted values, published as this parameter's "
+            "enum: " + ", ".join(ACTIONS) + "."
+        ),
+        json_schema_extra={"enum": list(ACTIONS)},
+    ),
     auth: AuthContext = Depends(get_auth),
     store_db: Database = Depends(get_store_db),
 ):
@@ -265,7 +520,9 @@ async def my_access_endpoint(
     return {"resource_id": resource_id, "action": action, "allowed": allowed}
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
+@router.post("", status_code=status.HTTP_201_CREATED,
+    responses=_errors(400, 401, ok=GrantWithClaimResponse, ok_code=201),
+)
 async def create_grant_endpoint(
     body: CreateGrantRequest,
     auth: AuthContext = Depends(get_auth),
@@ -313,6 +570,8 @@ async def create_grant_endpoint(
     # Direct user->user grant: requires can_admin on the resource.
     await offload_sync(_require_admin, auth, body.resource_id, store_db)
 
+    from mantle.services import grant_service
+
     now = _now_iso()
     grant = GrantEntity(
         id=str(uuid.uuid4()),
@@ -340,6 +599,13 @@ async def create_grant_endpoint(
         created_time=now,
         modified_time=now,
     )
+    # Narrowed to what the issuer holds, after the entity is built and before it is stored.
+    # `_require_admin` above answers whether this caller may manage grants here and says nothing
+    # about how much they may hand out. Without this clamp, `can_admin` mints every other right —
+    # to the caller or to anyone they name — while the invite path in this same handler refuses the
+    # identical request against the same ledger.
+    grant = await offload_sync(grant_service.clamp_grant_to_issuer, store_db, grant, auth.user_id)
+
     created = await offload_sync(create_grant, store_db, grant)
 
     # A grant nobody can see yet is a grant that does not work yet. `LightConeGrantVerifier`
@@ -433,7 +699,9 @@ def _require_key_owner(grant: GrantEntity, auth: AuthContext) -> None:
         raise HTTPException(status_code=404, detail="Grant key not found")
 
 
-@router.post("/keys", status_code=status.HTTP_201_CREATED)
+@router.post("/keys", status_code=status.HTTP_201_CREATED,
+    responses=_errors(400, 401, 403, ok=GrantKeyCreatedResponse, ok_code=201),
+)
 async def create_grant_key_endpoint(
     body: CreateGrantKeyRequest,
     auth: AuthContext = Depends(get_auth),
@@ -477,7 +745,9 @@ async def create_grant_key_endpoint(
     return response
 
 
-@router.get("/keys")
+@router.get("/keys",
+    responses=_errors(401, ok=List[GrantResponse]),
+)
 async def list_grant_keys_endpoint(
     include_revoked: bool = Query(False, description="Include revoked keys."),
     auth: AuthContext = Depends(get_auth),
@@ -494,9 +764,11 @@ async def list_grant_keys_endpoint(
     return [_grant_response(k) for k in keys]
 
 
-@router.get("/keys/{key_id}")
+@router.get("/keys/{key_id}",
+    responses=_errors(401, 404, ok=GrantKeyResponse),
+)
 async def read_grant_key_endpoint(
-    key_id: str,
+    key_id: Annotated[str, Path(description=_KEY_PARAM)],
     auth: AuthContext = Depends(get_auth),
     store_db: Database = Depends(get_store_db),
 ):
@@ -515,9 +787,11 @@ async def read_grant_key_endpoint(
     return response
 
 
-@router.delete("/keys/{key_id}")
+@router.delete("/keys/{key_id}",
+    responses=_errors(401, 404, ok=RevokedResponse),
+)
 async def revoke_grant_key_endpoint(
-    key_id: str,
+    key_id: Annotated[str, Path(description=_KEY_PARAM)],
     auth: AuthContext = Depends(get_auth),
     store_db: Database = Depends(get_store_db),
 ):
@@ -531,14 +805,18 @@ async def revoke_grant_key_endpoint(
     _require_key_owner(grant, auth)
 
     from mantle.services import grant_key_service
-    if not await offload_sync(grant_key_service.revoke, store_db, grant, auth.user_id):
-        raise HTTPException(status_code=500, detail="Failed to revoke grant key")
+    #: `revoke` returns nothing, deliberately: a guard computed as `update_grant(...) is not None`
+    #: is always true, since `update_grant` always returns the entity, so such a check can never
+    #: be false. A failed persist reaches the client by `put_artifact` raising, not by a guard here.
+    await offload_sync(grant_key_service.revoke, store_db, grant, auth.user_id)
     return {"id": key_id, "state": "revoked"}
 
 
-@router.post("/keys/{key_id}/members", status_code=status.HTTP_201_CREATED)
+@router.post("/keys/{key_id}/members", status_code=status.HTTP_201_CREATED,
+    responses=_errors(400, 401, 404, ok=GrantResponse, ok_code=201),
+)
 async def add_bundle_member_endpoint(
-    key_id: str,
+    key_id: Annotated[str, Path(description=_KEY_PARAM)],
     body: AddBundleMemberRequest,
     auth: AuthContext = Depends(get_auth),
     store_db: Database = Depends(get_store_db),
@@ -574,10 +852,12 @@ async def add_bundle_member_endpoint(
     return _grant_response(member)
 
 
-@router.delete("/keys/{key_id}/members/{member_id}")
+@router.delete("/keys/{key_id}/members/{member_id}",
+    responses=_errors(401, 404, ok=RevokedResponse),
+)
 async def remove_bundle_member_endpoint(
-    key_id: str,
-    member_id: str,
+    key_id: Annotated[str, Path(description=_KEY_PARAM)],
+    member_id: Annotated[str, Path(description=_MEMBER_PARAM)],
     auth: AuthContext = Depends(get_auth),
     store_db: Database = Depends(get_store_db),
 ):
@@ -598,14 +878,16 @@ async def remove_bundle_member_endpoint(
         raise HTTPException(status_code=404, detail="Bundle member not found")
 
     from mantle.services import grant_key_service
-    if not await offload_sync(grant_key_service.revoke, store_db, member, auth.user_id):
-        raise HTTPException(status_code=500, detail="Failed to remove bundle member")
+    #: No guard. Same shape as the key revocation above: `not True`, every call.
+    await offload_sync(grant_key_service.revoke, store_db, member, auth.user_id)
     return {"id": member_id, "state": "revoked"}
 
 
-@router.get("/{grant_id}")
+@router.get("/{grant_id}",
+    responses=_errors(401, 404, ok=GrantResponse),
+)
 async def read_grant(
-    grant_id: str,
+    grant_id: Annotated[str, Path(description=_GRANT_PARAM)],
     auth: AuthContext = Depends(get_auth),
     store_db: Database = Depends(get_store_db),
 ):
@@ -623,9 +905,11 @@ async def read_grant(
     return _grant_response(grant)
 
 
-@router.delete("/{grant_id}")
+@router.delete("/{grant_id}",
+    responses=_errors(401, 404, ok=RevokedResponse),
+)
 async def revoke_grant(
-    grant_id: str,
+    grant_id: Annotated[str, Path(description=_GRANT_PARAM)],
     auth: AuthContext = Depends(get_auth),
     store_db: Database = Depends(get_store_db),
 ):
@@ -649,8 +933,10 @@ async def revoke_grant(
     grant.revoked_by = auth.user_id
     grant.revoked_at = now
     grant.modified_time = now
-    if not update_grant(store_db, grant):
-        raise HTTPException(status_code=500, detail="Failed to revoke grant")
+    #: `update_grant` has one `return entity` and no error path, so a guard computed as
+    #: `not update_grant(...)` is always false: the annotation says `Optional`, but the body
+    #: never produces `None`.
+    update_grant(store_db, grant)
 
     # Revocation is the direction that matters — see `_invalidate_cache_for`. This path reaches
     # a grant KEY (`DELETE /grants/{id}` matches a key's own id) and a bundle MEMBER as readily
@@ -661,9 +947,11 @@ async def revoke_grant(
     return {"id": grant_id, "state": "revoked"}
 
 
-@router.post("/{grant_id}/accept")
+@router.post("/{grant_id}/accept",
+    responses=_errors(400, 401, 403, 404, ok=GrantResponse),
+)
 async def accept_grant(
-    grant_id: str,
+    grant_id: Annotated[str, Path(description=_GRANT_PARAM)],
     auth: AuthContext = Depends(get_auth),
     store_db: Database = Depends(get_store_db),
 ):
@@ -683,8 +971,8 @@ async def accept_grant(
     grant.accepted_by = auth.user_id
     grant.accepted_at = now
     grant.modified_time = now
-    if not update_grant(store_db, grant):
-        raise HTTPException(status_code=500, detail="Failed to accept grant")
+    #: No guard. Same as the revoke path above.
+    update_grant(store_db, grant)
 
     # `pending_accept` → `active` is a reachability change like any other: the store filters
     # non-active grants at read, so a memo warmed while this grant was pending answers without

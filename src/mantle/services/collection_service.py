@@ -585,6 +585,7 @@ def remove_artifact_from_collection_by_version(
     _emit(collection_id, "artifact.deleted", {
         "artifact_id": root_id, "collection_id": collection_id
     }, actor_id=user_id)
+    _note_membership_change(user_id, collection_id)
 
 
 def get_unattached_artifacts(db: Database, user_id: str) -> List[ArtifactEntity]:
@@ -624,8 +625,8 @@ def get_artifacts_for_user(db: Database, user_id: str) -> List[ArtifactEntity]:
     """Every non-archived artifact version ``user_id`` created, with
     ``committed_collection_ids`` hydrated.
 
-    Authorship, not access: the listing is keyed on ``created_by``, so it includes versions in
-    collections the user can no longer read and excludes ones they can read but did not write.
+    Authorship rather than access: the listing is keyed on ``created_by``, so it includes versions
+    in collections the user cannot read and excludes ones they can read but did not write.
     """
     artifacts = db_get_artifacts_by_creator_id(db, user_id)
     _attach_committed_collection_ids(db, artifacts)
@@ -731,10 +732,10 @@ def get_collection_artifacts_by_root_ids(
     ``committed_collection_ids`` hydrated. Roots absent from the collection are skipped, so the
     result may be shorter than the input, and results follow the order the roots were named in.
 
-    One chunked lineage read for the whole set, not one per root: the store publishes a
+    One chunked lineage read for the whole set rather than one per root: the store publishes a
     multi-root lineage read (``ArtifactStore.versions_of_many``, reached through
-    :func:`lattice_api.get_current_in_collection_many`), so the per-root round trip is no longer
-    the floor. Repeats in ``artifact_root_ids`` are read once and yielded once. The membership
+    :func:`lattice_api.get_current_in_collection_many`), so a per-root round trip is not the floor.
+    Repeats in ``artifact_root_ids`` are read once and yielded once. The membership
     hydration afterwards is collapsed across the set the same way — see
     :func:`_attach_committed_collection_ids`.
 
@@ -805,6 +806,23 @@ def get_collection_artifacts(
     return active_artifacts
 
 
+def _note_membership_change(user_id: str, collection_id: str) -> None:
+    """Tell the proximity digest that this collection changed, if a host installed one.
+
+    A collection's digest is a read over its members, so a membership change is what makes the
+    stored one out of date. The refresher counts the change and retakes the digest once the
+    collection has turned over; both halves live in `search.ingest.digest_refresh`.
+
+    Imported here rather than at module scope so a store with no proximity instrument never loads
+    it, and wrapped so a digest fault cannot fail the membership change that prompted it.
+    """
+    try:
+        from mantle.search.ingest.digest_refresh import note_membership_change
+    except Exception:  # noqa: BLE001 - the semantic extra is not installed
+        return
+    note_membership_change(user_id, collection_id)
+
+
 def add_artifact_to_collection_with_access_check(
     db: Database,
     user_id: str,
@@ -848,6 +866,7 @@ def add_artifact_to_collection_with_access_check(
     _emit(collection_id, "artifact.created", {
         "artifact": {**artifact.to_dict(), "collection_id": collection_id}
     }, actor_id=user_id)
+    _note_membership_change(user_id, collection_id)
     return artifact
 
 
@@ -912,7 +931,19 @@ def get_commits_for_collection(db: Database, user_id: str, collection_id: str) -
         data.setdefault("id", commit_id)
         data.setdefault("created_time", data.get("timestamp"))
         data.setdefault("modified_time", data.get("timestamp"))
-        entities.append(CommitEntity.from_dict(data))
+        entity = CommitEntity.from_dict(data)
+        # . `Commit.from_dict` takes only the fields the entity declares, and `adds` /
+        # `removes` are not among them — they live in the `CommitItem`s that `item_ids` points at.
+        # The store layer resolves them from the scan it already performs, and they are carried
+        # here so the API can report a changeset that is not permanently empty.
+        #
+        # Set on the instance rather than added to `Commit.__init__`: they are DERIVED for one
+        # collection's view of this commit, not state the entity owns. A commit spanning two
+        # collections has different `adds` in each, so storing them on the entity would make the
+        # answer depend on which query built it.
+        entity.adds = list(data.get("adds") or [])
+        entity.removes = list(data.get("removes") or [])
+        entities.append(entity)
     return entities
 
 # === Provenance helper ===

@@ -171,12 +171,35 @@ class _FakeStoreDB:
         self.graph = _FakeGraph()
 
 
+class _GrantedResource:
+    """A grant as `mask_of` reads one: a resource, an effect, and the action flags."""
+
+    def __init__(self, resource_id):
+        self.resource_id = resource_id
+        self.effect = "allow"
+        for _a in ("create", "read", "update", "delete", "evict", "invoke", "add", "share",
+                   "admin"):
+            setattr(self, "can_" + _a, True)
+
+
 class _FakeLightCone:
     def __init__(self, authorized: set) -> None:
         self._authorized = set(authorized)
 
     def resolve(self, principal_id, action="read", *, principal_type="user") -> set:
         return set(self._authorized) if principal_id == ALICE else set()
+
+    def _grants_for(self, principal_id: str, principal_type: str = "user"):
+        """The same reach this double already describes, expressed as grants.
+
+        `resolve_authorized_scope` authorizes each candidate by walking up from it and testing the
+        resources on the way against the caller's grants, so a double saying "these ids are
+        authorized" says it by granting them — each id its own granted resource, which is what an
+        artifact-scoped grant looks like. Derived from `resolve` rather than restated, so whatever
+        that method gates on carries here too.
+        """
+        return [_GrantedResource(a) for a in self.resolve(principal_id,
+                                                          principal_type=principal_type)]
 
 
 # ---------------------------------------------------------------------------
@@ -569,7 +592,13 @@ class TestCoverageCountsWhatTheNarrowingLookedUp:
                                {"content": "tantalum tantalum tantalum tantalum"},
                                _write_request())
         cover = _cover(stack, "tantalum")
-        assert cover["art-once"] == cover["art-repeat"] == Coverage(1, 0)
+        # The COUNTS, not the whole tuple: `Coverage` also names WHICH stems matched, and this
+        # test is about term frequency not raising a count. Both artifacts match the same single
+        # stem, so `matched` is equal here too — but asserting it would restate the fixture
+        # rather than the claim.
+        assert ((cover["art-once"].stems, cover["art-once"].bigrams)
+                == (cover["art-repeat"].stems, cover["art-repeat"].bigrams)
+                == (1, 0))
 
     def test_a_rare_term_and_a_common_one_count_the_same(self, stack):
         """Document frequency is not in this number either. `quasar` is in every artifact and
@@ -579,7 +608,9 @@ class TestCoverageCountsWhatTheNarrowingLookedUp:
 
     def test_a_quoted_phrase_carries_its_bigram_count(self, stack):
         cover = _cover(stack, '"quarterly budget"')
-        assert cover == {PDF: Coverage(2, 1)}
+        # Counts only: `Coverage` also names the stems, and this asserts the BIGRAM count.
+        assert set(cover) == {PDF}
+        assert (cover[PDF].stems, cover[PDF].bigrams) == (2, 1)
 
     def test_an_unquoted_query_issues_no_bigram_lookups_and_counts_none(self, stack):
         """Stated so the zero is read as "not looked up" rather than "looked up and absent".
@@ -657,3 +688,90 @@ class TestTheCountsAreNotAnExistenceOracleEITHER:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+class TestSalienceDecidesWhichStemsAreLookedUp:
+    """The narrowing looks up the stems that carry the question, not every stem typed.
+
+    The coverage ordering downstream counts stems WITHOUT weighting — deliberately, so that it
+    stays an ordinal on the query rather than a metric on the data (`_by_coverage`). That leaves
+    a function word worth exactly as much as the subject, and on the live corpus it decided
+    answers: `recall("what is a glacier")` narrowed on `what`/`is`/`glacier`, canon documents
+    titled "What this is (and is not)" matched two of the three, and they filled the reach arm's
+    pool before any glacier synset — which matched one — could enter it.
+
+    So the filter belongs above the count. `salient` is injected rather than imported because it
+    is the corpus's own measure and lives behind the `match` seam, which this layer may not
+    import.
+    """
+
+    def test_a_stem_the_measure_drops_is_never_looked_up(self, stack):
+        """Only the kept stem's artifacts enter the narrowing.
+
+        Keeping the SECRET's stem rather than the common one is what makes this discriminating:
+        every artifact carries `TERM`, so a filter that kept only that would return the same four
+        ids whether or not it ran. `SECRET_TERM` is in one artifact, so if the filter reaches the
+        lookup the answer collapses to that one, and if it does not the unfiltered pair returns
+        all four.
+        """
+        seen = []
+
+        # The measure sees STEMS, not the words typed — `acquisition` reaches it as `acquisit`.
+        # Deriving the expected pair with `phrase_stems` rather than writing it out keeps this
+        # test from encoding the stemmer's output as a constant.
+        subject_stems, _ = phrase_stems(TERM)
+        secret_stems, _ = phrase_stems(SECRET_TERM)
+
+        def only_the_secret(stems):
+            seen.append(list(stems))
+            return [s for s in stems if s in secret_stems]
+
+        lookup = stack["narrower"].lookup_for(
+            "%s %s" % (SECRET_TERM, TERM), _read_request(), salient=only_the_secret,
+        )
+        found = lookup(((CELL_PRINCIPAL, COLLECTION),))
+        assert seen and set(seen[0]) == set(subject_stems) | set(secret_stems), (
+            "the measure must see every stem before choosing which carry the question"
+        )
+        assert set(found) == {SECRET}, (
+            "dropping the common stem must leave only the artifact carrying the kept one; "
+            "all four coming back means the filter never reached the lookup"
+        )
+
+    def test_no_measure_keeps_every_stem(self, stack):
+        """`salient=None` is 'not measurable here', and must behave exactly as before."""
+        both = stack["narrower"].lookup_for(
+            "%s %s" % (SECRET_TERM, TERM), _read_request(),
+        )
+        assert SECRET in both(((CELL_PRINCIPAL, COLLECTION),))
+
+    def test_a_measure_that_raises_keeps_every_stem(self, stack):
+        """A measure that cannot run measures nothing; it must not narrow the query to nothing."""
+        def broken(_stems):
+            raise RuntimeError("no index to measure against")
+
+        lookup = stack["narrower"].lookup_for(
+            "%s %s" % (SECRET_TERM, TERM), _read_request(), salient=broken,
+        )
+        assert SECRET in lookup(((CELL_PRINCIPAL, COLLECTION),))
+
+    def test_a_measure_that_keeps_nothing_keeps_every_stem(self, stack):
+        """An empty answer is 'nothing distinguishes anything', not 'look nothing up'."""
+        lookup = stack["narrower"].lookup_for(
+            "%s %s" % (SECRET_TERM, TERM), _read_request(), salient=lambda _s: [],
+        )
+        assert SECRET in lookup(((CELL_PRINCIPAL, COLLECTION),))
+
+    def test_a_phrase_is_never_filtered(self, stack):
+        """A phrase's gate is a membership question over consecutive bigrams.
+
+        Dropping one of its stems would break an adjacency the caller explicitly asked for, and
+        quoting the words IS the claim that they belong together — which is the one claim a
+        salience measure is not entitled to overrule.
+        """
+        called = []
+        stack["narrower"].lookup_for(
+            '"%s %s"' % (SECRET_TERM, TERM), _read_request(),
+            salient=lambda s: called.append(list(s)) or [],
+        )
+        assert called == [], "a phrase must not be handed to the measure at all"

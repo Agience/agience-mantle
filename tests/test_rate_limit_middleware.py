@@ -71,8 +71,8 @@ def test_a_spoofed_header_does_not_lift_the_limit(app, store, monkeypatch):
 def test_the_store_does_not_grow_with_the_spoofed_values(app, store, monkeypatch):
     """500 distinct claims about who is calling, one socket — and one entry in the store.
 
-    This is the memory-growth path stated as a bound: an unauthenticated caller could
-    previously mint a permanent key per request just by varying a header it writes itself.
+    The memory-growth path stated as a bound: without it an unauthenticated caller mints a
+    permanent key per request just by varying a header it writes itself.
     """
     monkeypatch.setattr(main, "_RL_TRUSTED_PROXIES", ())
     monkeypatch.setattr(main, "_RL_MAX", 10_000)

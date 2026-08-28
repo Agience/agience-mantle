@@ -36,22 +36,77 @@ def _route_dependency_calls(route: APIRoute):
     return {dep.call for dep in route.dependant.dependencies if dep.call is not None}
 
 
-@pytest.mark.parametrize(
-    "method,path",
-    [
-        # Unified artifact endpoints (Mantle). Grant endpoints live in Origin;
-        # their auth-dependency check belongs in `origin/tests/`.
-        ("POST", "/artifacts"),
-        ("GET", "/artifacts/{artifact_id}"),
-        ("PATCH", "/artifacts/{artifact_id}"),
-        ("DELETE", "/artifacts/{artifact_id}"),
-        # POST /artifacts/{id}/op/{op_name} (operation dispatch) lives in the gateway
-        # (crystal) — its auth check lives in the gateway's tests.
-        ("POST", "/artifacts/recall"),
-    ],
-)
-def test_all_critical_routes_use_get_auth(method, path):
-    """All critical routes use the unified get_auth() dependency."""
+# =============================================================================
+# The policy is INVERTED: auth is the default, and every exception is named here.
+#
+# An enumerated list of protected routes is uncoverable by construction — a route added
+# tomorrow is simply absent from it, and absence is indistinguishable from "not critical
+# yet". That is exactly how all 16 `/grants` operations came to be unasserted: the list
+# said they belonged to another repo's tests, and `agience-origin/src` has no grants
+# surface at all, so the check ran nowhere.
+#
+# Here, a new route is covered the day it is mounted. Making one PUBLIC requires adding it
+# below with a reason — a visible, reviewable change, which is precisely the change that
+# should be hard to make by accident.
+# =============================================================================
+
+PUBLIC = {
+    ("GET", "/"):                                   "service root",
+    ("GET", "/status"):                             "liveness; no store access",
+    ("GET", "/version"):                            "build identity; no store access",
+    ("GET", "/.well-known/agience-source"):         "source disclosure document",
+    ("GET", "/.well-known/oauth-protected-resource"):
+        "RFC 9728 resource metadata — MUST be reachable unauthenticated, it is how a "
+        "client discovers WHICH authority to get a token from",
+    ("GET", "/auth/callback"):                      "the OAuth redirect target: pre-auth by definition",
+    ("GET", "/mcp"):                                "405 with `Allow: POST`; serves no data",
+    ("GET", "/mcp/"):                               "as above, trailing-slash form",
+    ("GET", "/grants/invite-context"):
+        "an invite link is followed BEFORE the recipient has an account. Safe because it "
+        "discloses no identity: it returns `has_target=bool(...)`, a boolean over the "
+        "target and never the target, while `resource_id`/`granted_by`/`name` are returned "
+        "only by `/grants/invite-details`, which is authenticated",
+}
+
+
+def _all_operations():
+    """Every (method, path) mounted on the app, HEAD/OPTIONS excluded."""
+    out = []
+    for route in _iter_api_routes(app):
+        for method in sorted((route.methods or set()) - {"HEAD", "OPTIONS"}):
+            out.append((method, route.path))
+    return sorted(set(out))
+
+
+@pytest.mark.parametrize("method,path", _all_operations())
+def test_every_route_requires_auth_unless_declared_public(method, path):
+    """Auth is the default. A route is exempt only by appearing in `PUBLIC` with a reason."""
+    if (method, path) in PUBLIC:
+        pytest.skip("declared public: %s" % PUBLIC[(method, path)])
     route = _get_route(path, method)
-    calls = _route_dependency_calls(route)
-    assert get_auth in calls, f"Expected get_auth on {method} {path}"
+    assert get_auth in _route_dependency_calls(route), (
+        "%s %s does not depend on get_auth. If it is meant to be reachable without "
+        "authentication, add it to PUBLIC in this file WITH A REASON — do not delete this "
+        "assertion." % (method, path)
+    )
+
+
+@pytest.mark.parametrize("method,path", sorted(PUBLIC))
+def test_the_public_allowlist_is_not_stale(method, path):
+    """Every exemption must still be real, and must still be an exemption.
+
+    Two ways an allowlist rots, both silent:
+
+      * the route is DELETED or renamed — the entry then documents a policy for something
+        that does not exist, and the next reader trusts it;
+      * the route GAINS `get_auth` — the entry now grants an exemption nobody is using,
+        and the day someone removes the dependency again, nothing complains.
+
+    Asserting both keeps the list honest in the direction that matters: it can only shrink
+    by someone noticing.
+    """
+    route = _get_route(path, method)          # raises if the route is gone
+    assert get_auth not in _route_dependency_calls(route), (
+        "%s %s is listed in PUBLIC but now DEPENDS on get_auth. Remove it from PUBLIC — "
+        "the route is protected, and leaving the entry preserves a stale exemption." % (method, path)
+    )

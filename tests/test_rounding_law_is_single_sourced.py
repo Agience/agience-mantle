@@ -129,6 +129,22 @@ ALLOWED = {
         "RANK / REPRESENTATION — `max(N, F) * eps * s_max`, numpy's own `matrix_rank` tolerance, "
         "deciding whether the mean direction is a direction or centring residue. Nothing "
         "accumulates: there is no running total, only a zero that has been rounded.",
+    ("beacon/cut.py", "_tie_tol"):
+        "ACCUMULATION, and the ONE site that may not delegate. "
+        "`test_the_cut_imports_and_works_with_beam_and_prism_all_blocked` blocks all of "
+        "prism for `cut.py` — stricter than `instrument.py`, which is allowed the single rounding "
+        "import — because that silhouette is what keeps mantle shippable on its "
+        "private. Calling `prism.rounding` here fails that test, so the bound is restated: every "
+        "salience `gap_split` is handed is a sum of at most `n` non-negative terms, giving a "
+        "relative forward error of `n * eps`, doubled because the compared quantity is a RATIO of "
+        "two such sums and carries the error of both.",
+    ("anchors/crosswalk.py", "is_isometry"):
+        "READ ONLY — reads float32's epsilon and hands it to `prism.rounding."
+        "accumulated_rounding`, which holds the law and states the model. Same shape as "
+        "`_float_noise` above: the dtype is the caller's to know, the band is not the caller's "
+        "to compute. ACCUMULATION — each entry of `MᵀM` is a sum of `dim_in` products, so "
+        "`n_operations = dim_in`, `total = 1.0` (the compared quantity is a deviation from the "
+        "identity, unit-magnitude). Bit-identical to the `eps32 * dim_in` it replaced.",
 }
 
 _EPS_NAMES = {"eps", "_eps", "epsilon", "_epsilon", "EPS", "EPSILON"}

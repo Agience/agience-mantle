@@ -33,10 +33,10 @@ The service image is built from `build/Dockerfile`, with the `agience-prism-py` 
 docker build -f build/Dockerfile --build-context prism=../agience-prism/py -t agience-mantle .
 ```
 
-`docker-compose.yml` at this repo's root runs that image alone for a smoke test — one service, because Mantle is one service. The full runnable stack — Origin + Mantle + MinIO (the local S3 edge for content/SSE cells) — lives in **agience-bundle**, whose compose file reads its overrides from Origin's `.env`:
+`docker-compose.yml` at this repo's root runs that image alone for a smoke test — one service, because Mantle is one service. The full runnable stack — Origin + Mantle + MinIO (the local S3 edge for content/SSE cells) — lives in **agience-observe**, whose compose file reads its overrides from Origin's `.env`:
 
 ```bash
-cd ../agience-bundle
+cd ../agience-observe
 docker compose --env-file ../agience-origin/.env -f docker-compose.local.yml up -d --build
 ```
 
@@ -46,7 +46,7 @@ Nothing is quarantined: `collect_ignore` in `tests/conftest.py` is empty, and ev
 
 Mantle is the database's auth core. Token verification, the per-state encrypted index, light-cone authorization, and trusted-issuer resolution must be exercised against a **running stack**:
 
-1. Rebuild the image and recreate the stack (from `agience-bundle`: `docker compose --env-file ../agience-origin/.env -f docker-compose.local.yml up -d --build --force-recreate`).
+1. Rebuild the image and recreate the stack (from `agience-observe`: `docker compose --env-file ../agience-origin/.env -f docker-compose.local.yml up -d --build --force-recreate`).
 2. Run an end-to-end check that exercises your change through the real API (index → query → verify scope; grant → revoke → verify the ciphertext goes dark) — the blackbox suite in `tests/e2e/` covers most of this surface.
 3. Include what you verified, and how, in the PR description.
 

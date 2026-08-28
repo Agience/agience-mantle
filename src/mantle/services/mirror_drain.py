@@ -44,9 +44,9 @@ type it claims. `ember`'s pool is `application/vnd.agience.task+json`; this one 
 :data:`MIRROR_TASK_CT`, which nothing else selects on. An ember worker sharing this lattice reads
 its own queue and never sees a row of ours, so it cannot claim one, cannot fail to invoke
 `op.content.mirror`, and cannot dead-letter at its own `MAX_ATTEMPTS` an obligation it never
-looked at the bytes for. What used to be a deployment invariant — *run the drain where an ember
-pool worker is not* — is a naming fact instead, and a naming fact is enforced by the query
-planner rather than by an operator remembering it.
+looked at the bytes for. The separation is a naming fact rather than a deployment invariant, so
+the query planner enforces it rather than an operator remembering to run the drain where an ember
+pool worker is not.
 
 MIGRATION
 ---------
@@ -80,9 +80,9 @@ logger = logging.getLogger(__name__)
 #: mantle row is which content type the row carries. Under this one it takes none.
 MIRROR_TASK_CT = "application/vnd.agience.mirror-task+json"
 
-#: The SHARED pool these tasks used to be written under — `ember`'s, and every other operator's.
-#: It appears here for exactly one reason: rows already on disk under it. Nothing is WRITTEN under
-#: it any more; see :func:`adopt_shared_pool_tasks`.
+#: The shared pool — `ember`'s, and every other operator's. It appears here for one reason: rows
+#: already on disk under it. This drain writes nothing under it; see
+#: :func:`adopt_shared_pool_tasks`.
 SHARED_TASK_CT = "application/vnd.agience.task+json"
 
 #: Distinct from `op.content.promote` (`shard/content_tier.py`), which walks the `content_ref`
@@ -383,10 +383,10 @@ def _settle_after(tasks, task_id: str, *, worker_id: str, task: Dict[str, Any],
                   result: Dict[str, Any], when: datetime) -> str:
     """Turn one attempt's result into the row's next state, atomically against the claim.
 
-    Every exit goes through `settle`, which compares on `claimed_by` — so a row that was rewritten
-    to `pending` underneath this attempt (a fresh failed upload for the same `content_key`, which
-    clears `claimed_by`) is NOT overwritten, and this returns `"lost"`. The in-flight attempt was
-    for superseded bytes and it loses, which is correct; what matters is that it finds out.
+    Every exit goes through `settle`, which compares on `claimed_by`, so a row rewritten to
+    `pending` underneath this attempt (a fresh failed upload for the same `content_key`, which
+    clears `claimed_by`) is left alone and this returns `"lost"`. The in-flight attempt was for
+    superseded bytes, and the return value is how it finds out.
     """
     attempts = int(task.get("attempts") or 0) + 1
     outcome = result.get("outcome")
@@ -526,10 +526,9 @@ def adopt_shared_pool_tasks(store_db) -> int:
     """Move this operator's LIVE rows off :data:`SHARED_TASK_CT` onto :data:`MIRROR_TASK_CT`.
     Returns how many moved.
 
-    The rename is only half a fix while the rows it was made for are still under the old name.
-    A `pending` row there is an obligation nothing will now discharge — this drain no longer looks
-    at that content type — while remaining exactly what an ember worker still claims and
-    dead-letters. So it is moved, at the head of every pass, before the window is read.
+    A `pending` row under the shared content type is an obligation nothing here discharges — this
+    drain selects on :data:`MIRROR_TASK_CT` alone — while remaining exactly what an ember worker
+    claims and dead-letters. So it is moved, at the head of every pass, before the window is read.
 
     **The move is a re-put of the row's own doc through `_put_op`, and that is the whole
     mechanism.** `ct` is a projected column of the doc, so writing the doc back with a different

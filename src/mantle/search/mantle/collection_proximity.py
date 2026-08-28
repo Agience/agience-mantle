@@ -23,7 +23,7 @@ Narrowing carries what distance should not
 The design decision this module is built to is a single sentence: **properties that are true
 of a frame become edges or tags in the lattice, and narrowing carries what distance should
 not.** It is the same architecture recall already uses — narrow, then rank — and it is why
-the injected instrument's ``spectral_distance`` (``entroptics.proximity.spectral_distance``, for
+the injected instrument's ``spectral_distance`` (``<probe>.spectral_distance``, for
 the reference instrument) is used exactly as shipped, with no size floor, no length
 normalisation and no weighting added to compensate for anything.
 
@@ -308,8 +308,8 @@ class CollectionProximityNarrower:
         self._slot = DigestSlot(oracle, posting_store)
         self._members_of = members_of
         #: `spectra -> object with .within(query, radius)` / `.nearest(query, k)`, exact against
-        #: a full scan — `entroptics.proximity.SpectrumProbe`'s contract. Injected because
-        #: mantle never imports entroptics: the same reason `digest_collection`'s read is
+        #: a full scan — `<probe>.SpectrumProbe`'s contract. Injected because
+        #: mantle imports no spectral library: the same reason `digest_collection`'s read is
         #: injected into `CollectionDigestRefresher` rather than imported here.
         self._probe_factory = probe_factory
 

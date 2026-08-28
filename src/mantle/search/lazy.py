@@ -12,7 +12,7 @@ enabling is an explicit opt-in) plus a per-write ``index`` hint.
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Optional, Tuple
 
 # "valence" — the one word borrowed from the design: the count of live relations.
 # WHO + WHEN are always on (2); +WHERE/WHAT/HOW once materialized (5). Derived.
@@ -28,10 +28,20 @@ def lazy_index_default() -> bool:
     return (os.getenv("MANTLE_LAZY_INDEX", "") or "").strip().lower() in _TRUTHY
 
 
+#: The `index` vocabulary, in ONE place. The API publishes its parameter enum from this tuple
+#: rather than restating the two strings — a second copy is what drifts.
+INDEX_HINTS: Tuple[str, ...] = ("eager", "lazy")
+
+
 def resolve_lazy(index_hint: Optional[str] = None) -> bool:
     """Should this write be latent (defer indexing)? A per-write ``index`` hint
     wins; otherwise the deployment default. ``"eager"`` indexes immediately;
-    ``"lazy"`` defers to first access."""
+    ``"lazy"`` defers to first access.
+
+    An unrecognised value is NOT refused — it falls through to the deployment default. That
+    is deliberate and documented on the parameter; publishes the enum so a generated
+    client cannot produce the typo in the first place, and leaves the runtime acceptance alone.
+    """
     if index_hint == "lazy":
         return True
     if index_hint == "eager":

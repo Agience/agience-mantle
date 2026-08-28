@@ -255,18 +255,87 @@ def test_no_module_owns_the_coordinate_system_s_lifecycle():
     """Not "raises" — gone. A function that exists only to raise is an invitation with a docstring.
 
     A client seeds the set; Mantle loads it and routes against it. Every name below is a way of
-    deriving, growing, reconciling or crosswalking one, and none of them resolves.
+    deriving, growing or reconciling one, and none of them resolves.
+
+    `crosswalk` / `crosswalk_artifact` are not on this list: they are in the package because
+    `ember/embed.py`'s `Aligner` imports them, and 27 ember tests plus 2 whole modules need them.
+
+    The risk this list is written against is real, and for those two it is accepted rather than
+    absent:
+
+        a projection between spaces lets a node answer in a basis its cells were never
+        written in.
+
+    What still holds the line, and what a reviewer should check instead of this test:
+      * `Crosswalk.is_isometry` MEASURES ‖MᵀM − I‖ rather than trusting `method`, so a stored
+        matrix that is not a gauge is detectable at the point of use.
+      * `FitResidual` defines no `__float__` and no ordering, so an in-sample residual cannot be
+        read as a fidelity guarantee — that exact misreading is why `error_bound` was retired.
+      * `null_residual` computes the shared-nothing null (E[cos]=0, sd=1/√D), so
+        `z_below_null == 0` says the walk carries no information. On the one real measurement in
+        the tree (6 anchors, 16→64 dim) the held-out residual was 1.026 against a null of 1.000 —
+        i.e. AT the null. A caller that ignores that number is the failure mode, not the module.
+
+    The clustering half of the original guard is untouched and still enforced by
+    `test_no_clustering_remains_in_the_anchor_layer` below: anchors are still seeded, never fitted.
     """
     import importlib
 
     import mantle.search.anchors as anchors_pkg
 
     assert not hasattr(anchors_pkg, "bootstrap_anchorset")
-    for gone in ("bootstrap", "seed_corpus", "grow", "reconciler", "density", "activate",
-                 "crosswalk", "crosswalk_artifact"):
+    for gone in ("bootstrap", "seed_corpus", "grow", "reconciler", "density", "activate"):
         with pytest.raises(ImportError):
             importlib.import_module(f"mantle.search.anchors.{gone}")
         assert not hasattr(anchors_pkg, gone), f"anchors.{gone} is re-exported"
+
+
+def test_the_crosswalk_cannot_pass_itself_off_as_a_gauge():
+    """The guard that replaces the import ban: a projection must PROVE it is an isometry.
+
+    `crosswalk` is admitted to the package (see above), so the question is whether it can
+    misreport what it is. These are the three properties the accepted risk
+    rests on; if any of them regresses, the ban was load-bearing after all.
+    """
+    import numpy as np
+
+    from mantle.search.anchors.crosswalk import (
+        LINEAR, PROCRUSTES, Crosswalk, FitResidual, null_residual,
+    )
+
+    # 1. A non-orthogonal matrix is not an isometry, whatever `method` claims.
+    liar = Crosswalk(
+        source_space_id="a", target_space_id="b", method=PROCRUSTES,
+        matrix=np.diag([2.0, 1.0]), dim_in=2, dim_out=2,
+        residual=FitResidual(in_sample=0.0, held_out=None, n_pairs=0, n_held_out=0,
+                             dim_in=2, dim_out=2, closed_form=True),
+    )
+    assert liar.is_isometry is False, (
+        "a matrix that scales an axis by 2 was accepted as an isometry — `is_isometry` has "
+        "stopped measuring and started trusting `method`.")
+    honest = Crosswalk(
+        source_space_id="a", target_space_id="b", method=PROCRUSTES,
+        matrix=np.eye(2), dim_in=2, dim_out=2,
+        residual=FitResidual(in_sample=0.0, held_out=None, n_pairs=0, n_held_out=0,
+                             dim_in=2, dim_out=2, closed_form=True),
+    )
+    assert honest.is_isometry is True, "the identity is an isometry and must measure as one"
+
+    # 2. A residual cannot be silently read as a number.
+    r = FitResidual(in_sample=0.01, held_out=1.0, n_pairs=6, n_held_out=2,
+                    dim_in=16, dim_out=64, closed_form=False)
+    with pytest.raises(TypeError):
+        _ = r < 0.05          # noqa: B015 — the point is that this raises
+    with pytest.raises(TypeError):
+        float(r)
+
+    # 3. A walk that carries no information says so, against a COMPUTED null.
+    null, se = null_residual(64, 2)
+    assert null == 1.0 and se > 0.0
+    assert abs(r.z_below_null) < 1.0, (
+        "a held-out residual sitting AT the null must not report as informative — that is the "
+        "measured case (6 anchors, 16->64 dim, held_out 1.026 vs null 1.000).")
+    assert r.underdetermined is True, "6 pairs fitting 16 input dims is underdetermined"
 
 
 def test_no_clustering_remains_in_the_anchor_layer():

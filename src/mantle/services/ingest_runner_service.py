@@ -159,6 +159,41 @@ def extract_text_from_artifact(artifact) -> Optional[str]:
     if not isinstance(ctx, dict):
         return None
 
+    # ── the LOCAL tier first: the object store is where a ref is promoted TO ────────────────
+    # `workspace_service._store_content_in_s3` states the contract this had backwards: "One
+    # destination. Content lives at `cas/<sha256 of the plaintext>` ... the object store is where
+    # the ref gets promoted to rather than an alternative place to put the bytes." An artifact
+    # therefore carries BOTH a `content_ref` (the local address) and a `content_key` (the
+    # promotion address), and this function read only the second.
+    #
+    # Measured 2026-08-25 on 71/home, which has no object-store credentials — a supported
+    # configuration, per `content_service.local_content_tier`: "a node whose keys volume is not
+    # mounted still has an object store to fall back to". The reverse is equally allowed and is
+    # what this node is. Every one of the 197 memory-lane captures had its blob present on local
+    # disk, and 116 of them failed to index with
+    #
+    #     ContentUrlSigningError: could not generate a signed content URL for artifacts/<id>.content
+    #     ... botocore NoCredentialsError
+    #
+    # So the body was two directories away and the indexer went to the internet for it.
+    cas_ref = getattr(artifact, "content_ref", None)
+    if cas_ref:
+        try:
+            from mantle.db.doc_boundary import CONTENT_KEY_PRINCIPAL, content_key_scope
+            from mantle.services.content_service import get_bytes_decrypted
+
+            doc = artifact.to_dict() if hasattr(artifact, "to_dict") else {}
+            principal = (doc.get(CONTENT_KEY_PRINCIPAL)
+                         or getattr(artifact, "created_by", None))
+            if principal:
+                return get_bytes_decrypted(
+                    "", principal, cas_ref=cas_ref,
+                    collection_id=content_key_scope(doc) if doc else None,
+                ).decode("utf-8")
+        except Exception:  # noqa: BLE001 — fall through to the promotion address below
+            logger.debug("local CAS read failed for %s; trying the object store",
+                         getattr(artifact, "id", None), exc_info=True)
+
     content_key = ctx.get("content_key")
     if not content_key:
         return None

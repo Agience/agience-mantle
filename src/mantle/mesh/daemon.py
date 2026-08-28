@@ -85,7 +85,7 @@ def run(store, *, interval: float = 30.0):
                           str(store.keys_dir) if store.keys_dir else ".")}), flush=True)
     while True:
         rec = {"mesh": True, "ts": time.time(), "role": role}
-        # 1. SYNC — THE ONE PATH: Merkle anti-entropy over S3 (op.mesh.reconcile). Publish my tree
+        # 1. SYNC — the one path: Merkle anti-entropy over S3 (op.mesh.reconcile). Publish my tree
         #    incrementally (only changed leaves) and pull ONLY the leaves that differ from each peer —
         #    vertices AND edges. Bulk catch-up and steady state are the same operation: a fresh node
         #    pulls every differing leaf; a converged node exchanges one 32 KB tree and stops. There is

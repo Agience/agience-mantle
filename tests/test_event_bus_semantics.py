@@ -130,7 +130,7 @@ def test_the_bus_contains_no_second_implementation_of_the_meet():
             offenders.append(node.lineno)
     assert not offenders, (
         f"event_bus.py intersects permission bits itself at line(s) {offenders}. Call "
-        f"`attenuation.attenuate` / `Mask.__and__` instead — two implementations of one algebra is "
+        f"`attenuation.meet` / `Mask.__and__` instead — two implementations of one algebra is "
         f"how the light-cone deny bug happened.")
 
 
@@ -144,7 +144,7 @@ def test_the_fanout_path_never_touches_a_mask():
     tree = ast.parse(_BUS_SRC.read_text(encoding="utf-8"))
     fanout = next(n for n in ast.walk(tree)
                   if isinstance(n, ast.AsyncFunctionDef) and n.name == "_fanout")
-    forbidden = {"Mask", "attenuate", "compose", "visibility_mask", "may_see", "TOP", "DENY"}
+    forbidden = {"Mask", "meet", "compose", "visibility_mask", "may_see", "TOP", "DENY"}
     used = {sub.id for sub in ast.walk(fanout) if isinstance(sub, ast.Name)} | \
            {sub.attr for sub in ast.walk(fanout) if isinstance(sub, ast.Attribute)}
     assert not (used & forbidden), (

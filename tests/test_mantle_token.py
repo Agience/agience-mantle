@@ -255,7 +255,7 @@ def test_a_manifest_that_holds_a_DIFFERENT_key_is_refused_before_minting(tmp_pat
 
 
 def test_help_survives_a_legacy_windows_code_page(capsys):
-    """A `⚠` in an argparse epilog raises `UnicodeEncodeError` on a cp1252 console and takes
+    """A `` in an argparse epilog raises `UnicodeEncodeError` on a cp1252 console and takes
     `--help` down with it — on the platform a newcomer is most likely to be reading it. This has
     bitten once already, so it is measured rather than reviewed for."""
     with pytest.raises(SystemExit):

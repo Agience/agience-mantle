@@ -135,55 +135,52 @@ def should_chunk_content(content: str, chunk_size: int = DEFAULT_CHUNK_SIZE) -> 
     return count_words(content) > max(1, _tokens_to_words(chunk_size))
 
 
-def extract_text_from_context(context_str: str) -> Dict[str, str]:
-    """
-    Extract searchable text fields from artifact context JSON.
+def extract_text_from_context(context_str) -> Dict[str, str]:
+    """Legacy compatibility read of `context`. Returns `{"title": ..., "description": ...}`.
 
-    Returns dict with:
-    - title: artifact title
-    - description: artifact description (primary search field)
-    - tags_raw: comma-separated tags
+    `context` is not the offer. An artifact's offer — the thing a need is matched against — is its
+    top-level `description`, and `pipeline_unified._extract_artifact_fields` reads that first. This
+    exists for rows written before that was true, and returns empty strings for anything it cannot
+    read as a structured object.
+
+    ## A bare string is not an offer
+
+    A `context` that does not parse as JSON is dropped rather than promoted whole to `description`.
+    Two ingests write exactly such a string, and neither describes what the artifact is about:
+
+        sage/canon.py           "canon knowledge: best-practices §intro"
+        stage0_sources.py       "the concept 0: a ConceptNet 5.7 English term node"
+
+    Those are provenance — where the row came from. Promoted to `description` they become the
+    artifact's stated offer, so every canon document in the store offers "canon knowledge": on the
+    live shard all 6,480 of them then position on `canon.n.01` and `cognition.n.01`, the same two
+    nodes. A field that says the same thing about every member of a corpus cannot discriminate
+    between them. The writers file provenance where provenance goes (`citation` / `source_path` /
+    `via`).
+
+    ## Tags are not read here either
+
+    A tag, a collection, a group and an attribute are the same thing — an edge to another artifact —
+    rather than a key in a dictionary, so group membership is read from the graph.
     """
     import json
 
-    result = {"title": "", "description": "", "tags_raw": ""}
-
-    if context_str is None or (isinstance(context_str, str) and not context_str.strip()):
-        return result
-    if not context_str:                      # empty dict / empty list -- nothing to extract
+    result = {"title": "", "description": ""}
+    if not context_str:
         return result
 
+    context = context_str
     if isinstance(context_str, str):
         try:
             context = json.loads(context_str)
-        except json.JSONDecodeError:
-            result["description"] = context_str.strip()
-            return result
-    else:
-        context = context_str
+        except (json.JSONDecodeError, ValueError):
+            return result          # prose in `context` is provenance, not an offer
     if not isinstance(context, dict):
-        # Valid JSON, but a scalar or list rather than an object (`"adds two numbers"` with quotes,
-        # or `[...]`). Still content; render it rather than dropping it.
-        result["description"] = (context_str.strip() if isinstance(context_str, str)
-                                 else str(context))
-        return result
+        return result              # a scalar or a list is not a structured offer either
 
     try:
-        # Extract title
-        result["title"] = context.get("title", "")
-
-        # Extract description (primary search field)
-        # Description is human-curated or AI-enhanced for optimal findability
-        result["description"] = context.get("description", "")
-
-        # Extract tags
-        tags = context.get("tags", [])
-        if isinstance(tags, list):
-            result["tags_raw"] = ", ".join(str(t) for t in tags if t)
-        elif isinstance(tags, str):
-            result["tags_raw"] = tags
-
-    except (json.JSONDecodeError, AttributeError, TypeError) as e:
-        logger.warning(f"Failed to extract text from context: {e}")
-
+        result["title"] = str(context.get("title") or "")
+        result["description"] = str(context.get("description") or "")
+    except (AttributeError, TypeError) as e:
+        logger.warning("Failed to extract text from context: %s", e)
     return result

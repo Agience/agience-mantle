@@ -52,6 +52,17 @@ class _FakeStoreDB:
         self.graph = _FakeGraph()
 
 
+class _GrantedResource:
+    """A grant as `mask_of` reads one: a resource, an effect, and the action flags."""
+
+    def __init__(self, resource_id):
+        self.resource_id = resource_id
+        self.effect = "allow"
+        for _a in ("create", "read", "update", "delete", "evict", "invoke", "add", "share",
+                   "admin"):
+            setattr(self, "can_" + _a, True)
+
+
 class _FakeLightCone:
     def __init__(self, authorized: Optional[list[str]] = None) -> None:
         self._authorized = authorized or []
@@ -59,6 +70,18 @@ class _FakeLightCone:
     def resolve(self, principal_id: str, *, action: str = "read",
                 principal_type: str = "user") -> set:
         return set(self._authorized)
+
+    def _grants_for(self, principal_id: str, principal_type: str = "user"):
+        """The same reach this double already describes, expressed as grants.
+
+        `resolve_authorized_scope` authorizes each candidate by walking up from it and testing the
+        resources on the way against the caller's grants, so a double saying "these ids are
+        authorized" says it by granting them — each id its own granted resource, which is what an
+        artifact-scoped grant looks like. Derived from `resolve` rather than restated, so whatever
+        that method gates on carries here too.
+        """
+        return [_GrantedResource(a) for a in self.resolve(principal_id,
+                                                          principal_type=principal_type)]
 
 
 class _FakeNarrower:
@@ -73,7 +96,11 @@ class _FakeNarrower:
         self.matches = matches
         self.calls: list[str] = []
 
-    def lookup_for(self, query_text, request):
+    def lookup_for(self, query_text, request, *, salient=None):
+        # `salient` is the corpus's measure of which stems carry the question, handed to
+        # the real narrower by `_salient_measure`. A double accepts and ignores it: these
+        # tests state what the ACCESSOR does with a narrowing's answer, and filtering the
+        # stems first would change the question they ask.
         self.calls.append(query_text)
         if self.matches is None:
             return None

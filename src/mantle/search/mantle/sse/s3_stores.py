@@ -24,8 +24,10 @@ adapter is a thin dictionary over S3.
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -97,11 +99,125 @@ class S3PostingStore:
             self._prefix, principal_id, "sse", "manifests", f"{artifact_id}.enc",
         )
 
+    def _entries_key(self, principal_id: str, blind_token: str) -> str:
+        """The entry envelope's own object key.
+
+        A different suffix from the legacy blob. Both describe the same slot, and sharing
+        `{blind_token}.enc` would have a conversion overwrite the legacy blob with a JSON envelope,
+        which `get_posting` then hands to `narrowing` as ciphertext to decrypt. Separate keys let a
+        slot hold both during the conversion and let the legacy read stay exactly
+        as truthful as it was.
+        """
+        return _join_key(
+            self._prefix, principal_id, "sse", "posting", f"{blind_token}.entries",
+        )
+
     def _posting_owner_prefix(self, principal_id: str) -> str:
         return _join_key(self._prefix, principal_id, "sse", "posting") + "/"
 
     # ------------------------------------------------------------------
-    # PostingStore Protocol — postings
+    # PostingStore Protocol — entries
+    # ------------------------------------------------------------------
+    #
+    # One object per slot rather than per entry, which is why these operations are entry-level in
+    # the protocol rather than "one object per entry".
+    #
+    # Per-entry rows are what `SqlitePostingStore` wants: an add is one upsert against a primary key.
+    # Per-entry OBJECTS would be a disaster here. One object per (owner × term × artifact) is the
+    # object explosion the local store was just rescued from, and worse, every probe would become a
+    # LIST instead of a GET — a paginated round trip per term per owner, against a read path already
+    # measured at 4,520 probes for a ten-term query over 194 owners.
+    #
+    # So this adapter keeps one object per token holding a JSON envelope of sealed entries, and does
+    # the read-modify-write itself. That is the SAME O(entries) cost the old caller-side shape had —
+    # honestly so — but here it is one round trip either way and the network dominates it, whereas on
+    # local disk it was the whole cost. The protocol states the operation; the store states the
+    # layout.
+    #
+    # The envelope is a JSON object of ``{entry_key: base64(sealed_entry)}`` rather than a
+    # `pack_posting` blob, because these bytes are already sealed per entry and cannot be re-sealed
+    # under a key this adapter does not have. It is a container rather than a cipher.
+
+    def _slot_envelope(self, principal_id: str, blind_token: str) -> dict:
+        raw = self._get(self._entries_key(principal_id, blind_token))
+        if raw is None:
+            return {}
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            # Not an entry envelope. Almost certainly a LEGACY `pack_posting` blob, which is
+            # ciphertext and therefore not UTF-8 JSON — `get_posting` is what reads those, and
+            # `narrowing`/`indexer` handle the conversion where the keys are. Returning empty here
+            # keeps the entry path from mistaking one for a corrupt envelope and deleting it.
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _put_slot_envelope(self, principal_id: str, blind_token: str, payload: dict) -> None:
+        key = self._entries_key(principal_id, blind_token)
+        if not payload:
+            self._delete(key)
+            return
+        self._put(key, json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+
+    @staticmethod
+    def _entry_key(artifact_id: str, collection_id: str) -> str:
+        # Length-prefixed so no two (artifact, collection) pairs can produce one key — the same rule
+        # `posting.entry_aad` states, and it has to hold here too or two entries would share a slot.
+        return "%d:%s:%s" % (len(artifact_id.encode("utf-8")), artifact_id, collection_id or "")
+
+    def add_entry(self, principal_id: str, blind_token: str, artifact_id: str,
+                  collection_id: str, blob: bytes) -> None:
+        if not isinstance(blob, (bytes, bytearray)):
+            raise TypeError("S3PostingStore.add_entry expects bytes")
+        payload = self._slot_envelope(principal_id, blind_token)
+        payload[self._entry_key(artifact_id, collection_id)] = base64.b64encode(
+            bytes(blob)).decode("ascii")
+        self._put_slot_envelope(principal_id, blind_token, payload)
+
+    def get_entries(self, principal_id: str, blind_token: str) -> List[Tuple[str, str, bytes]]:
+        """Every entry with its identity, recovered from the envelope key.
+
+        The key is ``len(artifact):artifact:collection``, so the split is on the FIRST colon for
+        the length and then that many BYTES for the artifact — never ``split(":")``, which an id
+        containing a colon would break.
+        """
+        out: List[Tuple[str, str, bytes]] = []
+        for key, encoded in self._slot_envelope(principal_id, blind_token).items():
+            try:
+                head, rest = key.split(":", 1)
+                width = int(head)
+                raw = rest.encode("utf-8")
+                artifact_id = raw[:width].decode("utf-8")
+                collection_id = raw[width + 1:].decode("utf-8")
+                out.append((artifact_id, collection_id, base64.b64decode(encoded)))
+            except Exception:                      # noqa: BLE001
+                # One unreadable entry must not cost the slot. The reader gives an unopenable
+                # entry the same treatment, so dropping it here keeps the two agreeing.
+                logger.warning("S3PostingStore: undecodable entry %r in %s/%s",
+                               key, principal_id, blind_token[:8])
+        return out
+
+    def delete_entries_for_artifact(self, principal_id: str, blind_token: str,
+                                    artifact_id: str) -> int:
+        payload = self._slot_envelope(principal_id, blind_token)
+        prefix = "%d:%s:" % (len(artifact_id.encode("utf-8")), artifact_id)
+        doomed = [k for k in payload if k.startswith(prefix)]
+        for k in doomed:
+            del payload[k]
+        if doomed:
+            self._put_slot_envelope(principal_id, blind_token, payload)
+        return len(doomed)
+
+    def delete_entry(self, principal_id: str, blind_token: str, artifact_id: str,
+                     collection_id: str) -> bool:
+        payload = self._slot_envelope(principal_id, blind_token)
+        if payload.pop(self._entry_key(artifact_id, collection_id), None) is None:
+            return False
+        self._put_slot_envelope(principal_id, blind_token, payload)
+        return True
+
+    # ------------------------------------------------------------------
+    # PostingStore Protocol — the legacy whole-slot blob, read-only
     # ------------------------------------------------------------------
 
     def get_posting(self, principal_id: str, blind_token: str) -> Optional[bytes]:
@@ -114,15 +230,37 @@ class S3PostingStore:
         self._delete(self._posting_key(principal_id, blind_token))
 
     def list_tokens_for_owner(self, principal_id: str) -> List[str]:
+        """Both layouts — see the Protocol. A lister that saw only one suffix would make a re-key
+        pass silently skip every slot in the other."""
         prefix = self._posting_owner_prefix(principal_id)
-        out: List[str] = []
+        out: set = set()
         for key in self._list_under(prefix):
-            if not key.endswith(".enc"):
-                continue
             base = key[len(prefix):]
-            if base.endswith(".enc"):
-                out.append(base[: -len(".enc")])
-        return out
+            for suffix in (".enc", ".entries"):
+                if base.endswith(suffix):
+                    out.add(base[: -len(suffix)])
+                    break
+        return sorted(out)
+
+    def list_owners(self) -> List[str]:
+        """Every principal with an index tree under this prefix.
+
+        Read by listing keys and cutting at the ``/sse/`` segment every layout in this store puts
+        between the principal and its blobs, rather than by asking S3 for common prefixes with a
+        delimiter: `_list_under` is the one listing path here, it already paginates, and a fake
+        client in a test only has to support the call it already supports.
+
+        Principal ids appear RAW in these keys — `_posting_key` does not escape them, unlike the
+        file store's directory names — so there is nothing to decode on the way back out.
+        """
+        base = (self._prefix + "/") if self._prefix else ""
+        out: set[str] = set()
+        for key in self._list_under(base):
+            rest = key[len(base):]
+            cut = rest.find("/sse/")
+            if cut > 0:
+                out.add(rest[:cut])
+        return sorted(out)
 
     # ------------------------------------------------------------------
     # PostingStore Protocol — manifests
@@ -140,6 +278,33 @@ class S3PostingStore:
     # ------------------------------------------------------------------
     # Shared S3 helpers
     # ------------------------------------------------------------------
+
+
+    # ------------------------------------------------------------------
+    # Which analysis wrote this index
+    # ------------------------------------------------------------------
+    #
+    # One small object beside the index rather than a per-principal one: the generation is a fact
+    # about the software that wrote the bucket, not about any owner's content, and it is cleartext
+    # for the same reason — a version number reveals nothing about what is stored.
+
+    def _analyzer_key(self) -> str:
+        return _join_key(self._prefix, "index", "analyzer")
+
+    def analyzer_generation(self):
+        """The stamp, or ``None`` for a bucket written before stamping existed — and for any
+        error reaching it, because a diagnostic must not be what takes an index offline."""
+        raw = self._get(self._analyzer_key())
+        if raw is None:
+            return None
+        try:
+            return int(raw.decode("utf-8").strip())
+        except (UnicodeDecodeError, ValueError):
+            return None
+
+    def record_analyzer_generation(self, generation: int) -> None:
+        """Stamp the writing generation. Idempotent; last writer wins."""
+        self._put(self._analyzer_key(), str(int(generation)).encode("utf-8"))
 
     def _get(self, key: str) -> Optional[bytes]:
         try:

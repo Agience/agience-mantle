@@ -61,6 +61,17 @@ class _FakeStoreDB:
         self.graph = _FakeGraph()
 
 
+class _GrantedResource:
+    """A grant as `mask_of` reads one: a resource, an effect, and the action flags."""
+
+    def __init__(self, resource_id):
+        self.resource_id = resource_id
+        self.effect = "allow"
+        for _a in ("create", "read", "update", "delete", "evict", "invoke", "add", "share",
+                   "admin"):
+            setattr(self, "can_" + _a, True)
+
+
 class _FakeLightCone:
     def __init__(self, authorized: Optional[list[str]] = None) -> None:
         self._authorized = authorized or []
@@ -73,6 +84,18 @@ class _FakeLightCone:
         principal_type: str = "user",
     ) -> set[str]:
         return set(self._authorized)
+
+    def _grants_for(self, principal_id: str, principal_type: str = "user"):
+        """The same reach this double already describes, expressed as grants.
+
+        `resolve_authorized_scope` authorizes each candidate by walking up from it and testing the
+        resources on the way against the caller's grants, so a double saying "these ids are
+        authorized" says it by granting them — each id its own granted resource, which is what an
+        artifact-scoped grant looks like. Derived from `resolve` rather than restated, so whatever
+        that method gates on carries here too.
+        """
+        return [_GrantedResource(a) for a in self.resolve(principal_id,
+                                                          principal_type=principal_type)]
 
 
 class _FakeNarrower:
@@ -93,7 +116,11 @@ class _FakeNarrower:
         self.coverage = coverage or {}
         self.calls: list[str] = []
 
-    def lookup_for(self, query_text, request):
+    def lookup_for(self, query_text, request, *, salient=None):
+        # `salient` is the corpus's measure of which stems carry the question, handed to
+        # the real narrower by `_salient_measure`. A double accepts and ignores it: these
+        # tests state what the ACCESSOR does with a narrowing's answer, and filtering the
+        # stems first would change the question they ask.
         self.calls.append(query_text)
         if self.matches is None:
             return None
@@ -665,7 +692,7 @@ class TestOrdering:
     def test_a_ranker_that_ran_and_matched_nothing_stays_empty(self):
         """An empty ranking is an answer; recency must not re-admit what it excluded.
 
-        The distinction is between an arm that COULD NOT RUN — which falls through to the
+        The distinction is between an arm that could not run — which falls through to the
         clock — and one that ran over the narrowed set and kept none of it. Ordering the
         second by recency would hand back every artifact the cosine just rejected.
         """
@@ -816,3 +843,68 @@ class TestScopeFiltering:
         assert result.total == 0
         # Short-circuit on empty contexts.
         assert ranker.calls == []
+
+
+class TestCoverageIsAllowedToNameTheAnswer:
+    """Reach is the right ranker for a question and the wrong one for a quote.
+
+    Measured on the live corpus, asking for a phrase that appears verbatim in exactly one canon
+    document: coverage put that document at rank 1 with more matched stems than anything else in
+    the pool, and the reach arm then moved it to 38, or cut it away. Reach measures conceptual
+    distance, and for a known-item query the answer is the document that COVERS the query — a
+    lexicon synset for one of its nouns sits at distance 0 and wins.
+
+    `_coverage_names_the_answer` decides which question was asked, from the shape of the corpus's
+    own answer rather than from anything about the query text.
+    """
+
+    @staticmethod
+    def _rows(*coverages):
+        from mantle.search.mantle.sse.narrowing import Coverage
+        from mantle.search.mantle.sse.router_accessor import _Ranked
+        return [_Ranked("art-%d" % i, float(c[0]), None, None, Coverage(*c))
+                for i, c in enumerate(coverages)]
+
+    @staticmethod
+    def _gate(rows, top_k=50):
+        from mantle.search.mantle.sse.router_accessor import MantleSseSearchAccessor
+        return MantleSseSearchAccessor._coverage_names_the_answer(rows, top_k)
+
+    def test_a_flat_spectrum_names_nothing(self):
+        """"what is a glacier": every candidate matches one stem. Coverage has no opinion, and
+        saying so is what leaves the ranking to reach."""
+        rows = self._rows((1, 0, ("glacier",)), (1, 0, ("what",)), (1, 0, ("what",)))
+        assert self._gate(rows) is None
+
+    def test_a_tied_leading_group_names_a_SET_not_an_answer(self):
+        """"what is a volcano" leaves many documents matching BOTH salient stems.
+
+        A leading group exists, but its members are indistinguishable, so returning it would be
+        returning `_by_coverage`'s tiebreak — a timestamp. Without this test the gate cost three
+        answers on the labelled question set.
+        """
+        tied = ("volcano", "what")
+        rows = self._rows((2, 0, tied), (2, 0, tied), (1, 0, ("what",)), (1, 0, ("what",)))
+        assert self._gate(rows) is None
+
+    def test_one_document_covering_more_of_the_query_is_the_answer(self):
+        rows = self._rows((7, 0, tuple("abcdefg")), (2, 0, ("a", "b")), (1, 0, ("a",)))
+        named = self._gate(rows)
+        assert named is not None
+        assert named[0].artifact_id == "art-0"
+
+    def test_it_returns_every_narrowed_row_and_cuts_NOTHING(self):
+        """Coverage does not cut and must not — `_by_reach` states the contract: coverage's
+        `total` is every narrowed match, reach's is what survived the cut.
+
+        The first version of this gate returned the leading group alone. Two existing tests caught
+        it, and a caller paging a coverage answer would have lost every row behind the leaders.
+        """
+        rows = self._rows((7, 0, tuple("abcdefg")), (2, 0, ("a", "b")), (1, 0, ("a",)))
+        named = self._gate(rows)
+        assert len(named) == len(rows), "the whole narrowed set must come back"
+        assert {r.artifact_id for r in named} == {r.artifact_id for r in rows}
+
+    def test_a_single_candidate_names_nothing(self):
+        """One row has no spectrum to read; there is nothing for `signal_end` to separate."""
+        assert self._gate(self._rows((3, 0, ("a", "b", "c")))) is None

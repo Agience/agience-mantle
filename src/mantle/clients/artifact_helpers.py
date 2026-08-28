@@ -4,14 +4,14 @@ Core uses ``content_type`` in artifact context; MCP convention uses ``mimeType``
 These helpers standardize the translation so every server reads artifact fields
 the same way.
 
-⚠ THIS MODULE EXISTS FOR EXTERNAL MCP CONSUMERS, NOT FOR MANTLE. Nothing in this
+This module serves external MCP consumers rather than Mantle itself: nothing in this
 repository imports it. Its callers are the `agience-chorus` personas — `astra`,
 `aria`, `sage`, `iris`, `seraph`, `ophan`, `lumen` — which call Mantle over the
 wire and need its artifact fields in MCP's vocabulary. It sits under ``clients/``
 because that package is about the wire between Mantle and someone else, and this
 is the consumer's side of it: it reads Mantle's responses and touches no store.
 
-It is a CANDIDATE TO MOVE INTO ``agience-chorus``, where every caller lives. What
+It is a candidate to move into ``agience-chorus``, where every caller lives. What
 holds it here is that all seven personas would import it from one place either
 way, and the move is theirs to make — not a deletion this repository can perform,
 because nothing here would notice it break.
@@ -61,6 +61,36 @@ def register_types_manifest(mcp_instance: Any, server_name: str, server_file: st
             except Exception:
                 continue
         return json.dumps(types)
+
+
+def artifact_url(base: str, artifact_id: str, *suffix: str) -> str:
+    """`{base}/artifacts/{id}` with the id encoded as ONE path segment.
+
+    An artifact id is an opaque string and this corpus's ids carry characters that mean something
+    in a URL. `canon:best-practices#intro` interpolated into an f-string yields the path
+    `/artifacts/canon:best-practices` with `#intro` split off as a fragment — and a fragment is
+    never sent to the server, so the request silently asks for a different artifact. Measured
+    against `httpx.Request`:
+
+        wn-glacier.n.01              path=/artifacts/wn-glacier.n.01           fragment=''
+        canon:best-practices#intro   path=/artifacts/canon:best-practices      fragment='intro'
+
+    Every canon id has a `#`, so every fetch of this project's own documentation asked for a
+    truncated id instead. None of the 276 truncated forms is an artifact, so the request 404s: the
+    failure is loud, and it covers all 6,480 canon artifacts.
+
+    `safe=""` encodes the whole id, including `:` and `/`, so an id can never end a segment early
+    or introduce one. The server decodes the path parameter, so the route matches the id it was
+    given rather than a prefix of it.
+
+    `suffix` appends further fixed segments — `artifact_url(base, aid, "children")` — and those are
+    NOT encoded, because they are route structure rather than data.
+    """
+    from urllib.parse import quote
+
+    parts = "/".join(str(p).strip("/") for p in suffix if str(p).strip("/"))
+    tail = ("/" + parts) if parts else ""
+    return "%s/artifacts/%s%s" % (str(base).rstrip("/"), quote(str(artifact_id), safe=""), tail)
 
 
 def parse_artifact_context(artifact: dict) -> dict:

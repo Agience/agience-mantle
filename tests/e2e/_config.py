@@ -21,7 +21,7 @@ AUTHORITY_ISSUER = os.getenv("E2E_AUTHORITY_ISSUER", "http://origin:8080")
 # <data>/keys/bootstrap.token. When the suite runs on the same host as the
 # compose stack it can read it directly; otherwise pass E2E_BOOTSTRAP_TOKEN.
 #
-# The stack is `agience-bundle`'s, and its default data root is `.data-local`
+# The stack is `agience-observe`'s, and its default data root is `.data-local`
 # (`docker-compose.local.yml`: `${LOCAL_DATA:-./.data-local}`). That repo is a
 # SIBLING of this one, so the walk goes up past the mantle repo root:
 # parents[0] = tests/e2e, [1] = tests, [2] = the repo, [3] = the workspace.
@@ -30,7 +30,7 @@ assert (_MANTLE_REPO / "src" / "mantle").is_dir(), (
     "path depth is wrong: parents[2] should be the agience-mantle repo root, got %s"
     % _MANTLE_REPO
 )
-_DEFAULT_DATA = _MANTLE_REPO.parent / "agience-bundle" / ".data-local"
+_DEFAULT_DATA = _MANTLE_REPO.parent / "agience-observe" / ".data-local"
 DATA_DIR = Path(os.getenv("E2E_DATA_DIR", str(_DEFAULT_DATA)))
 BOOTSTRAP_TOKEN_ENV = os.getenv("E2E_BOOTSTRAP_TOKEN", "")
 

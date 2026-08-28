@@ -29,7 +29,24 @@ COPY src/mantle/ ./mantle/
 
 ARG MANTLE_REVISION=unknown
 ARG MANTLE_BUILD_TIME=unknown
-RUN printf '{"version":"%s","build_time":"%s"}\n' "$MANTLE_REVISION" "$MANTLE_BUILD_TIME" \
+# ⭐ EVERY REPO THAT WENT INTO THIS IMAGE, NOT ONLY MANTLE'S [2026-08-24].
+#
+# `MANTLE_REVISION` alone can say "this node runs mantle@abc123" and cannot say which **prism** is
+# inside it — and prism is a build context here, so it is as much a part of this artifact as the
+# source in `src/`. `release.sh`'s `BUILD_INPUTS` is exactly `agience-mantle agience-prism/py`, and
+# it gates BOTH on being clean and pushed; the stamp had visibility of one of them.
+#
+# That gap is what makes an attestation impossible rather than merely incomplete: a client that
+# clones prism from this node has no revision to check its clone against, so "is this the code the
+# instance is running" has no answer for half the image.
+#
+# `name=sha,name=sha` — a flat string because a build ARG is a string. It is parsed once, in
+# `main.py::_load_build_info`, into the `components` map `/version` and `/.well-known/agience-source`
+# publish. Empty is a legal value and means "this build did not say", which reads differently from
+# an empty map and is what an un-stamped older image produces.
+ARG AGIENCE_COMPONENTS=""
+RUN printf '{"version":"%s","build_time":"%s","components":"%s"}\n' \
+      "$MANTLE_REVISION" "$MANTLE_BUILD_TIME" "$AGIENCE_COMPONENTS" \
       > /app/build_info.json
 
 # ---- drop root ----

@@ -38,9 +38,9 @@ def captured(monkeypatch):
 
 
 def test_the_recording_path_never_creates_a_container(monkeypatch):
-    """⛔ A READ MUST NOT WRITE. `_lookup_container` looks and gives up; provisioning is
-    `ensure_observations_container`, called from `user_provisioning`. Wiring creation back into
-    the read path would put a ~11s container create inside a user-facing tool call, announce it on
+    """A read does not write. `_lookup_container` looks and gives up; provisioning is
+    `ensure_observations_container`, called from `user_provisioning`. Creation on the read path
+    would put a ~11s container create inside a user-facing tool call, announce it on
     the change feed as a side effect of looking, and make an observation's `create_container` call
     the one that `test_mcp_can_write_and_find` sees instead of the tool's own."""
     from mantle.services import workspace_service
@@ -92,9 +92,9 @@ def test_the_published_payload_carries_no_body_anywhere(captured):
 
 
 def test_the_result_set_sits_under_the_key_redaction_reaches(captured):
-    """⭐ THE KEY NAME IS THE DEFENCE. `redact_content` strips bodies from `artifact`/`artifacts`
-    and nowhere else, so a rename to `hits`/`results` would take raw hits straight past it into the
-    durable log. This asserts the contract between the two modules rather than one side of it."""
+    """The key name is the defence. `redact_content` strips bodies from `artifact`/`artifacts` and
+    nowhere else, so a rename to `hits`/`results` would take raw hits past it into the durable log.
+    This asserts the contract between the two modules rather than one side of it."""
     observation.record_observation(
         store_db=None, principal_id="p1", tool="recall", query_text="q", hits=[{"id": "a1"}])
     (event,) = captured

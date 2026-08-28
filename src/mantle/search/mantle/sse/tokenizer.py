@@ -3,17 +3,46 @@
 Mirrors the structure of Lucene's `english_analyzer`, minus its stop-word
 stage:
 
-    standard tokenizer → lowercase → possessive stemmer → Porter stemmer
+    standard tokenizer → lowercase → ASCII-fold → possessive stemmer → Porter stemmer
+
+## Why an analysis pipeline exists at all
+
+A blind token is `HMAC(key, "field:term")`, so the server matches on byte
+equality of the term and nothing else. Two spellings of one word are two
+unrelated tokens unless something collapses them BEFORE the HMAC — and that
+is the entire job of the stages above. `Running`, `running`, `runs` and
+`RUNS` are one posting because lowercase and Porter make them one term.
+`dog's` and `dogs` are one posting because the possessive stemmer and Porter
+make them one term.
+
+The fold is a member of that chain, not an addition to it. `café`, `Cafés`
+and `cafes` name one thing and must reach one posting, and they do so the
+same way every other variant does: they are normalised to one term on the
+client, and only that term is ever encrypted. Lucene calls this stage
+`asciifolding` and places it exactly here, between lowercase and the
+stemmers.
+
+Without it, an accented word does not merely miss its ASCII spelling — it
+misses its own plural. `porter_stem` returns non-ASCII input untouched, so
+`cafés` never reaches the stemmer that would have taken it to `cafe`, while
+`cafes` does. Folding first is what puts every Latin word back on the path
+its ASCII twin already takes, and it restores the invariant `bigrams` states
+below: after this pipeline a stem is alphabetic and contains no space.
 
 Pure Python, no NLTK dependency. The Porter (1980) stemmer is implemented
 inline; it is deterministic, well-defined, and produces stable stems
 suitable for blind-token derivation in :mod:`mantle.search.mantle.sse.blind_tokens`.
 
 Index-time and query-time both call :func:`tokenize`, which guarantees the
-same string maps to the same blind tokens on both paths. The stemmer is
-fixed; if it ever changes (e.g., to Snowball/Porter2), every existing index
-must be rebuilt — there is no in-place migration. That is why this module
-has no dialect or version flag: stemmer choice is part of the index format.
+same string maps to the same blind tokens on both paths. The analysis is
+fixed; changing any stage (a different stemmer, a different fold) changes
+which term a document is filed under, so every existing index must be
+rebuilt — there is no in-place migration, because the server holds HMACs
+and cannot re-derive a term it has never seen. :data:`ANALYZER` names the
+generation an index was written by, so "this store predates the fold" is a
+fact a caller can read rather than infer. `search.init_search
+.reindex_all_artifacts` is the rebuild, and it already runs in the
+background on a store with no usable index.
 
 Public API:
 
@@ -22,6 +51,7 @@ Public API:
 The stages are also exposed individually for testing:
 
 - :func:`split_words`
+- :func:`fold_to_ascii`
 - :func:`strip_possessive`
 - :func:`porter_stem`
 """
@@ -29,6 +59,7 @@ The stages are also exposed individually for testing:
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import List
 
 
@@ -42,6 +73,27 @@ from typing import List
 # ASCII English; corner cases (URL splitting, CJK segmentation) are out of
 # scope for the SSE MVP. ``\w`` is Unicode-aware, so accented characters and
 # digits both work.
+#
+# How this class differs from the other lexical arm.
+#
+# `ember/corpus/fts.py` splits with `[^\W_]+`, which matches SQLite's `unicode61` exactly — 0
+# disagreements over a 13-probe set spanning apostrophes, underscores, hyphens, digits, accents
+# and Windows paths (pinned by `ember/tests/test_the_tokenizer_matches_fts5.py`). This regex
+# disagrees with `unicode61` on 6 of those 13, in exactly two ways:
+#
+#   Apostrophes. Keeping `dog's` whole is what lets `strip_possessive` take it to `dog`.
+#   `unicode61` splits it into `dog` and a junk `s` term, so it indexes a one-letter token that
+#   means nothing and matches everything possessive.
+#
+#   Underscores. Python's `\w` includes `_`, so `snake_case_name` stays one term here where FTS5
+#   makes three. Measured over the live store, 0 of 78,341 tokens emitted across 60,000 real
+#   artifact offers contain an underscore: this arm indexes the offer (title, description, tags),
+#   which is prose, and identifiers live in `content`, which it does not index at all. The class
+#   is part of the index format, so changing it forces a full reindex — and a reindex to fix a
+#   case the corpus does not contain buys nothing.
+#
+# The two arms write different stores and a query reaches one or the other, so they are not
+# required to agree with each other. Each is required to agree with the index it writes.
 _WORD_RE = re.compile(r"\w+(?:'\w*)*", flags=re.UNICODE)
 
 
@@ -58,6 +110,35 @@ def split_words(text: str) -> List[str]:
 
 # Inlined as ``token.lower()`` in :func:`tokenize`. No separate function:
 # str.lower is the canonical implementation, no need to wrap it.
+
+
+# ---------------------------------------------------------------------------
+# Stage 2.5 — ASCII folding
+# ---------------------------------------------------------------------------
+
+def fold_to_ascii(token: str) -> str:
+    """Remove combining marks, so one word has one spelling before it is stemmed.
+
+    Unicode's own canonical decomposition, not a transliteration table: NFD
+    separates a letter from its marks and the marks are dropped. A table is a
+    list somebody maintains and forgets; this covers every letter Unicode
+    decomposes, including ones nobody thought to list.
+
+    >>> fold_to_ascii("café")
+    'cafe'
+    >>> fold_to_ascii("Ångström")
+    'Angstrom'
+    >>> fold_to_ascii("plain")
+    'plain'
+
+    A letter with no decomposition — `ø`, `ß`, and every non-Latin script —
+    passes through unchanged. Those are not accented spellings of an English
+    word, so folding them would be a guess; they stay as they are and index
+    under themselves, which is what `porter_stem`'s non-ASCII branch already
+    assumes.
+    """
+    return "".join(c for c in unicodedata.normalize("NFD", token)
+                   if not unicodedata.combining(c))
 
 
 # ---------------------------------------------------------------------------
@@ -336,8 +417,15 @@ def porter_stem(token: str) -> str:
     """Apply the full Porter (1980) algorithm. Token must be lowercase ASCII.
 
     Tokens shorter than 3 characters are returned unchanged — Porter's
-    convention. Non-ASCII tokens pass through untouched; SSE indexes them
-    by their lowercase form.
+    convention.
+
+    Non-ASCII tokens pass through untouched. After :func:`fold_to_ascii`
+    that branch is unreachable for Latin text, which is the point: an
+    accented English word reaches this stemmer as its ASCII spelling and
+    gets the same stem its unaccented twin gets. What still reaches it
+    non-ASCII is a genuinely different script, or a letter Unicode does not
+    decompose — neither is an English word Porter has rules for, so both
+    index under themselves.
     """
     if len(token) <= 2:
         return token
@@ -365,10 +453,15 @@ def tokenize(text: str) -> List[str]:
 
     1. Split on non-word characters.
     2. Lowercase.
-    3. Strip English possessive (``'s`` / ``s'``).
-    4. Drop empty tokens.
-    5. Porter stem.
-    6. Drop tokens that became empty after stemming.
+    3. Fold combining marks away (``café`` -> ``cafe``).
+    4. Strip English possessive (``'s`` / ``s'``).
+    5. Drop empty tokens.
+    6. Porter stem.
+    7. Drop tokens that became empty after stemming.
+
+    Lowercase runs before the fold rather than after, so a letter whose
+    lowering itself produces a combining mark (Turkish ``İ`` lowers to ``i``
+    plus a combining dot) is folded on the result rather than around it.
 
     Returns the stems in input order. Duplicate stems are *not* deduplicated
     here — callers that need term frequencies (the SSE indexer) compute
@@ -379,7 +472,7 @@ def tokenize(text: str) -> List[str]:
         return []
     out: List[str] = []
     for raw in split_words(text):
-        token = strip_possessive(raw.lower())
+        token = strip_possessive(fold_to_ascii(raw.lower()))
         if not token:
             continue
         stem = porter_stem(token)
@@ -408,7 +501,21 @@ def bigrams(stems: List[str]) -> List[str]:
     return [f"{stems[i]} {stems[i + 1]}" for i in range(len(stems) - 1)]
 
 
+#: The generation of this analysis pipeline. A blind token is an HMAC of the
+#: analysed term, so the analysis IS part of the index format: a store written
+#: by one generation cannot be queried by another, and the server cannot
+#: re-derive terms it only holds hashes of. Bumped whenever any stage changes,
+#: so a store can record which generation wrote it and a mismatch is a fact
+#: rather than an unexplained recall failure. `reindex_all_artifacts` is the
+#: only migration.
+#:
+#:   1  standard -> lowercase -> possessive -> Porter
+#:   2  standard -> lowercase -> ASCII-fold -> possessive -> Porter
+ANALYZER = 2
+
 __all__ = [
+    "ANALYZER",
+    "fold_to_ascii",
     "bigrams",
     "porter_stem",
     "split_words",

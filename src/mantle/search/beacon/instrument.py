@@ -10,12 +10,12 @@
 
 """Beacon as an instrument — mantle's embodiment of `prism.instrument.Read`, on numpy alone.
 
-`ARCHITECTURE-TARGET.md` §3 declares an instrument slot with two implementations,
+`agience-pharos/genesis/ARCHITECTURE-TARGET.md` §3 declares an instrument slot with two implementations,
 and this is the second one::
 
     the aperture (ember)   domain: the signal — an ordered (T, F) frame
                             knows: ontology coordinates are sparse; evidence rows are correlated
-                            needs: entroptics + numpy
+                            needs: the aperture library + numpy
     beacon (mantle)         domain: the corpus — a set of vectors
                             knows: its own corpus statistics
                             needs: numpy
@@ -109,10 +109,16 @@ states which error it models:
 Two engines agreeing is not evidence either is correct, and disagreeing is not
 evidence either is wrong — both need the domain argument, not just the numbers.
 
-1. **`coherence` is always `None`.** A set has no ordered axis.
+There are six, and the bracketed number on each is its index in
+`prism.vectors/screen_read_vectors.json::_known_divergence`, which is where both
+engines read them. The two lists are ordered differently — this one runs by
+domain argument, the pin runs by the order they were found — so the cross-
+reference is stated per entry rather than left to position.
 
-2. **The certified interval models a different error.** The aperture's
-   `k_lo`/`k_hi` come from `entroptics.reads.resolved_dimension_interval`
+1. **`coherence` is always `None`.** A set has no ordered axis. [pin 3]
+
+2. [pin 4] **The certified interval models a different error.** The aperture's
+   `k_lo`/`k_hi` come from the upstream resolved-dimension read
    propagating a Weyl band `‖Ĉ − C‖₂ ≤ band` — the error in the sample covariance
    as an estimate of a population covariance. Beacon's domain is a corpus, so the
    set of vectors it holds *is* the population: there is no population covariance
@@ -125,7 +131,7 @@ evidence either is wrong — both need the domain argument, not just the numbers
    sits inside its interval — the two `k_certain` flags mean different things and
    must not be compared.
 
-3. **The minimum readable frame is 2 rows here, 4 there.** The aperture's
+3. [pin 5] **The minimum readable frame is 2 rows here, 4 there.** The aperture's
    `MIN_ROWS` is recovered from the falling factorial `T(T−1)(T−2)(T−3)` — the dof
    of the disjoint term of its lag-1 permutation variance. Beacon takes no lag-1
    statistic (divergence 1), so it has no such term; its own gate is the
@@ -133,25 +139,35 @@ evidence either is wrong — both need the domain argument, not just the numbers
    non-degenerate ensemble — the same fact as `Dynamics` being unfilled, seen
    from the shape end.
 
-4. **`k >= 1` on a readable frame**, pinned in
+4. [pin 1] **`k >= 1` on a readable frame**, pinned in
    `prism.vectors/screen_read_vectors.json` (`noise_only`: beacon 1, aperture 0).
    This module keeps one rank rule and inherits it rather than introducing a
    second, so `accumulated_read` also floors at 1, and the contract's
    `k_signal == 0` (unmeasurable) case is reached here only through
    `screened=False`, never through a readable frame.
 
-5. **Beacon fills no `Instrument` member; the aperture fills all three.** The
+5. [pin 6] **Beacon fills no `Instrument` member; the aperture fills all three.** The
    product divergence: the aperture projects, beacon cuts. Pinned in
    `screen_read_vectors.json` as divergence 6.
 
-All five divergences are pinned in `screen_read_vectors.json`, where both engines
+6. [pin 2] **A collapsed axis is reported, not smoothed.** When only one feature
+   channel survives whitening, beacon reports `live_channels=1` and
+   `degraded=True`; the aperture reports `scale_hazard=False` on the same frame.
+   Neither is wrong: beacon is saying the shape it was handed cannot carry a
+   spectral read, and the aperture is saying nothing about the *scale* is
+   hazardous. They answer different questions about the same degeneracy, which is
+   why the flags do not correspond and must not be reconciled. See `_hazard` in
+   the pin. Asserted by
+   `tests/test_beacon_instrument.py::test_a_collapsed_axis_is_still_flagged_through_the_embodiment`.
+
+All six divergences are pinned in `screen_read_vectors.json`, where both engines
 read them, and asserted here with their domain argument: a shared data pin says
 the numbers must not move, and a test says why they must not.
 
 ## Import boundary
 
-Numpy only. This module may not import `beam` or `entroptics` — beacon is what
-keeps mantle shippable while entroptics stays private, and
+Numpy only. This module may not import `beam` or any spectral library — beacon is
+what keeps mantle shippable on its own, and
 `tests/test_lexical_extra_is_numpy_free.py` holds the floor from the other side
 (the semantic arm fails without numpy).
 
@@ -163,8 +179,8 @@ five modules, because importing a submodule runs the package `__init__` first:
     prism · prism.canonical · prism.environment · prism.errors · prism.rounding
 
 all five held stdlib-only by prism's own `test_contract_install_is_pure.py`.
-`test_the_instrument_imports_with_beam_entroptics_and_prism_blocked` removes
-`beam` and `entroptics` from the import system outright and permits prism modules
+`test_the_instrument_imports_with_beam_and_prism_blocked` removes
+`beam` from the import system outright and permits prism modules
 by exact name; `prism.conservation` — where the same law is applied with numpy —
 is in the test's control set and must still fail to import here, so a second
 prism edge, or a transitive pull through one, fails this test the day it lands.
@@ -301,7 +317,7 @@ def _as_ordered_matrix(rows) -> np.ndarray:
 #
 # Beacon already had both nulls, under its own names. `signal_rank` is the closed-form
 # Tracy-Widom edge; `structure_rank` is the distribution-free permutation null, whose surrogate is
-# entroptics' own `shuffle_in_time` reproduced argsort-and-all so the two embodiments draw from the
+# the upstream `shuffle_in_time` reproduced argsort-and-all so the two embodiments draw from the
 # same null. These two objects select between them, so `read_ordered` has one body and the null
 # decides which edge it is read against, rather than two functions with two rank rules.
 
@@ -487,7 +503,7 @@ def read_ordered(rows, *, null=None, seed: int = 0, window: Optional[int] = None
     this kind.
 
     `with_screen` is accepted for signature parity and changes nothing here. The keyword exists on
-    the aperture to skip entroptics' folded `Screen`, the half that measures `coherence`; beacon has
+    the aperture to skip the upstream folded `Screen`, the half that measures `coherence`; beacon has
     no folded screen and cannot measure `coherence` in any case (see `Dynamics` in the module
     docstring), so the field the keyword gates reads `None` on both settings, never `0.0`. There is
     no second half here to skip.
@@ -902,7 +918,7 @@ def screen_normalize(rows, mask=None):
     measured on the whitened matrix, since the raw one is not a meaningful reference. The member
     exposes machinery that was already load-bearing here.
 
-    This is an independent implementation of the same estimator as `entroptics.entropy.normalize` —
+    This is an independent implementation of the same estimator as the upstream estimator —
     the two repos may not import each other, so their agreement is evidence rather than a shared
     dependency. Checked across five frames (iid 120×16, heterogeneous units, planted rank-3, a dead
     channel, a short 8×16): the maximum difference is 0.0, exactly. A future divergence is therefore
@@ -910,14 +926,14 @@ def screen_normalize(rows, mask=None):
     rounding difference to absorb.
 
     `mask` is accepted for contract compatibility and ignored — beacon has no masked path.
-    entroptics marks masked cells NaN and excludes them from the statistics; `_as_matrix` here fills
+    The upstream marks masked cells NaN and excludes them from the statistics; `_as_matrix` here fills
     non-finite cells with the column mean instead. Passing a mask and having it silently honoured on
     one embodiment and dropped on the other would be a divergence hiding inside a shared name, so it
     is stated: a caller needing masked normalisation needs the aperture.
     """
     if mask is not None:
         raise BeaconEngineError(
-            "beacon's screen_normalize has no masked path — entroptics excludes masked cells from "
+            "beacon's screen_normalize has no masked path — the upstream excludes masked cells from "
             "the per-channel statistics and beacon fills non-finite cells with the column mean, so "
             "honouring a mask here would silently differ from the aperture. Use the aperture.")
     return _whiten(rows)
@@ -1000,8 +1016,8 @@ def _float_noise(W: np.ndarray, energy: float, *, splits: int = 1) -> float:
     in prism and not stay duplicated here: `prism.conservation` needs numpy and sits behind `[wire]`,
     and a derivation behind an optional extra is a duplicate-drift risk: nothing forces the two
     copies to be checked against each other.
-    `test_the_instrument_imports_with_beam_entroptics_and_prism_blocked` still blocks `beam` and
-    `entroptics` outright and blocks every prism module except this one, so the edge is bounded by a
+    `test_the_instrument_imports_with_beam_and_prism_blocked` still blocks `beam`
+    outright and blocks every prism module except this one, so the edge is bounded by a
     measurement rather than by this sentence. What stays here is the one line prism cannot hold: `ε`
     read off the frame's own dtype, which is numpy vocabulary.
     """

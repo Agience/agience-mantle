@@ -133,7 +133,7 @@ VERTEX_DDL: List[str] = [
     #   * It costs the caller nothing. `<expr> = ?` cannot be true when `<expr>` is NULL, and
     #     SQLite knows it: the planner discharges the partial-index WHERE from the equality
     #     term alone, so no query has to name the `IS NOT NULL` predicate to get the seek.
-    #     Verified with EXPLAIN QUERY PLAN, not assumed.
+    #     Verified with `EXPLAIN QUERY PLAN`.
     #
     # `ct` is the second column so `WHERE ct = ? AND json_extract(...) = ?` — the shape
     # `LatticeArtifactStore.list_by_doc_field` emits — seeks on both terms, and `id` is third so
@@ -145,6 +145,42 @@ VERTEX_DDL: List[str] = [
     "CREATE INDEX IF NOT EXISTS ix_v_resource ON vertex("
     "  json_extract(doc, '$.resource_id'), ct, id"
     ") WHERE json_extract(doc, '$.resource_id') IS NOT NULL",
+    #
+    # `collection_id` is one of the most-queried `doc` fields in the system and had no index:
+    # `data_integrity_check`'s `artifacts_naming_a_missing_collection` and `orphan_content_roots`
+    # both filter on it, and it is the field the collectionless-replication sweep turns on. Measured
+    # 2026-08-25 on the live lattice, bounded probes over the same 200,000 rows: **0.22 s** for a
+    # column-only `GROUP BY ct` against **9.34 s** once `json_extract(doc,'$.collection_id')` was in
+    # the predicate. 42x, and all of it the JSON parse.
+    #
+    # The win is that it covers, not that it seeks. The plan is
+    # `SCAN vertex USING COVERING INDEX` — SQLite answers from the index and never reads the
+    # table, so the per-row JSON parse disappears entirely. That is why a scan-shaped query gets
+    # faster at all.
+    #
+    # Deliberately not partial, unlike the two above: copying their `WHERE ... IS NOT NULL` shape
+    # would build 64 MB of index that SQLite never uses, measured against the same rows:
+    #
+    #     index                      has a collection   has none     plan
+    #     FULL                            0.03 s         0.03 s      COVERING INDEX
+    #     PARTIAL (IS NOT NULL)           0.95 s         0.94 s      SCAN TABLE
+    #
+    # A partial index cannot cover a query whose result set may include the rows it excludes, and
+    # "which artifacts have NO collection" is exactly such a query. The grantee/resource indexes are
+    # partial because their queries only ever seek a present value; this one is asked both ways.
+    #
+    # An index, not a column, and the distinction is load-bearing: this store has a recorded case
+    # of a column disagreeing with its own JSON field, `vertex.root_id` against
+    # `json_extract(doc,'$.root_id')` differing on 2,169,111 of 2,169,683 rows (99.97%). An
+    # expression index computes the identical expression, so it cannot diverge; it only makes the
+    # same answer cheaper.
+    #
+    # Cost on first apply, measured at ~1.7 s and +5 MB per 200,000 rows: roughly 23 s and +64 MB
+    # against the 2.66M-row store. It is a one-time build on the next schema application, not a
+    # per-query cost.
+    "CREATE INDEX IF NOT EXISTS ix_v_collection ON vertex("
+    "  json_extract(doc, '$.collection_id')"
+    ")",
 ]
 
 #
@@ -300,6 +336,58 @@ PRAGMAS: List[str] = [
     "PRAGMA synchronous=NORMAL",
     "PRAGMA foreign_keys=OFF",
     #
+    # Without this, the WAL grows without bound and nothing reclaims it. Measured on a real node:
+    # a 10.3 GB database beside a 32.7 GB write-ahead log, having doubled from 16.7 GB in a day of
+    # bulk ingests. Every cold read scans that WAL — measured at >45 s cold against 6.28 s warm, a
+    # 7x penalty paid once per session by every reader — and `du` over the directory stopped
+    # returning at all, which is what hung the node's supervisor in its own preflight.
+    #
+    # This bounds future growth; it does not shrink what is there. `wal_autocheckpoint` runs
+    # passive checkpoints, which fold committed frames back into the database and then reuse the
+    # WAL from the start — the file stays at its high-water mark forever. Only
+    # `wal_checkpoint(TRUNCATE)` resets it to zero, and that needs the node quiet because an active
+    # reader's snapshot blocks it, so an existing oversized WAL is a separate, one-off maintenance
+    # action.
+    #
+    # `agience-ember`'s `src/ember/genesis.py::_wal_checkpoint` carries the same measurement for
+    # the same reason — an uncheckpointed bulk re-ingest grows its own lattice WAL and every read
+    # then scans the whole thing — and calls TRUNCATE every N bulk batches. Same file, same
+    # magnitude, same consequence. See
+    # `_archive/2026-08-26-tighten-threads-closed/LATTICE-WAL-NEVER-CHECKPOINTS.md`.
+    #
+    # 2000 pages against SQLite's inherited default of 1000: this store's pages are 4 KB, so a
+    # checkpoint is attempted roughly every 8 MB of WAL rather than every 4 MB. Doubling it halves
+    # the checkpoint attempts on a write-heavy ingest while still keeping the WAL two orders of
+    # magnitude below what it reached unattended. It is written out rather than inherited so that a
+    # future SQLite changing its default cannot change this store's behaviour silently.
+    "PRAGMA wal_autocheckpoint=2000",
+    #
+    # `wal_autocheckpoint` bounds the steady state; this bounds what is left after a blocked
+    # period, and they are not the same guarantee. Measured on scratch stores, both pragmas held
+    # constant except this one:
+    #
+    #     journal_size_limit  autocheckpoint=2000, steady-state WAL
+    #     -1                  8,408,952
+    #     65536               8,408,952      ← identical: with checkpoints RUNNING it changes nothing
+    #
+    # So it is not a steady-state fix. It matters when checkpoints are blocked — a reader holding
+    # an older snapshot stops frames being reclaimed, the WAL grows past any threshold, and the
+    # file then keeps that high-water mark forever:
+    #
+    #     journal_size_limit  after writes   after PASSIVE   after the NEXT write
+    #     -1                   2,768,672      2,768,672       2,768,672   ← peak held
+    #     65536                2,768,672      2,768,672          65,536   ← truncated
+    #
+    # The timing is counterintuitive: the truncation happens on the first write after a resetting
+    # checkpoint, not at the checkpoint itself. A reader measuring the file immediately after
+    # `wal_checkpoint(PASSIVE)` sees no change and would conclude the pragma does nothing.
+    #
+    # 64 MiB against an 8.19 MiB autocheckpoint threshold (2000 × 4 KiB pages) is eight times the
+    # steady state, so a normal ingest burst never touches it, while the residual after a
+    # reader-blocked stretch is bounded at 64 MiB rather than growing without limit. It is a
+    # ceiling, not a target — nothing shrinks to it on a store that never exceeds it.
+    "PRAGMA journal_size_limit=67108864",
+    #
     # The reason it cannot help: these stages do a single-pass sequential scan. Each page is
     # read once and evicted, so a larger cache has nothing to re-serve, while `mmap` adds
     # per-page mapping overhead to every one of them. A page cache pays for repeated access,
@@ -316,6 +404,41 @@ ALL_DDL: List[str] = VERTEX_DDL + EDGE_DDL + SUPPORT_DDL
 def apply_pragmas(conn: sqlite3.Connection) -> None:
     for p in PRAGMAS:
         conn.execute(p)
+
+
+def wal_checkpoint(conn: sqlite3.Connection, mode: str = "TRUNCATE") -> tuple[int, int, int]:
+    """Fold the write-ahead log back into the database and reset it. Returns SQLite's own triple.
+
+    The counterpart of `agience-ember`'s `genesis.py::_wal_checkpoint`, in the same shape for the
+    same reason: an uncheckpointed bulk write grows the WAL until every read scans the whole thing.
+    `journal_mode=WAL` alone is not enough; this is the missing half.
+
+    `TRUNCATE`, not `PASSIVE`, and the difference is the whole point. `PASSIVE` folds committed
+    frames back and then reuses the WAL from its start — the file stays at its high-water mark
+    forever, which is why `wal_autocheckpoint` alone never recovers a byte on its own. Only `TRUNCATE`
+    resets the file to zero.
+
+    AND IT CAN LEGITIMATELY DO NOTHING. A checkpoint cannot pass an active reader's snapshot: any
+    connection holding an older view blocks the frames after it. SQLite reports that by returning
+    `busy=1` rather than by raising, so a caller that ignored the return value would log a
+    successful checkpoint that moved nothing. The triple is returned for that reason, and the
+    return is `(busy, log_pages, checkpointed_pages)` exactly as SQLite defines it.
+
+    Not called automatically from here. Where a bulk path should checkpoint is a decision about that
+    path's batching - `genesis.py` does it every N batches and again after each pass - and guessing
+    at it from the schema module would put the policy in the wrong place.
+    """
+    mode = mode.upper()
+    if mode not in ("PASSIVE", "FULL", "RESTART", "TRUNCATE"):
+        raise ValueError("unknown checkpoint mode %r - SQLite defines PASSIVE, FULL, RESTART, "
+                         "TRUNCATE" % mode)
+    row = conn.execute("PRAGMA wal_checkpoint(%s)" % mode).fetchone()
+    # A connection with no WAL (an in-memory or journal-mode database) returns no row rather than
+    # zeros. Reporting that as `(0, 0, 0)` would be indistinguishable from a checkpoint that ran and
+    # found nothing to do.
+    if row is None:
+        return (0, -1, -1)
+    return (int(row[0]), int(row[1]), int(row[2]))
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:

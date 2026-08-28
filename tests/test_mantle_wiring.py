@@ -19,7 +19,7 @@ from mantle.search.mantle import wiring
 from mantle.search.mantle.file_cell_store import FileCellStore
 from mantle.search.mantle.indexer import MantleIndexer
 from mantle.search.mantle.s3_cell_store import S3CellStore
-from mantle.search.mantle.sse import FilePostingStore, S3PostingStore
+from mantle.search.mantle.sse import S3PostingStore, SqlitePostingStore
 
 
 class _FakeStoreDB:
@@ -191,12 +191,11 @@ PREREQUISITES = ("_build_oracle", "_build_sse_store", "_build_cell_store")
 class TestEveryQueryPrerequisiteIsHard:
     """Take any one of the three away and the query builder refuses. No degraded mode.
 
-    The cell store used to be best-effort here, which read backwards: a node with no SSE
-    store answered 503 while a node with no cell store answered 200 with an empty list. Recall
-    now narrows on the postings and RANKS on the cells, so a missing cell store is the state in
-    which nothing can rank — and a missing posting store is worse still, because the only two
-    things a recall could do without a narrowing are widen to the caller's whole light cone or
-    silently match nothing.
+    A best-effort cell store reads backwards: a node with no SSE store answers 503 while a node
+    with no cell store answers 200 with an empty list. Recall narrows on the postings and ranks on
+    the cells, so a missing cell store is the state in which nothing can rank — and a missing
+    posting store is worse still, because the only two things a recall can do without a narrowing
+    are widen to the caller's whole light cone or silently match nothing.
     """
 
     @pytest.mark.parametrize("missing", PREREQUISITES)
@@ -285,7 +284,7 @@ class TestSseStoreSelection:
         """With no object storage configured, the builder falls back to the local index rather
         than returning None — otherwise `POST /artifacts/recall {candidates}` would answer 503 on every
         standalone install, with no setting that could fix it."""
-        assert isinstance(self._build(*self._s3(configured=False)), FilePostingStore)
+        assert isinstance(self._build(*self._s3(configured=False)), SqlitePostingStore)
 
     def test_s3_configured_install_is_unaffected(self):
         """Configured and reachable resolves to the S3 adapter, matching every existing
@@ -303,7 +302,7 @@ class TestSseStoreSelection:
         """`MANTLE_SSE_STORE=file` selects the local index even when S3 is configured, so an
         operator does not have to unset content credentials to get one."""
         monkeypatch.setenv("MANTLE_SSE_STORE", "file")
-        assert isinstance(self._build(*self._s3(configured=True)), FilePostingStore)
+        assert isinstance(self._build(*self._s3(configured=True)), SqlitePostingStore)
 
     def test_s3_is_selectable_and_never_falls_back(self, monkeypatch):
         """`MANTLE_SSE_STORE=s3` never falls back to the local index: an operator who pinned

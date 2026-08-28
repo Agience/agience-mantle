@@ -32,7 +32,10 @@ from mantle.services.dependencies import (
 )
 
 _STORE_GRANTS = "mantle.services.dependencies.db_store.get_active_grants_for_principal_resource"
-_STORE_PARENT = "mantle.services.dependencies.db_store.get_origin_parent"
+#: The walk lives in `lattice_api.origin_chain` and calls its own module's
+#: `get_origin_parent`, so the double aims there. `db.backend` is a facade over the same
+#: function; patching the facade would leave the walk reading the real store.
+_STORE_PARENT = "mantle.db.lattice_api.get_origin_parent"
 
 # ---------------------------------------------------------------------------
 # Fixtures

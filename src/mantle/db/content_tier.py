@@ -47,7 +47,19 @@ import os
 import threading
 import time as _time
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:                    # pragma: no cover - annotation only
+    # `content_cipher` is annotated `-> "MultiFernet"`, and MultiFernet was bound ONLY
+    # inside that function's body — so the annotation named nothing a type checker could
+    # resolve. Imported here rather than at module scope to keep `cryptography` a lazy
+    # dependency, which is what the in-function import is for.
+    #
+    # This fixes the CHECKER, not `typing.get_type_hints(content_cipher)`, which still
+    # raises NameError — at run time `TYPE_CHECKING` is False and the name is absent from
+    # module globals. That is inherent to the idiom, not an oversight: a caller that needs
+    # the hint at run time must pass `localns`. Verified by running it, 2026-08-25.
+    from cryptography.fernet import MultiFernet
 
 from .content_cache import (CacheCorrupt, CacheMiss, ContentCacheError,
                             FileContentCache, _hash_of)
@@ -178,6 +190,25 @@ class TieredContentStore:
             blob = self.remote.get(ref)
         except Exception as e:
             self._count("remote_miss")
+            # ── a corrupt LOCAL object outranks a remote miss as the reported cause ──────────
+            # The guard above says "corrupt must not be laundered into miss by the tiering" and
+            # then only applies it when there is no remote. With a remote configured, a local
+            # `ContentKeyMismatch` was replaced by `RemoteMiss`, which `content_service` reports
+            # as "is not in this node's local content tier and there is no object-store address"
+            # — i.e. the surface says the object is ABSENT when it is present, intact, and simply
+            # will not decrypt.
+            #
+            # Measured 2026-08-25 on 71/home: all 313,982 CAS-backed artifacts failed to
+            # hydrate. The reported error named a missing blob and a missing content_key; the
+            # actual error, four layers down, was `ContentKeyMismatch: AES-GCM tag mismatch`, and
+            # `ref in cache` was True with the file present on disk the whole time. The wrong
+            # error sent the diagnosis after the blob and the object store instead of after the
+            # key.
+            #
+            # A plain `CacheMiss` still falls through to the remote answer, because there the
+            # remote genuinely is the better report: the object is not here and was not there.
+            if local_err is not None and not isinstance(local_err, CacheMiss):
+                raise local_err
             # boto3 raises the same ClientError family for absent-key and unreachable-backing;
             # the message carries which. Distinct-exception refinement can come with a measured
             # need — what must not happen is either case returning b"".

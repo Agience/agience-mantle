@@ -6,7 +6,7 @@
     python -m mantle.scripts.dev_init_keys --keys-dir ./.data/keys --force   # replace an existing set
     python -m mantle.scripts.dev_init_keys --keys-dir ./.data/keys --dry-run # report, write nothing
 
-⛔ DEVELOPMENT ONLY. These keys are generated on the spot by a script anyone can read, on a box
+Development only. These keys are generated on the spot by a script anyone can read, on a box
 with no key custody, and this file's whole job is to make them easy to produce. A deployment's
 keys come from its own custody process — the platform installer, a KMS, an init container — and
 `--force` exists so that replacing a dev keyset is a decision rather than an accident.
@@ -182,8 +182,8 @@ def _owner_record(keys_dir: Path) -> dict:
 def verify_keyset(keys_dir: Path) -> list:
     """Return a list of complaints about the keyset in *keys_dir*; empty means it is intact.
 
-    The check that matters is the last one: a shared file whose fingerprint no longer matches the
-    marker was replaced by something other than this script. That is exactly what a second install
+    The check that matters is the last one: a shared file whose fingerprint does not match the
+    marker was replaced by something other than this script. That is what a second install
     writing into the same directory looks like, and it is otherwise silent until a secret fails to
     decrypt — long after the run that caused it.
     """

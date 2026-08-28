@@ -10,7 +10,7 @@ calls. Tests cover:
 - direct grant + descendants → union
 - propagate mask blocks descendants → only direct included
 - unknown action → empty
-- deny-effect grant → not authorizing (audit S1)
+- deny-effect grant → not authorizing
 - the context lattice is seeded from what containment reached, held under a stated action
   ceiling, CONFINED to the grant-derived set, and bounded (D16)
 
@@ -65,7 +65,7 @@ def test_grant_lacking_action_flag_is_excluded():
 
 
 # ---------------------------------------------------------------------------
-# effect — deny is the absorbing element (audit S1)
+# effect — deny is the absorbing element
 # ---------------------------------------------------------------------------
 #
 # The resolver used to filter on the CRUDEASIO flag alone (`getattr(g, flag_attr, False)`),
@@ -471,6 +471,14 @@ def test_verifier_does_not_drop_requester_type_before_the_lookup():
             captured["principal_type"] = principal_type
             return set()
 
+        def _grants_for(self, principal_id, principal_type):
+            # A collection-scoped request is answered by walking up from the collection and
+            # testing each resource against the requester's grants, so this is where the type
+            # has to arrive. A grant key's grants are a resolved bundle and a user's are a
+            # ledger lookup; defaulting to "user" reads the wrong set for a key.
+            captured["principal_type"] = principal_type
+            return []
+
     with patch.object(
         lc, "_raw_artifact", return_value={"id": "col-1", "collection_id": "col-1"},
     ):
@@ -483,3 +491,169 @@ def test_verifier_does_not_drop_requester_type_before_the_lookup():
     # principal_type must be threaded through to the resolver rather than falling
     # back to the default "user" value regardless of who asked.
     assert captured["principal_type"] == "service"
+
+
+class TestAPostingKeyedByRootStillResolves:
+    """`_raw_artifacts` must answer for a ROOT id, not only for a vertex id.
+
+    `ingest/pipeline_unified._sse_index_artifact` indexes under `artifact.root_id or artifact.id`,
+    so every posting for a versioned artifact names the ROOT — and `workspace_service
+    .upsert_identity_member` deliberately never materialises that root ("the root is the identity
+    and the id is the version"). Without the second hop the narrowing names an id, the id lookup
+    misses, and `resolve_authorized_scope` drops it at `if not doc: continue`.
+
+    Measured 2026-08-25 on 71/home: the `Claude Code` capture collection held 97 containment edges
+    with zero existing targets and 183 captures with zero materialised roots. Every session
+    transcript and file mirror the hooks wrote for a month was narrowed to and then dropped.
+    """
+
+    @staticmethod
+    def _store(vertices, lineages):
+        """A store double: `id` lookups miss, `versions_of_many` answers by root."""
+        class _Artifacts:
+            def __init__(self):
+                self.calls = []
+
+            @property
+            def db(self):
+                raise RuntimeError("no SQL handle")     # force the per-id fallback path
+
+            def versions_of_many(self, root_ids):
+                self.calls.append(list(root_ids))
+                return {r: lineages[r] for r in root_ids if r in lineages}
+
+        class _Store:
+            def __init__(self):
+                self.artifacts = _Artifacts()
+
+        return _Store()
+
+    def test_a_root_id_resolves_to_its_newest_committed_version(self, monkeypatch):
+        from mantle.search.mantle import lightcone
+
+        store = self._store({}, {
+            "root-1": [
+                {"id": "v1", "root_id": "root-1", "state": "committed", "name": "old"},
+                {"id": "v2", "root_id": "root-1", "state": "committed", "name": "new"},
+            ],
+        })
+        monkeypatch.setattr(lightcone, "_raw_artifact", lambda *_a, **_k: None)
+        docs = lightcone._raw_artifacts(store, ["root-1"])
+        assert docs["root-1"]["name"] == "new", (
+            "the lineage is oldest-first, so the LAST committed doc is the current one"
+        )
+
+    def test_a_draft_is_not_substituted_for_a_missing_commit(self, monkeypatch):
+        """`recall` reads the committed segment; answering with a draft publishes what nobody did."""
+        from mantle.search.mantle import lightcone
+
+        store = self._store({}, {
+            "root-2": [{"id": "d1", "root_id": "root-2", "state": "draft", "name": "wip"}],
+        })
+        monkeypatch.setattr(lightcone, "_raw_artifact", lambda *_a, **_k: None)
+        assert lightcone._raw_artifacts(store, ["root-2"]) == {}
+
+    def test_the_second_hop_runs_only_on_the_misses(self, monkeypatch):
+        """An ordinary recall, where every id is a real vertex, must not pay a lineage read."""
+        from mantle.search.mantle import lightcone
+
+        store = self._store({}, {})
+        monkeypatch.setattr(
+            lightcone, "_raw_artifact",
+            lambda _s, aid: {"id": aid, "state": "committed"},
+        )
+        docs = lightcone._raw_artifacts(store, ["a", "b"])
+        assert set(docs) == {"a", "b"}
+        assert store.artifacts.calls == [], "no miss, so no lineage read"
+
+    def test_a_store_without_versions_of_many_behaves_exactly_as_before(self, monkeypatch):
+        """A test double or non-lattice backend must not start raising because of this."""
+        from mantle.search.mantle import lightcone
+
+        class _Bare:
+            class artifacts:                     # noqa: D106 - no versions_of_many at all
+                pass
+
+        monkeypatch.setattr(lightcone, "_raw_artifact", lambda *_a, **_k: None)
+        assert lightcone._raw_artifacts(_Bare(), ["x"]) == {}
+
+
+class TestAConeTooLargeToHoldCanStillBePaged:
+    """`authorized_page` answers "what may I see" without materialising the answer.
+
+    Measured 2026-08-25 on 71/home for `d36f0429`, the index-writer principal that holds
+    `stage.0.lexicon` (1.85M members) alongside grammar, world, ontology and the whole pharos tree:
+
+        LightConeResolver.resolve(...)      EdgesTruncated after 53.7s
+        authorized_page(offset=0,  limit=20)   20 ids in 0.09s
+        authorized_page(offset=100, limit=20)  20 ids in 0.49s
+
+    The raise happens inside `resolve_authorized_scope`, so before this the principal lost the
+    listing endpoint for EVERY collection it held, not only the oversized one.
+    """
+
+    @staticmethod
+    def _store(ids):
+        class _Conn:
+            def execute(self, sql, params=()):
+                assert "ORDER BY id" in sql, "offset indexes into a defined order or into nothing"
+                return [(i, None) for i in sorted(ids)]
+
+        class _Artifacts:
+            class db:
+                @staticmethod
+                def read():
+                    return _Conn()
+
+        class _Store:
+            artifacts = _Artifacts()
+
+        return _Store()
+
+    def _page(self, monkeypatch, ids, reachable, **kw):
+        from mantle.search.mantle import lightcone
+
+        monkeypatch.setattr(lightcone, "_grant_sets", lambda *_a, **_k: ({"g"}, set()))
+        monkeypatch.setattr(
+            lightcone, "_reaches",
+            lambda _db, aid, *_a, **_k: aid in reachable,
+        )
+        return lightcone.authorized_page(self._store(ids), object(), "p", **kw)
+
+    def test_it_returns_only_what_the_walk_authorizes(self, monkeypatch):
+        page = self._page(monkeypatch, ["a", "b", "c"], reachable={"a", "c"}, limit=10)
+        assert page == ["a", "c"]
+
+    def test_offset_indexes_into_the_authorized_sequence_not_the_scan(self, monkeypatch):
+        """Skipping must count authorized ids, or a page would drop rows the caller may see."""
+        page = self._page(monkeypatch, ["a", "b", "c", "d"], reachable={"a", "c", "d"},
+                          offset=1, limit=10)
+        assert page == ["c", "d"]
+
+    def test_limit_stops_the_scan(self, monkeypatch):
+        page = self._page(monkeypatch, ["a", "b", "c", "d"], reachable={"a", "b", "c", "d"},
+                          limit=2)
+        assert page == ["a", "b"]
+
+    def test_a_principal_with_no_grants_gets_nothing_without_scanning(self, monkeypatch):
+        from mantle.search.mantle import lightcone
+
+        monkeypatch.setattr(lightcone, "_grant_sets", lambda *_a, **_k: (set(), set()))
+        called = []
+        monkeypatch.setattr(lightcone, "_reaches",
+                            lambda *_a, **_k: called.append(1) or True)
+        assert lightcone.authorized_page(self._store(["a"]), object(), "p") == []
+        assert called == [], "no grants is answerable without touching the store"
+
+    def test_no_sql_handle_returns_empty_rather_than_raising(self, monkeypatch):
+        from mantle.search.mantle import lightcone
+
+        class _Bare:
+            class artifacts:
+                class db:
+                    @staticmethod
+                    def read():
+                        raise RuntimeError("no handle")
+
+        monkeypatch.setattr(lightcone, "_grant_sets", lambda *_a, **_k: ({"g"}, set()))
+        assert lightcone.authorized_page(_Bare(), object(), "p") == []

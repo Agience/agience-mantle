@@ -171,6 +171,12 @@ def test_exclusively_owned_artifact_is_destroyed_positive_control():
         patch("mantle.search.ingest.pipeline_unified.delete_artifact_from_index"),
         patch("mantle.db.backend.list_collection_artifacts", return_value=[{"id": "a-1", "root_id": "r-1"}]),
         patch("mantle.db.backend.count_other_containers_for_root", return_value=0),
+        # , 2026-08-26. An EXCLUSIVELY OWNED artifact is one whose origin parent is this
+        # workspace, so the caller's grant on the workspace already reaches it and the cascade may
+        # destroy it. Stated explicitly because the db here is a MagicMock: without this the origin
+        # lookup returns a mock that is not this container, the guard fails closed, and this
+        # positive control would silently become a test of the REFUSAL path.
+        patch("mantle.db.backend.get_origin_parent", return_value=("ws-1", 0)),
         patch("mantle.db.backend.delete_artifacts_by_root") as destroy,
         patch("mantle.db.backend.remove_all_edges_for_root") as nuke_edges,
         patch("mantle.db.backend.remove_artifact_from_collection") as evict,

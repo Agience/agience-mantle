@@ -3,19 +3,19 @@
 # Unified auth dependency layer.
 #
 # Public API:
-#   AuthContext        — dataclass returned by get_auth()
-#   get_auth()         — single FastAPI dependency for all endpoints
-#   get_person()       — load Person entity for the authenticated user
-#   resolve_auth()     — plain-function core (usable outside FastAPI DI)
-#   require_platform_admin() — post-auth guard
-#   get_end_user_claims() — user-only JWT guard (rejects retired API-key JWTs)
-#   check_access()        — verify principal has permission on an artifact
-#   _check_grant_permission() — grant permission helper
+# AuthContext — dataclass returned by get_auth
+# get_auth — single FastAPI dependency for all endpoints
+# get_person — load Person entity for the authenticated user
+# resolve_auth — plain-function core (usable outside FastAPI DI)
+# require_platform_admin — post-auth guard
+# get_end_user_claims — user-only JWT guard (rejects retired API-key JWTs)
+# check_access — verify principal has permission on an artifact
+# _check_grant_permission — grant permission helper
 
 import logging
 from dataclasses import dataclass, field
 from functools import partial
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import HTTPException, Depends, Security, Request
 from fastapi.security import (
@@ -48,12 +48,12 @@ logger = logging.getLogger(__name__)
 def get_store_db() -> Generator[Database, None, None]:
     """The store handle for FastAPI dependency injection — backend-selected (see `db.backend`).
 
-    Yields Mantle's OWN store (`db.lattice_api.LatticeDatabase`, one SQLite file opened once
-    per process — THE STANDALONE DB; the same handle startup uses).
+    Yields Mantle's own store (`db.lattice_api.LatticeDatabase`, one SQLite file opened once
+    per process — the standalone DB; the same handle startup uses).
 
-    Deliberately a SYNCHRONOUS generator, and it must stay one. FastAPI runs a sync generator
+    Deliberately a synchronous generator, and it must stay one. FastAPI runs a sync generator
     dependency in its worker thread pool; rewriting it as `async def` would move
-    `store_handle()` — which opens the SQLite file and runs `ensure_schema` on the first
+    `store_handle` — which opens the SQLite file and runs `ensure_schema` on the first
     request of a process — onto the event loop, where it would block every other request.
     "Make the dependency async" is the wrong direction here: the offload is `offload_sync`
     below, applied to the work, not to the handle.
@@ -73,7 +73,7 @@ async def offload_sync(fn, *args, **kwargs):
 
     Applied, not merely available: `get_auth` / `get_person` here, and in the routers the
     list / read / search / create handlers plus the byte path (see `routers/artifacts_router.py`,
-    `grants_router.py`, `system_router.py`). It is NOT applied to every store touch — the rule
+    `grants_router.py`, `system_router.py`). It is not applied to every store touch — the rule
     is that a call earns a hop by issuing more than one query or doing file/network/crypto I/O.
     A single indexed seek (`_artifact_exists`, `has_children`, `get_grant_by_id`) costs less than
     the thread hop that would wrap it, so those stay on the loop. Nor does a router whose handlers
@@ -88,7 +88,7 @@ async def offload_sync(fn, *args, **kwargs):
         sqlite3 refuses to allow.
       * Writers serialise on a process-wide `RLock` plus `BEGIN IMMEDIATE`, so concurrent
         workers queue on a cheap mutex instead of racing to `SQLITE_BUSY`.
-      * A transaction never spans threads. `write()`'s re-entrancy depth and every
+      * A transaction never spans threads. `write`'s re-entrancy depth and every
         `SeqAllocator`'s in-transaction cache are thread-local, so one whole store call must
         run in one thread — which is exactly what this does. Splitting a transaction across
         threads would break gap-free `_seq` allocation; passing a *whole* call across one does
@@ -119,9 +119,17 @@ async def offload_sync(fn, *args, **kwargs):
 # AuthContext
 # ---------------------------------------------------------------------------
 
+#: The commons. Imported rather than re-spelled: `AuthContext.__post_init__` refuses to let anything
+#: authenticate as it, and `check_access` reads a Read grant to it as publicity — two enforcement
+#: points that must be talking about the same id or the reservation means nothing. `db.access` has
+#: no module-level import of this module (its lattice reach is lazy, through `_api`), so this
+#: direction is the safe one.
+from mantle.db.access import PUBLIC_PRINCIPAL as _PUBLIC_PRINCIPAL      # noqa: E402
+
+
 @dataclass
 class AuthContext:
-    """Unified auth context returned by ``get_auth()``.
+    """Unified auth context returned by ``get_auth``.
 
     A single consistent shape for every auth path. Field names follow
     the Unified Artifact API spec.
@@ -129,7 +137,7 @@ class AuthContext:
 
     #: Who the work is done on behalf of: user_id | grant_id | service name. For every
     #: principal that acts FOR someone — ``delegation``, ``mcp_client`` — this is the
-    #: SUBJECT, not the machine; the machine is :attr:`actor`. A grant key is the
+    #: SUBJECT, not the machine; the machine is:attr:`actor`. A grant key is the
     #: exception that proves the rule: it acts for nobody, so it is its own subject.
     principal_id: str = ""
     principal_type: str = "user"                        # "user" | "grant_key" | "service" | "mcp_client"
@@ -157,6 +165,47 @@ class AuthContext:
     name: Optional[str] = None                          # profile display name from token claims
     bearer_grant: Optional[GrantEntity] = None           # convenience: grant resolved from Bearer grant key
     target_artifact_id: Optional[str] = None             # artifact scoping from prefixed Bearer token ({id}:agk_xxx)
+    #: The ``scope`` claim, when the token carries one. Origin issues system delegations under a
+    #: named purpose and stamps the matching scope — ``platform.email.send``,
+    #: ``platform.stripe.resolve`` — and its purpose table says why: "Scoped to one capability,
+    #: like every entry here, so it cannot be widened into a general secret-reader."
+    #:
+    #: This field is half of making that true. Measured 2026-08-26: ``payload.get("scope")``
+    #: appeared nowhere in ``agience-mantle/src``. The delegation branch below returns
+    #: ``principal_type="user"``, so a scoped platform token became an ordinary user principal
+    #: carrying `platform-system`'s full grants — a `platform-mail` token authenticated identically
+    #: to a `platform-stripe` one, and both reached whatever that principal reached.
+    #:
+    #: Recorded here; enforced by :func:`_enforce_token_scope`. Provenance alone would repeat the
+    #: gap — the claim was always present, it was never consulted.
+    scope: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        """Nobody authenticates as the commons.
+
+        `db/access.py` calls `PUBLIC_PRINCIPAL` a reserved principal, and this is where the
+        reservation is enforced. It is a plain string, and `user_id` on the default JWT path is
+        `str(payload.get("sub"))` — passed through from the token untouched. So a token whose `sub`
+        is the literal `public` produced a caller whose grant lookups return the COMMONS' grants as
+        its own direct grants: `_check_grants` asks
+        `get_active_grants_for_principal_resource(grantee_id=auth.user_id)`, and every grant that
+        made something public is a grant to exactly that id.
+
+        Enforced here rather than at the five `AuthContext(...)` sites in `get_auth`, because here it
+        covers all five and the sixth that gets added later. The commons is a grantEE and never a
+        grantOR or a caller: granting TO `public` stays the documented way to publish (no copy, no
+        re-key), and that is untouched.
+
+        Raises 401 rather than 403: this is not a caller being refused an action, it is a token that
+        does not name a principal that may act.
+        """
+        for label, value in (("sub", self.principal_id), ("user", self.user_id)):
+            if value and str(value) == _PUBLIC_PRINCIPAL:
+                raise HTTPException(
+                    status_code=401,
+                    detail=f"{_PUBLIC_PRINCIPAL!r} is the reserved commons principal and cannot "
+                           f"authenticate ({label})",
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +221,7 @@ class AuthContext:
 #: A node with no authority configured names no endpoint at all rather than inventing one, and a
 #: deployment fronted by an external IdP authenticates against that IdP's own endpoints — neither
 #: is knowable here, and `/.well-known/oauth-protected-resource` (RFC 9728, built from
-#: `config.authorization_servers()`) is the machine-readable answer in both cases. This scheme is
+#: `config.authorization_servers`) is the machine-readable answer in both cases. This scheme is
 #: Swagger affordance only; it is not a second claim about who the issuer is.
 _AUTHORITY = (config.AUTHORITY_ISSUER or "").rstrip("/")
 
@@ -232,7 +281,7 @@ def _claim_name(payload: dict) -> Optional[str]:
 def _claim_aud_str(payload: dict) -> Optional[str]:
     """``aud`` as a single readable string, for the audit field it is recorded in.
 
-    RFC 7519 allows ``aud`` to be an array, and a naive ``str()`` would render one as
+    RFC 7519 allows ``aud`` to be an array, and a naive ``str`` would render one as
     ``"['a', 'b']"`` — a Python repr in an audit log, and a name that matches no client id
     anyone could search for. Only ever read for provenance, never to decide access, so the
     ambiguous multi-audience case is spelled out rather than resolved.
@@ -273,11 +322,90 @@ def _validate_aud_for_principal(payload: dict) -> None:
             raise HTTPException(status_code=401, detail="Invalid token audience")
 
 
+#: What each named platform scope is allowed to reach, as ``scope -> (method, path predicate)``.
+#:
+#: Default-deny, and that is the whole point: a scope this table does not know is a bound Mantle
+#: cannot honour, and honouring it as "unrestricted" is how the claim became decorative in the
+#: first place. An unknown ``platform.*`` scope is refused, so adding a purpose to Origin's table
+#: without adding it here fails closed and loudly, rather than silently granting everything.
+#:
+#: Only ``platform.*`` scopes are governed. Ordinary OIDC tokens carry `scope` claims full of
+#: things Mantle has never interpreted (`openid`, `profile`, `email`, an IdP's own vocabulary), and
+#: refusing those would break every external-IdP login. The narrow prefix is what makes this
+#: enforceable today instead of a migration.
+_PLATFORM_SCOPE_PREFIX = "platform."
+
+
+def _scope_allows(scope: str, method: str, path: str) -> bool:
+    """Is *scope* permitted to make this request?
+
+    Both entries were derived from the only caller, `chorus/src/ophan/server.py`, measured
+    2026-08-26 — not from the scope names:
+
+        platform.email.send POST {MANTLE}/artifacts/{op_id}/op/invoke (server.py:269)
+        platform.stripe.resolve POST {MANTLE}/secrets/reveal (server.py:351)
+
+    Safe to make strict: `grep -c "system-delegation" origin.log` is 0 on 71/home, so this
+    exchange has never run and there is no live traffic to break.
+
+    `platform.stripe.resolve`'s target route does not exist — `/secrets/reveal` is one of the ten
+    dead in-house callers, deliberately left because it fails closed and loud. It is listed anyway:
+    this table says what a scope may reach, and a scope whose only destination 404s is a separate
+    problem from a scope that may reach everything.
+    """
+    if scope == "platform.email.send":
+        # The operator id is deliberately NOT pinned here. Ophan derives it as
+        # `uuid5(instance_namespace,...)` and Mantle's own provisioner derives the same value
+        # (`seed_provisioning/platform_email._operator_id`), so binding it would mean resolving the
+        # namespace on every request to gain a check the invoke path's own grants already make.
+        # The bound this enforces is "this token may only invoke, not read the whole store".
+        return method == "POST" and path.startswith("/artifacts/") and path.endswith("/op/invoke")
+    if scope == "platform.stripe.resolve":
+        return method == "POST" and path.rstrip("/") == "/secrets/reveal"
+    return False
+
+
+def _enforce_token_scope(auth: "AuthContext", request: Optional[Request]) -> None:
+    """Refuse a platform-scoped token on anything its scope does not name.
+
+    `aud` and `act.sub` sit inside the same Core-signed token, so a stolen delegation carries both
+    unchanged — a presenter-replay check on those fields cannot distinguish platform automation
+    from a genuine user delegation. What actually constrains a platform-scoped token is its shape:
+    the only tokens whose `aud` and `act.sub` differ are system delegations, and the rule this
+    enforces is that platform automation may not read a credential; only a user-delegated call may.
+
+    This lives at the authorizing layer rather than as a Chorus-side replay rule: it covers both
+    purposes, and it does not care which service presents the token.
+
+    Not established: the system principal's id derives from the instance namespace and needs
+    Origin's key material, so what it can reach is not resolved here. On the live store: 3,637
+    grants, 12 grantees, exactly one naming a platform principal (`platform.consolidate`) —
+    suggestive of a small blast radius, not proof.
+    """
+    scope = (auth.scope or "").strip()
+    if not scope or not scope.startswith(_PLATFORM_SCOPE_PREFIX):
+        return
+    # No request means no path to judge. Fail CLOSED: a scoped token whose target cannot be
+    # determined is exactly the case this exists to refuse.
+    method = (request.method if request is not None else "") or ""
+    path = (request.url.path if request is not None else "") or ""
+    if _scope_allows(scope, method, path):
+        return
+    logger.warning(
+        "refused a platform-scoped token: scope=%r may not reach %s %s (principal=%s actor=%s)",
+        scope, method or "?", path or "?", auth.principal_id, auth.actor,
+    )
+    raise HTTPException(
+        status_code=403,
+        detail=f"token scope {scope!r} does not permit this operation",
+    )
+
+
 def _check_grant_permission(grants: List[GrantEntity], action: str, resource_id: str = None) -> bool:
     """Check if any allow-effect grant permits the requested action.
 
     Deny-effect grants are excluded — callers that need deny semantics
-    should use check_access() instead.
+    should use check_access instead.
     """
     perm_attr = f"can_{action}"
     for grant in grants:
@@ -393,7 +521,7 @@ def resolve_auth(
         # token resolved to a principal that held no grants and no user id, so
         # `check_access` refused it on every route.
         #
-        # Rejected BY NAME, and before the audience rule, rather than deleted and left to
+        # Rejected by name, and before the audience rule, rather than deleted and left to
         # fall through: the default branch below is the user branch, which would read
         # `sub` — the string `server/<client_id>` — as a person and hand it a user's
         # identity. A principal type this node cannot resolve is a 401, not a user.
@@ -419,26 +547,25 @@ def resolve_auth(
             )
 
         if jwt_principal_type == "mcp_client":
-            # THE SUBJECT IS THE USER, THE CLIENT IS THE ACTOR — the same shape as
+            # The subject is the user, the client is the actor — the same shape as
             # `delegation` below, because it is the same situation: a machine calling on a
             # person's behalf, where `sub` names the person and a second claim names the
             # machine. Origin mints exactly that (`auth_router`: `sub` = user id, `aud` =
             # the client), so `aud` is an audience, not an identity to hold grants under.
             #
-            # Reading `aud` as `principal_id` split this principal in two. Everything that
-            # keys on `user_id` — `check_access`, and `list_visible`'s light cone, which
-            # resolves `auth.user_id` as a plain `"user"` — already saw the person and
-            # already worked. Only `acting_principal.acting_from_auth` reads `principal_id`,
-            # so the key oracle alone resolved a light cone for the CLIENT ID, found no
-            # grants under it, and refused every content key. A client could therefore list
-            # artifacts and never read one.
+            # Reading `aud` as `principal_id` would split this principal in two: everything
+            # that keys on `user_id` — `check_access`, and `list_visible`'s light cone, which
+            # resolves `auth.user_id` as a plain `"user"` — sees the person, but
+            # `acting_principal.acting_from_auth` reads `principal_id`, so the key oracle
+            # alone would resolve a light cone for the client id, find no grants under it,
+            # and refuse every content key — a client could list artifacts and never read one.
             #
-            # So this WIDENS NOTHING. It does not hand the client a reach it lacked; it
-            # makes key custody agree with the authorization decision two other call sites
-            # in the same request had already made against `sub`. The reachable set is
-            # unchanged — a request that was allowed is still allowed, a request that was
-            # denied is still denied — and what changes is that content under an allowed
-            # artifact now decrypts instead of failing closed.
+            # This widens nothing: it does not hand the client a reach it lacks, it makes key
+            # custody agree with the authorization decision two other call sites in the same
+            # request already make against `sub`. The reachable set is unchanged — a request
+            # that is allowed stays allowed, a request that is denied stays denied — and what
+            # changes is that content under an allowed artifact decrypts instead of failing
+            # closed.
             #
             # `scopes` is deliberately not consulted: Origin records it as "a record of the
             # request and not a per-client entitlement", so narrowing by it would read an
@@ -482,6 +609,10 @@ def resolve_auth(
                 actor=str(d_act_sub),
                 authority=str(payload.get("iss", "")) or None,
                 host_id=str(d_host),
+                # Carried through so `_enforce_token_scope` can honour it. Origin stamps this from
+                # its purpose table; a token without one is an ordinary user delegation and is
+                # unaffected.
+                scope=(str(payload.get("scope")) if payload.get("scope") else None),
             )
 
         # Default: user JWT.
@@ -541,7 +672,7 @@ async def get_auth(
     key issuance then fails closed rather than running under a stale or absent
     identity.
 
-    Resolution runs in a worker thread (see :func:`offload_sync`): it verifies a JWT, and on
+    Resolution runs in a worker thread (see:func:`offload_sync`): it verifies a JWT, and on
     the grant-key path reads and writes the store, none of it awaitable. On the event loop
     that work blocks every concurrent request, and it is on the front of every authenticated
     one. The acting principal is published below, back on the loop, because a contextvar set
@@ -555,6 +686,12 @@ async def get_auth(
     )
     if request is not None and auth.user_id:
         request.state.user_id = auth.user_id
+
+    # Before the acting principal is published, deliberately. `set_acting_principal` is what lets
+    # the key oracle issue material to this caller — so a token being refused for scope must not
+    # first be installed as the identity that may ask for keys. The whole point of the bound is that
+    # platform automation does not get to read a credential.
+    _enforce_token_scope(auth, request)
 
     # Each request runs in its own task with its own context copy, so this cannot
     # leak into another request; it is deliberately not reset, because it must stay
@@ -607,7 +744,7 @@ def _authority_bootstrap_complete(store_db: Database) -> bool:
     genuinely-bootstrapping operator isn't locked out by a transient query failure —
     the canonical grant check still gates everyone else.
 
-    Matches :func:`is_platform_admin` on ``can_admin`` deliberately. A weaker condition
+    Matches:func:`is_platform_admin` on ``can_admin`` deliberately. A weaker condition
     here would let the window close on a grant that confers no admin — leaving the
     operator retired and nobody able to appoint anyone, which is unrecoverable through
     the API.
@@ -756,6 +893,8 @@ def check_access(
     artifact_id: str,
     action: str,
     store_db: Database,
+    *,
+    grant_memo: Optional[Dict[str, list]] = None,
 ) -> GrantEntity:
     """Verify *auth* has permission to perform *action* on *artifact_id*.
 
@@ -769,6 +908,26 @@ def check_access(
     resolved (and narrowed by the bundle ceiling) at authentication. Everything after
     that — deny-first, root, light-cone walk — is identical, which is the point: a
     bearer key gets no separate, weaker enforcement path.
+
+    ``grant_memo`` — the hoist. Authorizing a page
+    of container members re-derives the same answer for the same ancestors once per member: every
+    member's chain passes through the container, so the container's grant row is fetched N times for
+    one page. Passing a dict caches the per-resource grant list for the length of one call site.
+
+    It memoises the lookup, not the verdict, and that distinction is the safety property. The
+    deny-first scan, the flag test and the walk order all still run per artifact against the cached
+    rows — so a deny sitting nearer than the container still wins, exactly as before. Caching the
+    *verdict* would let a container-level allow answer for a member carrying its own deny.
+
+    It is deliberately not a second traversal. The obvious hoist — resolve the container once,
+    then hand-roll a cheaper per-member check — would be a second implementation of the light-cone
+    walk, and this codebase has already paid for that: ``oracle.LightConeGrantVerifier`` asked the
+    same question of a collection and answered it by materialising every descendant, and the two
+    disagreed at scale. One traversal, memoised, cannot disagree with itself.
+
+    Request-scoped, never longer. The dict is supplied by the caller and dies with it. A memo that
+    outlived a request would serve a revoked grant to the next one — the cache would become the
+    authorization, which is the failure this parameter must never become. Nothing here stores it.
     """
     flag_attr = _ACTION_FLAG_MAP.get(action)
     if not flag_attr:
@@ -830,10 +989,14 @@ def check_access(
             # Already resolved and masked at authentication — re-querying by grantee
             # would find the members UNMASKED and hand back more than the bundle allows.
             grants = [g for g in auth.grants if g.resource_id == resource_id]
+        elif grant_memo is not None and resource_id in grant_memo:
+            grants = grant_memo[resource_id]
         else:
             grants = db_store.get_active_grants_for_principal_resource(
                 store_db, grantee_id=auth.user_id, resource_id=resource_id
             )
+            if grant_memo is not None:
+                grant_memo[resource_id] = grants
         for g in grants:
             if grant_is_deny(g) and getattr(g, flag_attr, False):
                 _witness("denied", "deny_grant")
@@ -843,60 +1006,75 @@ def check_access(
                 return g
         return None
 
-    # --- Direct grant on the target ---
-    direct = _check_grants(artifact_id)
-    if direct is not None:
-        _witness("allowed")
-        return direct
-
-    # --- Grant on the artifact's root ---
+    # --- The light cone, walked upward ---
     #
-    # A false denial here degrades availability, not confidentiality — the gap
-    # fails closed rather than open.
-    root_id = doc.get("root_id")
-    if root_id and root_id != artifact_id:
-        at_root = _check_grants(root_id)
-        if at_root is not None:
-            _witness("allowed")
-            return at_root
+    # `origin_chain` yields where a grant could sit to reach this artifact under this action,
+    # nearest first: the artifact, then its root, then each origin ancestor, stopping at the first
+    # edge whose propagate mask does not carry the action. That mask is the attenuation, and the
+    # same operator prunes the subtree behind such an edge when `list_origin_descendants` walks the
+    # other way — so the two directions cannot disagree about which edges conduct.
+    #
+    # The walk lives in `lattice_api` beside its downward twin rather than here, because
+    # `oracle.LightConeGrantVerifier` asks the same question about a collection and answered it by
+    # materialising every descendant instead. Two implementations of one traversal is how they came
+    # to disagree at scale: a collection with more members than `edges_of` will return raised there
+    # while this function answered in milliseconds.
+    #
+    # `_check_grants` raises on a deny at every level it visits, so the order of this loop is the
+    # deny-first rule: nothing further up can re-allow what a nearer deny refused.
+    try:
+        for resource in db_store.origin_chain(
+                store_db, artifact_id, action,
+                root_id=doc.get("root_id") or artifact_id):
+            held = _check_grants(resource)
+            if held is not None:
+                _witness("allowed")
+                return held
+    except db_store.OriginChainUnterminated:
+        _witness("denied", "origin_chain_did_not_terminate")
+        raise HTTPException(
+            status_code=500,
+            detail="origin chain did not terminate; the lattice is malformed",
+        )
 
-    # --- Light-cone: walk origin edges upward ---
-    cursor_id = doc.get("root_id") or artifact_id
-    visited = {cursor_id}
-    while True:
-        if len(visited) > _ORIGIN_WALK_CEILING:
-            _witness("denied", "origin_chain_did_not_terminate")
-            raise HTTPException(
-                status_code=500,
-                detail="origin chain did not terminate; the lattice is malformed",
-            )
-        parent = db_store.get_origin_parent(store_db, cursor_id)
-        if parent is None:
-            break
-        parent_id, propagate_mask = parent
-        if not parent_id or parent_id in visited:
-            break
+    # --- The commons: made public, so no grant is needed ---
+    #
+    # The API agrees with the mesh about what is public. `mesh/sync._withheld_lattice` stops
+    # withholding an artifact the moment `PUBLIC_PRINCIPAL` holds a Read grant reaching it, which is
+    # how "made public" publishes off-node with no copy and no re-key. Without this check a resource
+    # replicates to every peer while every API read of it 404s.
+    #
+    # Placed last. `_check_grants` raises on a deny grant at every level it visits, so by the time
+    # control reaches here no deny naming this principal exists on the artifact, its root, or any
+    # propagating ancestor. Publicity therefore cannot overturn a deny: it answers only the case
+    # where nothing said anything. Placed before the walk it would make a public resource
+    # unrevokable for a named principal.
+    #
+    # `is_made_public` rather than `is_public`. The latter also answers True for "born public" —
+    # ungrounded, or grounded in a collection no grant gates — which is the ordinary state of a
+    # private thing here and of any artifact whose `origin_root` could not be stamped, so reading it
+    # in this function would make the API fail open by default. See `db/access.py`.
+    #
+    # A read only. Publicity is a Read grant to the commons; it says nothing about writing, and the
+    # synthesized grant below carries exactly one bit so no caller can read more out of it than the
+    # commons was given.
+    if action == "read":
+        try:
+            from mantle.db import access as _access
 
-        # The light-cone prune, through the one attenuation operator rather than a second
-        # copy of it. This read `propagate_mask is not None and action not in propagate_mask`
-        # — the same rule `lattice_api.list_origin_descendants` spells out for the DOWNWARD
-        # BFS, written out a second time for the upward walk. `propagates` decodes the column
-        # with `Mask` and asks `allows`; the decoder is proved bit-for-bit equal to the old
-        # expression over every known column shape × every action in
-        # `tests/test_attenuation_algebra.py`, so no stored edge changes meaning. `action` is
-        # already known to be a CRUDEASIO verb (the `_ACTION_FLAG_MAP` guard at the top of
-        # this function), which is the only input on which the two could differ, and there
-        # the new one is the closed direction.
-        if not propagates(propagate_mask, action):
-            break
-
-        inherited = _check_grants(parent_id)
-        if inherited is not None:
-            _witness("allowed")
-            return inherited
-
-        visited.add(parent_id)
-        cursor_id = parent_id
+            if _access.is_made_public(store_db, doc):
+                _witness("allowed", "made_public")
+                return GrantEntity(
+                    id="", resource_id=artifact_id,
+                    grantee_type="user", grantee_id=_access.PUBLIC_PRINCIPAL,
+                    granted_by="", can_read=True,
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            # The grant subsystem could not answer whether this is public. Fall through to the 404
+            # below rather than allow: an unresolvable publicity question is not a publication.
+            logger.debug("publicity check failed for %s", artifact_id, exc_info=True)
 
     _witness("denied", "no_grant")
     raise HTTPException(status_code=404, detail="Not found")

@@ -267,8 +267,8 @@ async def test_a_task_whose_artifact_is_gone_dead_letters(routed, client):
 
 @pytest.mark.asyncio
 async def test_the_bytes_being_gone_dead_letters_rather_than_retrying_forever(routed, client):
-    """The local CAS no longer holds the ref. There is nothing on this node to mirror and no
-    second copy to recover it from — that absent copy is what the mirror was FOR."""
+    """The local CAS does not hold the ref. There is nothing on this node to mirror and no second
+    copy to recover it from — that absent copy is what the mirror is for."""
     up = await _upload(client, b"payload", mirror=_unreachable())
     with patch.object(cs, "local_content_has", return_value=False):
         report = _drain(routed, _Bucket())
@@ -439,9 +439,9 @@ async def test_a_refresh_beats_an_in_flight_claim_and_the_claim_finds_out(routed
 
 @pytest.mark.asyncio
 async def test_a_superseded_task_is_retried_once_and_then_dead_lettered(routed, client):
-    """A task naming a ref the artifact no longer points at is momentarily indistinguishable from a
-    live one — the refresh rewrites the row BEFORE `_record_content_ref` rewrites the artifact — so
-    it is retried once. A second sighting is the artifact's settled state and it dies."""
+    """A task naming a ref the artifact does not point at is momentarily indistinguishable from
+    a live one — the refresh rewrites the row before `_record_content_ref` rewrites the artifact —
+    so it is retried once. A second sighting is the artifact's settled state and it dies."""
     await _upload(client, b"payload", mirror=_unreachable())
     doc = _task_doc(routed)
     doc["arguments"] = {**doc["arguments"], "content_ref": "cas/" + "0" * 64}
@@ -585,10 +585,10 @@ def test_ember_selects_by_content_type_alone_and_this_is_not_the_one():
     used to, fail to invoke `op.content.mirror`, and dead-letter at its own `MAX_ATTEMPTS` an
     obligation it never looked at the bytes for.
 
-    Both halves are checked here, because either alone is worthless: that ember still selects on
-    the type alone (so the type is what matters), and that the type it selects is not ours (so it
-    selects none of our rows). What used to be a deployment invariant — *run the drain where an
-    ember pool worker is not* — is now a naming fact the query planner enforces.
+    Both halves are checked here, because either alone is worthless: that ember selects on the
+    type alone (so the type is what matters), and that the type it selects is not ours (so it
+    selects none of our rows). The separation is a naming fact the query planner enforces rather
+    than a deployment invariant about where the drain runs.
 
     Read as SOURCE rather than imported: `ember` imports `mantle` (not the other way round), so
     importing it from mantle's own suite would be a dependency cycle in the test rig. Skipped when

@@ -11,6 +11,7 @@ relies on. Read them before touching anything.
 """
 from __future__ import annotations
 
+import json
 import logging
 
 # Module level, not inside the try blocks that use it: an `except KeyCustodyDenied`
@@ -131,6 +132,24 @@ def encrypt_artifact_content(doc: dict) -> None:
     this codebase does not accept.
     """
     content = doc.get("content")
+
+    # Addressed content never enters the document. The bytes are already in the CAS at
+    # `cas/<sha256 of the plaintext>`, envelope-encrypted for their owner by
+    # `content_service.put_bytes_encrypted`, so the row carries the ADDRESS and nothing else.
+    # `decrypt_artifact_content` hydrates the body back on read, which is why indexing, recall
+    # previews and `GET /artifacts/{id}` never had to learn where it lives. Measured on 71/dev
+    # before this: 7.2 MB of 7.9 MB of doc bytes were artifact content; a 9,800-character body
+    # now leaves a 981-byte row.
+    if doc.get("content_ref"):
+        doc["content"] = ""
+        doc["content_encrypted"] = False
+        return
+
+    # Everything below is for rows written before the content tier, whose bytes exist nowhere else.
+    # Clearing an unaddressed body here would destroy the only copy, and encrypting it is the
+    # protection it has. The write path cannot reach this — `_store_content_in_s3` addresses every
+    # body it stores — so it is a read-modify-write of existing data rather than a second way to put
+    # content into the lattice.
     if not content or doc.get("content_encrypted"):
         return
     try:
@@ -163,7 +182,6 @@ def encrypt_artifact_content(doc: dict) -> None:
             "content encryption unavailable; refusing to persist plaintext"
         ) from exc
 
-
 def decrypt_artifact_content(raw: dict, *, strict: bool = True) -> None:
     """Decrypt an artifact doc's inline ``content`` in place if flagged.
 
@@ -183,6 +201,73 @@ def decrypt_artifact_content(raw: dict, *, strict: bool = True) -> None:
     ``require_encrypted=True``, so a flagged doc whose blob carries no MEC1 magic is an
     error rather than a passthrough — see the comment at the call below.
     """
+    # The bytes come from the CAS. `encrypt_artifact_content` keeps addressed content out of the
+    # document, so a row with a `content_ref` carries no body and this is where it comes back.
+    # Hydrating at the boundary rather than at each call site is what keeps indexing, previews and
+    # `GET /artifacts/{id}` reading `artifact.content` without learning where it lives.
+    #
+    # The read is authorized, not merely addressed: `get_bytes_decrypted` demands the envelope
+    # this artifact's own write sealed, and `FileContentCache` verifies the bytes against the
+    # address on the way out. A ref edited to name another object yields an error, not bytes.
+    ref = raw.get("content_ref")
+    if ref and not (raw.get("content") or ""):
+        # ── the WRITE keys on the collection; the READ must try that too ────────────────────
+        # `encrypt_artifact_content` seals under `content_key_principal` — "the collection's
+        # origin root ... NOT on `created_by`" — while this read asked for
+        # `CONTENT_KEY_PRINCIPAL or created_by`. The two agree only when `origin_root` is stamped.
+        #
+        # Measured 2026-08-25 on 71/home: the 310,003 bulk-ingested Wikipedia artifacts carry
+        # `collection_id` and NO `origin_root`, so the read asked for `created_by` (`54eaa8aa`,
+        # ember-source) and the envelope had been sealed under `stage.1.grammar`. Every body failed
+        # to hydrate, and the error read `GrantDenied` — a grant on `created_by` was minted to
+        # chase it and changed nothing, because that principal has no master key at all. Opening
+        # the same blob under the collection returned 16,116 bytes on the first try.
+        #
+        # Ordered candidates rather than one guess: the stamped principal is authoritative when it
+        # is there, the collection scope is what the writer actually used, and `created_by` stays
+        # last for the rows 📄 `content_key_principal` describes as "keyed to `created_by`" before
+        # the re-key migration. A wrong candidate raises and the next is tried; none of them can
+        # return the wrong plaintext, because AES-GCM authenticates.
+        scope = content_key_scope(raw)
+        candidates = []
+        for candidate in (raw.get(CONTENT_KEY_PRINCIPAL), scope, raw.get("created_by")):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        try:
+            from mantle.services.content_service import get_bytes_decrypted
+            context = raw.get("context")
+            if isinstance(context, str):
+                try:
+                    context = json.loads(context)
+                except (TypeError, ValueError):
+                    context = {}
+            content_key = (context or {}).get("content_key") if isinstance(context, dict) else None
+            last = None
+            for principal in candidates:
+                try:
+                    raw["content"] = get_bytes_decrypted(
+                        content_key or "", principal, cas_ref=ref, collection_id=scope,
+                    ).decode("utf-8")
+                    last = None
+                    break
+                except Exception as attempt:  # noqa: BLE001 — try the next candidate
+                    last = attempt
+            if last is not None:
+                raise last
+        except Exception as exc:
+            # An unreadable body is not an empty one. `strict` carries the same meaning it does
+            # below: a single-artifact read raises rather than hand back a document that looks
+            # like it has no content, and a list page drops the body so the row is visibly
+            # incomplete instead of silently wrong.
+            logger.warning("content hydration failed for %s from %s",
+                           raw.get("_key") or raw.get("id"), ref, exc_info=True)
+            if strict:
+                raise ContentDecryptionError(
+                    f"artifact content is addressed at {ref} but could not be read: {exc}"
+                ) from exc
+            raw["content"] = ""
+        return
+
     if not raw.get("content_encrypted"):
         return
 
@@ -247,8 +332,8 @@ def emit_artifact_change(entity, event_name: str) -> None:
     deserves an event". No such write is silent, including raw ones (the Person card, provisioning,
     seeds).
 
-    **Deletes are emitted one layer up**, by the services, and that is a decision rather than an
-    omission: a delete arrives at this boundary as an id, after the doc it names is already gone,
+    **Deletes are emitted one layer up**, by the services: a delete arrives at this boundary as an
+    id, after the doc it names is already gone,
     so the container the event has to be addressed to is no longer readable from anything this
     function is given. The service holds that context and emits there
     (`workspace_service._emit_event`, `collection_service._emit`). The consequence is that delete

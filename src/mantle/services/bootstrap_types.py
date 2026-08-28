@@ -113,7 +113,7 @@ AGIENCE_CORE_SLUG = "agience-beam"
 
 PLATFORM_AGENT_SLUGS = [
     "aria", "astra", "sage", "iris",
-    "ophan", "seraph", "verso",
+    "ophan", "seraph", "lumen",
 ]
 
 # ---------------------------------------------------------------------------

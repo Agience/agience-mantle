@@ -335,17 +335,51 @@ class TestEndToEnd:
 # The real verifier delegates to the light cone (it does not reimplement it)
 # ---------------------------------------------------------------------------
 
-class TestLightConeGrantVerifier:
-    def test_authorizes_only_contexts_the_light_cone_returns(self, monkeypatch):
-        import mantle.search.mantle.lightcone as lc
+class _Grant:
+    """A grant as `mask_of` reads one: a resource, an effect, and the action flags."""
 
-        monkeypatch.setattr(
-            lc, "resolve_authorized_contexts",
-            lambda db, who, *, lightcone, action, principal_type="user": (
-                [(PRINCIPAL, COLLECTION)] if who == ALICE else []
-            ),
-        )
-        v = LightConeGrantVerifier(object(), resolver=object())
+    def __init__(self, resource_id, effect="allow", **flags):
+        self.resource_id = resource_id
+        self.effect = effect
+        for action in ("create", "read", "update", "delete", "evict", "invoke", "add",
+                       "share", "admin"):
+            setattr(self, "can_" + action, flags.get("can_" + action, False))
+
+
+class _Resolver:
+    """The seam the verifier reads reach through: which grants a requester holds.
+
+    The verifier asks "may this requester reach THIS collection" by walking up from the collection
+    and testing each resource on the way against the requester's grants. So a double describes
+    reach by naming grants, where it once named resolved `(principal, collection)` pairs — the
+    property each test pins is unchanged, and the mechanism it is expressed through is the one that
+    now decides.
+    """
+
+    def __init__(self, by_requester):
+        self._by = by_requester
+        self.calls = []
+
+    def _grants_for(self, requester_id, requester_type):
+        self.calls.append((requester_id, requester_type))
+        return list(self._by.get(requester_id, ()))
+
+
+def _chain_is(monkeypatch, *resources):
+    """`origin_chain` yields these, in this order — the collection and whatever sits above it."""
+    import mantle.db.backend as backend
+
+    monkeypatch.setattr(backend, "origin_chain",
+                        lambda db, aid, action, **kw: iter(resources))
+
+
+class TestLightConeGrantVerifier:
+    def test_authorizes_only_what_the_requester_reaches(self, monkeypatch):
+        """Alice holds a grant that reaches the collection; Mallory holds none. The verifier's
+        answer follows the requester's reach and nothing else."""
+        _chain_is(monkeypatch, COLLECTION)
+        resolver = _Resolver({ALICE: [_Grant(COLLECTION, can_read=True)]})
+        v = LightConeGrantVerifier(object(), resolver=resolver)
 
         assert v.authorized(requester_id=ALICE, requester_type="user",
                             principal_id=PRINCIPAL, collection_id=COLLECTION,
@@ -354,12 +388,45 @@ class TestLightConeGrantVerifier:
                                 principal_id=PRINCIPAL, collection_id=COLLECTION,
                                 action="read")
 
+    def test_a_grant_above_the_collection_reaches_it(self, monkeypatch):
+        """The walk is what makes a container's grant reach what it contains. Alice's grant names
+        the PARENT, and the collection is authorized because the chain passes through it."""
+        _chain_is(monkeypatch, COLLECTION, "parent-collection")
+        resolver = _Resolver({ALICE: [_Grant("parent-collection", can_read=True)]})
+        v = LightConeGrantVerifier(object(), resolver=resolver)
+
+        assert v.authorized(requester_id=ALICE, requester_type="user",
+                            principal_id=PRINCIPAL, collection_id=COLLECTION,
+                            action="read")
+
+    def test_a_deny_nearer_the_collection_beats_an_allow_above_it(self, monkeypatch):
+        """Deny-first, at every level, matching `check_access`: nothing further up re-allows what a
+        nearer deny refused."""
+        _chain_is(monkeypatch, COLLECTION, "parent-collection")
+        resolver = _Resolver({ALICE: [_Grant(COLLECTION, effect="deny", can_read=True),
+                                      _Grant("parent-collection", can_read=True)]})
+        v = LightConeGrantVerifier(object(), resolver=resolver)
+
+        assert not v.authorized(requester_id=ALICE, requester_type="user",
+                                principal_id=PRINCIPAL, collection_id=COLLECTION,
+                                action="read")
+
+    def test_a_grant_for_another_action_does_not_authorize_this_one(self, monkeypatch):
+        _chain_is(monkeypatch, COLLECTION)
+        resolver = _Resolver({ALICE: [_Grant(COLLECTION, can_update=True)]})
+        v = LightConeGrantVerifier(object(), resolver=resolver)
+
+        assert not v.authorized(requester_id=ALICE, requester_type="user",
+                                principal_id=PRINCIPAL, collection_id=COLLECTION,
+                                action="read")
+
     def test_a_principal_with_no_grants_is_denied_everything(self, monkeypatch):
         import mantle.search.mantle.lightcone as lc
 
+        _chain_is(monkeypatch, COLLECTION)
         monkeypatch.setattr(lc, "resolve_authorized_contexts",
                             lambda db, who, *, lightcone, action, principal_type="user": [])
-        v = LightConeGrantVerifier(object(), resolver=object())
+        v = LightConeGrantVerifier(object(), resolver=_Resolver({}))
         assert not v.authorized(requester_id=MALLORY, requester_type="user",
                                 principal_id=PRINCIPAL, collection_id=COLLECTION,
                                 action="read")
@@ -368,19 +435,28 @@ class TestLightConeGrantVerifier:
                                 action="read")
 
     def test_memoization_does_not_outlive_its_ttl(self, monkeypatch):
-        """The authorization cache must expire; key material may be cached longer."""
-        import mantle.search.mantle.lightcone as lc
+        """The authorization cache must expire; key material may be cached longer.
 
-        calls = []
-
-        def _resolve(db, who, *, lightcone, action, principal_type="user"):
-            calls.append(who)
-            return [(PRINCIPAL, COLLECTION)]
-
-        monkeypatch.setattr(lc, "resolve_authorized_contexts", _resolve)
-        v = LightConeGrantVerifier(object(), resolver=object(), ttl_s=0)
+        The memo now holds the requester's GRANTS rather than resolved pairs, because that is what
+        the walk reads. It is kept for the reason it existed: the TTL is what bounds how long a
+        revoked grant keeps working, and dropping it would change that silently.
+        """
+        _chain_is(monkeypatch, COLLECTION)
+        resolver = _Resolver({ALICE: [_Grant(COLLECTION, can_read=True)]})
+        v = LightConeGrantVerifier(object(), resolver=resolver, ttl_s=0)
         for _ in range(3):
             v.authorized(requester_id=ALICE, requester_type="user",
                          principal_id=PRINCIPAL, collection_id=COLLECTION,
                          action="read")
-        assert len(calls) == 3, "a zero TTL must not memoize the decision"
+        assert len(resolver.calls) == 3, "a zero TTL must not memoize the decision"
+
+    def test_the_requester_type_reaches_the_lookup(self, monkeypatch):
+        """A grant key's grants are resolved differently from a user's, so the type has to travel
+        with the id or the wrong set is read."""
+        _chain_is(monkeypatch, COLLECTION)
+        resolver = _Resolver({ALICE: [_Grant(COLLECTION, can_read=True)]})
+        v = LightConeGrantVerifier(object(), resolver=resolver, ttl_s=0)
+        v.authorized(requester_id=ALICE, requester_type="grant_key",
+                     principal_id=PRINCIPAL, collection_id=COLLECTION, action="read")
+
+        assert resolver.calls == [(ALICE, "grant_key")]

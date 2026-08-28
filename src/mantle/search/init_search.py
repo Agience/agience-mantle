@@ -96,7 +96,7 @@ def reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
 def _reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
     """Body of :func:`reindex_all_artifacts`; assumes an acting principal is set."""
     from mantle import config
-    from mantle.db.backend import COLLECTION_ARTIFACTS, query_documents
+    from mantle.db.backend import COLLECTION_ARTIFACTS, iter_documents
     from mantle.entities.artifact import Artifact as ArtifactEntity
     from mantle.search.ingest.pipeline_unified import (
         index_artifact,
@@ -161,43 +161,47 @@ def _reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
     db = next(db_gen)
 
     try:
-        all_artifacts = list(query_documents(db, ArtifactEntity, COLLECTION_ARTIFACTS, {}))
-        logger.info("Found %d artifacts to reindex", len(all_artifacts))
+        # `unreadable="skip"`, because this is a MAINTENANCE pass and its job is to rebuild what
+        # can be rebuilt. An ordinary read keeps the default and still refuses to return a short
+        # list — the caller there cannot tell a filtered result from a truncated one. Here it can,
+        # because the count is reported below and the ids are named.
+        #
+        # Measured on 71/dev: ONE artifact whose content was written under a key the node no longer
+        # holds raised out of the hydration loop and blocked the rebuild of all 613. The index then
+        # stayed on the previous analyzer generation — silently, because a stale index answers.
+        # `denied="omit"` is NOT a second flavour of `unreadable`. An artifact behind an absorbing
+        # deny (`propagate='[]'` on its `contains` edge) is not damaged — the index writer simply
+        # may not read it, which is the grant system working. Indexing a document you may not read
+        # is not a thing that should happen, so omitting it is correct rather than a concession,
+        # and it is counted apart from `unreadable` so a deliberate deny is never reported as
+        # corruption. Measured on 71/home: 6 such edges out of 2,158,434, one of them over a real
+        # collection ("Mantle work products"), and before this they ended the whole pass.
+        unreadable: List[Tuple[str, str]] = []
+        refused: List[Tuple[str, str]] = []
+        # STREAMED, not listed. `query_documents` materialises, and hydrating an artifact decrypts
+        # it, so the list form of this plane is what put the pass into the pagefile. `unreadable`
+        # and `refused` fill as the stream is consumed, so both are only complete once it is
+        # exhausted — which is why they are reported after the loop rather than before it.
+        artifact_stream = iter_documents(db, ArtifactEntity, COLLECTION_ARTIFACTS, {},
+                                         unreadable="skip", skipped_out=unreadable,
+                                         denied="omit", denied_out=refused)
+        # ── Streamed in bounded chunks, and that is the whole design ────────────────────────
+        # This pass used to materialise the plane THREE times: every hydrated artifact, every
+        # prepared item, and one future per item. Hydrating an artifact DECRYPTS it, so the first
+        # of those is far larger than the rows it came from. Measured on 71/home: 2,165,743
+        # artifacts drove the working set past 16 GB and into the pagefile — 3,147 pages/sec, free
+        # RAM from 7.6 GB to 6.2 GB and falling — before one index entry had been written. It could
+        # not finish on the hardware it runs on, which is not a slow pass, it is a broken one.
+        #
+        # Now one chunk is hydrated, prepared, indexed and dropped before the next is read, so peak
+        # memory is set by CHUNK rather than by the size of the corpus. The trade is that
+        # `prepare_reindex_items` batches its embedding calls per chunk instead of once — the same
+        # number of texts, in more batches — which costs round-trips on a remote embedder and
+        # nothing at all when the vector arm is off.
+        CHUNK = max(1, int(getattr(config, "REINDEX_CHUNK_SIZE", 2000) or 2000))
 
-        items: List[Tuple[str, ArtifactEntity]] = []
-        not_indexable = 0
-        for artifact in all_artifacts:
-            if artifact.state == ArtifactEntity.STATE_ARCHIVED:
-                continue
-            # Platform trust config is not user content and has no search context —
-            # filtered here as well as at the gate so it is never counted as work
-            # this run was supposed to do. See pipeline_unified.NON_INDEXABLE_CONTENT_TYPES.
-            if not is_indexable(artifact):
-                not_indexable += 1
-                continue
-            # Root artifacts (no parent collection) self-reference their own id —
-            # consistent with resolve_authorized_contexts: doc.get("collection_id") or doc.get("_key").
-            collection_id = artifact.collection_id or artifact.id
-            items.append((collection_id, artifact))
-
-        if not_indexable:
-            logger.info(
-                "Reindex: %d platform trust-config artifact(s) are not search targets",
-                not_indexable,
-            )
-
-        if not items:
-            logger.info("Reindex complete: no artifacts to index")
-            return {"indexed": 0, "skipped": 0, "failed": 0, "total": 0}
-
-        # Extract fields once + batch-warm the embeddings cache (the fast path).
-        prepared = prepare_reindex_items(items)
-        if not prepared:
-            logger.info("Reindex complete: no indexable artifacts")
-            return {"indexed": 0, "skipped": 0, "failed": 0, "total": 0}
-
-        # Load the AnchorSet once up front (single-threaded): workers then see an
-        # existing set rather than racing on the load, and its embeds hit the warm cache.
+        # Loaded ONCE, before any chunk: workers see an existing set rather than racing on the
+        # load, and re-checking per chunk would repeat a deployment fact thousands of times.
         vector_arm_available = True
         try:
             from mantle.search.anchors.store import (
@@ -206,85 +210,183 @@ def _reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
             )
             require_live_anchorset()
         except AnchorSetNotProvisioned:
-            # The AnchorSet is provisioned, never derived, so its absence is a
-            # deployment state that retrying cannot change. Recorded once here; the
-            # per-artifact path would otherwise repeat the same result N times.
+            # The AnchorSet is provisioned, never derived, so its absence is a deployment state
+            # that retrying cannot change. Recorded once here; the per-artifact path would
+            # otherwise repeat the same result N times.
             vector_arm_available = False
             logger.warning(
-                "Reindex: no AnchorSet provisioned; the vector arm is OFF for this "
-                "run and %d artifact(s) will be lexical-only until the canonical "
-                "AnchorSet artifact is provisioned",
-                len(prepared),
-            )
+                "Reindex: no AnchorSet provisioned; the vector arm is OFF for this run and every "
+                "artifact will be lexical-only until the canonical AnchorSet artifact is "
+                "provisioned")
         except Exception:
             vector_arm_available = False
             logger.warning(
-                "Reindex: AnchorSet unavailable up front; per-artifact path "
-                "will retry (vector arm may be skipped if it can't be built)",
-                exc_info=True,
-            )
+                "Reindex: AnchorSet unavailable up front; per-artifact path will retry "
+                "(vector arm may be skipped if it can't be built)", exc_info=True)
 
-        workers = max(
-            1,
-            min(
-                max_workers or getattr(config, "INDEX_QUEUE_MAX_WORKERS", 16),
-                len(prepared),
-            ),
-        )
-        logger.info("Reindexing %d artifacts (%d workers)...", len(prepared), workers)
+        # ONE indexer for the whole pass, so a chunk can commit once (see `run_chunk`). Built
+        # here rather than per chunk because the store holds the connection and the transaction
+        # depth; a per-chunk instance would reopen both for no gain. `None` is tolerated — the
+        # per-artifact path is unchanged and still correct, just slower.
+        shared_indexer = None
+        try:
+            from mantle.search.mantle.wiring import build_sse_indexer
+            from mantle.services.dependencies import get_store_db as _gsd_idx
+            shared_indexer = build_sse_indexer(next(_gsd_idx()), segment="committed")
+        except Exception:
+            logger.warning("Reindex: no shared SSE indexer; falling back to one transaction per "
+                           "artifact (correct, and slower)", exc_info=True)
+        batched = shared_indexer is not None and getattr(
+            getattr(shared_indexer, "_postings", None), "transaction", None) is not None
+
+        workers = max(1, int(max_workers or getattr(config, "INDEX_QUEUE_MAX_WORKERS", 16)))
+        logger.info("Reindexing in chunks of %d (%s)...", CHUNK,
+                    "one transaction per chunk" if batched
+                    else "%d workers, one transaction per artifact" % workers)
 
         indexed = 0
         skipped = 0
         failed = 0
+        total = 0
+        not_indexable = 0
 
-        def index_safe(
-            collection_id: str, artifact: ArtifactEntity, fields: dict
-        ):
-            """Return the artifact's :class:`IndexOutcome`, or ``None`` if it raised.
-            """
+        def index_safe(collection_id: str, artifact: ArtifactEntity, fields: dict):
+            """Return the artifact's :class:`IndexOutcome`, or ``None`` if it raised."""
             try:
-                return index_artifact(
-                    artifact, collection_id, is_head=True, fields=fields
-                )
+                return index_artifact(artifact, collection_id, is_head=True, fields=fields)
             except Exception as exc:
-                logger.warning(
-                    "Reindex failed for %s: %s", artifact.id, exc, exc_info=True,
-                )
+                logger.warning("Reindex failed for %s: %s", artifact.id, exc, exc_info=True)
                 return None
 
-        # `propagate` captures this thread's context (which carries the system
-        # acting principal, set below) so each pool worker runs under it. Without
-        # it a worker starts from an empty context and every index write fails
-        # closed with NoActingPrincipal — see services.acting_principal.propagate.
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [
-                executor.submit(propagate(index_safe), coll_id, artifact, fields)
-                for coll_id, artifact, fields in prepared
-            ]
-            for i, future in enumerate(futures, 1):
+        def _tally(outcome):
+            nonlocal indexed, skipped, failed
+            if outcome is None or outcome.failed:
+                failed += 1
+            elif outcome.wrote_nothing:
+                skipped += 1
+            else:
+                indexed += 1
+
+        def run_chunk(batch, executor):
+            """Prepare and index one chunk. Returns nothing; counters are closed over.
+
+            ── One transaction per CHUNK, not per artifact ──────────────────────────────────────
+            The SSE index is a single SQLite file and every artifact's update takes an exclusive
+            `BEGIN IMMEDIATE` on it (`sse/indexer.py::_atomic_slot_writes` — a correctness
+            mechanism: two writers on one term would otherwise lose an entry and leave an artifact
+            that reports success and is not findable). So the 16 workers never ran in parallel;
+            they queued, and the pass measured 0.64 cores with the disk 94% idle.
+
+            Batching is therefore the only lever that exists here, and it is worth pulling because
+            SQLite commit cost is fsync-dominated: 2,000 commits become one. It requires SHARING an
+            indexer, because reentrancy is thread-local depth on the store instance and
+            `build_sse_indexer` otherwise constructs a fresh one — with a fresh connection — per
+            artifact.
+
+            Sharing one store means one connection, so the chunk is indexed on THIS thread rather
+            than fanned out. That costs nothing: the fan-out was already serialized by the very
+            lock this avoids.
+            """
+            nonlocal total
+            prepared = prepare_reindex_items(batch)
+            if not prepared:
+                return
+            total += len(prepared)
+
+            postings = getattr(shared_indexer, "_postings", None) if shared_indexer else None
+            txn = getattr(postings, "transaction", None) if postings is not None else None
+            if txn is not None:
                 try:
-                    outcome = future.result()
-                    if outcome is None or outcome.failed:
-                        failed += 1
-                    elif outcome.wrote_nothing:
-                        skipped += 1
-                    else:
-                        indexed += 1
+                    with txn():
+                        for coll_id, artifact, fields in prepared:
+                            _tally(index_artifact(artifact, coll_id, is_head=True, fields=fields,
+                                                  sse_indexer=shared_indexer))
+                    del prepared
+                    return
+                except Exception as exc:
+                    # ONE artifact must not cost the other 1,999. A chunk transaction is
+                    # all-or-nothing, so a raise here rolled the whole chunk back and nothing was
+                    # written — the artifacts are re-run below one at a time, each in its own
+                    # transaction, which is exactly the pre-batching behaviour. Rare by
+                    # construction (measured 26 failures in 60,835), so the fast path dominates
+                    # and the slow path is still correct.
+                    logger.warning(
+                        "Chunk transaction rolled back (%s: %s); re-running its %d artifact(s) "
+                        "individually so one failure does not discard the rest",
+                        type(exc).__name__, exc, len(prepared))
+
+            # Per-artifact path: no shared store, or the chunk transaction was rolled back.
+            # `propagate` captures this thread's context (which carries the system acting
+            # principal) so each pool worker runs under it. Without it a worker starts from an
+            # empty context and every index write fails closed with NoActingPrincipal.
+            futures = [executor.submit(propagate(index_safe), coll_id, artifact, fields)
+                       for coll_id, artifact, fields in prepared]
+            for future in futures:
+                try:
+                    _tally(future.result())
                 except Exception as exc:
                     failed += 1
                     logger.warning("Unexpected reindex error: %s", exc)
-                if i % 50 == 0:
-                    logger.info(
-                        "  Progress: %d/%d (%d indexed, %d skipped, %d failed)",
-                        i, len(futures), indexed, skipped, failed,
-                    )
+            # Both drop out of scope here, which is the point of the chunking.
+            del futures, prepared
+
+        batch: List[Tuple[str, ArtifactEntity]] = []
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for artifact in artifact_stream:
+                if artifact.state == ArtifactEntity.STATE_ARCHIVED:
+                    continue
+                # Platform trust config is not user content and has no search context — filtered
+                # here as well as at the gate so it is never counted as work this run was supposed
+                # to do. See pipeline_unified.NON_INDEXABLE_CONTENT_TYPES.
+                if not is_indexable(artifact):
+                    not_indexable += 1
+                    continue
+                # Root artifacts (no parent collection) self-reference their own id — consistent
+                # with resolve_authorized_contexts: doc.get("collection_id") or doc.get("_key").
+                batch.append((artifact.collection_id or artifact.id, artifact))
+                if len(batch) >= CHUNK:
+                    run_chunk(batch, executor)
+                    batch = []
+                    logger.info("  Progress: %d indexed, %d skipped, %d failed (%d seen)",
+                                indexed, skipped, failed, total)
+            if batch:
+                run_chunk(batch, executor)
+
+        if refused:
+            logger.info(
+                "Reindex: %d artifact(s) refused key custody and are NOT in this rebuild. These "
+                "are DENY decisions, not damage: this principal holds no grant reaching them, so "
+                "they are not its to index. First: %s (%s)",
+                len(refused), refused[0][0], refused[0][1])
+        if unreadable:
+            logger.warning(
+                "Reindex: %d artifact(s) could not be read and are NOT in this rebuild — their "
+                "content is addressed but does not decrypt with the keys this node holds. They "
+                "stay unsearchable until repaired or removed; every other artifact is rebuilt. "
+                "First: %s (%s)",
+                len(unreadable), unreadable[0][0], unreadable[0][1])
+
+        if not_indexable:
+            logger.info("Reindex: %d platform trust-config artifact(s) are not search targets",
+                        not_indexable)
+        if not total:
+            logger.info("Reindex complete: no artifacts to index")
+            return {"indexed": 0, "skipped": 0, "failed": 0, "total": 0,
+                    "unreadable": len(unreadable), "denied": len(refused)}
 
         result = {
             "indexed": indexed,
             "skipped": skipped,
             "failed": failed,
-            "total": len(prepared),
+            "total": total,
             "vector_arm": "on" if vector_arm_available else "off (no AnchorSet)",
+            # Counted separately from `failed`: a failure is an artifact this pass TRIED and could
+            # not index, and these were never readable enough to try. Collapsing them would report
+            # a rebuild as clean when part of the corpus is not in it.
+            "unreadable": len(unreadable),
+            # Distinct from `unreadable` on purpose: unreadable is damage, denied is a grant
+            # decision. An operator seeing `denied` should check the light cone, not the disk.
+            "denied": len(refused),
         }
         # A reindex that wrote nothing, or that had failures, logs at WARNING.
         logger.log(
@@ -297,6 +399,13 @@ def _reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
         # leaves the marker unset, so the next boot tries again — which is the point. Claiming
         # completion after a partial pass would turn a one-off loop into a permanently half-built
         # index that reports itself finished, which is worse than repeating the work.
+        # `unreadable` deliberately does NOT block the marker, and that is a choice rather than an
+        # oversight. An artifact whose content does not decrypt with the keys this node holds is a
+        # PERMANENT condition until someone repairs or removes it — retrying cannot change it. Left
+        # blocking, every boot would restart a full pass that can never complete, which is the
+        # non-converging loop this function refuses at the top. So the pass records that it finished
+        # doing what it could; the count rides in the summary and the ids are logged at WARNING on
+        # every explicit rebuild, which is where someone is looking when they care.
         if indexed and not failed:
             try:
                 from datetime import datetime, timezone

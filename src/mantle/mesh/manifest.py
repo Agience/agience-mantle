@@ -48,7 +48,7 @@ def content_root(item_hashes: List[str]) -> str:
 @dataclass
 class ShardItem:
     """One item's row in a manifest — and, because the manifest names its signing `authority`,
-    ONE OBSERVER'S ATTESTATION of that item.
+    one observer's attestation of that item.
 
     `origin` lets agreement count distinct ORIGINS, not distinct holders, because N replicas of
     one origin are one observation and not N. Empty means unattributed — this authority holds the

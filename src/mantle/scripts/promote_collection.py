@@ -6,10 +6,10 @@
         --to-url   https://mantle.home.agience.ai --to-token-file ~/.claude/home.token \
         --dry-run
 
-⭐ IT HAS TO GO THROUGH THE API, AND THAT IS THE PRODUCT WORKING RATHER THAN A DETOUR AROUND IT.
-The first cut of this moved seed files between the two lattices directly and carried NO CONTENT:
-every body arrived empty, the promotion looked complete, and `recall` on the target matched nothing.
-The cause is the invariant the whole store is built on — content keys come from
+It goes through the API, which is the product working rather than a detour around it. Moving seed
+files between the two lattices directly carries no content: every body arrives empty, the promotion
+looks complete, and `recall` on the target matches nothing. The cause is the invariant the whole
+store is built on — content keys come from
 `content_crypto._default_master_key`, "checked against the grant ledger", so a process holding the
 FILE holds ciphertext and nothing else. Measured on one artifact, both ways:
 
@@ -19,28 +19,29 @@ FILE holds ciphertext and nothing else. Measured on one artifact, both ways:
 So the source must DECRYPT as a principal that may read, and the target must ENCRYPT as a principal
 that may write. Those are two authorized sessions, which means HTTP, which means a token per side.
 
-⭐ AND GOING THROUGH THE API MAKES THIS SMALLER, NOT BIGGER. The direct-file version had to
-hand-build three things the write path already does: the creator's owner grant (without which a
-promotion lands invisible — measured: `list_artifacts` showed 4 unrelated artifacts and recall found
-nothing), the index enqueue (without which it lands unfindable — the seed loader contains no index
-call at all), and a grant seed card to repair the first. None of that is here, because
-`POST /artifacts` does all three for every artifact it writes.
+Going through the API also makes this smaller. A direct-file version has to hand-build three things
+the write path already does: the creator's owner grant (without which a promotion lands invisible —
+`list_artifacts` shows unrelated artifacts and recall finds nothing), the index enqueue (without
+which it lands unfindable — the seed loader makes no index call), and a grant seed card to repair
+the first. None of that is here, because `POST /artifacts` does all three for every artifact it
+writes.
 
-⭐ IDENTITY IS SERVER-SIDE, SO RE-PROMOTING IS AN UPDATE. Each artifact is written with
+Identity is server-side, so re-promoting is an update. Each artifact is written with
 `identity = promoted:<source>:<root_id>` and the target derives its id from that
-(`services/artifact_identity`), so the second promotion of a thing lands on the first artifact
-without this script remembering anything. There is no promotion ledger, and losing this machine
-changes nothing.
+(`services/artifact_identity`), so a second promotion of a thing lands on the first artifact without
+this script remembering anything. There is no promotion ledger, and losing this machine changes
+nothing.
 
-⚠ MEMBERSHIP IS A SECOND CALL, BECAUSE `identity` AND `container_id` ARE MUTUALLY EXCLUSIVE — "a
+Membership is a second call, because `identity` and `container_id` are mutually exclusive — "a
 collection member is born a draft and grows a second live version on first edit-after-commit, so
-there is no single row to aim at". Each member is therefore created TOP-LEVEL with its identity, and
-then linked into the promoted collection with `source_artifact_id`, which the API documents as
-"link an existing artifact in (edge only), no new artifact". Edges are keyed by
-`blake2b(src ‖ dst ‖ label)`, so re-linking is an upsert and re-running promotes nothing twice.
+there is no single row to aim at". Each member is created top-level with its identity and then
+linked into the promoted collection with `source_artifact_id`, which the API documents as "link an
+existing artifact in (edge only), no new artifact". Edges are keyed by `blake2b(src ‖ dst ‖ label)`,
+so re-linking is an upsert and re-running promotes nothing twice.
 
-⚠ ONE WAY. Two-way promotion is a conflict-resolution problem — both sides edited the same artifact
-since the last run — and this has no answer for it. One direction has no conflicts by construction.
+One way. Two-way promotion is a conflict-resolution problem — both sides edited the same artifact
+since the last run — and this has no answer for it. One direction has no conflicts by
+construction.
 """
 from __future__ import annotations
 
@@ -54,8 +55,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# ⚠ THE CONSOLE HERE IS cp1252 and every box character below raises UnicodeEncodeError on it — the
-# previous cut of this tool died while printing its own progress, after the work was done.
+# The console here is cp1252, where every box character below raises UnicodeEncodeError — which
+# would kill this tool while printing its own progress, after the work is done.
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8", errors="replace")

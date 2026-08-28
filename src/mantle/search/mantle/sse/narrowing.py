@@ -67,6 +67,7 @@ Stdlib + ``cryptography`` only, like the rest of the lexical core — see
 
 from __future__ import annotations
 
+
 import logging
 from typing import (
     Any,
@@ -131,10 +132,28 @@ class Coverage(NamedTuple):
     "two of these five" on one query and "two of these two" on another. What they are
     comparable across is the artifacts of ONE narrowing, which is the whole of what ordering
     them needs.
+
+    ``matched`` — WHICH stems it was found under, not how many. A fact about this artifact
+    alone, and the caller already holds the artifact, so naming its own matches tells a caller
+    nothing it could not read off the document.
+
+    It exists because the counts TIE: a one-stem query ties everywhere by construction (see
+    above), and after salience a two-stem query ties between the artifacts matching either one.
+    Measured, `what is a vaccine` narrows to 662 artifacts ALL at ``stems=1`` — those carrying
+    `vaccin` and those carrying `what` are indistinguishable by the count, and the artifact
+    titled `vaccine` sat at position 88 of a 50-wide reach horizon and was never ranked.
+
+    A document frequency would break that tie, and this deliberately does NOT carry one.
+    ``len(stem_ids)`` is a count over the raw index, INCLUDING artifacts the light cone will
+    refuse, so a rarity computed here changes depending on whether a document the caller may not
+    see exists — which is precisely the existence oracle `TestTheCountsAreNotAnExistenceOracle`
+    forbids, and which it caught. The frequencies are counted by the reach arm instead, over the
+    artifacts that survived the meet, where they can leak nothing.
     """
 
     stems: int = 0
     bigrams: int = 0
+    matched: Tuple[str, ...] = ()
 
 
 #: What a compiled narrowing returns: per-artifact coverage over the pairs it was handed.
@@ -190,7 +209,8 @@ class TokenNarrower:
     # Public surface
     # ------------------------------------------------------------------
 
-    def lookup_for(self, query_text: str, request: Any) -> Optional[CoverageLookup]:
+    def lookup_for(self, query_text: str, request: Any,
+                   *, salient=None) -> Optional[CoverageLookup]:
         """Compile a query into a ``lookup(pairs) -> {artifact_id: Coverage}`` callback.
 
         ``request`` is the key provider's policy object (``oracle.KeyRequest`` in the
@@ -204,6 +224,33 @@ class TokenNarrower:
         stems, is_phrase = phrase_stems(query_text)
         if not stems or not self._fields:
             return None
+
+        # ── the stems that carry the question, not every stem typed ──────────────────────────
+        # `salient` is the corpus's own measure, handed in by the caller because it lives behind
+        # the `match` seam and this layer cannot import it. It keeps a term carrying at least the
+        # query's own mean IDF, so nothing is chosen and an unmeasurable corpus keeps everything.
+        #
+        # Needed because the coverage ordering downstream counts stems WITHOUT weighting — that is
+        # deliberate and documented in `_by_coverage`, which makes it an ordinal on the query
+        # rather than a metric on the data. The consequence is that an unfiltered function word is
+        # worth exactly as much as the subject: `what is a glacier` narrowed on `what`/`is`/
+        # `glacier`, canon documents titled "What this is (and is not)" matched two stems, and they
+        # filled the reach arm's pool before any glacier synset — which matched one — could enter.
+        #
+        # So the filter belongs HERE, above the count, rather than as a weighting below it. The
+        # ordinal stays an ordinal; what changes is which stems it is an ordinal over.
+        #
+        # A PHRASE is never filtered. Its gate is a membership question over consecutive bigrams,
+        # so dropping a stem would break an adjacency the query actually asked for — and a phrase
+        # is an explicit statement that these words belong together, which is exactly the claim
+        # salience is not entitled to overrule.
+        if salient is not None and not is_phrase:
+            try:
+                kept = list(salient(list(stems)))
+            except Exception:  # noqa: BLE001 — a measure that raises measures nothing
+                kept = []
+            if kept:
+                stems = kept
 
         def _lookup(pairs: Sequence[Tuple[str, str]]) -> Mapping[str, Coverage]:
             return self.ids_for_stems(stems, pairs, request, is_phrase=is_phrase)
@@ -256,6 +303,7 @@ class TokenNarrower:
                 held = found.get(artifact_id)
                 found[artifact_id] = cover if held is None else Coverage(
                     max(held.stems, cover.stems), max(held.bigrams, cover.bigrams),
+                    tuple(dict.fromkeys(held.matched + cover.matched)),
                 )
         return found
 
@@ -282,6 +330,13 @@ class TokenNarrower:
                 principal_id,
             )
             return {}
+
+        # No owner-index accelerator. It earns its risk only when every probe below is an `open()`
+        # on a file store — 4,520 of them for a ten-term query over 194 owners, mostly misses — so
+        # one blob holding the owner's whole token map pays for itself. `SqlitePostingStore` makes a
+        # probe an indexed lookup on a primary key, so there is nothing left to collapse, and the
+        # blob's own failure modes go with it: a partial index read as complete made a whole prior
+        # corpus unfindable, and its read-modify-write lost concurrent writers.
 
         # The bigram gate. `indexer` writes a posting entry per adjacent stem pair, so a
         # phrase's adjacency is a membership question over those entries: an artifact clears
@@ -317,12 +372,16 @@ class TokenNarrower:
         # corpus statistic, no weight.
         owner_ids: Optional[Set[str]] = None
         stem_hits: Dict[str, int] = {}
+        # Which stems each artifact was found under. The COUNT is `stem_hits`; this is the
+        # identity, and the reach arm needs it to tell two artifacts apart that the count cannot.
+        matched: Dict[str, list] = {}
         for stem in stems:
             stem_ids = self._ids_for_term(
                 principal_id, owner_sse_key, stem, authorized_collections,
             )
             for artifact_id in stem_ids:
                 stem_hits[artifact_id] = stem_hits.get(artifact_id, 0) + 1
+                matched.setdefault(artifact_id, []).append(stem)
             if self._require_all_stems:
                 if not stem_ids:
                     return {}
@@ -337,7 +396,9 @@ class TokenNarrower:
         surviving = owner_ids if gate is None else (owner_ids & gate)
         return {
             artifact_id: Coverage(
-                stem_hits.get(artifact_id, 0), bigram_hits.get(artifact_id, 0),
+                stem_hits.get(artifact_id, 0),
+                bigram_hits.get(artifact_id, 0),
+                tuple(matched.get(artifact_id, ())),
             )
             for artifact_id in surviving
         }
@@ -367,15 +428,46 @@ class TokenNarrower:
         """Decrypted posting entries for one blind token. ``[]`` for a miss and for a blob
         that fails GCM authentication — one unreadable posting list must not fail a recall,
         and a narrowing that raised would be a way to tell an unreadable token from an absent
-        one."""
+        one.
+
+        One probe, always — there is no accelerator to consult first. On `SqlitePostingStore` this
+        is an indexed range scan over `(principal_id, blind_token)`, which is what made the
+        owner-index blob unnecessary rather than merely repaired.
+
+        Two layouts, tried in that order. A slot written since the entry layout holds one sealed
+        blob per `(artifact, collection)`; one written before holds a single blob sealing them all.
+        Splitting a legacy blob needs the owner's key, so there is no migration pass for it: the
+        entries win where they exist, and `SseIndexer._absorb_legacy_slot` converts a slot on the
+        next write that touches it. Entries-first rather than legacy-first because a slot mid-
+        conversion could briefly hold both, and the entries are the newer truth.
+        """
+        key = posting_mod.derive_posting_key(owner_sse_key, bt)
+
+        out: List[dict] = []
+        for artifact_id, collection_id, blob in self._postings.get_entries(principal_id, bt):
+            try:
+                # The AAD is built from the row key, so the row key has to agree with what the
+                # ciphertext says it is. The key is plaintext and mutable by anyone who can write
+                # to the store; the sealed entry names the slot it was minted for. An entry moved
+                # to another artifact, collection or token fails here rather than being served.
+                out.append(posting_mod.unpack_entry(
+                    blob, key,
+                    aad=posting_mod.entry_aad(principal_id, bt, artifact_id, collection_id),
+                ))
+            except posting_mod.PostingError as exc:
+                logger.warning(
+                    "SSE narrowing: dropping unreadable entry owner=%s token=%s artifact=%s "
+                    "reason=%s", principal_id, bt[:8], artifact_id, exc,
+                )
+        if out:
+            return out
+
         blob = self._postings.get_posting(principal_id, bt)
         if blob is None:
             return []
         try:
-            key = posting_mod.derive_posting_key(owner_sse_key, bt)
-            # The slot AAD `SseIndexer._upsert_into_posting` writes with. `allow_unbound`
-            # stays at its default so posting lists written before slot binding still open
-            # through `decrypt_blob`'s dual-read.
+            # The slot AAD the legacy writer used. `allow_unbound` stays at its default so posting
+            # lists written before slot binding still open through `decrypt_blob`'s dual-read.
             return posting_mod.unpack_posting(
                 blob, key, aad=posting_mod.posting_aad(principal_id, bt),
             )

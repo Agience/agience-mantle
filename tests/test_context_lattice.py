@@ -63,11 +63,11 @@ def db(tmp_path):
 def _chain(db, *nodes, propagate=None, is_origin=True):
     """`a → b → c …` as context edges — each node is the context of the next.
 
-    `propagate` is one value PER HOP, or None for an UNRESTRICTED chain — spelled `TOP`
-    rather than left to the writer's default, because the writer's default is now the empty
-    mask and a chain that quietly transmitted nothing would make every traversal test below
-    pass for the wrong reason. Per-hop rather than one-for-all because every interesting
-    property here is about a chain whose hops differ.
+    `propagate` is one value per hop, or None for an unrestricted chain — spelled `TOP` rather
+    than left to the writer's default, because that default is the empty mask and a chain
+    transmitting nothing would make every traversal test below pass for the wrong reason. Per-hop
+    rather than one-for-all, because every interesting property here is about a chain whose hops
+    differ.
     """
     hops = list(zip(nodes, nodes[1:]))
     masks = list(propagate) if propagate is not None else [TOP] * len(hops)
@@ -139,10 +139,10 @@ def test_a_context_edge_is_written_with_the_promoted_columns(db):
 
 
 def test_an_edge_written_with_no_mask_propagates_nothing(db):
-    """The default that used to be `None` → `TOP`, i.e. *everything flows*.
+    """A `None` default decodes to `TOP`, i.e. *everything flows*.
 
-    A default that confers maximum authority is the wrong default for a security-relevant
-    edge: it makes the careless write the dangerous one. The empty mask is not a new
+    A default that confers maximum authority is the wrong default for a security-relevant edge:
+    it makes the careless write the dangerous one. The empty mask is not a new
     encoding — `'[]'` is what `artifacts_router` already writes on a non-lineage link and
     what the one decoder already reads as `attenuation.NOTHING`, a permitted path that
     transmits nothing.
@@ -664,10 +664,10 @@ def test_a_deny_grant_reaches_nothing_through_the_context_lattice_either(db):
 
 
 def test_the_resolver_threads_its_bound_into_the_context_walk(db):
-    """The bound is still per-node and still threaded (pinned directly in
-    `tests/test_lightcone_resolver.py`). Here it is the CONSEQUENCE that is asserted: because
-    the walk is confined, the answer no longer depends on how deep it was allowed to go —
-    truncation cannot change a set the walk cannot add to."""
+    """The bound is per-node and threaded (pinned directly in
+    `tests/test_lightcone_resolver.py`). Here it is the consequence that is asserted: because the
+    walk is confined, the answer does not depend on how deep it was allowed to go, and truncation
+    cannot change a set the walk cannot add to."""
     _seed_grant(db, "alice", "n0", can_read=True)
     _chain(db, *[f"n{i}" for i in range(10)])
 

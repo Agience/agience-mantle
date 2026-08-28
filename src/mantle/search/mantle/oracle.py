@@ -133,6 +133,60 @@ class FernetMasterKeyStore:
         return dict(self._persist)
 
 
+
+#: The framed master-key payload: ``MK1:`` ‖ len(principal)(2, big-endian) ‖ principal ‖ DEK.
+#:
+#: The wrap names who the key is for. The KEK wrap protects the DEK's confidentiality and
+#: integrity and nothing else — `Fernet.encrypt` takes no associated data, `kms.encrypt` is called
+#: with no `EncryptionContext`, and Vault's `context` is unused — so the only thing tying a
+#: wrapped key to its principal was the document id it happened to be stored under, which is a
+#: plaintext, mutable database field.
+#:
+#: That made keys relocatable: copy the `token` out of `master-key:alice` into
+#: `master-key:mallory`, and the unwrap succeeds — nothing in the ciphertext disagrees. Mallory then
+#: receives Alice's master key through the self-custody base case (a principal may always fetch its
+#: own key), and derives Alice's content key, SSE key and every cell key offline, with the grant
+#: ledger never consulted.
+#:
+#: Framing the principal INSIDE the authenticated plaintext fixes that for all three custody models
+#: at once, without changing the `KeyProvider` interface: every provider already authenticates the
+#: bytes it wraps, so a moved token now decrypts to a payload that names the wrong principal, and
+#: the equality check below rejects it.
+_MK_MAGIC = b"MK1:"
+
+#: Counts unframed (pre-binding) master keys still being read, so the fallback below has a
+#: measurable end. Counted only on SUCCESS — "un-migrated keys really out there", not failures.
+legacy_unbound_master_keys: int = 0
+
+
+def _frame_master_key(principal_id: str, dek: bytes) -> bytes:
+    pid = principal_id.encode("utf-8")
+    if len(pid) > 0xFFFF:
+        raise ValueError("principal id too long to frame")
+    return _MK_MAGIC + len(pid).to_bytes(2, "big") + pid + dek
+
+
+def _unframe_master_key(principal_id: str, raw: bytes) -> bytes:
+    """Return the DEK, or raise if the payload names a different principal.
+
+    An unframed payload is a key written before the binding existed. Those are returned unchanged
+    and counted — breaking every existing install to close a database-write-access attack would be
+    the wrong trade, and re-wrapping happens on the next `put`.
+    """
+    global legacy_unbound_master_keys
+    if not raw.startswith(_MK_MAGIC):
+        legacy_unbound_master_keys += 1
+        return raw
+    pid_len = int.from_bytes(raw[4:6], "big")
+    bound_to = raw[6:6 + pid_len].decode("utf-8", "replace")
+    if bound_to != principal_id:
+        raise MasterKeyUnavailable(
+            f"the wrapped master key stored for {principal_id!r} is bound to {bound_to!r} — "
+            f"refusing to unwrap a key that was minted for a different principal"
+        )
+    return raw[6 + pid_len:]
+
+
 class LatticeMasterKeyStore:
     """The durable master key store over the standalone lattice — the production backend.
 
@@ -166,7 +220,9 @@ class LatticeMasterKeyStore:
         if not token:
             return None                      # genuinely absent — first use, safe to generate
         try:
-            return self._kek.unwrap(token)
+            return _unframe_master_key(principal_id, self._kek.unwrap(token))
+        except MasterKeyUnavailable:
+            raise                            # already precise: the key names another principal
         except Exception as exc:
             logger.error("Failed to unwrap master key for %s: %s", principal_id, exc)
             raise MasterKeyUnavailable(
@@ -175,7 +231,7 @@ class LatticeMasterKeyStore:
             ) from exc
 
     def put(self, principal_id: str, master_key: bytes) -> None:
-        token = self._kek.wrap(master_key)
+        token = self._kek.wrap(_frame_master_key(principal_id, master_key))
         self._db_factory().artifacts.put_artifact({
             "id": self._id(principal_id),
             "content_type": self.CONTENT_TYPE,
@@ -441,10 +497,6 @@ class LightConeGrantVerifier:
         collection_id: Optional[str],
         action: str,
     ) -> bool:
-        pairs = self._contexts(requester_id, requester_type, action)
-        if collection_id:
-            return (principal_id, collection_id) in pairs
-
         # BASE CASE: a principal has custody of its own key. The light cone below resolves pairs
         # whose principal is a collection's origin root — and a user's first collections are
         # themselves self-rooted, so no pair ever carries the user as principal. Without this base
@@ -455,16 +507,241 @@ class LightConeGrantVerifier:
         # This is not a bypass. `_authorize` has already bound `requester_id` to the authenticated
         # acting principal and rejects any request naming someone else ("a caller may only request
         # keys as itself"), so reaching this line means the caller IS `principal_id`. It therefore
-        # widens nothing: it cannot yield another principal's key, and the collection-scoped branch
-        # above is untouched. What it removes is a circularity, not a check.
+        # widens nothing: it cannot yield another principal's key. What it removes is a
+        # circularity, not a check.
+        #
+        # Checked before the collection scope, and the position is what makes it reachable. Below
+        # `if collection_id: return (principal, collection) in pairs` it is unreachable the moment a
+        # caller names a scope, and the C10 repair names one on
+        # every content write (`content_service.put_bytes_encrypted` now passes `collection_id`).
+        # The effect was exactly the failure the paragraph above predicts: a first
+        # `create_artifact` on a virgin store answered `ContentEncryptionError: content encryption
+        # unavailable`, reproduced 2026-08-17 by following the README quickstart on a clean install.
+        #
+        # C10 is right and stays. It bound the AAD to the scope, which decides which BLOB opens —
+        # a different question from whose key this is. The scope still narrows every request for
+        # SOMEONE ELSE'S key, which is what C10's finding was about ("reach any one collection under
+        # an owner, get the key to all of them"). A master key is per-principal by construction, so
+        # on your OWN key there is nothing for a collection to narrow: refusing it there denies a
+        # caller a key they already hold, and denies it in a way no grant can repair.
         if requester_id == principal_id:
             return True
 
-        # Principal-scoped key (e.g. the SSE key, which spans a principal's whole
-        # corpus): authorized iff the requester reaches at least one collection
-        # under that principal. Scoping below the principal is not possible for a
-        # key that is derived per-principal by construction.
-        return any(p == principal_id for p, _ in pairs)
+        # ── one collection, walked rather than enumerated ────────────────────────────────────
+        # The question is "may this requester reach THIS collection", and answering it does not
+        # require the requester's whole light cone. Enumerating means materialising every
+        # descendant of every grant — `list_origin_descendants` holds them all in a set — and that
+        # does not survive a corpus: `stage.0.lexicon` has 1,841,335 members, so `edges_of` raises
+        # `EdgesTruncated` at its cap and the cone cannot be computed at all. One large grant then
+        # denied keys for every OTHER collection the requester held, because the failure was in
+        # computing the answer rather than in the answer.
+        #
+        # `origin_chain` walks the other way: the collection, its root, then each origin ancestor,
+        # stopping at the first edge whose propagate mask does not carry the action. It is the same
+        # traversal `check_access` performs for an artifact and the same attenuation
+        # `list_origin_descendants` applies going down, in one implementation — which is the point.
+        # Two readers of one question is how they came to disagree at scale.
+        #
+        # It is not wider than the cone. A collection is authorized here only when the requester
+        # holds a grant on it or on an ancestor that still conducts the action, which is exactly
+        # what descending from those grants would have reached.
+        if collection_id:
+            return self._reaches(requester_id, requester_type, collection_id, action)
+
+        # Principal-scoped key (e.g. the SSE key, which spans a principal's whole corpus):
+        # authorized iff the requester reaches at least one collection under that principal.
+        # Scoping below the principal is not possible for a key derived per-principal by
+        # construction.
+        #
+        # Enumerating answered this by building every `(cell_principal, collection)` pair the
+        # requester reaches and asking whether any names this principal — and that is the same
+        # materialisation that raises on a 1.8-million-member collection. The SSE key IS
+        # principal-scoped, so an index write took exactly this branch: the collection case could
+        # be fixed and indexing would still fail.
+        #
+        # It has an exact answer that enumerates nothing. A cell principal is a collection's ORIGIN
+        # ROOT, and `principal.resolve_cell_principal` states the property this turns on: it is
+        # "stable and single-valued for the collection's whole sub-tree". So every collection
+        # reachable THROUGH a granted resource shares that resource's root, and
+        #
+        #     any(p == principal_id for p, _ in pairs)   ==   any(root_of(r) == principal_id
+        #                                                        for r in granted resources)
+        #
+        # which is `O(grants x depth)` walks up instead of one walk down over everything below.
+        return self._roots_include(requester_id, requester_type, principal_id, action)
+
+    def _roots_include(self, requester_id: str, requester_type: str,
+                       principal_id: str, action: str) -> bool:
+        """Does any resource this requester holds sit under `principal_id`'s origin root?
+
+        A set membership over :meth:`_granted_roots`, which is where the walking happens and where
+        it is memoized. `principal_id` is only ever COMPARED to the result of that walk — it does
+        not steer it — which is what makes the walk shareable across every principal asked about.
+        """
+        return str(principal_id) in self._granted_roots(requester_id, requester_type, action)
+
+    def _granted_roots(self, requester_id: str, requester_type: str, action: str) -> frozenset:
+        """The origin roots of every resource this requester may `action`, memoized.
+
+        ⚑ **Measured 2026-08-28 on 71/home, and this is why it exists.** `_roots_include` walked
+        `_root_of(resource)` for every granted resource on EVERY call. That principal holds 7,268 of
+        the store's 7,388 grants, and the SSE narrowing path asks the question once per principal
+        whose index it might open — 51 principals in that index. One recall therefore ran **103,111
+        SQL statements to return ZERO hits**, of which `_roots_include` was **11.51s of a 13.93s**
+        `cProfile`, via 61,698 `_root_of` and 95,761 `get_origin_parent` calls.
+
+        `_grants` was already memoized; the walk over its results was not. Hoisting it is the whole
+        change: the roots are a fact about the REQUESTER's grants, so the 51 questions share one
+        answer instead of each paying for it.
+
+        📄 The same fix was made to the recall path's origin-chain walk on 2026-08-25 and did not
+        reach this second walker — see `status/RETRIEVAL-PATH-2026-08-25.md`, which also records
+        that its first attempt was written up as effective and never hit once. Hence
+        `tests/test_granted_roots_is_memoized.py`, which counts the walks rather than trusting this
+        paragraph.
+
+        ⛔ **THE STALENESS WINDOW IS NOT NEW, AND MUST NOT BECOME NEW.** This reuses `_grants`'s own
+        cache, key shape, lock, clock and `_memo_ttl` — the TTL capped by the requester's earliest
+        grant expiry — so how long a REVOKED grant keeps working is exactly what it was before this
+        method existed. `invalidate` clears it for free, because it is the same dict and this key
+        carries `requester_id` first, which is what `invalidate(requester_id)` filters on. A cache
+        of its own, with a lifetime of its own, would silently change post-revocation validity, and
+        that is a policy change wearing a refactor's clothes.
+
+        `ttl_s <= 0` still means NO memo: the walk runs per call, exactly as it did before.
+        """
+        from mantle.entities.grant import mask_of
+
+        # ── the memo is OPTIONAL, and `ttl_s <= 0` already says so ──────────────────────────────
+        # `_roots_include` used to need only `_grants` and `_root_of`, and tests build a verifier
+        # with `LightConeGrantVerifier.__new__` and stub exactly those two seams — see
+        # `test_a_virgin_store_takes_its_first_write.py`. Such an object has no `_cache`, `_clock`,
+        # `_lock` or `_ttl_s` at all, and reading one unguarded turned a seam-level test into an
+        # AttributeError. Absent infrastructure is read as `ttl_s = 0`, which this class ALREADY
+        # defines as "no memo at all — nothing is stored and every call recomputes". So the fallback
+        # is the documented configuration rather than a new branch invented to keep a test quiet.
+        ttl_s = getattr(self, "_ttl_s", 0.0)
+        ck = (requester_id, requester_type, "\x00roots:" + str(action))
+        now = self._clock() if ttl_s > 0 else 0.0
+        if ttl_s > 0:
+            with self._lock:
+                hit = self._cache.get(ck)
+                if hit is not None and hit[0] > now:
+                    return hit[1]
+
+        allow, deny = [], set()
+        for g in self._grants(requester_id, requester_type):
+            rid = getattr(g, "resource_id", None)
+            if not rid:
+                continue
+            m = mask_of(g)
+            if m.is_deny and m.carries(action):
+                deny.add(str(rid))
+            elif m.allows(action):
+                allow.append(str(rid))
+
+        roots = set()
+        for resource in allow:
+            if resource in deny:
+                continue
+            try:
+                roots.add(str(self._root_of(resource)))
+            except Exception:  # noqa: BLE001 — an unreadable chain under-reaches, fail closed
+                continue
+        result = frozenset(roots)
+
+        # The TTL is computed the way `_grants` computes it, from the same resolver, so the two
+        # entries expire together rather than drifting apart.
+        if ttl_s > 0:
+            from .lightcone import LightConeResolver
+            resolver = self._resolver or LightConeResolver(self._db)
+            ttl = self._memo_ttl(resolver, requester_id, requester_type)
+            if ttl > 0:
+                with self._lock:
+                    self._cache[ck] = (now + ttl, result)
+        return result
+
+    def _root_of(self, artifact_id: str) -> str:
+        """The top of an artifact's origin chain — its cell principal. A seam, for the same reason
+        `_chain` is one: a test describes a containment shape without reaching into the store."""
+        from mantle.db.backend import get_origin_root
+
+        return str(get_origin_root(self._db, artifact_id))
+
+    def _reaches(self, requester_id: str, requester_type: str,
+                 collection_id: str, action: str) -> bool:
+        """Does a grant this requester holds sit on `collection_id`, or above it and still conduct?
+
+        Deny is checked at every level before allow, matching `check_access`: a deny nearer the
+        artifact refuses, and nothing further up re-allows it.
+
+        The grant set comes from `_grants` below, which is memoized on the same key and TTL the
+        pair cache used — so revocation is bounded exactly as it was, and `invalidate` still clears
+        it.
+        """
+        from mantle.entities.grant import mask_of
+
+        allow, deny = set(), set()
+        for g in self._grants(requester_id, requester_type):
+            rid = getattr(g, "resource_id", None)
+            if not rid:
+                continue
+            m = mask_of(g)
+            if m.is_deny and m.carries(action):
+                deny.add(str(rid))
+            elif m.allows(action):
+                allow.add(str(rid))
+        if not allow:
+            return False
+
+        try:
+            for resource in self._chain(str(collection_id), action):
+                if resource in deny:
+                    return False
+                if resource in allow:
+                    return True
+        except Exception:  # noqa: BLE001 — a malformed or unreadable chain authorizes nothing,
+            return False   # which is the fail-closed direction
+        return False
+
+    def _chain(self, collection_id: str, action: str):
+        """Where a grant could sit to reach `collection_id` under `action`, nearest first.
+
+        One method for one external dependency, so a test can describe a containment shape without
+        reaching past this object into the store. Production reads
+        `lattice_api.origin_chain`, the same walk `check_access` performs for an artifact.
+        """
+        from mantle.db.backend import origin_chain
+
+        return origin_chain(self._db, collection_id, action)
+
+    def _grants(self, requester_id: str, requester_type: str):
+        """The requester's grants, memoized on `(requester, type)` for the same TTL the resolved
+        pairs used.
+
+        The memo exists because the enumerating path re-walked the whole light cone once per cell.
+        A walk does not need it for speed — it is a handful of edges — but it is kept because the
+        TTL is what BOUNDS POST-REVOCATION VALIDITY, and dropping it would silently change when a
+        revoked grant stops working. That is a policy change, not a refactor, so the memo stays and
+        `invalidate` still clears it.
+        """
+        ck = (requester_id, requester_type, "\x00grants")
+        now = self._clock()
+        if self._ttl_s > 0:
+            with self._lock:
+                hit = self._cache.get(ck)
+                if hit is not None and hit[0] > now:
+                    return hit[1]
+
+        from .lightcone import LightConeResolver
+
+        resolver = self._resolver or LightConeResolver(self._db)
+        grants = tuple(resolver._grants_for(requester_id, requester_type) or ())
+        ttl = self._memo_ttl(resolver, requester_id, requester_type)
+        if ttl > 0:
+            with self._lock:
+                self._cache[ck] = (now + ttl, grants)
+        return grants
 
     def invalidate(self, requester_id: Optional[str] = None) -> None:
         """Drop memoized authorization decisions (grant change / revocation).

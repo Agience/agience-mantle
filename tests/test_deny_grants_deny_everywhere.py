@@ -23,7 +23,6 @@ to the stored column) and `tests/test_attenuation_is_single_sourced.py` (the AST
 from __future__ import annotations
 
 import uuid
-from types import SimpleNamespace
 
 import pytest
 
@@ -330,8 +329,12 @@ def _list_visible(bearer_grant, action="read"):
     with patch("mantle.search.mantle.lightcone.LightConeResolver", _Resolver), \
             patch.object(ar, "_hydrate_batch",
                          side_effect=lambda db, ids: {i: {"id": i} for i in ids}):
-        return asyncio.run(ar.list_visible(
+        body = asyncio.run(ar.list_visible(
             content_type=None, action=action, limit=100, offset=0, auth=auth, store_db=None))
+    #: `/visible` returns `{items, total, has_more}` since 2026-08-25 (P-6/P-7). Asserted here so
+    #: every test below keeps comparing a plain list while the envelope itself stays covered.
+    assert set(body) == {"items", "total", "has_more"}, "the list envelope changed: %r" % (body,)
+    return body["items"]
 
 
 def test_a_deny_bearer_grant_does_not_appear_in_the_visible_list() -> None:
@@ -483,3 +486,111 @@ def test_a_doc_with_no_effect_at_all_confers_nothing(helper) -> None:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ── the resolver that decides KEY CUSTODY ─────────────────────────────────────────────────
+#
+# This section exists because the file above did not cover the one path that matters most.
+# Four enforcement points were pinned — `db/access`, `lattice_api.get_active_collection_ids_
+# for_user`, `grant_service`, `list_visible` — and `LightConeResolver.resolve` was not among
+# them. It is the resolver that feeds `oracle.LightConeGrantVerifier`, so it does not merely
+# decide what a listing shows: it decides which content keys get issued.
+#
+# Without the subtraction, with allow-read and deny-read both on `col-1`:
+#
+#     resolve('u1', 'read') -> {'col-1', 'art-a'}      check_access('col-1') -> 404
+#
+# `recall` returned the denied artifact and hydration decrypted its content inline. And because
+# keys are derived per (principal, collection) while `contexts` is deliberately un-narrowed, the
+# denied principal was issued a key for the WHOLE COLLECTION rather than a stray id in a list.
+#
+# The resolver's own module docstring states the contract these tests enforce: "this resolver
+# must not exceed [check_access]" — which tests deny first, at every level of its walk.
+
+def _resolver_grant(resource_id: str, effect: str):
+    from mantle.entities.grant import Grant
+
+    return Grant(resource_id=resource_id, grantee_type="user", grantee_id="u1",
+                 granted_by="u1", effect=effect, can_read=True, state="active")
+
+
+def _resolve_with(grants, descendants):
+    """`resolve` over a stubbed grant set and containment graph."""
+    from unittest.mock import MagicMock, patch
+
+    from mantle.search.mantle.lightcone import LightConeResolver
+
+    resolver = LightConeResolver(MagicMock())
+    with patch.object(LightConeResolver, "_grants_for", return_value=grants), \
+         patch("mantle.db.backend.list_origin_descendants",
+               side_effect=lambda db, ids, a: {d for i in ids for d in descendants.get(i, ())}), \
+         patch("mantle.services.context_service.reach") as reach:
+        reach.return_value = MagicMock(ids=set())
+        return resolver.resolve("u1", "read")
+
+
+def test_the_resolver_returns_what_an_allow_confers_positive_control() -> None:
+    """The control. Everything below asserts absence; without this one they would all pass on a
+    resolver that returned the empty set for every input."""
+    got = _resolve_with([_resolver_grant("col-1", "allow")], {"col-1": {"art-a"}})
+    assert got == {"col-1", "art-a"}
+
+
+def test_a_deny_beside_an_allow_removes_the_resource_from_the_resolver() -> None:
+    """The reported defect. `allows()` already stopped a deny from SEEDING the cone, so a deny
+    standing alone was handled — but nothing removed what a co-located allow had already seeded.
+    Absorbing a deny is not the same as subtracting one."""
+    got = _resolve_with(
+        [_resolver_grant("col-1", "allow"), _resolver_grant("col-1", "deny")],
+        {"col-1": {"art-a"}},
+    )
+    assert got == set(), (
+        "a denied resource reached the resolver, which issues content keys — %r" % (got,))
+
+
+def test_a_deny_on_a_member_removes_only_that_member() -> None:
+    """Deny is subtracted at artifact granularity, not collection granularity. Losing the whole
+    collection here would be the fail-closed direction, but it would also make a single deny
+    revoke everything filed beside it."""
+    got = _resolve_with(
+        [_resolver_grant("col-1", "allow"), _resolver_grant("art-a", "deny")],
+        {"col-1": {"art-a", "art-b"}},
+    )
+    assert got == {"col-1", "art-b"}
+
+
+def test_a_deny_on_a_container_reaches_the_artifacts_inside_it() -> None:
+    """Deny expands through containment exactly as the allow did. Without this, denying a
+    container would leave every artifact inside it reachable — the same bug one level down, and
+    the reason `db/access.invokable_resources` expands both piles."""
+    got = _resolve_with(
+        [_resolver_grant("col-1", "allow"), _resolver_grant("col-2", "allow"),
+         _resolver_grant("col-2", "deny")],
+        {"col-1": {"art-a"}, "col-2": {"art-b", "art-c"}},
+    )
+    assert got == {"col-1", "art-a"}
+
+
+def test_a_deny_carrying_a_different_action_does_not_subtract() -> None:
+    """The bit test is per-action on the deny side too. A deny that speaks only about `update`
+    must not remove a `read` the principal holds — over-subtracting is fail-closed, but it would
+    make deny grants unusable for narrowing a single verb.
+
+    `can_read=False` is load-bearing in this fixture. `Grant.__init__` defaults `can_read=True`
+    (`entities/grant.py:176`), so a deny grant constructed for `update` alone carries the `read`
+    bit as well — and a deny grant's bits name
+    the actions it DENIES. Built without this argument, the fixture denies read, the subtraction
+    fires correctly, and the test fails while the code is right.
+
+    That default is a real hazard in its own direction: on the ALLOW side the same line means a
+    partial grant doc materialises as allow-read. It is recorded in the audit; this fixture only
+    has to state which behaviour it is pinning.
+    """
+    from mantle.entities.grant import Grant
+
+    deny_update_only = Grant(resource_id="col-1", grantee_type="user", grantee_id="u1",
+                             granted_by="u1", effect="deny",
+                             can_read=False, can_update=True, state="active")
+    got = _resolve_with([_resolver_grant("col-1", "allow"), deny_update_only],
+                        {"col-1": {"art-a"}})
+    assert got == {"col-1", "art-a"}

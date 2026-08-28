@@ -18,8 +18,10 @@ The sections, in order:
   3. Absence stays absence. An empty or single-candidate input produces a computed null, never a
      plausible number in its place.
   4. The measured degeneracy. Pins `heads > n_features`, a real defect reproduced deliberately
-     rather than repaired, because repairing it would move a live pilot's answers.
-  5. The dependency floor. beacon acquires no edge to `beam`, `entroptics` or `prism` through the
+     rather than repaired, because repairing it would move a live pilot's answers. Two OTHER
+     defects in the same file were repaired on 2026-08-22 — see the oracle header — and section 4a
+     pins what that repair moved.
+  5. The dependency floor. beacon acquires no edge to `beam` or `prism` through the
      new module.
 
 What these checks cannot show: the oracle is a verbatim copy of the source implementation, so
@@ -67,7 +69,100 @@ def _o_resolved_rank(M) -> int:
     return int(signal_rank(M))
 
 
+# ── `gap_split` and `top_break` ──────────────────────────────────────────────────────────────
+#
+# These two oracle bodies are maintained here rather than copied verbatim from the source, which is
+# the arrangement this file states above: "if `cut.py` changes deliberately, these bodies change in
+# the same commit and every moved number is
+# explained."
+#
+# What was wrong. Both defects had one shape — the lock returned a cut where it had found nothing
+# to cut at:
+#
+#   1. The median floor hid the break it was looking for. The break that ends a top cluster sits
+#      BETWEEN the cluster and what follows, which is exactly the boundary the floor excludes. On
+#      `[9,8,8,1,1,1,1,1]` the region is `[9,8,8]`, offering only the ratios 1.125 and 1.000, so it
+#      cut after the 9 and kept one item of an obvious three; the real break, 8 -> 1 at a ratio of
+#      8, was on the other side. Repaired by carrying one element below the floor into the region,
+#      used to find the break and never itself kept.
+#   2. A tied group was cut to one arbitrary member: all ratios are 1.0 and `argmax` lands on index
+#      0. `[9,9,9,5,5,5,1,1]` kept 1 of 3; `[1]*9` kept 1 of 9; and the tie test needed a tolerance
+#      derived from the dtype, because identical rows give powers differing in the last bits and a
+#      ratio of `1 + 4e-15` is still greater than 1.
+#
+# What moved, and it is a live pilot's behaviour on these shapes:
+#
+#       spectrum                    before   after
+#       [9, 9, 9, 5, 5, 5, 1, 1]         1       3
+#       [9, 8, 8, 1, 1, 1, 1, 1]         1       3
+#       [5, 5, 5, 5, 1, 1, 1, 1]         1       4
+#       [7, 7, 1, 1]                     1       2
+#       [1] * 9                          1       9
+#       [10, 9, 1, 1e-3, 1e-9]           1       2
+#
+# On retrieval-shaped input it reaches about one spectrum in twenty (19 of 400 measured), and on
+# every one of those it keeps MORE, never fewer — median 6 -> 8. That is the defect being undone:
+# the old lock was cutting clusters short, and the recovered items sit between the first element
+# and the real break. Whether they help is a question about a corpus and is not settled here; it is
+# a recall-up change to a precision-oriented lock, and the labelled benches are where that gets
+# adjudicated. The parity sweep below still passes bit-equal over its whole corpus, which is why
+# the defects survived this long: the tests agreed because the inputs never reached them.
+#
+# `test_the_repair_is_what_changed_and_nothing_else` pins the before-and-after so the delta is
+# checkable rather than asserted.
+
+
+def _o_tie_tol(s):
+    return 2.0 * max(1, s.size) * float(np.finfo(s.dtype).eps)
+
+
+def _o_gap_split_at(s, tol):
+    n = s.size
+    if n <= 1:
+        return np.ones(n, dtype=bool), 1.0
+    order = np.argsort(s)[::-1]
+    sd = s[order]
+    ratios = sd[:-1] / np.clip(sd[1:], _ORACLE_RATIO_FLOOR, None)
+    c = int(np.argmax(ratios))
+    keep = np.zeros(n, dtype=bool)
+    if ratios[c] <= 1.0 + tol:
+        keep[:] = True
+        return keep, 1.0
+    keep[order[: c + 1]] = True
+    return keep, float(ratios[c])
+
+
 def _o_gap_split(scores):
+    s = np.asarray(scores, dtype=np.float64).ravel()
+    if s.size <= 1:
+        return np.ones(s.size, dtype=bool), 1.0
+    return _o_gap_split_at(s, _o_tie_tol(s))
+
+
+def _o_top_break(scores):
+    s = np.asarray(scores, dtype=np.float64).ravel()
+    n = s.size
+    keep = np.zeros(n, dtype=bool)
+    if n <= 1:
+        keep[:] = True
+        return keep, 1.0
+    tol = _o_tie_tol(s)
+    order = np.argsort(s)[::-1]
+    med = float(np.median(s))
+    n_above = int((s[order] > med * (1.0 + tol)).sum())
+    if n_above == 0:
+        keep[:] = True
+        return keep, 1.0
+    region = order[: min(n_above + 1, n)]
+    keep_local, rel_gap = _o_gap_split_at(s[region], tol)
+    n_keep = min(int(keep_local.sum()), n_above)
+    keep[order[:n_keep]] = True
+    return keep, rel_gap
+
+
+# ── the pre-repair bodies, kept so the delta is measurable rather than described ──────────────
+
+def _pre_repair_gap_split(scores):
     s = np.asarray(scores, dtype=np.float64).ravel()
     n = s.size
     if n <= 1:
@@ -81,7 +176,7 @@ def _o_gap_split(scores):
     return keep, float(ratios[c])
 
 
-def _o_top_break(scores):
+def _pre_repair_top_break(scores):
     s = np.asarray(scores, dtype=np.float64).ravel()
     n = s.size
     keep = np.zeros(n, dtype=bool)
@@ -93,7 +188,7 @@ def _o_top_break(scores):
     if idx.size <= 1:
         keep[order[:1]] = True
         return keep, 1.0
-    keep_local, rel_gap = _o_gap_split(s[idx])
+    keep_local, rel_gap = _pre_repair_gap_split(s[idx])
     keep[idx[keep_local]] = True
     return keep, rel_gap
 
@@ -477,6 +572,11 @@ def test_the_public_surface_is_exactly_the_screen_math() -> None:
     assert set(cut.__all__) == {
         "gap_split", "top_break",
         "derive_heads", "head_screen", "signal_power", "select",
+        # `screen_frame` is screen math and nothing else: it derives the head count and builds the
+        # head screen, both already here, and returns the (T, F) array. It carries no retrieval
+        # policy, no store access and no graceful-degradation contract — it raises like everything
+        # else in this module.
+        "screen_frame",
     }
     for name in cut.__all__:
         assert callable(getattr(cut, name)), f"`cut.{name}` is exported and is not callable"
@@ -525,12 +625,79 @@ def test_more_heads_than_features_yields_an_all_zero_screen_and_keeps_one_item()
         "the all-zero screen is gone — if `head_screen` now refuses or bounds the head count, "
         "that is the repair, and this test is what has to move with it")
     kept = cut.select(E, q, heads=64)
-    assert kept.tolist() == [19], (
-        "the degenerate path no longer keeps exactly the last candidate; whatever changed, it "
-        "changed what a live pilot would produce")
+    # Repaired 2026-08-22: this asserted `[19]` — the last candidate by `argsort`, kept because an
+    # all-zero spectrum has nothing strictly above its median. The lock now reports that it found
+    # no break and keeps everything, so the degeneracy is still here (the screen is still all
+    # zeros) without a confident cut being produced out of nothing. Bounding `H <= n_features` in
+    # `head_screen` is a separate repair this test awaits.
+    assert kept.tolist() == list(range(20)), (
+        "the degenerate path no longer keeps everything; whatever changed, it changed what a live "
+        "pilot would produce")
     # The control: with a head count the width can carry, the screen is real and the cut reads.
     good = cut.head_screen(E, q, 4)
     assert good.any() and good.shape == (20, 4)
+
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════
+# 4a · What the 2026-08-22 repair moved, and what it did not
+# ═════════════════════════════════════════════════════════════════════════════════════════════
+
+_REPAIR_DELTA = {
+    (9.0, 9.0, 9.0, 5.0, 5.0, 5.0, 1.0, 1.0): (1, 3),
+    (9.0, 8.0, 8.0, 1.0, 1.0, 1.0, 1.0, 1.0): (1, 3),
+    (5.0, 5.0, 5.0, 5.0, 1.0, 1.0, 1.0, 1.0): (1, 4),
+    (7.0, 7.0, 1.0, 1.0): (1, 2),
+    (1.0,) * 9: (1, 9),
+    (10.0, 9.0, 1.0, 1e-3, 1e-9): (1, 2),
+}
+
+
+def test_the_repair_is_what_changed_and_nothing_else() -> None:
+    """The before-and-after, pinned on the shapes the repair targets.
+
+    The pre-repair bodies are kept in this file so this is a measurement rather than a claim. On
+    every one of these the old lock returned a cut it reported no evidence for."""
+    for spectrum, (before, after) in _REPAIR_DELTA.items():
+        a = np.array(spectrum, dtype=np.float64)
+        assert int(_pre_repair_top_break(a)[0].sum()) == before, (spectrum, "before")
+        assert int(cut.top_break(a)[0].sum()) == after, (spectrum, "after")
+
+
+def test_the_repair_reaches_about_one_in_twenty_real_spectra_and_only_ever_keeps_MORE() -> None:
+    """How far the repair reaches, measured rather than assumed — and it is not zero.
+
+    It reaches roughly 5% of the synthetic pools below — a figure later shown to be an artefact of
+    the generator, which plants near-identical rows and so manufactures the defect's own trigger.
+    On real corpora it reads 0.0% (144 cached bge-m3 spectra) and 0.2% (832 lattice-path spectra).
+    The assertion here is about this generator and is kept because it pins what the repair does; it
+    is not a deployment estimate.
+
+    The direction is one-way and is the defect being undone: on every differing draw the repaired
+    lock keeps more, never fewer (19/19 over 400 draws, median 6 -> 8). That is what "the median
+    floor hid the break" means in practice — the old lock cuts clusters short, and the items it now
+    recovers are the ones between the first element and the real break.
+
+    Whether the recovered items help is a question about a corpus and cannot be settled here.
+    It is a recall-up change to a precision-oriented lock; the labelled benches are where that gets
+    adjudicated, and this test only fixes what the change is."""
+    rng = np.random.default_rng(4242)
+    differing, more, fewer = 0, 0, 0
+    for _ in range(400):
+        n = int(rng.integers(8, 90))
+        d = int(rng.choice([64, 128, 384, 768]))
+        E = rng.normal(size=(n, d))
+        E[: max(1, n // 4)] += 2.0 * rng.normal(size=(1, d))
+        q = rng.normal(size=d)
+        p = cut.signal_power(cut.head_screen(E, q, 8))
+        after, before = cut.top_break(p)[0], _pre_repair_top_break(p)[0]
+        if np.array_equal(after, before):
+            continue
+        differing += 1
+        more += int(after.sum() > before.sum())
+        fewer += int(after.sum() < before.sum())
+    assert 0 < differing <= 40, f"{differing}/400 — the reach of the repair moved"
+    assert fewer == 0, f"{fewer} draws kept FEWER after the repair; that is not this repair"
+    assert more == differing
 
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════
@@ -539,7 +706,7 @@ def test_more_heads_than_features_yields_an_all_zero_screen_and_keeps_one_item()
 
 _PROBE = '''
 import sys, json
-BLOCKED = ("beam", "entroptics", "prism")
+BLOCKED = ("beam", "prism")
 for name in BLOCKED:
     assert name not in sys.modules, name + " was imported before the blocker went up"
 MARK = "BLOCKED by the negative control"
@@ -580,9 +747,9 @@ print(json.dumps(v))
 '''
 
 
-def test_the_cut_imports_and_works_with_beam_entroptics_and_prism_all_blocked() -> None:
-    """Fails if the silhouette acquires an edge to `beam`, `entroptics` or `prism` — directly or
-    transitively — and mantle stops being shippable while entroptics stays private. Keeping that
+def test_the_cut_imports_and_works_with_beam_and_prism_all_blocked() -> None:
+    """Fails if the silhouette acquires an edge to `beam` or `prism` — directly or
+    transitively — and mantle stops being shippable on its own. Keeping that
     edge closed is why the reduced instrument exists.
 
     Stricter than `instrument.py`'s probe: `instrument.py` is allowed one prism module
@@ -597,7 +764,7 @@ def test_the_cut_imports_and_works_with_beam_entroptics_and_prism_all_blocked() 
     assert all(v["blocker_fires"].values()), (
         f"the blocker did not bite on every edge: {v['blocker_fires']} — every conclusion below "
         "would be vacuous")
-    assert v["works"], f"the cut broke without beam/entroptics/prism: {v.get('error')}"
+    assert v["works"], f"the cut broke without beam/prism: {v.get('error')}"
     assert v["heads"] >= 2 and 1 <= v["kept"] <= 40
     assert not v["leaked"], f"a blocked package reached sys.modules anyway: {v['leaked']}"
 
@@ -611,3 +778,45 @@ def test_the_cut_is_not_re_exported_from_the_package_promise() -> None:
     published surface doubles by accident. Widening it is a separate deliberate act."""
     from mantle.search import beacon
     assert set(beacon.__all__).isdisjoint(set(cut.__all__))
+
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════
+# 6 · The shared corpus — the contract with the sibling implementation
+# ═════════════════════════════════════════════════════════════════════════════════════════════
+# `tests/lock_corpus.json` holds the same 6,400 cases as the sibling implementation's corpus. Both
+# read it, so a change to the lock on either side fails on BOTH rather than only where somebody
+# happened to write a test. That is the difference between a conformance test and a contract: the
+# sibling's suite already measured this side, and nothing measured that one.
+#
+# It is a copy and not an import because the two trees do not depend on each other and must not
+# start to: beacon is Apache and numpy-only so a store can ship standalone.
+#
+# It is not a byte-copy: this copy is LF (100,966 bytes), the sibling's is CRLF (107,351) — 6,400
+# lines differing by line ending alone, so the two have never been byte-identical and no gate
+# checks that. What has to match is the parsed cases, which is what `_lock_corpus()` reads and
+# what the tests below compare.
+
+
+def _lock_corpus():
+    import json
+    import pathlib
+    return json.loads(
+        (pathlib.Path(__file__).parent / "lock_corpus.json").read_text(encoding="utf8"))["cases"]
+
+
+def test_the_shared_lock_corpus_reads_the_way_both_sides_recorded_it() -> None:
+    """76 cases: every shape the 2026-08-22 defects lived in, plus 60 screen-shaped spectra."""
+    for case in _lock_corpus():
+        s = np.array(case["scores"], dtype=np.float64)
+        for fn, name in ((cut.gap_split, "gap_split"), (cut.top_break, "top_break")):
+            keep, gap = fn(s)
+            assert [int(i) for i in np.where(keep)[0]] == case[name]["keep"], (case["name"], name)
+            assert abs(gap - case[name]["rel_gap"]) <= 1e-12 * max(1.0, abs(case[name]["rel_gap"])), (
+                case["name"], name, gap, case[name]["rel_gap"])
+
+
+def test_the_corpus_covers_the_shapes_the_repair_moved() -> None:
+    """A corpus of easy cases certifies nothing. These are the ones that moved on 2026-08-22."""
+    names = {c["name"] for c in _lock_corpus()}
+    assert {"plateau-3", "plateau-4", "flat", "cluster-with-inner-wobble",
+            "tail-artifact", "near-tie", "all-zero", "empty"} <= names

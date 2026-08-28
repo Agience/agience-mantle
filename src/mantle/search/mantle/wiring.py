@@ -46,8 +46,9 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 import threading
-from typing import NamedTuple, Optional
+from typing import Any, NamedTuple, Optional
 
 from .engine import MantleQueryEngine
 from .indexer import MantleIndexer
@@ -55,10 +56,10 @@ from .lightcone import LightConeResolver
 from .oracle import OracleService
 from .s3_cell_store import S3CellStore
 from .sse import (
-    FilePostingStore,
     MantleSseSearchAccessor,
     PostingStore,
     S3PostingStore,
+    SqlitePostingStore,
     SseIndexer,
     TokenNarrower,
 )
@@ -503,33 +504,94 @@ def local_sse_root() -> str:
     return str(config.BASE_DIR / ".data" / "mantle-sse")
 
 
-def _build_file_sse_store(sse_prefix: str) -> Optional[FilePostingStore]:
-    """The local posting store, or ``None`` if the root cannot be created.
+def local_sse_path(sse_prefix: str) -> str:
+    """The local index database file for one segment: ``<root>/<prefix>.db``.
+
+    One file per segment, which is what the file store's `prefix` did with one directory tree per
+    segment. The root stays :func:`local_sse_root` so ``MANTLE_SSE_DIR`` keeps meaning the same
+    thing and an operator who pointed it somewhere writable does not have to move it.
+    """
+    return os.path.join(local_sse_root(), "%s.db" % sse_prefix)
+
+
+def _build_file_sse_store(sse_prefix: str) -> Optional[SqlitePostingStore]:
+    """The local posting store, or ``None`` if it cannot be opened.
+
+    SQLite, not a directory tree. `SqlitePostingStore` is the only posting store; see that module
+    for the four measured problems a one-file-per-slot layout produces (write cost linear in corpus
+    size, the object explosion, an accelerator blob that has to exist and brings its own
+    corpus-losing failure mode, and no atomicity across a posting's read-modify-write).
 
     ``None`` here is the same honest refusal the S3 path makes: there is nowhere to put an index,
-    so the caller answers 503 rather than pretending.
+    so the caller answers 503 rather than pretending. `sqlite3.Error` joins `OSError` because the
+    ways a database file can be unusable are a superset of the ways a directory can — a corrupt
+    header, a read-only WAL, an unsupported filesystem lock — and every one of them means the same
+    thing to this caller.
     """
-    root = local_sse_root()
+    path = local_sse_path(sse_prefix)
     try:
-        store = FilePostingStore(root, prefix=sse_prefix)
-    except OSError as exc:
+        store = SqlitePostingStore(path)
+    except (OSError, sqlite3.Error) as exc:
         logger.warning(
-            "MANTLE-SSE stores: local index root %r is not usable (%s: %s) — encrypted search is "
+            "MANTLE-SSE stores: local index %r is not usable (%s: %s) — encrypted search is "
             "OFF until it is. Set MANTLE_SSE_DIR to a writable directory.",
-            root, type(exc).__name__, exc,
+            path, type(exc).__name__, exc,
         )
         return None
-    logger.info("MANTLE-SSE stores: local index at %s (prefix %s)", root, sse_prefix)
+    logger.info("MANTLE-SSE stores: local index at %s", path)
+    _report_analyzer_generation(store, path)
     return store
+
+
+def _report_analyzer_generation(store: Any, where: str) -> None:
+    """Say, once at open, whether this index was written by the analysis this build runs.
+
+    A blind token is an HMAC of an ANALYSED term, so the pipeline is part of the index format and
+    no in-place migration exists: the store holds hashes and cannot re-derive a term it never saw.
+    A client whose analysis has moved queries terms the store was never filed under and gets an
+    empty answer that is indistinguishable from a correct one — well-formed query, healthy store,
+    nothing found.
+
+    Reported rather than refused, and that is a judgement about blast radius rather than
+    squeamishness. Generation 2 added ASCII folding, which is the identity on ASCII, so the terms
+    that move are exactly those containing combining marks and everything else still matches.
+    Refusing here would take a working index offline over a subset of its content; staying silent
+    would leave the subset unreachable with nothing to read. Naming it does neither.
+
+    An unstamped store reads as generation 1 only when it holds something. An EMPTY unstamped store
+    is not stale — nothing has been written under any analysis yet — and the first index write
+    stamps it. Telling those apart is why this asks the store for its owners.
+    """
+    from mantle.search.mantle.sse.posting import analyzer_generation_of
+    from mantle.search.mantle.sse.tokenizer import ANALYZER
+
+    found = analyzer_generation_of(store)
+    if found == ANALYZER:
+        return
+    if found is None:
+        try:
+            populated = bool(store.list_owners())
+        except Exception:
+            populated = False
+        if not populated:
+            return                      # empty and unstamped: the first write claims it
+        found = 1                       # written before stamping existed, which is generation 1
+
+    logger.warning(
+        "MANTLE-SSE stores: %s was written by analyzer generation %s and this build is generation "
+        "%s. Terms are HMAC'd after analysis, so there is no in-place migration and content "
+        "indexed under the old analysis is unreachable — silently, as an empty result. Rebuild "
+        "with `mantle.search.init_search.reindex_all_artifacts`.",
+        where, found, ANALYZER,
+    )
 
 
 def _build_sse_store(segment: str = "committed") -> Optional[PostingStore]:
     """Construct the posting store for one index segment.
 
-    ONE STORE, WHERE THERE WERE TWO. The second was the per-owner BM25 corpus-statistics blob;
+    One store, where there were two. The second was the per-owner BM25 corpus-statistics blob;
     nothing computes a corpus statistic, so nothing writes or reads it and no backend for it
-    is built. Existing `stats.enc` objects in a bucket or index tree are inert and are left
-    alone — see :mod:`.sse.file_stores`.
+    is built. Existing `stats.enc` objects in a bucket are inert and are left alone.
 
     Both backends implement the same Protocol and both receive ciphertext only; the choice
     is where the bytes land, never what they are.
@@ -562,7 +624,9 @@ def _build_sse_store(segment: str = "committed") -> Optional[PostingStore]:
     if s3_client is None:
         return None
 
-    return S3PostingStore(s3_client, bucket=bucket, prefix=sse_prefix)
+    store = S3PostingStore(s3_client, bucket=bucket, prefix=sse_prefix)
+    _report_analyzer_generation(store, "s3://%s/%s" % (bucket, sse_prefix))
+    return store
 
 
 def sse_index_storage_available(segment: str = "committed") -> bool:
@@ -595,6 +659,61 @@ def build_sse_indexer(
     return SseIndexer(oracle, posting_store)
 
 
+def build_digest_refresher(
+    members_provider, *, read, engine_id: str, segment: str = "committed"
+):
+    """Construct the collection-digest refresher, or ``None`` if a prerequisite is missing.
+
+    `read` and `engine_id` are the caller's, and neither has a default: mantle does not import
+    any spectral library, so the instrument that takes the read cannot be resolved here. A host
+    passes `read=<probe>.mp_deviation,
+    engine_id=<probe>.ENGINE_ID_PROXIMITY`. This builder supplies the two
+    collaborators mantle owns, the key provider and the posting store.
+
+    `engine_id` travels with every digest because a digest taken against one instrument is not
+    comparable with one taken against another — `collection_proximity` refuses a cross-engine
+    comparison rather than silently mixing them.
+
+    Returns ``None`` on a missing oracle or posting store, matching every other builder here: a
+    node that cannot hold digests declines to keep them rather than keeping them somewhere else.
+    """
+    oracle = _build_oracle()
+    posting_store = _build_sse_store(segment)
+    if oracle is None or posting_store is None:
+        return None
+    from mantle.search.ingest.digest_refresh import CollectionDigestRefresher
+    from mantle.search.mantle.collection_proximity import DigestSlot
+
+    return CollectionDigestRefresher(
+        DigestSlot(oracle, posting_store), members_provider, read=read, engine_id=engine_id,
+    )
+
+
+def build_collection_proximity_narrower(
+    members_of, *, probe_factory, segment: str = "committed"
+):
+    """Construct the query-side proximity narrower, or ``None`` if a prerequisite is missing.
+
+    `probe_factory` is injected for the same reason `read` is above: the probe's contract is
+    `<probe>.SpectrumProbe`'s — exact against a full scan, not an approximation —
+    and mantle cannot name it.
+
+    The narrower compiles to the same `lookup(pairs) -> set[artifact_id]` shape the blind-token
+    narrowing produces, so it meets the light cone through the single `ids &= …` line rather than
+    as a second authorization path. That is what makes it safe to add to a recall: it can only
+    ever narrow, and it narrows a set the light cone has already decided.
+    """
+    oracle = _build_oracle()
+    posting_store = _build_sse_store(segment)
+    if oracle is None or posting_store is None:
+        return None
+    from mantle.search.mantle.collection_proximity import CollectionProximityNarrower
+
+    return CollectionProximityNarrower(
+        oracle, posting_store, members_of, probe_factory=probe_factory,
+    )
+
+
 class _QueryStack(NamedTuple):
     """The two collaborators a recall runs on, built once from one prerequisite check."""
 
@@ -605,7 +724,7 @@ class _QueryStack(NamedTuple):
 def _build_query_stack(segment: str) -> Optional[_QueryStack]:
     """Everything a recall needs, or ``None`` if ANY of it is missing.
 
-    THREE PREREQUISITES, ALL HARD: the oracle, the posting store and the cell store. Recall
+    Three prerequisites, all hard: the oracle, the posting store and the cell store. Recall
     narrows on the blind-token postings and ranks what survives on the cells, so a node
     missing either store cannot answer — and the two ways it could pretend to are both worse
     than a 503.
@@ -616,9 +735,9 @@ def _build_query_stack(segment: str) -> Optional[_QueryStack]:
     200 with an empty list for a query that matched — silent, and indistinguishable from a
     correct empty answer. Neither is visible to the caller, so neither is allowed to happen.
 
-    Without a CELL STORE nothing can rank by cosine. That one used to be best-effort, and it
-    read backwards: a node with no SSE store answered 503 while a node with no cell store
-    answered 200 with an empty list.
+    Without a cell store nothing can rank by cosine, so that store is required on the same terms.
+    Treating it as best-effort reads backwards: a node with no SSE store answers 503 while a node
+    with no cell store answers 200 with an empty list.
 
     A cell store is not a working semantic arm — routing also needs a provisioned AnchorSet,
     which is not a store and which nothing here can build. That node returns an accessor, and

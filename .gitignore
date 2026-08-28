@@ -25,6 +25,15 @@ compose/secrets/
 # setuptools staging output `python -m build` writes into that same directory.
 build/lib/
 build/bdist.*/
+# PyInstaller's work directory (`packaging/build.py --workpath`). Same reasoning as the two above:
+# `build/` holds a tracked Dockerfile, so only the generated subdirectories are ignored — never the
+# directory itself.
+build/pyinstaller/
+# Stamped by `packaging/build.py` immediately before each build: version, timestamp, commit, dirty.
+# ⛔ GENERATED, AND A COMMITTED COPY WOULD BE WORSE THAN NONE — it is what `agience version` reports,
+# so a stale tracked copy makes a binary confidently misidentify itself, which is the one thing a
+# promote-by-digest workflow cannot tolerate.
+packaging/agience_build_info.py
 __pycache__/
 *.py[cod]
 *$py.class

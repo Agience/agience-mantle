@@ -7,12 +7,12 @@ lands in the cell of its nearest anchor, a query fans out to its nearest anchors
 one node's cells comparable with another's, which is why a **client seeds it** — the set arrives
 as a file the client authored, and every node admits the same one.
 
-MANTLE DOES NOT DERIVE, GROW, RECONCILE OR CROSSWALK A COORDINATE SYSTEM, and that is deliberate.
+Mantle does not derive, grow, reconcile or crosswalk a coordinate system, and that is deliberate.
 Anchors are vectors, this process runs no model (the no-models rule), and anchors fitted locally
 would mint region ids no peer computes. So the whole contract is three steps: seed a set, supply a
 query vector in that set's space, get ranked results. This command is step one.
 
-WHAT STAYS DARK WITHOUT A SET. The AnchorSet is the semantic arm's on switch, and a node nobody
+What stays dark without a set. The AnchorSet is the semantic arm's on switch, and a node nobody
 has seeded has none. Until one is loaded:
 
     an artifact write        indexed LEXICALLY; the vector arm returns `skipped` and warns
@@ -62,6 +62,68 @@ def _fingerprint(aset) -> str:
     """The set's fingerprint — imported here so `--help` costs nothing but argparse."""
     from mantle.search.anchors import anchorset_fingerprint
     return anchorset_fingerprint(aset)
+
+
+def action_replace(path: str, dry_run: bool) -> None:
+    """Make the set in `path` THE set: remove what is there, then admit this one.
+
+    `load` adds, which grows a set rather than correcting one: a corrected 16-anchor set loaded
+    over an existing 21 produces 37, with the superseded regions still routing, the command
+    reporting "37 anchors in the store (37 new)", and every later query answering 200 out of a
+    coordinate system nobody chose. This action is the way back from a mis-seed.
+
+    It invalidates every cell. An anchor id is the cluster id, so a different set is a different
+    coordinate system: existing cells were written under the old regions and are not comparable
+    with anything routed under the new ones. `/status` reports it — `matches_cells` goes false and
+    `indexed_fingerprint` stops equalling `fingerprint` — and the fix is to reindex, the same
+    instruction `load` ends with and a heavier one here.
+
+    The file is verified BEFORE anything is removed. `AnchorSet.load` recomputes every id from
+    its own content and refuses the file whole if one disagrees, so a corrupt file cannot leave
+    the node with no set at all — the failure mode a delete-then-load ordering would invite.
+    """
+    if not path:
+        raise SystemExit(
+            "--path is required for replace. It is the AnchorSet JSON your client wrote with "
+            "`AnchorSet.save`, e.g. `--action replace --path anchors.json`."
+        )
+    try:
+        aset = AnchorSet.load(path)
+    except AnchorSetCorrupt as e:
+        raise SystemExit(f"REFUSED: {e}") from None
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"REFUSED: {path} is not a readable AnchorSet file: {e}") from None
+
+    repo = get_anchor_repo()
+    before = repo.count()
+    logger.info("AnchorSet in %s: %d anchors, model=%s, dim=%d", path, len(aset), aset.model_id,
+                aset.dim)
+    logger.info("  fingerprint %s", _fingerprint(aset))
+    logger.info("  this REPLACES %d anchor(s) already in the store", before)
+    if dry_run:
+        logger.info("[DRY-RUN] verified; nothing removed and nothing written.")
+        return
+
+    removed = repo.clear()
+    logger.info("  removed %d", removed)
+
+    def _progress(done: int, total: int) -> None:
+        logger.info("  ... %d/%d anchors", done, total)
+
+    try:
+        repo.bulk_add(aset.anchors, progress=_progress)
+    except AnchorSetCorrupt as e:
+        raise SystemExit(f"REFUSED: {e}") from None
+
+    from mantle.search.anchors import reset_anchorset
+    reset_anchorset()
+    logger.info("Replaced: %d anchors in the store (was %d). Ids preserved from the file.",
+                repo.count(), before)
+    logger.info("Send queries with space_id=%s; any other space is refused by name.",
+                aset.model_id)
+    logger.info("⚠ REINDEX NOW. Every cell was written under the old regions and routes into a "
+                "coordinate system this set does not have; `/status` reports matches_cells false "
+                "until they are rewritten.")
 
 
 def action_load(path: str, dry_run: bool) -> None:
@@ -178,7 +240,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--action", choices=["load", "inspect"], required=True,
+        "--action", choices=["load", "replace", "inspect"], required=True,
         help=(
             "load: admit an AnchorSet file (--path), ids preserved and verified. "
             "inspect: whether this node has a live AnchorSet at all — the semantic arm is off "
@@ -196,7 +258,9 @@ def main() -> None:
     from mantle.services.system_identity import system_acting_context
 
     with system_acting_context(scope="platform.manage-anchors"):
-        if args.action == "load":
+        if args.action == "replace":
+            action_replace(args.path, args.dry_run)
+        elif args.action == "load":
             action_load(args.path, args.dry_run)
         elif args.action == "inspect":
             action_inspect(args.dry_run)

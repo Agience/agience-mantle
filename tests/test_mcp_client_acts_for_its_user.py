@@ -122,7 +122,7 @@ class TestTheClientIsRetainedAsTheActor:
         assert _resolve(_mcp_payload()).actor == CLIENT
 
     def test_an_array_aud_is_recorded_as_a_name_and_not_a_python_repr(self):
-        """RFC 7519 allows `aud` to be an array. A bare `str()` would write `"['a', 'b']"`
+        """RFC 7519 allows `aud` to be an array. A bare `str` would write `"['a', 'b']"`
         into the access log — a name no client id search would ever match. It stays
         provenance either way; this is about the log being readable, not about a decision."""
         assert _resolve(_mcp_payload(aud=[CLIENT])).actor == CLIENT
@@ -144,22 +144,62 @@ class TestTheClientIsRetainedAsTheActor:
 
     def test_the_actor_is_never_an_authorization_input(self):
         """Stated as a property of the tree, not of a code path: if nothing reads `actor` to
-        decide access, then recording it here cannot have granted anything. A future reader
-        that does consult it has to change this test to do so."""
+        decide access, then recording it here cannot have granted anything.
+
+        Asserted as the property, not as a count. This required `len(reads) == 1` — the audit
+        context being the only reader — which is a PROXY for "actor decides nothing", and the two
+        come apart in both directions. It fired on 2026-08-26 for a second reader that was a
+        `logger.warning` naming the actor of a refused platform-scoped token: provenance, in a log
+        line, deciding nothing. Its own message asked the right question — *"is one a decision?"* —
+        and the count could not answer it.
+
+        Relaxing the number to 2 would have been the wrong repair: it buys silence until the
+        third reader, and the third might be a branch. What matters is WHERE the value is read, so
+        that is what this asks — `auth.actor` may be passed, stored or logged, and may never appear
+        in a test, a comparison, or a boolean. A future reader that wants to consult it for access
+        still has to come here and say so.
+        """
         import ast
         import inspect
 
         from mantle.services import dependencies
 
         tree = ast.parse(inspect.getsource(dependencies))
+
+        parents = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+
         reads = [
             node for node in ast.walk(tree)
             if isinstance(node, ast.Attribute) and node.attr == "actor"
             and isinstance(node.value, ast.Name) and node.value.id == "auth"
         ]
-        # The audit context is the only place `auth.actor` is read in this module, and it is
-        # read into a dict that `_witness` records — never into a branch.
-        assert len(reads) == 1, f"auth.actor gained {len(reads)} readers; is one a decision?"
+        assert reads, "auth.actor is no longer read at all — the audit record has lost the client"
+
+        deciding = []
+        for r in reads:
+            node, hops = r, 0
+            while node in parents and hops < 12:
+                parent = parents[node]
+                # The value steers control flow: `if auth.actor`, `x if auth.actor else y`,
+                # `auth.actor ==`, `auth.actor and...`, `not auth.actor`.
+                if isinstance(parent, (ast.Compare, ast.BoolOp, ast.UnaryOp)):
+                    deciding.append(ast.unparse(parent))
+                    break
+                if isinstance(parent, (ast.If, ast.IfExp, ast.While)) and node is parent.test:
+                    deciding.append(ast.unparse(parent.test))
+                    break
+                # A call argument or a dict value is provenance — stop climbing; it is recorded,
+                # not consulted.
+                if isinstance(parent, (ast.Call, ast.Dict, ast.Assign, ast.Return)):
+                    break
+                node, hops = parent, hops + 1
+
+        assert not deciding, (
+            "auth.actor is consulted to decide something, which makes the machine's identity an "
+            "authorization input: %s" % deciding)
 
     def test_the_audit_record_names_the_client(self):
         """A person who was not present must not be the whole story in the access log."""

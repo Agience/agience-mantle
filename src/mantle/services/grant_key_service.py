@@ -133,7 +133,13 @@ def mint(
     now = _now_iso()
 
     if resource_id:
-        bits = _flags_from(flags, role)
+        # A key cannot carry more than its issuer holds. A grant key is a bearer credential —
+        # whatever bits land here are exercised by anyone holding the token, so minting is the
+        # moment new authority would enter the lattice from nowhere. The router's `_require_admin`
+        # establishes that the issuer may mint HERE; this establishes HOW MUCH.
+        from mantle.services.grant_service import clamp_to_issuer
+        bits = clamp_to_issuer(db, issuer_id=user_id, resource_id=resource_id,
+                               requested=_flags_from(flags, role))
     else:
         # A bundle root with explicit flags is a caller deliberately pre-narrowing the
         # ceiling; without them it stays open. See `_open_ceiling`.
@@ -177,8 +183,14 @@ def add_member(
     (``can_admin`` on *resource_id*) is the caller's job.
     """
     from mantle.db import backend as store
+    from mantle.services.grant_service import clamp_to_issuer
 
     now = _now_iso()
+    # Clamped to what `granted_by` holds on this resource. `_open_ceiling` gives a resource-less
+    # bundle root all nine bits on the grounds that the members are separately admin-checked, and an
+    # admin check is not a ceiling, so without this clamp the open root is
+    # narrowed by nothing on the way down. `masked_by` composes the BUNDLE's ceiling at resolve
+    # time; this is the ISSUER's, and the two are different questions.
     member = GrantEntity(
         id=str(uuid.uuid4()),
         resource_id=resource_id,
@@ -191,7 +203,8 @@ def add_member(
         expires_at=expires_at,
         created_time=now,
         modified_time=now,
-        **_flags_from(flags, role),
+        **clamp_to_issuer(db, issuer_id=granted_by, resource_id=resource_id,
+                          requested=_flags_from(flags, role)),
     )
     store.create_grant(db, member)
     # NOT `_invalidate(bundle_id)`: a nested bundle names its immediate parent, while the
@@ -296,7 +309,11 @@ def touch(db, root: GrantEntity) -> None:
         logger.debug("grant-key touch failed", exc_info=True)
 
 
-def revoke(db, grant: GrantEntity, revoked_by: str) -> bool:
+#: RETURNS NOTHING, 2026-08-26. It returned `bool`, computed as
+#: `update_grant(...) is not None`, which is ALWAYS True because `update_grant` always returns the
+#: entity. Two callers tested it and neither test could fail. Returning `None` is what stops a
+#: third being written: a caller cannot branch on a value that is not there.
+def revoke(db, grant: GrantEntity, revoked_by: str) -> None:
     """Soft-revoke a key or member. Members are left in place — the bundle they hang
     off is gone, so they resolve to nothing."""
     from mantle.db import backend as store
@@ -306,9 +323,8 @@ def revoke(db, grant: GrantEntity, revoked_by: str) -> bool:
     grant.revoked_by = revoked_by
     grant.revoked_at = now
     grant.modified_time = now
-    updated = store.update_grant(db, grant) is not None
+    store.update_grant(db, grant)
     invalidate_for(db, grant)
-    return updated
 
 
 # ---------------------------------------------------------------------------

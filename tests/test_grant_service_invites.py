@@ -190,7 +190,7 @@ def test_an_untargeted_invite_still_reports_its_details(db):
     assert "target_entity" not in details and token not in str(details)
 
 
-# ── deny grants confer nothing here either (audit S1's share/admin sibling) ───
+# ── deny grants confer nothing here either's share/admin sibling) ───
 def test_a_deny_grant_confers_neither_share_nor_admin(db):
     """A deny grant sets the bits naming what it DENIES, so `getattr(g, "can_share")` answered
     True for one. See `tests/test_deny_grants_deny_everywhere.py` for the whole family."""

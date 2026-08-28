@@ -144,7 +144,7 @@ def test_the_rekey_script_shares_the_writers_format_rather_than_restating_it():
 # copies the AST instrument above rather than importing it.
 #
 # The tests do not import upward: mantle is the standalone database and is below crystal
-# (`ARCHITECTURE-TARGET.md` §2); a mantle test that imported `crystal.ontology` would make mantle's
+# (`agience-pharos/genesis/ARCHITECTURE-TARGET.md` §2); a mantle test that imported `crystal.ontology` would make mantle's
 # own suite unrunnable without crystal installed, which is the property this repo exists to have.
 # The AST helper is duplicated on purpose: it is ~40 lines of stdlib and the alternative is a
 # test-only package edge between two components that must not depend on each other.
@@ -231,7 +231,6 @@ def test_the_key_completeness_warning_is_no_longer_rate_gated():
     ("mantle.system.manage_anchors", "_LISTED", 12),
     ("mantle.shard.content_tier", "_ERR_SAMPLE", 200),
     ("mantle.shard.content_tier", "_QUARANTINE_MAX", 1000),
-    ("mantle.services.workspace_service", "_MAX_INLINE_BYTES", 128 * 1024),
 ])
 def test_a_kept_bound_is_named_and_stated_once(module, name, value):
     """These are bounds that cannot be derived. The rule they obey instead: one name, stated,
@@ -251,7 +250,6 @@ def test_a_kept_bound_is_named_and_stated_once(module, name, value):
     ("mantle.system.manage_anchors", "_LISTED"),
     ("mantle.shard.content_tier", "_ERR_SAMPLE"),
     ("mantle.shard.content_tier", "_QUARANTINE_MAX"),
-    ("mantle.services.workspace_service", "_MAX_INLINE_BYTES"),
     ("mantle.db.vertex", "DEMAND_PAGE"),
     ("mantle.mesh.demand", "_PAGE"),
     ("mantle.mesh.sync", "_GATED_PAGE"),

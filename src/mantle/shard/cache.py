@@ -27,7 +27,7 @@ from prism.attestation import SELF_ORIGIN, AgreementRead, Ledger
 
 #: The READ-TIME seam. Given a root and the revisions standing under it — each with the agreement
 #: read over it — return the ids that ANSWER a query. mantle may not import the aperture (only
-#: `ember/optics.py` imports entroptics), so the measurement arrives as an injection rather than a
+#: `ember/optics.py` reaches it), so the measurement arrives as an injection rather than a
 #: dependency; a reader that has the aperture supplies one, a reader that does not gets every
 #: revision and decides for itself.
 Resolver = Callable[[str, List["Item"], Dict[str, Optional[AgreementRead]], Dict[str, Any]],
@@ -124,7 +124,7 @@ class LocalCache:
         # There is no stored head. Every revision commits and stands; which one answers a query
         # is decided when the query is made, by the resolver the reader supplies — head is
         # observer-relative, not a write-time verdict. mantle may not import the aperture
-        # (one-aperture rule: only `ember/optics.py` imports entroptics), so the measurement is
+        # (one-aperture rule: only `ember/optics.py` reaches the aperture), so the measurement is
         # injected — a declared seam, exactly like the transport in `aria/identity.py`.
         #
         # With no resolver, every revision answers. That is the honest default: a store that

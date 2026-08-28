@@ -110,7 +110,7 @@ import logging
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Set
 
 from mantle.attenuation import ACTIONS, TOP, Mask
-from mantle.db.edge import CONTEXT_LABEL, DEFAULT_CONTEXT_PROPAGATE
+from mantle.db.edge import CONTEXT_LABEL, DEFAULT_CONTEXT_PROPAGATE, EdgesTruncated
 from mantle.entities.context import (
     CONTEXT_CONTENT_TYPE,
     Context,
@@ -274,6 +274,12 @@ def _edges(db: Any, node_id: str, direction: str) -> List[Dict[str, Any]]:
         if typed is not None:
             return list(typed(node_id, direction=direction) or [])
         return list(graph.edges_of(node_id, label=CONTEXT_LABEL, direction=direction) or [])
+    except EdgesTruncated:
+        # The fail-closed reading above ("an unreadable edge withholds reach") is right for a row
+        # that will not open and wrong for a read that stopped early: the edges ARE readable and
+        # there are more of them. Yielding `[]` would withhold reach the graph does grant, which
+        # is a wrong answer rather than a conservative one.
+        raise
     except Exception:
         return []
 

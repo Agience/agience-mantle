@@ -44,7 +44,11 @@ class _FakeNarrower:
     def __init__(self, matches=("a1", "a2")):
         self.matches = set(matches)
 
-    def lookup_for(self, query_text, request):
+    def lookup_for(self, query_text, request, *, salient=None):
+        # `salient` is the corpus's measure of which stems carry the question, handed to
+        # the real narrower by `_salient_measure`. A double accepts and ignores it: these
+        # tests state what the ACCESSOR does with a narrowing's answer, and filtering the
+        # stems first would change the question they ask.
         return lambda pairs: {a: Coverage(1, 0) for a in self.matches}
 
 

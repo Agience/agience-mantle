@@ -54,8 +54,8 @@ from mantle.search.query_parser import parse_query
 import numpy as np
 
 #: `digest_collection`/`CollectionProximityNarrower` take an injected proximity instrument now
-#: — mantle never imports entroptics, so the real one (`entroptics.proximity`) lives in and is
-#: tested by `agience-entroptics`'s own suite. This file is about the narrowing/authorization
+#: — mantle imports no spectral library, so the real one lives in and is
+#: tested by its own suite. This file is about the narrowing/authorization
 #: plumbing built around an injected instrument, not the instrument's own math, so a minimal
 #: stand-in is enough — deterministic, real (not a fake number), and correct by construction
 #: rather than optimised, since the probe's exactness is not this file's claim to prove.
@@ -87,10 +87,10 @@ class _Hit:
 
 
 class _BruteForceProbe:
-    """A correct-by-construction stand-in for `entroptics.proximity.SpectrumProbe`: same
+    """A correct-by-construction stand-in for `<probe>.SpectrumProbe`: same
     `within`/`nearest` interface, a full scan instead of the real probe's searchsorted-based
     pruning. This file's claims are about narrowing and authorization, not about the probe's
-    own exactness (which is entroptics' own test's job), so a brute-force reference that is
+    own exactness (which is that instrument's own test's job), so a brute-force reference that is
     trivially correct is the right double here."""
 
     def __init__(self, spectra):
@@ -259,12 +259,35 @@ class _FakeStoreDB:
         self.graph = _FakeGraph()
 
 
+class _GrantedResource:
+    """A grant as `mask_of` reads one: a resource, an effect, and the action flags."""
+
+    def __init__(self, resource_id):
+        self.resource_id = resource_id
+        self.effect = "allow"
+        for _a in ("create", "read", "update", "delete", "evict", "invoke", "add", "share",
+                   "admin"):
+            setattr(self, "can_" + _a, True)
+
+
 class _FakeLightCone:
     def __init__(self, authorized: set) -> None:
         self._authorized = set(authorized)
 
     def resolve(self, principal_id, action="read", *, principal_type="user") -> set:
         return set(self._authorized) if principal_id == ALICE else set()
+
+    def _grants_for(self, principal_id: str, principal_type: str = "user"):
+        """The same reach this double already describes, expressed as grants.
+
+        `resolve_authorized_scope` authorizes each candidate by walking up from it and testing the
+        resources on the way against the caller's grants, so a double saying "these ids are
+        authorized" says it by granting them — each id its own granted resource, which is what an
+        artifact-scoped grant looks like. Derived from `resolve` rather than restated, so whatever
+        that method gates on carries here too.
+        """
+        return [_GrantedResource(a) for a in self.resolve(principal_id,
+                                                          principal_type=principal_type)]
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +406,7 @@ class TestTheGalleryWouldOtherwiseReturnTheSecret:
 
 
 # ---------------------------------------------------------------------------
-# THE SECURITY PROPERTY
+# The security property
 # ---------------------------------------------------------------------------
 
 
@@ -524,9 +547,9 @@ class TestNarrowingCarriesWhatDistanceDoesNot:
 
     # `test_the_distance_itself_was_not_touched` used to AST-inspect
     # `mantle.search.beacon.proximity.spectral_distance` here — no floor, no normalisation, no
-    # weight added. That module now lives in `agience-entroptics`
-    # (`src/entroptics/proximity.py`), reachable from mantle only through the
-    # `read=`/`engine_id=`/`probe_factory=` seam, so the guard belongs in entroptics' own test
+    # weight added. That module now lives upstream
+    # (its own repository), reachable from mantle only through the
+    # `read=`/`engine_id=`/`probe_factory=` seam, so the guard belongs in its own test
     # suite rather than this one.
 
     def test_a_property_narrowing_can_only_remove(self, stack):
