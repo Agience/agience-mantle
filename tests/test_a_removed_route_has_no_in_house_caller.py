@@ -43,6 +43,15 @@ SIBLINGS = ("agience-chorus", "agience-crystal", "agience-ember", "agience-obser
 
 _SKIP = [".git", "node_modules", "_ci-work", "dist", "build", "__pycache__", ".venv"]
 
+#: Both sweeps below read the sibling repos, which only exist in a developer workspace: a CI
+#: checkout holds this repo alone. The marker is shared so the two cannot drift apart — one of
+#: them carrying the guard and the other not is how a green suite here became a red one in CI.
+_NEEDS_SIBLINGS = pytest.mark.skipif(
+    not any((_WORKSPACE / name).is_dir() for name in SIBLINGS),
+    reason="no sibling repo is checked out beside mantle; this guard measures a "
+           "developer-workspace property a lone checkout cannot supply",
+)
+
 
 def _sources():
     for name in SIBLINGS:
@@ -124,8 +133,7 @@ def _calls_in(text: str):
     return hits
 
 
-@pytest.mark.skipif(not (_WORKSPACE / "agience-chorus").is_dir(),
-                    reason="siblings not checked out beside mantle")
+@_NEEDS_SIBLINGS
 def test_no_sibling_repo_calls_a_removed_route():
     offenders = []
     for path in _sources():
@@ -151,6 +159,7 @@ def test_the_removed_set_matches_the_removal_test():
         % (sorted(theirs), sorted(REMOVED_PREFIXES)))
 
 
+@_NEEDS_SIBLINGS
 def test_the_scan_reaches_real_files():
     """A guard that reads nothing passes for ever."""
     seen = sum(1 for _ in _sources())
