@@ -1,9 +1,10 @@
 # Agience Mantle
 
-[![Version](https://img.shields.io/badge/version-0.1.0-blue)](pyproject.toml)
-[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](pyproject.toml)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/agience-mantle)](https://pypi.org/project/agience-mantle/)
+[![Python](https://img.shields.io/pypi/pyversions/agience-mantle)](https://pypi.org/project/agience-mantle/)
+[![License](https://img.shields.io/pypi/l/agience-mantle)](LICENSE)
 [![CI](https://github.com/Agience/agience-mantle/actions/workflows/ci.yml/badge.svg)](https://github.com/Agience/agience-mantle/actions/workflows/ci.yml)
+[![Sponsor](https://img.shields.io/badge/Sponsor-Agience-EA4AAA?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/Agience)
 
 **The lattice — where the data lives.**
 
