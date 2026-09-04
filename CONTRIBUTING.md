@@ -6,11 +6,11 @@ Thank you for considering a contribution. Mantle is the encrypted store beneath 
 
 ## Before You Start
 
-**Sign off every commit** (`git commit -s`) to certify the [Developer Certificate of Origin](https://developercertificate.org/) (DCO). By contributing you agree your contribution is licensed under the Apache License 2.0 (per Section 5 of the license), including the Section 3 patent grant for your contribution. For substantial contributions, Ikailo Inc. may additionally request a signed CLA — the bot will tell you if it applies, and links the current text.
+**Sign off every commit** (`git commit -s`) to certify the [Developer Certificate of Origin](https://developercertificate.org/) (DCO). Sign-off is checked by a maintainer at review, not by automation, so a PR whose commits are unsigned will be sent back rather than flagged on open. By contributing you agree your contribution is licensed under the Apache License 2.0 (per Section 5 of the license), including the Section 3 patent grant for your contribution. For substantial contributions, Ikailo Inc. may additionally request a signed CLA; a maintainer will raise that on the PR and supply the current text.
 
 **Read the security invariants** in [README.md](README.md#security-invariants). They are the contract this repository exists to keep. A change that weakens one will not be merged.
 
-**Canonical design docs live in agience-pharos** under `dev-legacy/dev-features/` (the per-state search index, trust floor + event-driven architecture, trusted issuers as artifacts, the canonical search architecture). Read the relevant doc before changing the index or auth paths, and keep it current when you do.
+**The design canon is internal to Ikailo** and is not distributed with this repository, so nothing here asks you to read or update it. Everything a contribution must hold is in this repo: the security invariants in the README, the invariant tests listed below, and the architecture section of [README.md](README.md#architecture). Where a change would cross a design decision the README does not cover, open an issue and a maintainer will answer from the canon.
 
 ---
 
@@ -23,32 +23,27 @@ test suite runs host-side, from the repo root:
 KEYS_DIR=<tmp-dir> MANTLE_LATTICE_PATH=<tmp-file> python -m pytest tests src/mantle -q
 ```
 
-Both roots are named because both hold tests. The unit suite lives at `tests/`; `src/mantle/db/` keeps its own in-tree tests **deliberately** — they prove the embeddable surface, and a check that cannot run without the package it exists to prove unnecessary would prove nothing. `pyproject.toml` holds the only pytest config and its `testpaths` names the same two roots, so bare `pytest` from the repo root is equivalent (it is what CI runs). Point `KEYS_DIR` and `MANTLE_LATTICE_PATH` at throwaway locations so a run does not write a keyset and a store into your checkout.
+Both roots are named because both hold tests. The unit suite lives at `tests/`; `src/mantle/db/` keeps its own in-tree tests because they certify the embeddable surface, and a check that cannot run without the package it exists to prove unnecessary would measure nothing. `pyproject.toml` holds the only pytest config and its `testpaths` names the same two roots, so bare `pytest` from the repo root is equivalent. Point `KEYS_DIR` and `MANTLE_LATTICE_PATH` at throwaway locations so a run does not write a keyset and a store into your checkout.
 
-The suite needs **`agience-prism-py`** on the path. It is not on PyPI — clone it beside this repo and install it editable (`pip install -e ../agience-prism/py`); see the README's Quick Start for the expected directory layout.
+CI runs two jobs, and the first is the narrower one. `embeddable-surface` installs the **base** distribution only (`pip install .`) and runs `python -m pytest src/mantle/db -q`; it is what holds `pip install agience-mantle` to stdlib plus `cryptography`, so a new module-level import of a third-party or sibling package fails there and nowhere else. `full-suite` then installs `[dev]` alongside a checked-out `agience-prism` and runs both roots. A change that passes locally can still fail `embeddable-surface`, which is the point of it.
 
-The service image is built from `build/Dockerfile`, with the `agience-prism-py` trust floor supplied as a named build context:
+The suite needs **`agience-prism`** on the path. It is published on PyPI, so `pip install -e '.[dev]'` resolves it; to work on both at once, clone it beside this repo and install it editable (`pip install -e ../agience-prism/py`), which takes precedence. See the README's Quick Start for the layout.
 
-```bash
-docker build -f build/Dockerfile --build-context prism=../agience-prism/py -t agience-mantle .
-```
+Mantle ships as a Python distribution and runs as an ordinary process — there is no image to build. `pip install -e '.[service]'` followed by `mantle-serve` is the whole of it, against a throwaway `KEYS_DIR` and `MANTLE_LATTICE_PATH`. That is what an outside contributor is expected to run.
 
-`docker-compose.yml` at this repo's root runs that image alone for a smoke test — one service, because Mantle is one service. The full runnable stack — Origin + Mantle + MinIO (the local S3 edge for content/SSE cells) — lives in **agience-observe**, whose compose file reads its overrides from Origin's `.env`:
-
-```bash
-cd ../agience-observe
-docker compose --env-file ../agience-origin/.env -f docker-compose.local.yml up -d --build
-```
+A fuller stack — Mantle behind an OIDC issuer, with an S3-compatible bucket for content and SSE cells — is what maintainers run before merge. It lives in Ikailo's internal deployment repo and is not distributed here, so nothing below asks you to bring it up.
 
 Nothing is quarantined: `collect_ignore` in `tests/conftest.py` is empty, and every test in both roots is collected. `src/mantle/db/test_collect_ignore_is_honest.py` keeps it that way — an entry hides a file from collection entirely, so it is reported as neither run nor skipped, and that test measures each entry rather than taking its stated reason on trust. Adding one means proving the file is genuinely uncollectable. **Record the green/failing baseline before your change and compare after.**
 
-## Live Verification Is Mandatory for Auth and Index Changes
+## Live Verification for Auth and Index Changes
 
-Mantle is the database's auth core. Token verification, the per-state encrypted index, light-cone authorization, and trusted-issuer resolution must be exercised against a **running stack**:
+Mantle is the database's auth core. Token verification, the per-state encrypted index, light-cone authorization, and trusted-issuer resolution must be exercised against a **running server**, not only in unit tests:
 
-1. Rebuild the image and recreate the stack (from `agience-observe`: `docker compose --env-file ../agience-origin/.env -f docker-compose.local.yml up -d --build --force-recreate`).
-2. Run an end-to-end check that exercises your change through the real API (index → query → verify scope; grant → revoke → verify the ciphertext goes dark) — the blackbox suite in `tests/e2e/` covers most of this surface.
+1. Run `mantle-serve` against a throwaway `KEYS_DIR` and lattice.
+2. Run an end-to-end check that exercises your change through the real API (index → query → verify scope; grant → revoke → verify the ciphertext goes dark). The blackbox suite in `tests/e2e/` covers most of this surface and is configured entirely by environment — `E2E_MANTLE_URL`, `E2E_ORIGIN_URL`, `E2E_AUTHORITY_ISSUER` — so it runs against whatever stack you have, including your own issuer.
 3. Include what you verified, and how, in the PR description.
+
+Maintainers re-run this against the full internal stack before merge. Your job is to show the change works against a real server; the cross-service run is ours.
 
 ## Security-Invariant Tests
 
@@ -88,17 +83,16 @@ Two things this operator is **not**. Invariant #1 ("geometry never authorizes") 
 
 ## What Gets Accepted
 
-Bug fixes with tests; invariant-test hardening; documentation corrections; performance work that leaves the security posture untouched and proves it. **Out of scope without prior discussion:** changes to the crypto path or key-derivation strings, new authorization mechanisms, Docker/compose changes to the core stack, and anything that moves authorization decisions into the geometry path.
+Bug fixes with tests; invariant-test hardening; documentation corrections; performance work that leaves the security posture untouched and proves it. **Out of scope without prior discussion:** changes to the crypto path or key-derivation strings, new authorization mechanisms, packaging and release changes, and anything that moves authorization decisions into the geometry path.
 
 ## Pull Request Checklist
 
-- [ ] CLA signed (bot checks on PR open)
 - [ ] Test suite run (`KEYS_DIR=<tmp> MANTLE_LATTICE_PATH=<tmp-file> python -m pytest tests src/mantle -q` from the repo root), baseline compared
 - [ ] Auth/index changes live-verified against a running stack (described in the PR)
 - [ ] Invariant tests added/extended where the change touches routing, keys, grants, or cells
 - [ ] Any permission-mask intersection goes through `mantle.attenuation`, not a new local copy
-- [ ] Relevant canonical design doc in agience-pharos (`dev-legacy/dev-features/`) updated if behavior changed
-- [ ] Commit messages follow the convention; commits signed off
+- [ ] No new module-level third-party or sibling-package import under `src/mantle/db/` (the `embeddable-surface` CI job)
+- [ ] Commit messages follow the convention; every commit signed off (`git commit -s`)
 
 ---
 
@@ -112,7 +106,7 @@ Be respectful. Contributions, issues, and discussions must remain professional a
 
 ## License
 
-By contributing you agree to the DCO above.
+Mantle is **Apache License 2.0** (see [LICENSE](LICENSE), [NOTICE](NOTICE)). By contributing you agree to the DCO above.
 
 ---
 

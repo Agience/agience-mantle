@@ -349,11 +349,10 @@ class TestForeignSpaceIsRefused:
     def test_with_no_anchorset_every_space_is_foreign_and_the_vector_is_refused(self):
         """No AnchorSet is the case where EVERY name is unusable, not where any name will do.
 
-        This used to pass the numbers through, on the reading that there was no basis to be
-        foreign to. What that produced was a 200 carrying the caller's whole visible corpus in
-        recency order — the same body, field for field, that a query with no vector at all
-        comes back as. A caller that supplied a vector could not tell it had been ignored, and
-        `ordering` could not tell it either.
+        Passing the numbers through, on the reading that there is no basis to be foreign to,
+        produces a 200 carrying the caller's whole visible corpus in recency order — the same body,
+        field for field, that a query with no vector comes back as. A caller that supplied a vector
+        could not tell it had been ignored, and neither could `ordering`.
         """
         from mantle.search.anchors import store as _store
         from mantle.search.anchors.repo import InMemoryAnchorRepo

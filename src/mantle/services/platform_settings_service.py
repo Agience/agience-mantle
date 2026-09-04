@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-#  Default values — Docker-friendly infrastructure settings
+#  Default values — infrastructure settings
 # ---------------------------------------------------------------------------
 
 DEFAULTS: dict[str, str] = {

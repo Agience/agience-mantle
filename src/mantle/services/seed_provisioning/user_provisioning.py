@@ -104,14 +104,13 @@ def inbox_workspace_id(user_id: str) -> str:
 
 
 def _seeds_base() -> Optional[Path]:
-    """Root of the platform SEED corpus, or None when Mantle runs BARE.
+    """Root of the platform seed corpus, or None when Mantle runs bare.
 
-    Mantle bundles NO seed content — it is a bare encrypted data plane. The
-    Agience platform seed corpus is an INSTALL-PACKAGE artifact (it lives in
-    `agience-observe/package/seeds`, not in the Mantle image), provided at deploy time by pointing
-    ``AGIENCE_SEEDS_ROOT`` at the mounted seeds. Unset ⇒ no seed application
-    (bare) — the runtime provisioners (People/Authorities collections, Person
-    cards, issuers) still run; only the declarative grant seeds are skipped."""
+    Mantle bundles no seed content: it is a bare encrypted data plane. A seed corpus is an
+    install-package artifact supplied by the deployment rather than shipped in the Mantle image,
+    provided at deploy time by pointing ``AGIENCE_SEEDS_ROOT`` at the mounted seeds. Unset means no
+    seed application: the runtime provisioners (People/Authorities collections, Person cards,
+    issuers) still run, and only the declarative grant seeds are skipped."""
     env = os.getenv("AGIENCE_SEEDS_ROOT")
     return Path(env) if env else None
 

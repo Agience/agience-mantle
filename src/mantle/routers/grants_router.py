@@ -55,18 +55,18 @@ router = APIRouter(prefix="/grants", tags=["Grants"])
 #: reaches a grant key (`DELETE /grants/{id}` matches a key's own id) and a bundle member as
 #: readily as a user grant" — and a caller reading only the parameter name would not guess it.
 _GRANT_PARAM = (
-    "The grant to act on. ⚠ Accepts THREE kinds of id: an ordinary user grant, a grant KEY, or a "
-    "bundle MEMBER — revocation reaches all three by the same path. So a `404` here "
-    "means 'no grant, key or member with this id that you may see', not 'not a grant'."
+    "The grant to act on. Accepts three kinds of id: an ordinary user grant, a grant key, or a "
+    "bundle member — revocation reaches all three by the same path. A `404` here therefore means "
+    "'no grant, key or member with this id that you may see'."
 )
 _KEY_PARAM = (
     "The grant KEY — the shareable credential itself, not the grant it was minted from and not a "
     "member hanging off it."
 )
 _MEMBER_PARAM = (
-    "The member WITHIN the key named by `key_id`. ⚠ Removing a member is a soft revoke and leaves "
-    "the row in place: the bundle it hangs off is what stops resolving, so the member is left "
-    "where it is rather than deleted."
+    "The member within the key named by `key_id`. Removing a member is a soft revoke that leaves "
+    "the row in place: the bundle it hangs off is what stops resolving, so the member stays where "
+    "it is rather than being deleted."
 )
 
 
@@ -188,9 +188,9 @@ class GrantResponse(BaseModel):
     granted_by: Optional[str] = None
     grantee_id: Optional[str] = Field(
         None,
-        description="Who the grant is for. ⛔ `null` for a grant key or an invite: those hold a "
-                    "TOKEN HASH here and the router redacts it, so a `null` on those two "
-                    "grantee types means WITHHELD, not absent.",
+        description="Who the grant is for. `null` for a grant key or an invite: those hold a token "
+                    "hash here and the router redacts it, so on those two grantee types a `null` "
+                    "means withheld rather than absent.",
     )
     grantee_type: Optional[str] = None
     id: Optional[str] = None

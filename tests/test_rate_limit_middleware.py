@@ -122,7 +122,7 @@ def test_a_window_that_aged_out_is_dropped_rather_than_kept(app, store, monkeypa
 
 
 def test_the_limiter_is_off_at_zero(app, store, monkeypatch):
-    """`docker-compose.yml` sets 0, because one local stack shares one source address."""
+    """0 disables it, which is what a single-node deployment behind one source address wants."""
     monkeypatch.setattr(main, "_RL_TRUSTED_PROXIES", ())
     monkeypatch.setattr(main, "_RL_MAX", 0)
     client = _client(app, "203.0.113.7")

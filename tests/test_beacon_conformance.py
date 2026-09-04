@@ -31,7 +31,7 @@ from mantle.search import beacon
 #
 # This adds no new dependency edge: `mantle => prism` already exists (~28 modules import prism; it
 # is declared under the `service` extra) and prism is the Apache-2.0 floor that imports nothing
-# from this workspace. `agience-prism-py` is named in the `dev` extra so this test can reach the
+# from this workspace. `agience-prism` is named in the `dev` extra so this test can reach the
 # vectors directly. `mantle => beam` remains the edge the target DAG forbids, which is why the
 # shared vector data lives in prism rather than beam.
 from prism.vectors import load_vectors

@@ -629,25 +629,23 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
         cid, aid = str(cid), str(aid)
         row = cur.execute("SELECT 1 FROM vertex WHERE id = ?", (cid,)).fetchone()
         if not row:
-            # ── a container that is not here is LOUD, and still not fatal ───────────────────
-            # This used to `return` in silence, on the reasoning that an edge to a vertex that
-            # does not exist is a relation to nothing. True — and the consequence was worse than
-            # the edge would have been: the artifact lands, every listing shows it inside the
-            # collection it names, and NO grant on that collection reaches it, because
-            # authorization walks the edge and there is none.
+            # ── a container that is not here is loud, and still not fatal ───────────────────
+            # An edge to a vertex that does not exist is a relation to nothing, so no edge is
+            # written. Passing over that in silence is worse than the missing edge: the artifact
+            # lands, every listing shows it inside the collection it names, and no grant on that
+            # collection reaches it, because authorization walks the edge and there is none.
             #
-            # Measured 2026-08-25 on 71/home: 3,894 artifacts name a collection with no vertex,
-            # across six collection ids, with no error and no counter recording any of it. One
-            # principal lost 3,897 of its 4,082 artifacts that way.
+            # Measured on 71/home: 3,894 artifacts name a collection with no vertex, across six
+            # collection ids, with no error and no counter recording any of it. One principal held
+            # 3,897 of its 4,082 artifacts in that state.
             #
-            # Raising was tried and reverted. `MissingCollection` on this branch failed 54 tests
+            # This logs rather than raising. `MissingCollection` on this branch fails 54 tests
             # across the suite: writing an artifact that names a collection nobody created is
-            # relied on widely, including by the change-feed and lattice-api suites. That is a
-            # migration, not a one-line correctness fix, so the honest landing is to make the
-            # condition impossible to miss rather than impossible to create. The durable half of
-            # this lives in the gate — `agience-cloud/deploy/data_integrity_check.py` counts
-            # artifacts naming a collection that does not exist, so the population can only
-            # shrink.
+            # relied on widely, including by the change-feed and lattice-api suites. Refusing it
+            # is a migration rather than a one-line correctness fix, so this branch makes the
+            # condition impossible to miss rather than impossible to create. A deployment that
+            # cares counts artifacts naming a collection that does not exist, so the population
+            # can only shrink.
             _log.warning(
                 "artifact %r names collection %r, which is not in this store: no containment "
                 "edge written. It will appear in listings that read `collection_id` and be "

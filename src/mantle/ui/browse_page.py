@@ -3,7 +3,7 @@
 One document, no build step, no external request. CSS and JS are inline because the one page that
 must render when everything else is broken cannot depend on a second request succeeding. It is a
 Python constant rather than a package data file so nothing has to be declared in `pyproject`, added
-to the wheel, or copied by the Dockerfile to keep working.
+to the wheel, or copied by a packaging step to keep working.
 
 Authorization code + PKCE (RFC 7636). A login flow that instead does
 `location.replace("https://issuer/login?redirect_uri=" + location.origin + "/")` and then reads

@@ -27,14 +27,13 @@ leave.
 
 The context walk may not widen this set
 ---------------------------------------
-It used to. `resolve` unioned an unconfined context walk into its result, so a grant on
-`org` came back holding `{"org", "project", "doc-1"}` — ids no grant reached and
-`check_access` would refuse. This path feeds `oracle.LightConeGrantVerifier` (content-key
-issuance) and `sse/router_accessor` (result decryption), so "reaches more than the read gate
-allows" is not a recall nicety; it is a key handed out for an artifact the gate would 404.
-The walk is now confined to the grant-derived set — `context_service.reach(..., within=...)`
-— which makes `resolve(p, a) ⊆ grants-alone(p, a)` a property of the call rather than a
-claim about it.
+An unconfined context walk unioned into the result would widen it: a grant on `org` would come
+back holding `{"org", "project", "doc-1"}` — ids no grant reaches and `check_access` would
+refuse. This path feeds `oracle.LightConeGrantVerifier` (content-key issuance) and
+`sse/router_accessor` (result decryption), so reaching more than the read gate allows is not a
+recall nicety; it is a key handed out for an artifact the gate would 404. The walk is confined
+to the grant-derived set — `context_service.reach(..., within=...)` — which makes
+`resolve(p, a) ⊆ grants-alone(p, a)` a property of the call rather than a claim about it.
 
 Where this stands against `check_access`
 ----------------------------------------
@@ -766,16 +765,15 @@ def resolve_authorized_scope(
 
         kept: set = set()
         stamps: Dict[str, str] = {}
-        # ── the chain above a COLLECTION is walked once, not once per artifact ──────────────
+        # ── the chain above a collection is walked once, not once per artifact ──────────────
         # `origin_chain` yields `artifact_id`, then `root_id`, then each origin ancestor, stopping
-        # at the first edge whose propagate mask does not carry the action. Two facts make the tail
-        # shareable, and the first one is the one I got wrong twice:
+        # at the first edge whose propagate mask does not carry the action. Two measurements make
+        # the tail shareable:
         #
-        #   * `root_id` is the artifact's VERSION root, not its collection. Measured, it equals the
-        #     artifact's own id for 5,000 of 5,000 sampled synsets and 3,000 of 3,000 canon rows —
-        #     so keying a cache on it gives one entry per artifact and never hits. That version was
-        #     written, shipped and written up as effective before the call count was looked at.
-        #   * The first true ANCESTOR is the collection, and a narrowed set spans very few:
+        #   * `root_id` is the artifact's version root rather than its collection, and it equals
+        #     the artifact's own id for 5,000 of 5,000 sampled synsets and 3,000 of 3,000 canon
+        #     rows. Keying a cache on it would give one entry per artifact and never hit.
+        #   * The first true ancestor is the collection, and a narrowed set spans very few:
         #     600 sampled artifacts had 2 distinct origin parents.
         #
         # So the walk is consumed lazily and handed off at the first resource that is neither the

@@ -420,14 +420,13 @@ class TestBothOrderingsHonourTheSameFilter:
         assert result.ordering == "semantic"
 
     def test_candidates_returns_the_same_universe_search_does(self, stack):
-        """`candidates()` is the chokepoint every external search flavor ranks within, and it
-        now runs the same narrowing `search()` does — the filter AND the query's terms.
+        """`candidates()` is the chokepoint every external search flavor ranks within, and it runs
+        the same narrowing `search()` does — the filter and the query's terms.
 
-        It used to run the filter alone, on the argument that narrowing by the terms would
-        decide part of the ranking for the flavor. What that actually returned for
-        `quasar type:application/pdf` was `{PDF, DECOY}`: the decoy is a PDF and passes the
-        filter, and does not carry the term. A flavor asking what matched `quasar` was handed
-        a document that does not contain it. `search()` refuses to answer that way — it raises
+        Running the filter alone, so that narrowing by terms does not decide part of the ranking for
+        the flavor, returns `{PDF, DECOY}` for `quasar type:application/pdf`: the decoy is a PDF and
+        passes the filter without carrying the term. A flavor asking what matched `quasar` would be
+        handed a document that does not contain it. `search()` refuses to answer that way — it raises
         rather than widen to everything authorized — and one accessor cannot hold both
         positions. What `candidates()` still declines to state is the ORDER.
         """

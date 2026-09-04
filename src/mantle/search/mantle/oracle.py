@@ -583,36 +583,32 @@ class LightConeGrantVerifier:
     def _granted_roots(self, requester_id: str, requester_type: str, action: str) -> frozenset:
         """The origin roots of every resource this requester may `action`, memoized.
 
-        ⚑ **Measured 2026-08-28 on 71/home, and this is why it exists.** `_roots_include` walked
-        `_root_of(resource)` for every granted resource on EVERY call. That principal holds 7,268 of
-        the store's 7,388 grants, and the SSE narrowing path asks the question once per principal
-        whose index it might open — 51 principals in that index. One recall therefore ran **103,111
-        SQL statements to return ZERO hits**, of which `_roots_include` was **11.51s of a 13.93s**
-        `cProfile`, via 61,698 `_root_of` and 95,761 `get_origin_parent` calls.
+        The memo is why this is a method rather than a walk inside `_roots_include`. Measured on
+        71/home: walking `_root_of(resource)` for every granted resource on every call, where the
+        holder has 7,268 of the store's 7,388 grants and the SSE narrowing path asks the question
+        once per principal whose index it might open — 51 principals in that index — ran 103,111 SQL
+        statements to return zero hits, of which the walk was 11.51s of a 13.93s `cProfile`, via
+        61,698 `_root_of` and 95,761 `get_origin_parent` calls.
 
-        `_grants` was already memoized; the walk over its results was not. Hoisting it is the whole
-        change: the roots are a fact about the REQUESTER's grants, so the 51 questions share one
-        answer instead of each paying for it.
+        `_grants` is memoized and the walk over its results is memoized here: the roots are a fact
+        about the requester's grants, so the 51 questions share one answer instead of each paying
+        for it.
 
-        📄 The same fix was made to the recall path's origin-chain walk on 2026-08-25 and did not
-        reach this second walker — see `status/RETRIEVAL-PATH-2026-08-25.md`, which also records
-        that its first attempt was written up as effective and never hit once. Hence
-        `tests/test_granted_roots_is_memoized.py`, which counts the walks rather than trusting this
-        paragraph.
+        `tests/test_granted_roots_is_memoized.py` counts the walks, rather than trusting this
+        paragraph that the memo is reached.
 
-        ⛔ **THE STALENESS WINDOW IS NOT NEW, AND MUST NOT BECOME NEW.** This reuses `_grants`'s own
-        cache, key shape, lock, clock and `_memo_ttl` — the TTL capped by the requester's earliest
-        grant expiry — so how long a REVOKED grant keeps working is exactly what it was before this
-        method existed. `invalidate` clears it for free, because it is the same dict and this key
-        carries `requester_id` first, which is what `invalidate(requester_id)` filters on. A cache
-        of its own, with a lifetime of its own, would silently change post-revocation validity, and
-        that is a policy change wearing a refactor's clothes.
+        The memo shares `_grants`'s own cache, key shape, lock, clock and `_memo_ttl` — the TTL
+        capped by the requester's earliest grant expiry — so how long a revoked grant keeps working
+        is a property of the grant cache rather than of this method. `invalidate` clears it for
+        free: it is the same dict, and this key carries `requester_id` first, which is what
+        `invalidate(requester_id)` filters on. A cache of its own, with a lifetime of its own, would
+        change post-revocation validity, which is a policy change wearing a refactor's clothes.
 
-        `ttl_s <= 0` still means NO memo: the walk runs per call, exactly as it did before.
+        `ttl_s <= 0` means no memo: the walk runs per call.
         """
         from mantle.entities.grant import mask_of
 
-        # ── the memo is OPTIONAL, and `ttl_s <= 0` already says so ──────────────────────────────
+        # ── the memo is optional, and `ttl_s <= 0` says so ──────────────────────────────────────
         # `_roots_include` used to need only `_grants` and `_root_of`, and tests build a verifier
         # with `LightConeGrantVerifier.__new__` and stub exactly those two seams — see
         # `test_a_virgin_store_takes_its_first_write.py`. Such an object has no `_cache`, `_clock`,

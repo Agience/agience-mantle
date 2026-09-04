@@ -225,8 +225,8 @@ def decrypt_artifact_content(raw: dict, *, strict: bool = True) -> None:
         #
         # Ordered candidates rather than one guess: the stamped principal is authoritative when it
         # is there, the collection scope is what the writer actually used, and `created_by` stays
-        # last for the rows 📄 `content_key_principal` describes as "keyed to `created_by`" before
-        # the re-key migration. A wrong candidate raises and the next is tried; none of them can
+        # last for the rows `content_key_principal` describes as keyed to `created_by`. A wrong
+        # candidate raises and the next is tried; none of them can
         # return the wrong plaintext, because AES-GCM authenticates.
         scope = content_key_scope(raw)
         candidates = []

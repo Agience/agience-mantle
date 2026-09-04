@@ -41,8 +41,8 @@ _OP_EXCLUDE = {                # operational state is per-box, never replicated 
     # written on node A would make node B skip indexing an artifact B has never indexed — silently,
     # with nothing to see but a search result that is not there.
     "application/vnd.agience.materialized-marker+json",
-    # A sensor reading describes one box — `agience-cloud/scripts/sensor_*.py` write this node's
-    # services, store, authority, certificate and code into `host.<id>`. Replicated, a reading
+    # A sensor reading describes one box: a node's own services, store, authority, certificate and
+    # code, written into `host.<id>`. Replicated, a reading
     # written on node A would claim node B's services are whatever A measured, its disk is A's disk,
     # and its certificate expires when A's does. Every one of those is confidently wrong rather than
     # missing, which is the worse failure: an operator would act on it.
@@ -787,9 +787,8 @@ def _withheld_endpoints(v, erecs, priv_set, *, cap: int = 200000):
 
     Leaf assembly filters vertices by `_is_replicated` and ships edges unconditionally. Excluding a
     content type that is an edge endpoint therefore sends the edge and withholds its vertex, and the
-    peer ends up holding a membership edge to an artifact that is not there — which is exactly
-    `contains_edges_to_missing_vertex`, an invariant `agience-cloud/deploy/data_integrity_check.py`
-    pins at 0.
+    peer ends up holding a membership edge to an artifact that is not there — the
+    `contains_edges_to_missing_vertex` condition, which a deployment integrity gate pins at 0.
 
     Measured on 71/home: 18 `contains` edges point at `application/vnd.agience.shard-done+json`
     vertices, which are in `_OP_EXCLUDE` — the current store publishes 18 dangling edges the moment

@@ -77,10 +77,10 @@ class JsonRpcResponse(BaseModel):
         None, description="Echoes the request's `id`. `null` when the request could not be parsed "
                           "far enough to have one.")
     result: Optional[Any] = Field(
-        None, description="Present on success. Its shape is the TOOL's — deliberately open.")
+        None, description="Present on success. Its shape is the tool's, and is left open.")
     error: Optional[Dict[str, Any]] = Field(
-        None, description="Present on failure: `{code, message}`. ⚠ Its presence, not the HTTP "
-                          "status, is how a caller learns the call failed.")
+        None, description="Present on failure: `{code, message}`. Its presence, rather than the "
+                          "HTTP status, is how a caller learns the call failed.")
 
 
 # ── the tool surface ──────────────────────────────────────────────────────────────────────────
@@ -773,7 +773,7 @@ def _as_text(data: Any) -> str:
     responses={
         200: {"model": JsonRpcResponse,
               "description":
-              "A JSON-RPC response envelope. ⚠ A FAILING TOOL ARRIVES HERE, not in the 4xx: "
+              "A JSON-RPC response envelope. A failing tool arrives here rather than in the 4xx: "
               "`error` is set and `result` is absent, because the transport succeeded even though "
               "the call did not."},
         202: {"description":
@@ -781,7 +781,7 @@ def _as_text(data: Any) -> str:
               "body is empty by construction rather than by omission."},
         400: {"description":
               "The envelope itself is unusable — unparseable JSON, or an empty batch. The body is "
-              "a JSON-RPC error object. ⚠ A failing TOOL does not arrive here: that answers `200` "
+              "a JSON-RPC error object. A failing tool does not arrive here: that answers `200` "
               "with an error member, which is what JSON-RPC specifies."},
     },
 )
@@ -824,18 +824,17 @@ async def mcp_post(request: Request,
         "405 with `Allow: POST`, which is the spec's own answer for a server that offers no "
         "GET stream. A 200 stream that never emits would leave the client waiting forever."
     ),
-    #: It declared a `200` it can never send. FastAPI documents `200` by default, and this
-    #: handler has exactly one `return` — `405`. So the spec promised a success this route does
-    #: not have, and a generated client had a branch for it and none for the answer it always
-    #: gets. `status_code=405` makes the default match the only reality; `responses` then
-    #: carries the description a caller can act on.
+    #: FastAPI documents `200` by default, and this handler has exactly one `return` — `405`.
+    #: `status_code=405` makes the documented default the answer the route actually gives, so a
+    #: generated client carries a branch for it rather than for a success this route never sends.
+    #: `responses` then carries the description a caller can act on.
     status_code=405,
     responses={
         405: {"description":
-              "Always. This server originates nothing, so there is no GET stream to join. The "
-              "`Allow: POST` header names the verb that works. ⚠ This is the ONLY answer this "
-              "operation gives — it is not an error condition, it is the endpoint's whole "
-              "contract."},
+              "Always. This server originates nothing, so there is no GET stream to join, and the "
+              "`Allow: POST` header names the verb that works. This is the only answer the "
+              "operation gives: it is the endpoint's whole contract rather than an error "
+              "condition."},
     },
 )
 @mcp_router.get("/", include_in_schema=False)

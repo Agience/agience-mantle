@@ -370,6 +370,6 @@ def test_the_filter_grammar_reaches_the_field_it_governs():
 
     missing = [f for f in filterable_field_names() if ("`%s`" % f) not in desc]
     assert not missing, "filterable fields the description does not list: %s" % missing
-    assert "MISSPELLED" in desc, (
+    assert "misspelled" in desc.lower(), (
         "the description does not state the deliberate trade — that an unknown `word:value` "
         "searches as a term instead of erroring")

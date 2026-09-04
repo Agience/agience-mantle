@@ -183,10 +183,10 @@ class TestTheCutNeverCostsTheAnswer:
 
 class TestTheCutDoesNotDragPrismIn:
     def test_the_cut_imports_without_prism(self, monkeypatch):
-        """`beacon/instrument.py` imports `prism.rounding`, and `agience-prism-py` is not on
-        PyPI. The cut is a different module and reaches only `beacon.engine`, so putting it
-        on the recall path adds no install requirement — measured here by removing prism
-        from the import system and importing the path the arm actually takes.
+        """`beacon/instrument.py` imports `prism.rounding`. The cut is a different module and
+        reaches only `beacon.engine`, so putting it on the recall path adds no install
+        requirement — measured here by removing prism from the import system and importing the
+        path the arm actually takes.
         """
         import builtins
         import sys

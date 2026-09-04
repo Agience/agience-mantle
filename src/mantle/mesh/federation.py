@@ -260,11 +260,9 @@ def pull_from_peers(store, *, max_pages: int = 40, page: int = 25, with_content:
                     #
                     # `pull_from_peers` has no callers in `src/` today, which is the only reason a
                     # regression here would surface as a note rather than an incident — it stops
-                    # being latent the moment federation is wired, which is now one config away since
-                    # the mesh daemon became startable (`build/mantle/docker-compose.yml`, profile
-                    # `mesh`). The same class of defect sits at `oci/store.py::_put`, where it is at
-                    # least loud; `agience-cloud/build/mantle/oci_ingest.py` refuses up front and
-                    # names it.
+                    # being latent the moment federation is wired, which is one config away while
+                    # the mesh daemon is startable. The same
+                    # class of defect sits at `oci/store.py::_put`, where it is at least loud.
                     _coll = doc.get("collection_id") or ""
                     if _coll:
                         try:

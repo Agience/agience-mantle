@@ -3,9 +3,8 @@
     python packaging/build.py [--onedir] [--clean]
 
 What this produces: one file carrying mantle, prism, FastAPI, uvicorn and the crypto stack, so an
-install resolves nothing at install time. `agience-prism-py` is not on PyPI, which is why
-`pip install -e '.[service]'` fails on a machine that is not a developer's, and vendoring prism here
-takes the sibling-checkout assumption out of the delivery path.
+install resolves nothing at install time. Vendoring prism here takes every index lookup out of the
+delivery path, so the bundle runs on a machine with no network and no Python toolchain.
 
 The digest is the artifact. This prints the sha256 of what it built and stamps the same build id
 into the binary, so `agience version` and the file on disk name the same thing. The fleet's

@@ -112,11 +112,10 @@ def test_a_configured_kind_with_no_client_library_names_the_extra(
 ):
     """`shard/sqlite_store.py`'s discipline: refuse, and say what to install.
 
-    The absent library is SIMULATED, not waited for. This used to `pytest.skip` whenever the client
-    library turned out to be importable — and `redis` IS installed in this environment, so the skip
-    always fired and neither assertion below ever ran: the refusal path and the message naming the
-    extra were pinned by nothing. A guard that stops running because a dependency got installed is
-    the same silent pass as a permanent skip.
+    The absent library is simulated rather than waited for. Skipping when the client library turns
+    out to be importable would mean the skip fires wherever `redis` is installed, so neither
+    assertion below would run and the refusal path would be pinned by nothing. A guard that stops
+    running because a dependency got installed is the same silent pass as a permanent skip.
 
     `sys.modules[name] = None` is what makes `import name` raise `ImportError` inside `start()`,
     which is the condition under test, on every machine — installed or not. Both shipped adapters

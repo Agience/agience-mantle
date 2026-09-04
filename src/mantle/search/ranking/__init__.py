@@ -506,10 +506,10 @@ def _reach_rank(cand: List[Tuple[str, str, float]], query: str, store,
                     # title term that IS new adds one position and is then measured like every
                     # other: it lifts the candidate only if it actually reaches the fired field,
                     # and costs it `mu` if it does not. Nothing here is weighted or preferred.
-                    # ── a candidate is placed as a SUBJECT, and a subject can be a verb ─────
-                    # This read `offer_synsets`, which is NOUN-ONLY by design: it places an OFFER,
-                    # where a verb is the frame rather than the subject — 📄 "describes markdown
-                    # documents contributes `markdown`/`document` and nothing from 'describes'."
+                    # ── a candidate is placed as a subject, and a subject can be a verb ─────
+                    # `offer_synsets` is noun-only by design, because it places an offer, where a
+                    # verb is the frame rather than the subject: "describes markdown documents"
+                    # contributes `markdown`/`document` and nothing from "describes".
                     #
                     # An artifact is the other case. `cn-frighten` is ABOUT frightening, and placing
                     # it by its nouns alone places it nowhere. Measured 2026-08-25 over 500

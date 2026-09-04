@@ -64,7 +64,7 @@ def _upload_of(result):
 
 
 def test_a_patch_with_no_status_leaves_the_status_alone(db, upload):
-    """The defect: this used to write `uploading` over a completed upload."""
+    """A patch that omits `status` leaves a completed upload completed."""
     cid, aid = upload
     with acting_as("u", principal_type="user"):
         result = ws.update_upload_status(db=db, user_id="u", workspace_id=cid, upload_id=aid,

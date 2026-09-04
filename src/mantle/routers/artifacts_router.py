@@ -261,12 +261,12 @@ class CreateArtifactRequest(BaseModel):
         description=(
             "When to index: `" + "` immediately, `".join(INDEX_HINTS)
             + "` deferred to first access. Unset uses the deployment default. "
-            "⚠ Applies to a plain member of a collection ONLY. A top-level artifact (the "
-            "navigable frame) and an `identity` member (a mirror, whose purpose is to be found) "
-            "are always indexed EAGERLY, and this hint is ignored on both. "
-            "⚠ An unrecognised value is not refused — `search/lazy.py::resolve_lazy` returns "
-            "the deployment default for anything that is neither, so a misspelling is silently "
-            "the default rather than an error."
+            "Applies to a plain member of a collection only. A top-level artifact (the navigable "
+            "frame) and an `identity` member (a mirror, whose purpose is to be found) are always "
+            "indexed eagerly, and this hint is ignored on both. "
+            "An unrecognised value is not refused: `search/lazy.py::resolve_lazy` returns the "
+            "deployment default for anything that is neither, so a misspelling resolves to the "
+            "default rather than raising."
         ),
         json_schema_extra={"enum": list(INDEX_HINTS)},
     )
@@ -342,9 +342,9 @@ class UpdateArtifactRequest(BaseModel):
         return v
     content_type: Optional[str] = Field(
         None,
-        description="The MIME-ish label carried with the artifact. ⚠ Mantle treats it as an "
-                    "OPAQUE label and does not interpret it — changing it re-labels the artifact "
-                    "and converts nothing." + _PATCH_LEAVE,
+        description="The MIME-ish label carried with the artifact. Mantle treats it as an opaque "
+                    "label and does not interpret it, so changing it re-labels the artifact and "
+                    "converts nothing." + _PATCH_LEAVE,
     )
     name: Optional[str] = Field(
         None, description="The artifact's display name." + _PATCH_LEAVE,
@@ -363,9 +363,9 @@ class UpdateArtifactRequest(BaseModel):
     )
     space_id: Optional[str] = Field(
         None,
-        description="Names the vector space `vector` belongs to. ⛔ Supplying it WITHOUT a "
-                    "`vector` is a `400` — *“it names the space of a vector that is not "
-                    "here”* — rather than being quietly ignored.",
+        description="Names the vector space `vector` belongs to. Supplying it without a `vector` "
+                    "is a `400` — *“it names the space of a vector that is not here”* — rather "
+                    "than being ignored.",
     )
 
 
@@ -384,7 +384,7 @@ class InvokeArtifactRequest(BaseModel):
 #: is stated in both directions: `candidate_budget` says it is ignored for ordered recall, and every
 #: field this string is appended to says it is ignored in candidates mode.
 _IGNORED_IN_CANDIDATES = (
-    " ⚠ IGNORED when `candidates: true` — that mode is budget-bounded and unordered, so this is"
+    " Ignored when `candidates: true`: that mode is budget-bounded and unordered, so this is"
     " replaced rather than applied. No error is raised; see `candidates`."
 )
 
@@ -407,11 +407,10 @@ _QUERY_TEXT_DESCRIPTION = (
     " `field:=\"Exact Value\"` (case-sensitive, whole), `!field:value` (negated), and"
     " `field:>value` / `field:<value` on date fields only. Filters conjoin."
     " `field:~value` is not supported.\n\n"
-    "⚠ `word:value` is a FILTER ONLY when `word` is one of those fields. Any other word"
+    "`word:value` is a filter only when `word` is one of those fields. Any other word"
     " keeps its colon and searches as an ordinary term, so a URL, `meeting at 3:30` or"
-    " `ratio 16:9` are ordinary queries rather than errors. The cost is deliberate and"
-    " worth knowing: a MISSPELLED field is a search term, not an error — `titel:foo`"
-    " searches for the literal text."
+    " `ratio 16:9` are ordinary queries rather than errors. A misspelled field therefore"
+    " searches as literal text: `titel:foo` looks for that string."
 ) % ", ".join("`%s`" % f for f in _filterable_field_names())
 
 
@@ -473,10 +472,10 @@ class ArtifactRecallRequest(BaseModel):
     scope: Optional[List[str]] = Field(
         None,
         description=(
-            "Restrict the recall to these containers, by id. Narrows by CONTAINER where"
+            "Restrict the recall to these containers, by id. Narrows by container where"
             " `field:value` narrows by metadata; both intersect the light cone before"
-            " retrieval. ⚠ Naming a container you cannot read narrows the search rather"
-            " than widening it — it cannot reach anything you could not already read."
+            " retrieval. Naming a container you cannot read narrows the search rather than"
+            " widening it, since it reaches nothing you could not already read."
         ),
     )
     state: str = Field(
@@ -798,9 +797,9 @@ def _context_as_stored(context: Optional[Union[Dict[str, Any], str]]) -> Optiona
 #: so it reports `total: null` and page length is the only signal. That is why `has_more` is the
 #: thing to read rather than arithmetic over `total`.
 _FILTER_BEFORE_PAGE = (
-    " ⚠ The filter is applied BEFORE the page is taken, so `items` is a page of the FILTERED "
-    "set and `total` is the filtered count. Decide whether to continue from `has_more`, never "
-    "from the number of items — `total` is `null` where it is genuinely unknown."
+    " The filter is applied before the page is taken, so `items` is a page of the filtered set "
+    "and `total` is the filtered count. Decide whether to continue from `has_more` rather than "
+    "from the number of items, since `total` is `null` where the count is genuinely unknown."
 )
 
 def _page(items: list, *, total: Optional[int], has_more: bool) -> Dict[str, Any]:
@@ -954,22 +953,22 @@ class WarmResponse(BaseModel):
 
     collection_id: str = Field(description="The container that was swept.")
     materialized: int = Field(
-        description="Members newly enqueued for indexing by THIS call. Already-materialized "
+        description="Members newly enqueued for indexing by this call. Already-materialized "
                     "members are skipped, so a re-run reports only what it added.")
     examined: int = Field(
         description="Distinct members looked at, whether or not they needed warming.")
     failed: int = Field(
-        description="Members whose enqueue raised. ⚠ Non-zero with `complete: true` means the "
-                    "sweep finished but did not warm everything it examined.")
+        description="Members whose enqueue raised. Non-zero with `complete: true` means the sweep "
+                    "finished but did not warm everything it examined.")
     truncated: bool = Field(
-        description="The sweep stopped at its bound and MORE MEMBERS REMAIN. ⚠ Re-run only AFTER "
-                    "the enqueued work has been indexed: a member counts as materialized when its "
-                    "index job COMPLETES, not when it is enqueued, so a sweep re-run immediately "
-                    "examines the same members again and reaches no further.")
+        description="The sweep stopped at its bound and more members remain. Re-run once the "
+                    "enqueued work has been indexed: a member counts as materialized when its "
+                    "index job completes rather than when it is enqueued, so a sweep re-run "
+                    "immediately examines the same members again and reaches no further.")
     complete: bool = Field(
-        description="The sweep ran to the end without the member listing itself failing. "
-                    "⛔ `false` means every other number here is PARTIAL — this is the field that "
-                    "separates 'nothing to do' from 'could not tell'.")
+        description="The sweep ran to the end without the member listing itself failing. `false` "
+                    "means every other number here is partial, which is what separates 'nothing "
+                    "to do' from 'could not tell'.")
 
 
 def _delete_counts(counts: Any) -> "tuple[int, int, int]":
@@ -1007,11 +1006,11 @@ class DeleteArtifactResponse(BaseModel):
     refused: int = Field(
         0,
         description=(
-            "Members this cascade asked to DESTROY and could not, so they were evicted from this "
-            "container instead and still exist. ⚠ Non-zero means you did not get what you asked "
-            "for: the caller holds no delete right on those artifacts and this container is not "
-            "their origin parent, so destroying them would reach past what the container grant "
-            "covers (audit D4). Always present; `0` on an ordinary delete."
+            "Members this cascade asked to destroy and could not, so they were evicted from this "
+            "container instead and still exist. Non-zero means the call did less than it was "
+            "asked to: the caller holds no delete right on those artifacts and this container is "
+            "not their origin parent, so destroying them would reach past what the container "
+            "grant covers. Always present; `0` on an ordinary delete."
         ),
     )
 
@@ -1073,9 +1072,9 @@ class ArtifactResponse(BaseModel):
     content_type: Optional[str] = Field(None, description="`null` when none was supplied.")
     origin_root: Optional[str] = Field(
         None,
-        description=("The root this artifact's grants descend from. ⚠ Present only for a "
-                     "TOP-LEVEL artifact — one with no `collection_id` is its own origin root — "
-                     "and `null` for a member, whose origin is reached through its container."))
+        description=("The root this artifact's grants descend from. Present only for a top-level "
+                     "artifact — one with no `collection_id` is its own origin root — and `null` "
+                     "for a member, whose origin is reached through its container."))
 
 
 #: The key set `ArtifactResponse` promises, derived from the model so the two cannot drift.
@@ -1174,10 +1173,10 @@ class PutContentResponse(BaseModel):
         False,
         description=(
             "A mirror this node is configured for could not be reached, so a mirror leg is"
-            " still OWED and has been queued. ⚠ The write itself succeeded and the bytes are"
-            " durable locally — this is not a partial failure — but until the queued task"
-            " runs, this node is the only copy. A caller that cares about off-node"
-            " durability should treat `true` as 'not yet replicated'."
+            " still owed and has been queued. The write itself succeeded and the bytes are"
+            " durable locally; until the queued task runs, this node is the only copy. A"
+            " caller that cares about off-node durability reads `true` as 'not yet"
+            " replicated'."
         ),
     )
 
@@ -2081,21 +2080,20 @@ async def warm_collection_endpoint(
     description=(
         "Universal container model: any artifact may have children. Paginated — a collection "
         "has no bounded size, and the per-child membership enrichment below costs a query each. "
-        "⛑ `total` IS ALWAYS `null` HERE, and that is deliberate (audit H3, ruled "
-        "2026-08-26). The authorized count is only knowable by authorizing EVERY member, "
-        "and each authorization is several queries plus an access-audit write — so "
-        "reporting a number made one page of an N-member collection cost N of both, "
-        "whatever `limit` said. Page with `has_more`, never by arithmetic on `total`. "
-        "⚑ COST NOW SCALES WITH HOW MUCH OF THIS CONTAINER YOU MAY READ, not with its "
-        "size: members are authorized a page at a time until the page is full. "
-        "⭐ `has_more` means ANOTHER MEMBER YOU MAY READ EXISTS — not merely that more "
-        "members exist — so a page is never short except a genuinely last one. Both "
-        "follow from the same rule: a short page would let you count, by arithmetic, the "
-        "members you are not permitted to see. "
-        "ORDER (audit H5) is the container's own child order — the ascending `order_key` on "
-        "each membership edge, which is what `PATCH /artifacts/{artifact_id}/children/order` "
-        "writes. It is stable across calls while nobody reorders. There is no `sort` "
-        "parameter because the order is a property of the CONTAINER, not of the query."
+        "`total` is always `null` here. The authorized count is knowable only by authorizing "
+        "every member, and each authorization is several queries plus an access-audit write, "
+        "so reporting a number would make one page of an N-member collection cost N of both "
+        "whatever `limit` said. Page with `has_more` rather than by arithmetic on `total`. "
+        "Cost scales with how much of this container you may read rather than with its size: "
+        "members are authorized a page at a time until the page is full. `has_more` means "
+        "another member you may read exists, rather than merely that more members exist, so a "
+        "page is short only when it is genuinely the last one. Both follow from the same rule: "
+        "a short page would let you count, by arithmetic, the members you are not permitted to "
+        "see. "
+        "Order is the container's own child order — the ascending `order_key` on each "
+        "membership edge, which is what `PATCH /artifacts/{artifact_id}/children/order` writes. "
+        "It is stable across calls while nobody reorders. There is no `sort` parameter because "
+        "the order is a property of the container rather than of the query."
     ),
 
     responses=_errors(401, 404, 500, ok=PageResponse),
@@ -2110,11 +2108,11 @@ async def list_children(
     ),
     workspace_id: Optional[str] = Query(
         None,
-        description="Include draft children homed in this workspace. ⚠ A workspace you cannot read "
-                    "is IGNORED, not refused: you get the committed children and no error. That is "
-                    "deliberate — answering 403 would confirm the workspace exists to someone with "
-                    "no access to it — but it means an empty draft list cannot be distinguished "
-                    "from no access. If you need that distinction, read the workspace directly.",
+        description="Include draft children homed in this workspace. A workspace you cannot read "
+                    "is ignored rather than refused: you get the committed children and no error, "
+                    "because answering 403 would confirm the workspace exists to someone with no "
+                    "access to it. An empty draft list is therefore indistinguishable from no "
+                    "access; read the workspace directly when you need that distinction.",
     ),
     limit: int = Query(100, ge=1, le=1000, description="Page size."),
     offset: int = Query(0, ge=0, description="How many children to skip."),
@@ -2335,11 +2333,11 @@ async def delete_artifact(
     cascade: bool = Query(
         False,
         description=(
-            "Destroy members instead of detaching them. ⛔ DEFAULT `false`, which EVICTS "
-            "the members of a collection — they survive, detached. With `true`, a member "
-            "reachable ONLY through this collection is destroyed outright, while one also "
-            "reachable through another collection is merely evicted from this one. "
-            "`rmdir` refuses a non-empty directory by default; `rm -r` does not."
+            "Destroy members instead of detaching them. Defaults to `false`, which evicts the "
+            "members of a collection — they survive, detached. With `true`, a member reachable "
+            "only through this collection is destroyed outright, while one also reachable "
+            "through another collection is evicted from this one. `rmdir` refuses a non-empty "
+            "directory by default; `rm -r` does not."
         ),
     ),
     auth: AuthContext = Depends(get_auth),
@@ -2790,12 +2788,12 @@ class UploadInitiateRequest(BaseModel):
     order_key: Optional[str] = Field(
         None,
         description=(
-            "Where this artifact sits among its container's members. ⚠ A FRACTIONAL "
-            "INDEX, not a position: an opaque string compared LEXICOGRAPHICALLY, so a "
-            "new member can always be placed between two existing ones without "
-            "renumbering anything. Omit it — that is the ordinary case — and the server "
-            "appends after the current last key. Sending `1`, `2`, `3` will not do what "
-            "it looks like: `10` sorts before `2`."
+            "Where this artifact sits among its container's members. A fractional index "
+            "rather than a position: an opaque string compared lexicographically, so a new "
+            "member can always be placed between two existing ones without renumbering "
+            "anything. Omit it — the ordinary case — and the server appends after the "
+            "current last key. Sending `1`, `2`, `3` does not extend the way it looks: once "
+            "the sequence reaches `10`, that key sorts before `2`."
         ),
     )
     #: Object only, which is the canonical form. `create` and `update` also accept a deprecated
@@ -2805,10 +2803,10 @@ class UploadInitiateRequest(BaseModel):
     context: Optional[Dict[str, Any]] = Field(
         None,
         description=(
-            "Caller metadata about this artifact, as an OBJECT. ⚠ Unlike `POST /artifacts` "
-            "and `PATCH /artifacts/{artifact_id}`, this route does NOT accept a JSON string: "
-            "the string form is deprecated everywhere and was never introduced here, so "
-            "sending one is a 422 rather than a quietly accepted legacy shape."
+            "Caller metadata about this artifact, as an object. Unlike `POST /artifacts` and "
+            "`PATCH /artifacts/{artifact_id}`, this route does not accept a JSON string: the "
+            "string form is deprecated, so sending one here is a 422 rather than a quietly "
+            "accepted legacy shape."
         ),
     )
 
@@ -2843,11 +2841,11 @@ class UploadStatusRequest(BaseModel):
         ge=0.0,
         le=1.0,
         description=(
-            "How far the upload has got, as a FRACTION between 0 and 1 — `0.5` is half."
-            " ⛔ Bounded here since 2026-08-26 (audit P2). The service clamps with"
-            " `max(0.0, min(1.0, progress))`, so a caller working in PERCENT sent `50` and"
-            " recorded `1.0` — a completed-looking upload on its first progress report, with no"
-            " error. A `422` naming the range is the answer a clamp cannot give."
+            "How far the upload has got, as a fraction between 0 and 1 — `0.5` is half."
+            " Bounded at the route. The service clamps with `max(0.0, min(1.0, progress))`, so"
+            " a caller working in percent would send `50` and record `1.0`: a"
+            " completed-looking upload on its first progress report, with no error. A `422`"
+            " naming the range is the answer a clamp cannot give."
         ),
     )
     parts: Optional[List[UploadPart]] = Field(
@@ -2855,16 +2853,15 @@ class UploadStatusRequest(BaseModel):
         description=(
             "Completed multipart parts, required to finalise a multipart upload. Each part is"
             " the `{PartNumber, ETag}` pair the object store returned when that part was"
-            " written. ⚠ NOT vestigial: `multipart-part-url` was removed, but completion still"
-            " needs the part list."
+            " written. Completing a multipart upload needs the full part list."
         ),
     )
     context_patch: Optional[Dict[str, Any]] = Field(
         None,
         description=(
-            "Top-level keys to merge into the artifact's context. ⚠ A SHALLOW merge: each key"
+            "Top-level keys to merge into the artifact's context. A shallow merge: each key"
             " replaces its whole value, so a nested object is overwritten rather than merged"
-            " into. Not part of the upload's own state — that is `status`, `progress` and"
+            " into. Not part of the upload's own state, which is `status`, `progress` and"
             " `parts`."
         ),
     )
@@ -2883,9 +2880,9 @@ class BatchFetchRequest(BaseModel):
         min_length=1,
         max_length=_MAX_PAGE,
         description="The artifacts to fetch. Each id costs two store operations, so the list is "
-                    "bounded. ⚠ Ids you cannot read, and ids that do not exist, are SKIPPED — the "
-                    "response carries only what was returnable, so asking for 50 may yield 48 with "
-                    "no indication of which two. The two cases are deliberately indistinguishable: "
+                    "bounded. Ids you cannot read, and ids that do not exist, are both skipped: "
+                    "the response carries only what was returnable, so asking for 50 may yield 48 "
+                    "with no indication of which two. The two cases are indistinguishable because "
                     "reporting them separately would make this endpoint an existence oracle for "
                     "artifacts you cannot see. Match the response back by `id`.",
     )
@@ -3917,9 +3914,9 @@ async def get_artifact_access_log(
     since: Optional[str] = Query(
         None,
         description=(
-            "Only events at or after this ISO-8601 timestamp. ⛑ Added because this log is"
-            " APPEND-ONLY and grows with use: without a time bound the only way to reach an"
-            " old event was to page through everything newer than it."
+            "Only events at or after this ISO-8601 timestamp. The log is append-only and grows"
+            " with use, so a time bound is how an old event is reached without paging through"
+            " everything newer than it."
         ),
     ),
     until: Optional[str] = Query(
