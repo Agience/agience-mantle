@@ -345,13 +345,12 @@ def test_every_moved_function_is_bit_identical_to_the_body_it_came_from() -> Non
         check("gap_split", cut.gap_split, _o_gap_split, s)
         check("top_break", cut.top_break, _o_top_break, s)
 
-    # Measured at 4020 after the novelty/drift retirement dropped five of the eight per-frame
-    # checks (anomaly, anomaly_rank, most_anomalous, novelty_score, subspace_coherence, and the
-    # in_subspace_fraction pair) — the floor below is set with margin under that count, not at it.
+    # Measured at 4020 comparisons; the floor below sits with margin under that count rather than
+    # at it, so an ordinary change in the number of per-frame checks does not trip it.
     assert n >= 3500, f"the sweep collapsed to {n} comparisons and would prove almost nothing"
     assert not bad, (
-        f"{len(bad)} of {n} comparisons disagree with the body the function came from. ⛔ Do NOT "
-        f"'fix' either side until the DOMAIN argument is settled. First five:\n"
+        f"{len(bad)} of {n} comparisons disagree with the body the function came from. Settle the "
+        f"domain argument before changing either side. First five:\n"
         + "\n".join(repr(b) for b in bad[:5]))
 
 

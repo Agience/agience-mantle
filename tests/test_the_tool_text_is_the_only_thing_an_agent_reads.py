@@ -1,20 +1,19 @@
-"""The MCP surface must not describe itself wrongly, and must not break on a malformed message.
+"""The MCP surface describes itself accurately, and does not break on a malformed message.
 
-*"Correct the tool descriptions. They are the only text an agent reads."* — the audit's step 10. A
-human reads the code when a description misleads them; a model reads the description and nothing
-else, so a wrong one is not a documentation bug, it is the tool being wrong for its only caller.
+A human reads the code when a description misleads them; a model reads the description and nothing
+else. A wrong tool description is therefore not a documentation bug — it is the tool being wrong for
+its only caller.
 
-Five findings, and four of them were behaviour rather than text. Fixing only the text would have
-described broken behaviour accurately, which leaves an agent unable to do the thing:
+The checks here pin both halves of that, because a description can only be accurate about behaviour
+that works:
 
-1. `update_artifact` silently dropped `name`/`description` for a collection MEMBER while promising
-   "only the fields you supply change".
-2. `create_artifact` dropped `description` on the ordinary member-create path — the field its own
-   schema recommends supplying so the artifact can be found again.
-3. `list_artifacts` claimed "newest first"; it is id order.
-4. `additionalProperties: false` was declared by every schema and read by nothing.
-5. Malformed JSON-RPC returned 500 — the server reporting itself broken over a message it
-   understood well enough to reject.
+- `update_artifact` changes `name`/`description` on a collection member, which is what "only the
+  fields you supply change" promises.
+- `create_artifact` keeps `description` on the ordinary member-create path — the field its own
+  schema recommends supplying so the artifact can be found again.
+- `list_artifacts` says it returns id order, and points at the tool that does match.
+- `additionalProperties: false` is enforced rather than merely declared.
+- Malformed JSON-RPC answers a JSON-RPC error, not a 500.
 """
 from __future__ import annotations
 

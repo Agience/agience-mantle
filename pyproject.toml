@@ -7,30 +7,50 @@ name = "agience-mantle"
 version = "0.1.0"
 description = "Agience Mantle — the standalone data store: SQLite + encrypted content-addressed filesystem, artifacts/collections with immutable version lineage, CRUDEASIO access grants, and a Merkle-synced mesh. Runs with zero external database processes. Import name is `mantle`."
 requires-python = ">=3.11"
-license = { text = "Apache-2.0" }
-authors = [{ name = "Ikailo Inc." }]
-readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Ikailo Inc.", email = "connect@agience.ai" }]
+readme = { file = "README.md", content-type = "text/markdown" }
+keywords = ["agience", "mantle", "database", "sqlite", "encrypted", "content-addressed",
+            "artifact-store", "searchable-encryption", "access-control", "mcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
 
-# ⛔ THE BASE INSTALL IS THE STORE, AND ITS DEPENDENCY SET IS DELIBERATELY ONE PACKAGE.
+# The base install is the store, and its dependency set is one package.
 #
-# `pip install agience-mantle` gives you artifacts, collections, version lineage, access grants,
-# the encrypted local content tier, and encrypted lexical search (SSE blind tokens) — the whole
-# embeddable surface — on stdlib plus
-# `cryptography`. Nothing else. That is the product claim ("Mantle IS the standalone data store"),
-# so it is expressed here as an install contract rather than a README sentence, and it is
-# ENFORCED by `src/mantle/db/test_embeddable_surface.py` (AST + runtime + functional).
-# That test lives under db/ rather than tests/ because `tests/conftest.py` imports the SERVICE
+# `pip install agience-mantle` gives you artifacts, collections, version lineage, access grants, the
+# encrypted local content tier, and encrypted lexical search (SSE blind tokens) — the whole
+# embeddable surface — on stdlib plus `cryptography`, and nothing else. The claim is an install
+# contract rather than a README sentence, and `src/mantle/db/test_embeddable_surface.py` holds it by
+# AST scan, runtime import and a functional round trip.
+#
+# That test lives under `db/` rather than `tests/` because `tests/conftest.py` imports the service
 # stack — `mantle.main` (the FastAPI app), httpx, bcrypt and `prism.trust.key_manager` — so every
-# module collected under that root already requires the extras this test exists to prove
-# unnecessary. A check that cannot run on the base install proves nothing about the base install.
+# module collected under that root already requires the extras the test exists to prove unnecessary.
+# A check that cannot run on the base install measures nothing about the base install.
 #
-# MEASURED, not assumed: an AST scan of the store subtree finds ZERO module-level third-party
-# imports and zero imports of any sibling Agience package. `cryptography` itself is imported
-# lazily inside functions; it is a hard dependency anyway because the store encrypts at rest, and
-# declaring it optional would make "can this store open its own content" an install-shape lottery.
+# Measured: an AST scan of the store subtree finds no module-level third-party imports and no
+# imports of any sibling Agience package. `cryptography` is imported lazily inside functions, and is
+# a hard dependency regardless because the store encrypts at rest; declaring it optional would make
+# "can this store open its own content" a property of the install shape.
 dependencies = [
     "cryptography>=42",
 ]
+
+[project.urls]
+Homepage = "https://agience.ai"
+Source = "https://github.com/Agience/agience-mantle"
+Issues = "https://github.com/Agience/agience-mantle/issues"
 
 [project.optional-dependencies]
 # The DURABLE tier (S3/R2/any bucket + CDN read path). Only needed to mirror content off-box;
@@ -58,22 +78,21 @@ mqtt = ["paho-mqtt>=2.0"]
 # only two SSE modules that would otherwise reach the vector arm — which is what keeps the lexical
 # surface free of numpy.
 #
-# MEASURED, not assumed (AST import graph over all 194 mantle modules, module-level imports only,
-# because an import inside a function body is not an install requirement):
+# Measured (AST import graph over all 194 mantle modules, module-level imports only, because an
+# import inside a function body is not an install requirement):
 #
 #     import numpy at module level ......  14 modules
 #     reach numpy transitively .........  25 modules
 #     numpy-free .......................  169 modules
 #
 # and the closure of the LEXICAL surface — `search.mantle.sse` + `search.query_parser` +
-# `search.types` + `db` — is 24 modules whose only third-party requirement is
-# `cryptography`. numpy is not in it. So the split is real rather than declared:
+# `search.types` + `db` — is 24 modules whose only third-party requirement is `cryptography`. numpy
+# is not in it, so the split is measured rather than declared:
 
 # The encrypted lexical arm: the tokenizer, blind tokens, encrypted posting lists, and the
-# blind-token narrowing that reads them. Deliberately EMPTY — its whole content is the claim that
-# this surface needs nothing beyond the base install (stdlib + `cryptography`). An empty extra is
-# the honest way to say that: it names the surface and pins the contract, and
-# `tests/test_lexical_extra_is_numpy_free.py` blocks numpy at the import system and proves the
+# blind-token narrowing that reads them. Empty, because this surface needs nothing beyond the base
+# install (stdlib + `cryptography`). An empty extra names the surface and pins that contract, and
+# `tests/test_lexical_extra_is_numpy_free.py` blocks numpy at the import system and holds that the
 # surface still imports, indexes and narrows with it gone.
 lexical = []
 
@@ -81,63 +100,54 @@ lexical = []
 # AnchorSet from JSON, routes against it, and reads nothing else off disk. YAML belongs to seed
 # provisioning and the addon manifests, which are `[service]`, and is declared there.
 #
-# ⭐ `agience-prism-py` IS THE SHARED FLOOR FOR THE ROUNDING LAW. `search/beacon/instrument.py`
-# needs the same floating-point rounding bound that decides beacon's routing floor and its
-# conservation verdict; keeping that logic in exactly one place, rather than duplicated per
-# consumer, is what keeps beacon's numbers and a sibling engine's numbers provably identical — a
-# derivation that exists in two places can silently drift out of agreement with itself.
+# `agience-prism` is the shared floor for the rounding law. `search/beacon/instrument.py` needs
+# the same floating-point rounding bound that decides beacon's routing floor and its conservation
+# verdict; holding that logic in one place, rather than duplicating it per consumer, is what keeps
+# beacon's numbers and a sibling engine's numbers identical. A derivation that exists in two places
+# can drift out of agreement with itself without either copy changing visibly.
 #
-# The law lives in `prism.rounding`, on prism's DEPENDENCY-FREE base. MEASURED, not assumed: the
-# whole new-module closure of `import prism.rounding` is `prism · prism.canonical ·
-# prism.environment · prism.errors · prism.rounding`, five stdlib-only contract modules — no numpy,
-# no cryptography, no extra of prism's own. `tests/test_beacon_instrument.py` permits exactly those
-# five at the import system and still REFUSES the rest of prism (with `prism.conservation` in the
-# control set), so this edge is bounded by a measurement rather than by this comment.
+# The law lives in `prism.rounding`, on prism's dependency-free base. Measured: the whole new-module
+# closure of `import prism.rounding` is `prism · prism.canonical · prism.environment · prism.errors ·
+# prism.rounding`, five stdlib-only contract modules — no numpy, no cryptography, no extra of
+# prism's own. `tests/test_beacon_instrument.py` permits exactly those five at the import system and
+# refuses the rest of prism, with `prism.conservation` in the control set, so the edge is bounded by
+# a measurement rather than by this comment.
 #
-# ⚠ NO NEW REPO EDGE. `mantle => prism` already exists and is already declared — 19 modules import
-# prism, it is named under `service` and `dev`, and prism is the Apache-2.0 floor that imports
-# nothing from this workspace. What is new is that the SEMANTIC ARM needs it, so it is named here
-# rather than being satisfied silently by a dev workspace's editable install. The BASE install is
-# untouched: `db/test_embeddable_surface.py` still proves by AST scan that the store subtree
-# has no sibling-package imports, so `pip install agience-mantle` reads exactly as it did.
-semantic = ["numpy>=1.24", "agience-prism-py"]
+# The semantic arm names prism here rather than relying on a dev workspace's editable install to
+# satisfy it. The base install is unaffected: `db/test_embeddable_surface.py` holds by AST scan that
+# the store subtree has no sibling-package imports.
+semantic = ["numpy>=1.24", "agience-prism>=0.1.1"]
 
-# The union, under the name that already existed — every current consumer of `[search]` keeps
-# exactly what it had, so the split adds a lighter option without silently taking anything away.
+# Both arms together. `[lexical]` alone is the lighter option for a consumer that needs encrypted
+# term search without the vector arm's weight.
 search = ["agience-mantle[lexical,semantic]"]
 
-# Mantle as a DEPLOYED SERVICE — the FastAPI app, routers, OIDC, seed provisioning.
+# Mantle as a deployed service — the FastAPI app, routers, OIDC, seed provisioning.
 #
-# Mantle does not depend on `agience-origin`: settings live in `mantle/config.py`, and
-# `scopes`, `services/principal.py` and `system/logging_utils.py` are mantle's own, so this surface never
-# needs another service's source tree to import. `tests/test_origin_is_not_a_dependency.py` blocks
-# the module at the import system and proves the blocker actually fires before concluding anything —
-# a guard that silently does nothing would be indistinguishable from a passing test.
+# Mantle does not depend on `agience-origin`: settings live in `mantle/config.py`, and `scopes`,
+# `services/principal.py` and `system/logging_utils.py` are mantle's own, so this surface needs no
+# other service's source tree to import. `tests/test_origin_is_not_a_dependency.py` blocks the
+# module at the import system, and asserts the blocker fires before concluding anything from it — a
+# guard that silently does nothing is indistinguishable from a passing test.
 #
-# `agience-prism` is the one declared cross-package edge. ⛑ Re-measured 2026-08-26 by AST, not
-# by grep: **24 modules**, 36 import statements — 13 at module scope across 11 files (`mesh/` `search/`
-# `services/` `shard/`) and 23 deferred inside functions. ⭐ `import mantle` reaches NONE of them:
-# `mantle/__init__.py` imports only `os`, which is what keeps the base install honest at its single
-# declared dependency. The comment said 19 and `config.py` said ~28; both predate this count
-# (trust.key_manager, trust.service_identity, mass, canonical, envelope, grounding, law, vector);
-# prism is the designated floor, Apache-2.0, and imports nothing from this workspace, so it is the
-# right edge to depend on.
+# `agience-prism` is the one declared cross-package edge. Measured by AST: 24 modules, 36 import
+# statements — 13 at module scope across 11 files (`mesh/` `search/` `services/` `shard/`) and 23
+# deferred inside functions. `import mantle` reaches none of them, because `mantle/__init__.py`
+# imports only `os`; that is what holds the base install at its single declared dependency. prism is
+# the designated Apache-2.0 floor and imports nothing from this workspace, so it is the edge this
+# distribution can depend on.
 #
-# ⚠ NOT ON PyPI, AND NAMED HERE WITHOUT A URL ON PURPOSE. Every install of `[service]`,
-# `[semantic]` or `[dev]` therefore needs the sibling checkout installed FIRST:
+# prism is published on PyPI as `agience-prism`, so `[service]`, `[semantic]` and `[dev]` resolve
+# from an index with no sibling checkout. A developer working on both at once still installs it
+# editable (`pip install -e ../agience-prism/py`), which takes precedence over the released wheel.
 #
-#     pip install -e ../agience-prism/py
-#
-# and the README's Quick Start states that as a prerequisite rather than leaving it to this
-# comment. A `@ git+https://…@<rev>` direct reference would pin it, but it would also make this
-# distribution unpublishable — PyPI rejects any release whose metadata carries a direct URL — so
-# the pin cannot be added until prism itself is published. Naming the package without a source is
-# the honest statement of that: the requirement is real and the resolver will say so.
+# The requirement is named without a URL. A `@ git+https://…@<rev>` direct reference would pin a
+# revision at the cost of making this distribution unpublishable, because PyPI rejects any release
+# whose metadata carries a direct URL. A version floor pins what matters instead.
 service = [
     "agience-mantle[s3,search]",
-    # The distribution name is `agience-prism-py` — do not confuse it with the retired,
-    # unpublished project archived at `_archive/agience-prism/pyproject.toml`.
-    "agience-prism-py",
+    # Distribution `agience-prism`; import name `prism`; GitHub repo `agience-prism-py`.
+    "agience-prism>=0.1.1",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.30",
     "starlette>=0.37",
@@ -148,69 +158,61 @@ service = [
     "python-dotenv>=1.0",
     "httpx>=0.27",
     "authlib>=1.3",
-    # ⚠ `bcrypt` and `itsdangerous` WERE BARE until 2026-08-25, alone among this extra's
-    # entries — every neighbour already carried a floor. A bare requirement is satisfied by
-    # whatever is installed, so two boxes with different versions both "satisfy" this file.
+    # Every entry in this extra carries a version floor. A bare requirement is satisfied by whatever
+    # happens to be installed, so two boxes running different versions would both satisfy this file.
     "bcrypt>=4.0",
     "itsdangerous>=2.1",
     "pyyaml>=6.0",
 ]
 
-# `agience-prism-py` is named here for the TESTS specifically, and it adds no new edge beyond the
-# one already declared under `service` above: 19 modules import prism, and prism is the designated
-# Apache-2.0 floor that imports nothing from this workspace. What's new is only that
-# `tests/test_beacon_conformance.py` needs it, and that test runs for anyone who installs `[dev]`
-# WITHOUT `[service]`.
+# `agience-prism` is named here for the tests, so that `[dev]` installs without `[service]` still
+# run them. It is the same edge already declared under `service` above, not a second one.
 #
-# It needs prism as DATA, not as code: `prism.vectors/screen_read_vectors.json` is the pinned read
-# holding mantle's reduced beacon and beam's full aperture to the SAME number. beam itself cannot be
-# a mantle dependency — that IS the edge the target DAG forbids — so the vectors travel with the
-# floor package instead. Declaring the dependency here makes the gate's data an install requirement
-# rather than a property of somebody's directory layout.
+# The tests need prism as data rather than as code: `prism.vectors/screen_read_vectors.json` is the
+# pinned read that holds mantle's reduced beacon and beam's full aperture to the same number. beam
+# cannot be a mantle dependency — that is the edge the target DAG forbids — so the vectors travel
+# with the floor package instead. Declaring the dependency here makes the gate's data an install
+# requirement rather than a property of someone's directory layout.
 #
-# The STORE subtree is untouched: `db/test_embeddable_surface.py` still proves by AST scan
-# that `db/` has no module-level third-party or sibling-package imports, so the
-# `pip install agience-mantle` claim at the top of this file reads exactly as it did.
 # `threadpoolctl` is how `tests/test_blas_thread_pin.py` reads the OpenBLAS pool size back as a
-# PUBLISHED number rather than hand-rolling a probe. Declared, not optional: without it that test
-# can only check that a string was set, never that the pin took effect, and a check that degrades
-# to a skip is a silent pass.
+# published number rather than hand-rolling a probe. Declared rather than optional: without it that
+# test can only check that a string was set, never that the pin took effect, and a check that
+# degrades to a skip is a silent pass.
 #
-# `pytest-asyncio` is required by the config below, not merely useful to it:
+# `pytest-asyncio` is required by the config below rather than merely useful to it.
 # `asyncio_mode = "auto"` is that plugin's option, and without the plugin the async fixtures in
 # `tests/conftest.py` never run — which surfaces as unrelated failures rather than as a missing
 # dependency.
 #
-# The `mcp` SDK is NOT a dependency of this distribution, in any extra. `routers/mcp_router.py`
-# serves the protocol by writing JSON-RPC 2.0 over Streamable HTTP itself — that is ~200 lines
-# against a published wire format, and it is what keeps the MCP surface free of an SDK whose
-# release cadence would otherwise reach the runtime image.
+# The `mcp` SDK is not a dependency of this distribution, in any extra. `routers/mcp_router.py`
+# serves the protocol by writing JSON-RPC 2.0 over Streamable HTTP itself — about 200 lines against
+# a published wire format — which keeps the MCP surface free of an SDK whose release cadence would
+# otherwise reach the runtime image.
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=1.0",
-    "agience-prism-py",
+    "agience-prism>=0.1.1",
     "threadpoolctl>=3.0",
 ]
 
 all = ["agience-mantle[s3,smb,search,service,dev]"]
 
 [project.scripts]
-# ⭐ AN INSTALL SHOULD YIELD A COMMAND. Without these, `pip install agience-mantle[service]`
-# produces a package the consumer must already know how to start — the ASGI path
-# `mantle.main:app` is knowledge that lives in this repo's Dockerfile, not in the wheel.
+# An install yields commands. Without these, `pip install agience-mantle[service]` produces a
+# package the consumer must already know how to start: the ASGI path `mantle.main:app` is knowledge
+# that would otherwise live in a deployment recipe rather than in the wheel.
 #
-# `mantle-serve` is a thin wrapper over uvicorn so the app object, the default port and the log
+# `mantle-serve` is a thin wrapper over uvicorn, so the app object, the default port and the log
 # config travel with the package rather than with the command line. `mantle-init-keys` writes a
 # throwaway development keyset, because a fresh `KEYS_DIR` does not boot and nothing else in this
 # distribution populates one.
 #
-# `mantle-token` is the other half of that keyset. `mantle-init-keys` already writes the signing key
-# AND the manifest anchor that trusts its public half, so a standalone node trusts its own key from
-# the first boot — but nothing in this distribution signed a USER token against it
-# (`services/peer_signing` signs one service JWT and must keep signing only that), so an installed,
-# booted node had no credential anyone could authenticate with and answered 401 to everything. That
-# is the whole gap between `pip install` and a working MCP round trip, and it is a command-shaped
-# gap: the material is already on disk and already trusted.
+# `mantle-token` is the other half of that keyset. `mantle-init-keys` writes the signing key and the
+# manifest anchor that trusts its public half, so a standalone node trusts its own key from first
+# boot; nothing else here signs a user token against it, since `services/peer_signing` signs one
+# service JWT and only that. Without `mantle-token` an installed, booted node holds no credential
+# anyone can authenticate with and answers 401 to everything. The material is already on disk and
+# already trusted, so the gap between `pip install` and a working MCP round trip is command-shaped.
 mantle-serve = "mantle.scripts.serve:main"
 mantle-init-keys = "mantle.scripts.dev_init_keys:main"
 mantle-token = "mantle.scripts.dev_mint_token:main"
@@ -223,21 +225,21 @@ mantle-wal-checkpoint = "mantle.scripts.wal_checkpoint:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-# ⚠ A GLOB ONLY COVERS THE PACKAGE IT NAMES. `mantle = [...]` would match files directly in
-# `src/mantle/`; it does not descend into subpackages, each of which is a package in its own right
-# and therefore needs its own entry. Two consequences, both of them measured against the tree:
+# A glob covers only the package it names. `mantle = [...]` matches files directly in `src/mantle/`
+# and does not descend into subpackages, each of which is a package in its own right and needs its
+# own entry. Two consequences, both measured against the tree:
 #
 #   · `mantle.system` is a distinct package, so `uvicorn_log_config.json` is not reached by a
-#     top-level glob. Its absence FAILS SILENTLY: a wheel built without it installs and runs,
-#     just with default log formatting, and nothing to say why.
+#     top-level glob. Its absence fails silently: a wheel built without it installs and runs, with
+#     default log formatting and nothing to say why.
 #
-#   · A pattern that matches nothing is not free — it reads as a declaration that such files exist.
-#     There are zero `.sql` files in this tree; the lattice schema is inline Python, created on
-#     open. So no `*.sql` entry. `mantle.search.anchors` ships no data either: the seed corpus is
-#     provisioned by the application on top of Mantle, not bundled here. So no entry for it.
+#   · A pattern that matches nothing reads as a declaration that such files exist. There are no
+#     `.sql` files in this tree — the lattice schema is inline Python, created on open — so there is
+#     no `*.sql` entry. `mantle.search.anchors` ships no data either: the seed corpus is provisioned
+#     by the application on top of Mantle rather than bundled here, so it has no entry.
 #
-# `tests/test_wheel_ships_its_data.py` BUILDS a wheel and reads its manifest, rather than trusting
-# this declaration — the failure mode above is invisible to any check that only inspects source.
+# `tests/test_wheel_ships_its_data.py` builds a wheel and reads its manifest rather than trusting
+# this declaration, because the failure mode above is invisible to a check that inspects only source.
 # It also holds every pattern below to the second point: a glob that matches nothing fails there.
 [tool.setuptools.package-data]
 # `uvicorn_log_config.json` — the single source of truth for log formatting, read by
@@ -246,31 +248,29 @@ where = ["src"]
 "mantle.system" = ["*.json"]
 
 [tool.pytest.ini_options]
-# THE ONE PYTEST CONFIG FOR THIS REPO. A single source of truth here means `python -m pytest` and
-# `python -m pytest src/mantle` resolve the same settings regardless of invocation path — two
-# configs that could disagree would make a green run evidence about the command line instead of
-# evidence about the code, and the failing invocation would be the shorter one a newcomer types
-# first.
+# The one pytest config for this repo. A single source of truth means `python -m pytest` and
+# `python -m pytest src/mantle` resolve the same settings regardless of invocation path. Two configs
+# that could disagree would make a green run evidence about the command line rather than about the
+# code, and the failing invocation would be the shorter one a newcomer types first.
 #
 # `pythonpath = ["src"]` is what makes an uninstalled checkout work: test helper imports are fully
 # qualified as `mantle.tests.*`, so nothing needs `src/mantle` added to the path to resolve them,
 # and a bare top-level `tests` package name is never ambiguous with anything outside this repo.
 #
-# TWO ROOTS: the unit suite lives at `tests/`, while `src/mantle/db/` keeps its own tests
-# in-tree — deliberately, because they prove the embeddable surface, and `tests/conftest.py` pulls
-# in the FastAPI app and the prism trust stack, so a check placed under that root could never run
-# on the base install it exists to certify.
+# Two roots: the unit suite lives at `tests/`, while `src/mantle/db/` keeps its own tests in-tree.
+# Those certify the embeddable surface, and `tests/conftest.py` pulls in the FastAPI app and the
+# prism trust stack, so a check placed under that root could never run on the base install it exists
+# to certify.
 testpaths = ["tests", "src/mantle"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 
-# THE MARKERS THE E2E SUITE APPLIES, DECLARED WHERE EVERY COLLECTION CAN SEE THEM.
-# `tests/e2e/` sits under `testpaths`, and it carries no config of its own, so `pytest tests/e2e`
-# and the root run resolve this same file — same rootdir, same marks, same asyncio settings. A
-# nested `pytest.ini` there would take over as the configfile for the direct invocation and answer
-# a different question than the root run does, which is what makes a green run evidence about the
-# command line rather than about the code.
+# The markers the e2e suite applies, declared where every collection can see them. `tests/e2e/` sits
+# under `testpaths` and carries no config of its own, so `pytest tests/e2e` and the root run resolve
+# this same file — same rootdir, same marks, same asyncio settings. A nested `pytest.ini` there
+# would take over as the configfile for the direct invocation and answer a different question than
+# the root run does.
 markers = [
     "real_content_store: exercise the real artifact content write path instead of the addressed stub in conftest",
     "lazy: requires MANTLE_LAZY_INDEX=on (the first-observation regime)",

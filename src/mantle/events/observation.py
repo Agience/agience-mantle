@@ -160,18 +160,15 @@ def ensure_observations_container(store_db, principal_id: str) -> Optional[str]:
     CRUDEASIO", which is the owner grant the visibility rule then depends on — see the module
     docstring on why the container, and not the matched artifacts, is what an observation names.
 
-    The id is DERIVED. This is check-then-act and nothing makes it atomic, so find-then-create
-    does not prevent the race — it IS the race. An earlier version of this docstring claimed the
-    opposite ("find-then-create rather than create-then-catch: two racing calls would otherwise
-    leave one principal owning two containers"); that outcome is what find-then-create produces,
-    not what it avoids. Both racers see no container and both create one, and with a minted UUID
-    each the principal ends up owning two containers of the same content type with nothing to say
-    which is theirs — exactly the harm the sentence was worried about.
+    The id is derived rather than minted. This is check-then-act and nothing makes it atomic, so
+    find-then-create is the race rather than a guard against it: both racers see no container and
+    both create one, and with a minted UUID each the principal ends up owning two containers of the
+    same content type with nothing to say which is theirs.
 
     Pinning the id makes both writes address the same row. See
-    :func:`seed_provisioning.user_provisioning.inbox_workspace_id`, the same fix for the same
-    defect on the first-login path, for the measurement this rests on: a duplicate create UPSERTS
-    rather than raising, so this converges but must never be read as an arbiter.
+    :func:`seed_provisioning.user_provisioning.inbox_workspace_id`, the same approach on the
+    first-login path, for the measurement this rests on: a duplicate create upserts rather than
+    raising, so this converges. It is not an arbiter, and must not be read as one.
     """
     existing = _lookup_container(store_db, principal_id)
     if existing:

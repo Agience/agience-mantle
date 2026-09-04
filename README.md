@@ -3,7 +3,7 @@
 [![Version](https://img.shields.io/badge/version-0.1.0-blue)](pyproject.toml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
-[![CI](https://github.com/Agience/agience-mantle/actions/workflows/build-image.yml/badge.svg)](https://github.com/Agience/agience-mantle/actions/workflows/build-image.yml)
+[![CI](https://github.com/Agience/agience-mantle/actions/workflows/ci.yml/badge.svg)](https://github.com/Agience/agience-mantle/actions/workflows/ci.yml)
 
 **The lattice — where the data lives.**
 
@@ -26,9 +26,7 @@ Mantle is one of the instruments of the Agience system. This repository is the *
 
 | Path | Purpose |
 |---|---|
-| `src/mantle/` | The FastAPI service: the standalone lattice store (one SQLite file + a filesystem CAS, opened in-process — `db/backend.py` → `db/lattice_api.py` → `db/vertex.py` + `db/edge.py`), encrypted retrieval on both arms — MANTLE-SSE blind-token narrowing and anchor-routed vector cells, on object storage or the local disk; the vector arm is inert until an AnchorSet is seeded (see [below](#-semantic-recall-is-inert-until-you-seed-an-anchorset)) — per-state index segments, light-cone authorization, and governable trusted-issuer auth. Depends on **`agience-prism-py`** and talks to Origin over the wire (HTTP/MCP) — `clients/origin_client.py` is the only outbound peer client. |
-| `build/Dockerfile` | The service image. The shared foundation is `agience-prism-py`, supplied as a named build context: `docker build -f build/Dockerfile --build-context prism=../agience-prism/py -t agience-mantle .` |
-| `docker-compose.yml` | A single-service stack for smoke-testing that image without the rest of the platform. |
+| `src/mantle/` | The FastAPI service: the standalone lattice store (one SQLite file + a filesystem CAS, opened in-process — `db/backend.py` → `db/lattice_api.py` → `db/vertex.py` + `db/edge.py`), encrypted retrieval on both arms — MANTLE-SSE blind-token narrowing and anchor-routed vector cells, on object storage or the local disk; the vector arm is inert until an AnchorSet is seeded (see [below](#-semantic-recall-is-inert-until-you-seed-an-anchorset)) — per-state index segments, light-cone authorization, and governable trusted-issuer auth. Depends on **`agience-prism`** and talks to Origin over the wire (HTTP/MCP) — `clients/origin_client.py` is the only outbound peer client. |
 | `tests/e2e/` | Blackbox HTTP end-to-end suite — drives a live stack over the wire. See [tests/e2e/README.md](tests/e2e/README.md). |
 | `.env.example` | Config template — copy to `.env`. Only `MANTLE_LATTICE_PATH` and `KEYS_DIR` are set outright; everything else is commented out, so an untouched copy runs on defaults. |
 
@@ -43,7 +41,7 @@ Mantle is one of the instruments of the Agience system. This repository is the *
 | `services/` | Orchestration — workspaces, collections, grants, content, contexts, OIDC, seed provisioning, plus `peer_signing.py` (the one outbound signature, a service JWT). `content_crypto.py` is the per-principal content envelope, which is also all there is to a secret. `acting_principal.py` answers who is acting; `principal.py` answers what artifact a principal IS — a person, or a foundation entity for an author that is not a human. |
 | `api/` | Pydantic request/response models, grouped by domain — including `api/vectors.py`, the shape validation for writer-supplied vectors. |
 | `entities/` | Entity models and serialization. A collection *is* an artifact; `entities/collection.py` says so literally. `context.py` and `subscription.py` are the same move again: a role an artifact plays, discriminated by `content_type`. |
-| `search/` | Retrieval. `embeddings.py` and `embeddings_cache.py` are the vector arm's provider facade and its long-term cache; `search/mantle/sse/` is the encrypted lexical arm (blind-token narrowing), which runs on every install; `search/mantle/lightcone.py` is authorization as reachability; `search/anchors/` and `search/beacon/` are the semantic arm and its result cut — `search/anchors/store.py` loads a client-seeded AnchorSet and never derives, grows or reconciles one, so the semantic arm stays dark until a set is seeded; `search/ingest/` is the indexing queue. |
+| `search/` | Retrieval. `embeddings.py` and `embeddings_cache.py` are the vector arm's provider facade and its long-term cache; `search/mantle/sse/` is the encrypted lexical arm (blind-token narrowing), covering **5.9%** of our reference corpus with the remainder on the plaintext index; `search/mantle/lightcone.py` is authorization as reachability; `search/anchors/` and `search/beacon/` are the semantic arm and its result cut — `search/anchors/store.py` loads a client-seeded AnchorSet and never derives, grows or reconciles one, so the semantic arm stays dark until a set is seeded; `search/ingest/` is the indexing queue. |
 | `attenuation.py` | The one authorization meet — CRUDEASIO masks, deny absorbing, composed along every path. One of the four modules in the package root, beside `__init__.py` (the BLAS pin), `main.py` (the app) and `config.py` (the settings every layer reads). |
 | `events/` | The change feed: `event_bus.py` is in-process fan-out and a durable log with cursor replay; `event_backplane.py` is the optional Redis/MQTT back-plane for multi-process nodes. |
 | `system/` | Boot and operations — `logging_utils.py` and its `uvicorn_log_config.json`, `runner_hooks.py` (what the store asks of a runner, injected rather than imported), and the `manage_*.py` bootstrap/seed/addon/anchor operations. |
@@ -59,28 +57,32 @@ Mantle is one of the instruments of the Agience system. This repository is the *
 
 **Mantle IS the database.** The store is one SQLite file (`MANTLE_LATTICE_PATH`, schema created on open) plus a filesystem CAS, opened in-process — zero external database processes to provision.
 
-### Prerequisite: a sibling `agience-prism` checkout
+### The trust floor: `agience-prism`
 
-`[service]` (and `[semantic]`, and `[dev]`) require **`agience-prism-py`**, which is not on PyPI. Every
-delivery path resolves it from a sibling checkout, so clone it beside this repo first — the
-directory layout below is what the `docker build` command and the relative `pip install` path both
-assume:
+`[service]` (and `[semantic]`, and `[dev]`) require **`agience-prism`**, published on PyPI under that
+name — the import name is `prism`, and the GitHub repository is `agience-prism-py`. Nothing extra is
+needed to install:
+
+```bash
+pip install -e '.[service]'    # resolves agience-prism from PyPI
+```
+
+`prism` is the trust floor `main.py`'s key initialization calls into, so the app fails at import
+without it.
+
+To work on both at once, clone prism beside this repo and install it editable — an editable install
+takes precedence over the released wheel:
 
 ```text
 <workspace>/
 ├── agience-mantle/     ← this repo
-└── agience-prism/py/   ← the `agience-prism-py` distribution
+└── agience-prism/py/   ← the `agience-prism` distribution
 ```
 
 ```bash
-# The repository is the one `.github/workflows/build-image.yml` checks out as the `prism` build
-# context: `<this repo's owner>/agience-prism-py`.
 git clone https://github.com/Agience/agience-prism-py ../agience-prism/py
 pip install -e ../agience-prism/py
 ```
-
-Without it, `pip install -e '.[service]'` cannot resolve, and the app fails at import — `prism` is
-the trust floor `main.py`'s key initialization calls into.
 
 ### Local
 
@@ -266,21 +268,18 @@ static `Authorization` header above is the supported path.
 the default, or a configured `AGIENCE_TRUSTED_ISSUERS`. An undeclared node omits the key rather than
 naming a server it cannot serve. Point a node at a real issuer and the document names it.
 
-### Docker
+### Running it as a service
+
+Mantle is distributed on PyPI and runs as an ordinary Python process. There is no image to build.
 
 ```bash
-docker build -f build/Dockerfile --build-context prism=../agience-prism/py -t agience-mantle .
-python src/mantle/scripts/dev_init_keys.py --keys-dir ./.data/keys
-docker compose up
+pip install 'agience-mantle[service]'
+mantle-init-keys --keys-dir ./.data/keys
+mantle-serve
 ```
 
-`docker-compose.yml` in this repo runs mantle alone against a bind-mounted `./.data`. The full
-platform stack — Origin + Mantle + MinIO — lives in **agience-observe**:
-
-```bash
-cd ../agience-observe
-docker compose --env-file ../agience-origin/.env -f docker-compose.local.yml up -d --build
-```
+`mantle-serve` wraps uvicorn, so the app object, the default port and the log config travel with the
+package. Point `MANTLE_LATTICE_PATH` and `KEYS_DIR` at wherever the node's state should live.
 
 Mantle boots as a pure database layer with an empty type registry. An
 application on top (Agience/Origin) provisions data via Mantle's API.
@@ -384,11 +383,11 @@ exactly what anyone with read access to that directory could mint by hand, and t
 *verifies* the result through the same generic path it verifies every other issuer with. No route
 issues a token, and `sign_service_jwt` hard-codes `principal_type: service`.
 
-The canonical design docs live in the **agience-pharos** repo under
-`dev-legacy/dev-features/` — notably the per-state search index, the trust floor + event-driven
-architecture, and trusted issuers as artifacts (`vnd.agience.issuer+json`). Mantle
-verifies tokens from any configured OIDC issuer via one generic verifier, with the
-authority manifest as a bootstrap seed.
+The design canon lives in the **agience-pharos** repo under `genesis/` — `LATTICE-CONTRACT.md`,
+`SEARCH-ARCHITECTURE.md`, `MANTLE-TYPES.md`, `S3-SUBSTRATE-RESILIENCY.md` and
+`SUBSTRATE-ONE-FIELD.md`. What is true today, measured, is `status/CURRENT.md`, and
+`status/CLAIMS.md` binds what any surface may claim. Mantle verifies tokens from any configured
+OIDC issuer via one generic verifier, with the authority manifest as a bootstrap seed.
 
 ### The surfaces
 
@@ -469,7 +468,8 @@ Everything is an artifact, so most of what follows is a `content_type` rather th
   so no filter can reveal — or hint at — an artifact the caller could not already read, and a
   filter naming an unreadable artifact is indistinguishable from one matching nothing.
   Filterable is everything a doc plainly carries; `content` is not, because it is encrypted at
-  rest and the postings are blind tokens. `state` is not either — it selects the index segment,
+  rest and its postings are blind tokens over the **5.9%** the encrypted index covers, plaintext
+  postings over the rest. `state` is not either — it selects the index segment,
   which is a separately keyed tree chosen before the query runs, so it stays the `state` request
   field. Both are refused with a 400 naming them, because both are fields a caller can
   reasonably expect — being unfilterable here is a fact about the store, not a spelling

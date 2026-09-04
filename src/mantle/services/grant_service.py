@@ -128,17 +128,15 @@ _ALL_FLAGS = tuple(FLAG_OF[a] for a in ACTIONS)
 
 def effective_flags(db: Database, user_id: str, resource_id: str) -> Dict[str, bool]:
     """Every CRUDEASIO flag *user_id* actually holds on *resource_id* — the union of what their
-    active ALLOW grants authorize, minus anything a deny grant names. NO creator fast-path:
-    `created_by` is provenance and grants no access, so the creator holds exactly what their
-    explicit grant gives (minted at creation).
+    active allow grants authorize, minus anything a deny grant names. There is no creator
+    fast-path: `created_by` is provenance and grants no access, so the creator holds exactly what
+    their explicit grant gives, minted at creation.
 
-    This is the ceiling `create_invite` clamps a role preset against, so a flag that is wrong
-    here becomes a real grant on somebody's account one claim later. It used to fold
-    `getattr(g, f, False)` over every grant with no effect check, which meant a **deny** grant
-    carrying `can_admin` reported admin as held — and a holder of an ordinary `can_share` grant
-    could then mint an admin invite, claim it, and convert a denial into an allow grant. Same
-    defect as `user_has_any_action`, one layer up, and the escalation is the reason it is worth
-    naming separately.
+    This is the ceiling `create_invite` clamps a role preset against, so a flag that is wrong here
+    becomes a real grant on somebody's account one claim later. Reading each grant's flags without
+    checking its effect would report a **deny** grant carrying `can_admin` as admin held, and a
+    holder of an ordinary `can_share` grant could then mint an admin invite, claim it, and convert
+    a denial into an allow grant. `user_has_any_action` holds the same rule one layer down.
 
     Composed with the one operator: the allow grants join (union, `|` expressed as the union of
     each mask's authorized actions) and the deny grants are removed afterwards, in that order,

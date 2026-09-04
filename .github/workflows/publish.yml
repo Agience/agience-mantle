@@ -1,31 +1,31 @@
 name: Release
 
-# Cut a release by running this workflow MANUALLY (see the PARKED note below — the tag trigger is
-# removed on purpose). When it is restored, the tag minus "v" must match `version` in
-# pyproject.toml:
+# Cut a release by pushing a tag. The tag minus "v" must match `version` in pyproject.toml, and the
+# job below refuses the pair when they disagree:
+#
 #     git tag v0.1.0 && git push origin v0.1.0
-# One job builds, creates the GitHub Release, and publishes to PyPI via
-# Trusted Publishing (OIDC) — no token stored. Tests are NOT re-run here:
-# ci.yml gates every commit on main, and the tag points at a tested one.
 #
-# Only the BASE install (stdlib + cryptography) is published here — the `service`,
-# `semantic` and `dev` extras still declare `agience-prism-py`, resolved from PyPI once that
-# package is published in its own repo. No change needed here when that happens; the extras
-# already name it.
-# ⛔ PARKED 2026-08-13 — `workflow_dispatch` ONLY, DELIBERATELY. This used to trigger on `v*`,
-# which is the SAME trigger `build-image.yml` uses to cut a release image. Tagging `v0.1.0` to
-# produce an image therefore also fired PyPI Trusted Publishing against a publisher that does not
-# exist, and created a public GitHub Release as a side effect of an internal build. Two unrelated
-# outcomes on one tag, one of them outward-facing and unintended.
+# One job builds, creates the GitHub Release, and publishes to PyPI via Trusted Publishing (OIDC) —
+# no token stored. Tests are not re-run here: ci.yml gates every commit on main, and the tag points
+# at a tested one.
 #
-# Neither `agience-mantle` nor `agience-prism-py` is published, and the current decision (John,
-# 2026-08-13) is that both stay private. The job below is CORRECT CODE for a future public cut and
-# is kept rather than deleted; it simply must not be reachable by pushing a tag. Restore the
-# `push: tags:` trigger when a PyPI publisher actually exists — and note the `dev`/`service`/
-# `semantic` extras still name `agience-prism-py`, so mantle cannot publish usefully until prism
-# does.
+# Mantle is distributed on PyPI and only on PyPI; there is no image. The `service`, `semantic` and
+# `dev` extras declare `agience-prism`, which is published, so an extras install resolves from an
+# index with no sibling checkout.
+#
+# Two things must be true before a tag publishes anything, and neither lives in this file:
+#
+#   1. A PyPI Trusted Publisher for `agience-mantle` naming this repository, this workflow file, and
+#      the `pypi` environment below. Without it the publish step fails at the OIDC exchange.
+#   2. A `pypi` environment on this repository. The `environment:` key below is what the publisher
+#      matches against.
+#
+# A version is permanent once published: PyPI refuses a re-upload of the same version, so a bad cut
+# is fixed by releasing a new version rather than by replacing one.
 on:
-  workflow_dispatch: {}      # manual dry run: build only (no release/publish)
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}      # manual dry run: builds and twine-checks, publishes nothing
 
 permissions:
   contents: write            # create the GitHub Release

@@ -183,10 +183,9 @@ class TestIndexArtifactBasic:
     ):
         """The manifest is the token list and nothing else.
 
-        It used to carry `field_dls` beside them — the per-field document length, kept so a
-        re-index could subtract the old document's contribution from the BM25 corpus
-        statistics. There are no corpus statistics; a length nothing reads is a length that
-        does not need writing.
+        It carries no `field_dls` — the per-field document length a re-index would subtract from
+        BM25 corpus statistics. There are no corpus statistics here, and a length nothing reads is a
+        length that does not need writing.
         """
         indexer.index_artifact(
             "owner-A", "col-1", "art-1",

@@ -357,7 +357,7 @@ def _body_offer(content: str) -> str:
     return dense_excerpt(content)
 
 
-#: Separators inside a group id. `collection:agience-pharos/features` and `stage.0.lexicon` are
+#: Separators inside a group id. `collection:project-docs/features` and `stage.0.lexicon` are
 #: both paths; the words in them are what a person would type.
 _GROUP_SPLIT = re.compile(r"[:/._\-]+")
 
@@ -376,8 +376,8 @@ def _group_terms(artifact: Artifact) -> list[str]:
     strings its context happened to carry.
 
     The id is split into words rather than emitted whole, because a group id is a path and the
-    words in it are what a person types — `collection:agience-pharos/features` yields
-    `agience`, `pharos`, `features`. `normalize_tags` then dedupes and canonicalises, so a term
+    words in it are what a person types — `collection:project-docs/features` yields
+    `project`, `docs`, `features`. `normalize_tags` then dedupes and canonicalises, so a term
     repeated across an artifact's groups costs nothing.
     """
     ids: list[str] = []
@@ -392,7 +392,7 @@ def _group_terms(artifact: Artifact) -> list[str]:
     seen: set[str] = set()
     for gid in ids:
         # ── the SCHEME is a type marker, not a name ──────────────────────────────────────────
-        # `collection:agience-pharos/features` splits to `collection, agience, pharos, features`,
+        # `collection:project-docs/features` splits to `collection, project, docs, features`,
         # and `collection` is then a tag on every artifact that is in a collection — which is all
         # of them. A term carried by every member of a corpus cannot distinguish between them:
         # the same defect as `canon knowledge` in the offer (§111) and the cardinal numbers in

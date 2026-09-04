@@ -407,8 +407,8 @@ def routed(node, envelope, tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_put_then_get_round_trips_binary_on_a_node_with_no_object_store(routed, client):
-    """The whole defect, end to end: `PUT /artifacts/{id}/content` → `GET .../content`, binary,
-    byte for byte, on a node that has no bucket. It used to 500 and then 404."""
+    """`PUT /artifacts/{id}/content` → `GET .../content`, binary and byte for byte, on a node that
+    has no bucket."""
     _db, store_root = routed
     payload = bytes(range(256)) * 8 + b"\x00\xff\x00"
 

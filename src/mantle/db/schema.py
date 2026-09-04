@@ -349,11 +349,8 @@ PRAGMAS: List[str] = [
     # reader's snapshot blocks it, so an existing oversized WAL is a separate, one-off maintenance
     # action.
     #
-    # `agience-ember`'s `src/ember/genesis.py::_wal_checkpoint` carries the same measurement for
-    # the same reason — an uncheckpointed bulk re-ingest grows its own lattice WAL and every read
-    # then scans the whole thing — and calls TRUNCATE every N bulk batches. Same file, same
-    # magnitude, same consequence. See
-    # `_archive/2026-08-26-tighten-threads-closed/LATTICE-WAL-NEVER-CHECKPOINTS.md`.
+    # A bulk re-ingest that never checkpoints grows its own lattice WAL, and every read then scans
+    # the whole thing, so a bulk writer calls TRUNCATE every N batches for the same reason.
     #
     # 2000 pages against SQLite's inherited default of 1000: this store's pages are 4 KB, so a
     # checkpoint is attempted roughly every 8 MB of WAL rather than every 4 MB. Doubling it halves

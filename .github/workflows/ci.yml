@@ -28,15 +28,14 @@ jobs:
       - run: pip install pytest
       - run: python -m pytest src/mantle/db -q
 
-  # The full suite, including the service stack and the security-invariant tests. Needs
-  # `agience-prism-py` on the path (see CONTRIBUTING.md).
+  # The full suite, including the service stack and the security-invariant tests. Needs `prism` on
+  # the path (see CONTRIBUTING.md).
   #
-  # ⚠ PRISM COMES FROM A CHECKOUT, NOT FROM PyPI, and the `.[dev]` extra that names it cannot be
-  # what resolves it. `agience-prism-py` is NOT a published package — the repo is private and
-  # deliberately so — which this job asserted otherwise for its whole existence: the first time it
-  # ever ran (2026-08-13) it failed with `No matching distribution found for agience-prism-py`.
-  # Installing the checkout FIRST satisfies the requirement, so the `.[dev]` install below then
-  # resolves without reaching an index for it. Same order, same reason, as `build-image.yml`.
+  # Prism comes from a checkout rather than from PyPI. `agience-prism` is published, so the `.[dev]`
+  # extra would resolve on its own, but CI tests mantle against the prism revision in this
+  # organization's repository rather than against whatever version the index served that day.
+  # Installing the checkout first satisfies the requirement, so the `.[dev]` install below does not
+  # reach an index for it.
   full-suite:
     runs-on: ubuntu-latest
     steps:
@@ -55,27 +54,24 @@ jobs:
           python-version: "3.12"
           cache: pip
       # setuptools/wheel: needed AT RUNTIME by `tests/test_wheel_ships_its_data.py`, which builds a
-      # wheel in a subprocess and inspects it. See the same note in `build-image.yml`.
+      # wheel in a subprocess and inspects it.
       - run: python -m pip install --upgrade pip setuptools wheel
       - run: python -m pip install ./.prism
-      # ⚠ `[dev]` DOES NOT CARRY THE SERVICE STACK, AND MUST NOT — pyproject.toml:152-186 states the
-      # opposite requirement deliberately: `[dev]` has to install WITHOUT `[service]` so that
+      # `[dev]` does not carry the service stack, and must not: `[dev]` has to install without
+      # `[service]` so that
       # `test_beacon_conformance.py` runs for someone who only wants the store. But `tests/conftest.py`
       # imports `mantle.main` and httpx at module scope, so `tests/` cannot even be COLLECTED against a
       # `[dev]`-only environment: it dies in conftest with `No module named 'httpx'` before one test
-      # runs (measured 2026-08-13, run 31705726733). The extras are right; this job was reading them as
-      # a promise they never made. requirements.txt is the pinned runtime set the image itself
-      # installs, so testing against it also means testing what ships. Same step, same position, same
-      # reason as `build-image.yml:67`.
+      # runs. The extras are right; installing the pinned runtime set first is what makes `tests/`
+      # collectable, and it means the suite runs against the versions a deployment gets.
       - run: python -m pip install -r src/mantle/requirements.txt
       - run: pip install -e '.[dev]'
-      # The ignored file measures a developer-workspace property CI cannot reproduce — see the
-      # long note on the same flag in `build-image.yml`.
+      # The ignored file measures a developer-workspace property CI cannot reproduce.
       - name: Run the suite (throwaway KEYS_DIR / MANTLE_LATTICE_PATH)
         env:
-          # Preventive, not a diagnosed failure: `build-image.yml` pins this on the job running the
-          # same suite and says one thread is the only safe setting in CI too. `mantle/__init__.py`
-          # pins it on import, so this is redundant whenever mantle is imported before numpy — and
+          # Preventive, not a diagnosed failure: one thread is the only safe setting in CI.
+          # `mantle/__init__.py` pins it on import, so this is redundant whenever mantle is imported
+          # before numpy — and
           # load-bearing exactly when it is not, which is the case nobody notices until OpenBLAS
           # faults at exit 139 or hangs. Two workflows running one suite should not disagree about
           # it, and the cheap side of that disagreement is this line.

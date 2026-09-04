@@ -1,18 +1,17 @@
-# The RUNTIME install for the service image. `build/Dockerfile` installs this file and nothing
-# else, so every line here lands in the production image.
+# The pinned runtime set for a Mantle deployment: the resolved closure of `pyproject.toml`'s
+# `[service]` extra.
 #
-# ⭐ THIS FILE IS THE RESOLVED CLOSURE OF `pyproject.toml`'s `[service]` EXTRA, pinned.
-# `[service]` states the contract in ranges; this states one reproducible resolution of it, because
-# an image is a specific set of bytes and a range is not. Two lists that name different packages
-# would make "what the service needs" a question with two answers, and the image would be the one
-# nobody reads. Keep them in step: a package added to `[service]` is added here, and nothing is
-# added here that `[service]` does not name.
+# `[service]` states the contract in ranges; this states one reproducible resolution of it, so a
+# deployment can install a known set rather than whatever the index resolves that day. Two lists
+# that name different packages would make "what the service needs" a question with two answers, so
+# keep them in step: a package added to `[service]` is added here, and nothing is added here that
+# `[service]` does not name.
 #
-# TEST TOOLING DOES NOT BELONG IN A RUNTIME IMAGE and is declared in `[dev]` instead. CI installs
-# `-e '.[dev]'` alongside this file; the image installs this file alone.
+# Test tooling is not a runtime requirement and is declared in `[dev]` instead. CI installs
+# `-e '.[dev]'` alongside this file.
 #
-# `agience-prism-py` is the one `[service]` requirement absent here on purpose: it is not on PyPI,
-# and the Dockerfile installs it from the `prism` build context in the same builder stage.
+# `agience-prism` is the one `[service]` requirement absent here on purpose: CI installs it from a
+# checkout so the suite runs against this organization's prism revision.
 
 # ── base install ─────────────────────────────────────────────────────────────
 # The store encrypts at rest, so this is a hard dependency, not an extra.

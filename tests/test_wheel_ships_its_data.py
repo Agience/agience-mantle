@@ -22,9 +22,8 @@ it wrong. So this file builds a real wheel with the real backend and reads the a
 ## How the wheel is built
 
 The source tree is COPIED to a temporary directory and built there. Building in place would
-create `build/lib/` and `build/bdist.*/` inside `build/`, which in this repo is a tracked
-directory holding the Dockerfile — a test that leaves artifacts beside a checked-in file is a test
-that eventually gets blamed for a dirty tree.
+create `build/lib/` and `build/bdist.*/` in the checkout — a test that leaves artifacts behind is a
+test that eventually gets blamed for a dirty tree.
 
 The PEP 517 backend is called directly rather than through `python -m build`, which would
 construct an isolated virtualenv and fetch its build requirements from an index. `setuptools` is
@@ -211,7 +210,7 @@ def test_the_console_scripts_are_declared_in_the_wheel() -> None:
 #: declaration that looked right, and "everything except what we listed, with a reason" is the one
 #: shape that cannot quietly grow a hole.
 _NOT_SHIPPED = {
-    "requirements.txt": "the runtime install list for build/Dockerfile — an image input, not a "
+    "requirements.txt": "the pinned runtime set for a deployment — a deployment input, not a "
                         "package resource; the wheel's dependencies come from [project] instead",
 }
 

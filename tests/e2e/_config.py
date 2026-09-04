@@ -1,5 +1,5 @@
 """E2E harness configuration — all knobs come from the environment so the same
-suite runs against a local `docker compose` stack or a remote deployment.
+suite runs against a locally-run stack or a remote deployment.
 
 Nothing here imports mantle/origin/core: this is a true blackbox client.
 """

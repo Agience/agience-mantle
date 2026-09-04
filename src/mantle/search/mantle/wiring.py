@@ -764,10 +764,10 @@ def build_sse_search_accessor(
     with a ``SearchHit`` hydrator over the lattice. This is the canonical search backend the
     artifacts router uses, on both of its entry points.
 
-    ``field_boosts`` and ``rrf_k`` USED TO BE PARAMETERS HERE. A field boost was a BM25 weight
-    and a rank-fusion constant was RRF's; there is no scorer to weight and nothing to fuse, so
-    neither names anything a caller could set. A field is now a place the narrowing looks, and
-    it looks in all four.
+    There is no ``field_boosts`` or ``rrf_k`` parameter. A field boost is a BM25 weight and a
+    rank-fusion constant is RRF's; this stack has no scorer to weight and nothing to fuse, so
+    neither would name anything a caller could set. A field here is a place the narrowing looks,
+    and it looks in all four.
 
     Returns ``None`` when any of the three prerequisites is missing — the router converts that
     to 503 (no plaintext fallback by design). An accessor that comes back from here always has

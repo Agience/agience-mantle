@@ -1,17 +1,16 @@
 """An artifact's collection is one fact, recorded by one write.
 
-## The two halves that used to be written separately
+## The two halves of that fact
 
 `collection_id` on the document is what a listing filters on (`list_artifacts(collection_id=…)`).
 The `contains` edge is what authorization walks: `LightConeResolver.resolve` seeds from a
 principal's grants and expands through `list_origin_descendants`, a BFS over exactly those edges.
 
-They were written by different code. The API path called `add_artifact_to_collection`, which writes
-the edge. Bulk ingest set the field on the document and wrote no edge. Each side was self-consistent
-— an ingest counts its own members with `list_artifacts(collection_id=…)` — so nothing had to agree
-until a recall asked a question that crossed between them. Measured on a live 2.94M-artifact store:
-2,933,349 documents carried the field and 155 carried the edge, so a grant on `stage.0.lexicon`
-reached the collection artifact and none of its 1,841,335 members.
+Writing them from different code paths lets them disagree, and each side stays self-consistent while
+they do — an ingest counts its own members with `list_artifacts(collection_id=…)` — so nothing
+reconciles until a recall asks a question that crosses between them. Measured on a live
+2.94M-artifact store in that state: 2,933,349 documents carried the field and 155 carried the edge,
+so a grant on `stage.0.lexicon` reached the collection artifact and none of its 1,841,335 members.
 
 `_put_one` is the single point every artifact write passes through — `put_artifact` and `put_many`
 both reach it — so the edge is written there, on the caller's cursor, inside the caller's savepoint.

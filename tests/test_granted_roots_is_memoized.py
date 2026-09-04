@@ -1,14 +1,13 @@
 """The origin-chain walk behind `_roots_include` happens once per requester, not once per principal.
 
-⚑ Measured on 71/home, 2026-08-28: `_roots_include` walked `_root_of(resource)` for every granted
-resource on every call. The holder there has 7,268 of 7,388 grants and the SSE narrowing path asks
-the question once per principal whose index it may open — 51 of them. One recall ran **103,111 SQL
-statements to return zero hits**, `_roots_include` being 11.51s of a 13.93s profile.
+Measured on 71/home: walking `_root_of(resource)` for every granted resource on every call, where
+the holder has 7,268 of 7,388 grants and the SSE narrowing path asks the question once per principal
+whose index it may open — 51 of them — ran 103,111 SQL statements to return zero hits, the walk
+being 11.51s of a 13.93s profile.
 
 `principal_id` is only compared against the walk's result, never used to steer it, so the walk is
-shareable. This file holds that it is actually shared — by COUNTING the walks, because
-📄 `status/RETRIEVAL-PATH-2026-08-25.md` records the same fix on the sibling walker being written up
-as effective while never hitting once. A memo asserted is not a memo measured.
+shareable. This file holds that it is actually shared, by counting the walks: a memo asserted is not
+a memo measured.
 
 The other four tests are the ones that matter more than the speed: a cache on an authorization path
 is only admissible if it cannot outlive the grants it was derived from.

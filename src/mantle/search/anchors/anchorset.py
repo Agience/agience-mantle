@@ -333,8 +333,8 @@ class AnchorSet:
     # into disjoint cells, with no overlap between them.
     #
     # So there is no constructor that fits a set, none that extends one, and none that maps one
-    # onto another — the same rule the leaf already obeys (agience-ember/README.md §First light:
-    # "A leaf must *never* author its own"). `AnchorSet.load` and the anchor repo are the ways in.
+    # onto another. A leaf must never author its own set; `AnchorSet.load` and the anchor repo are
+    # the ways in.
 
     # ------------------------------------------------------------- persistence
     #

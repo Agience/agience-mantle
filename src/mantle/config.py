@@ -145,7 +145,7 @@ def load_env(base_dir: Optional[Path] = None) -> Optional[Path]:
     """Load mantle's `.env` — CALLED EXPLICITLY from `main.py`, never at import.
 
     A `.env` only ever provides DEFAULTS: the shell/container environment always wins
-    (`override=False`, standard 12-factor). In Docker the container sets env directly and there is
+    (`override=False`, standard 12-factor). A managed deployment sets env directly and there is
     no `.env`, so this is a no-op there.
     """
     # Tests set AGIENCE_NO_DOTENV=1 so a real dev `.env` can never leak in: `load_dotenv` mutates
@@ -266,7 +266,7 @@ KEYS_DIR = Path(os.getenv("KEYS_DIR", str(BASE_DIR / ".data" / "keys")))
 #: `MANTLE_LATTICE_PATH` is unset. Absolute, and derived from `BASE_DIR` exactly as `KEYS_DIR`
 #: above, the embeddings cache (`.data/mantle/`) and the SSE index (`.data/mantle-sse`,
 #: `search/mantle/wiring.py`) are. Everything this node writes therefore lands under one `.data/`
-#: directory, which is what `.gitignore` and `.dockerignore` exclude as a unit.
+#: directory, which is what `.gitignore` excludes as a unit.
 #:
 #: A bare relative name would resolve against the working directory each time it was read, so the
 #: same node would open a different store depending on where it was started from — and come up
@@ -559,7 +559,7 @@ def declared_public_uri() -> str:
 
     What decides is whether it was said, not what it says. Rejecting the value `http://localhost…`
     is the reading that cannot be argued with: a node that genuinely answers on localhost — a
-    laptop, a sidecar, a `docker run -p 8081:8081` — has no way to say so, because the only
+    laptop, a sidecar, a port-forwarded process — has no way to say so, because the only
     sentence that is true of it is the one being refused. `MANTLE_URI=http://localhost:8081` set on
     purpose is a statement; the same string arrived at by saying nothing is not.
 

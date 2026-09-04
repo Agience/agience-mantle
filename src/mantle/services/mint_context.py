@@ -16,14 +16,14 @@ up conferring authority.
 Why this exists
 ===============
 
-Measured 2026-08-24 on 71/home: **every content namespace carries an empty `doc['context']`** —
-`canon:` 0%, `wiki-` 0%, all three lexicons 0%, `cn-` 0%, over 3,000 rows sampled each. Only
-`collection:` rows and the Claude Code hooks' writes have one.
+Measured on 71/home: every content namespace carries an empty `doc['context']` — `canon:` 0%,
+`wiki-` 0%, all three lexicons 0%, `cn-` 0%, over 3,000 rows sampled each. Only `collection:` rows
+and the Claude Code hooks' writes have one.
 
-📄 `_scratch/lab/reindex/index_namespace.py` names the cause: *"The 2.9 million corpus vertices were
-bulk-ingested straight into the lattice and never went through `pipeline_unified.index_artifact`."*
-That repair back-fills the search INDEX. **Nothing back-fills context, because context is not
-derivable from the row** — it is what was true at the moment of the write, and afterwards it is gone.
+The cause is bulk ingest: 2.9 million corpus vertices went straight into the lattice and never
+through `pipeline_unified.index_artifact`. A reindex back-fills the search index, but nothing
+back-fills context, because context is not derivable from the row — it is what was true at the
+moment of the write, and afterwards it is gone.
 
 The consequences are not subtle and all three were measured:
 
@@ -31,13 +31,12 @@ The consequences are not subtle and all three were measured:
     no anchors  ->  `diagram`/`colimit` cannot run (outgoing edges: {})
     no vector   ->  the semantic arm is inert, by contract
 
-Why it is HERE and not in a tekton
+Why it is here and not in a tekton
 ==================================
 
-Because mantle must be useful alone. 📄 `search/beacon/__init__.py`: *"Beacon is the permissive
-half of the two-tier model, deliberately: **mantle ships Apache so a store can be taken, built on and
-shipped by anyone, and beacon is the reduced instrument that makes such a store genuinely useful on
-its own.**"*
+Because mantle must be useful alone. `search/beacon/__init__.py` states the same rule: beacon is the
+permissive half of the two-tier model, so that a store can be taken, built on and shipped by anyone,
+with beacon the reduced instrument that makes such a store useful on its own.
 
 Mantle is Apache; chorus is AGPL. Putting an ingest tekton on the critical path of a correct mint
 would make an Apache store depend on an AGPL service at the one place that can never be repaired
@@ -45,10 +44,10 @@ afterwards. So context minting takes the shape this store already uses twice —
 spectral read, coverage/`_knee` for ranking:
 
     thin arm, ships here      this module. Complete, not provisional.
-    sharp arm, when present   a host fills the `context` seam (astra), and enriches IN PLACE.
+    sharp arm, when present   a host fills the `context` seam (astra), and enriches in place.
 
-📄 `search/ranking` states the rule: *"a thin arm that is **not less correct**, and a sharper one when
-it is present."*
+`search/ranking` states the same rule: a thin arm that is not less correct, and a sharper one when it
+is present.
 
 The split, and the one question that decides it
 ===============================================
@@ -316,27 +315,22 @@ def _load_context_host() -> None:
 
 
 def _stamp_rung(ctx: Dict[str, Any]) -> None:
-    """Stamp the provenance rung this write actually EARNED. Server-side, from the principal.
+    """Stamp the provenance rung this write earned, server-side, from the principal.
 
-    The store has no mass. Measured 2026-08-24 on 71/home: not one vertex carries
-    `mass > 0` — of 2.17M rows, only the 5,484 colimit objects have the field at all and every one
-    reads `0.0`. So `colimit._mass` sums zeros and "fewer objects, more mass each" is arithmetic
-    over nothing.
+    The store has no mass. Measured on 71/home: not one vertex carries `mass > 0` — of 2.17M rows,
+    only the 5,484 colimit objects have the field at all, and every one reads `0.0`. So
+    `colimit._mass` sums zeros and "fewer objects, more mass each" is arithmetic over nothing.
 
-    📄 `genesis/MANTLE-MASS.md` names this as a known, unmet prerequisite in so many words:
+    Carrying a rung is a write-time property: `prism.mass.stamp()` supplies the mechanism, and a
+    write path has to call it. This is the write path that does, which is why the rung arrives here
+    rather than being reconstructed later — the same shape as the context finding this module exists
+    for, one field over.
 
-        "Two prerequisites, both real work:
-         1. artifacts carry a rung at write time — `prism.mass.stamp()` exists;
-            Mantle's write paths must call it."
-
-    The mechanism exists but no write path called it before this one — the same shape as the
-    context finding this module exists for, one field over.
-
-    And it must be derived here, not accepted from a caller. 📄 same document: "Provenance is a
-    claim about origin, and claims need an authority. The rung must be derived server-side from the
-    authenticated context, and a client's self-declared rung ignored — a raw client `POST` is forced
-    to `UNKNOWN`." This function runs inside the store, holding the authenticated acting principal,
-    which is the only place that derivation is honest.
+    The rung is derived here rather than accepted from a caller. Provenance is a claim about origin
+    and claims need an authority, so the rung is derived server-side from the authenticated context
+    and a client's self-declared rung is ignored: a raw client `POST` is forced to `UNKNOWN`. This
+    function runs inside the store, holding the authenticated acting principal, which is the only
+    place that derivation is honest.
 
     `prism.mass.authorize_and_stamp` is *"the one call a server write path makes"*. This is that
     path, so this is that call.

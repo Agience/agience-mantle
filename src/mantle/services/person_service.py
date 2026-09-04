@@ -46,12 +46,10 @@ def get_user_by_id(db, id: str,  # noqa: A002 — keep `id` for compat
     `/internal/delegation-token` already applies, which is why it is sent under that route's own
     field name (:data:`SUBJECT_TOKEN_HEADER`).
 
-    **Additive, and it must stay that way.** Origin's requirement is gated off by default —
-    `agience-chorus/src/ophan/server.py::_resolve_person_email` is a live caller of this same
-    route that cannot be updated from here, and it sends service headers only. So this is a
-    header an ungated Origin ignores, never a precondition Mantle enforces locally: sending it
-    cannot make a call fail that would otherwise have succeeded, and omitting it leaves the call
-    exactly as it was.
+    Additive, and it must stay that way. Origin's requirement is gated off by default, and other
+    live callers of this same route send service headers only. So this is a header an ungated
+    Origin ignores, never a precondition Mantle enforces locally: sending it cannot make a call
+    fail that would otherwise have succeeded, and omitting it leaves the call exactly as it was.
 
     **Not every caller has one, and none of them invents one.** `None` is the honest value for a
     path with no request-scoped bearer, and the call is then the unscoped one it has always been:

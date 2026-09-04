@@ -47,7 +47,7 @@ class UTCFormatter(logging.Formatter):
 # ---------------------------------------------------------------------------
 # `uvicorn_log_config.json` (this file's sibling) is the SINGLE source of truth
 # for log formatting. It is consumed two ways:
-#   1. The Docker CMD passes it to uvicorn via `--log-config` (origin/mantle).
+#   1. A process supervisor passes it to uvicorn via `--log-config`.
 #   2. `configure_logging()` applies the same dict in-process at app import.
 # (2) is the reliable path: uvicorn configures its own loggers in
 # `Config.__init__`, which runs BEFORE the app module is imported, so a

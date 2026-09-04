@@ -10,8 +10,7 @@
 
 """Beacon as an instrument — mantle's embodiment of `prism.instrument.Read`, on numpy alone.
 
-`agience-pharos/genesis/ARCHITECTURE-TARGET.md` §3 declares an instrument slot with two implementations,
-and this is the second one::
+The architecture declares an instrument slot with two implementations, and this is the second one::
 
     the aperture (ember)   domain: the signal — an ordered (T, F) frame
                             knows: ontology coordinates are sparse; evidence rows are correlated

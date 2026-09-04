@@ -6,9 +6,9 @@
     agience version                     what this binary is, and what it was built from
 
 Why a binary at all. `pip install -e '.[service]'` cannot resolve on a machine that is not a
-developer's: `agience-prism-py` is not on PyPI, so a source delivery assumes a sibling checkout at
-`../agience-prism/py`. This build vendors prism into the artifact instead, so what is handed to
-someone else carries everything it needs and resolves nothing at install time.
+developer's, because it reaches an index for every requirement. This build vendors prism and the
+rest into the artifact instead, so what is handed to someone else carries everything it needs and
+resolves nothing at install time.
 
 A front door rather than a second implementation. Every subcommand delegates to the module that
 already does the job — `mantle.scripts.dev_init_keys`, `uvicorn`, `mantle.scripts.dev_mint_token` —

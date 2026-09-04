@@ -82,11 +82,9 @@ async def _call(route, gate):
             auth=MagicMock(), store_db=MagicMock(),
         )
     assert set(body) == {"items", "total", "has_more"}, "the list envelope changed: %r" % (body,)
-    # `total` IS `None` HERE BY RULING. This used to assert
-    # `total == len(items)`, because `total` counted the AUTHORIZED, filtered set — which was
-    # only knowable by authorizing EVERY member before the page was taken. That cost is what
-    # the ruling removed: `check_access` is several queries plus an audit write per decision,
-    # so a page of an N-member container performed N of each.
+    # `total` is `None` here by design. An authorized count is knowable only by authorizing every
+    # member before the page is taken, and `check_access` is several queries plus an audit write per
+    # decision, so reporting one would make a page of an N-member container perform N of each.
     #
     # The assertion is not weakened, it is RE-AIMED: an authorized count is exactly the
     # thing this route may no longer compute, so requiring one would require the defect back.
@@ -145,9 +143,8 @@ async def test_the_filter_runs_before_the_page_is_taken(monkeypatch, route):
     #: `total` reports the AUTHORIZED set, never the container's real size; reporting 2
     #: here would leak the unreadable member by arithmetic, which is the oracle this
     #: whole file exists to refuse.
-    #(H3): `total` is null, so what this test pins is the ROWS — the caller
-    # sees exactly the member it may read and not the one it may not. That was always the real
-    # subject; the count was the way it used to be observed.
-    assert paged["total"] is None, "an authorized count is no longer computed (H3)"
+    # `total` is null, so what this test pins is the rows: the caller sees exactly the member it
+    # may read and not the one it may not.
+    assert paged["total"] is None, "an authorized count must not be computed"
     assert len(paged["items"]) == 1, "the caller must still see exactly what it may read"
     assert paged["has_more"] is False, "one authorized member, page of one: last page"

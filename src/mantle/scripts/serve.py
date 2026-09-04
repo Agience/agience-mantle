@@ -7,8 +7,9 @@
 
 An install should yield a command. Without this, `pip install agience-mantle[service]` produces a
 package whose consumer must already know the ASGI path (`mantle.main:app`), the port the rest of
-the platform expects it on, and where the log config lives — three facts that live in this repo's
-Dockerfile rather than in the wheel. Those defaults belong to the package, so they travel with it.
+the platform expects it on, and where the log config lives — three facts that would otherwise live
+in a deployment recipe rather than in the wheel. Those defaults belong to the package, so they
+travel with it.
 
 This is a thin wrapper and stays one: every flag below maps to a uvicorn parameter of the same
 name, and anything uvicorn offers that is not here is still reachable by invoking uvicorn
@@ -23,13 +24,13 @@ import argparse
 import os
 import sys
 
-#: The port the rest of the platform addresses this service on (the Dockerfile's `EXPOSE`, the
-#: compose files' mapping, and every `MANTLE_URI` default). A different default here would make the
-#: pip path disagree with the container path about where Mantle is.
+#: The port the rest of the platform addresses this service on (every `MANTLE_URI` default, and
+#: what a reverse proxy in front of a node is pointed at). A different default here would make the
+#: package's own default disagree with where the rest of the platform looks for Mantle.
 _DEFAULT_PORT = 8081
 
-#: How long uvicorn waits for in-flight requests before dropping them on shutdown. Matches the
-#: Dockerfile, so a container restart and a local Ctrl-C behave the same way.
+#: How long uvicorn waits for in-flight requests before dropping them on shutdown, so a supervised
+#: restart and a local Ctrl-C behave the same way.
 _GRACEFUL_SHUTDOWN_S = 10
 
 
@@ -54,14 +55,13 @@ def main(argv: list | None = None) -> int:
     # Imported here rather than at module scope so `--help` works, and reports the real defaults,
     # in an environment where the `[service]` extra is not installed.
     #
-    # The base install puts this command on the path without being able to run it.
-    # `[project.scripts]`
-    # declares `mantle-serve` unconditionally, while uvicorn arrives only with `[service]` — so
-    # `pip install agience-mantle` followed by `mantle-serve` is a reachable first move, and the
-    # bare `ModuleNotFoundError: No module named 'uvicorn'` it used to raise names the missing
-    # module but not the remedy. The reader cannot tell whether the install is broken, the wheel
-    # is incomplete, or a second command exists. Say which, and exit like the other refusal in
-    # this file rather than unwinding a traceback out of a console script.
+    # The base install puts this command on the path without being able to run it:
+    # `[project.scripts]` declares `mantle-serve` unconditionally, while uvicorn arrives only with
+    # `[service]`, so `pip install agience-mantle` followed by `mantle-serve` is a reachable first
+    # move. A bare `ModuleNotFoundError: No module named 'uvicorn'` names the missing module but
+    # not the remedy, and leaves the reader unable to tell whether the install is broken, the wheel
+    # is incomplete, or a second command exists. The handler below names the remedy, and exits like
+    # the other refusal in this file rather than unwinding a traceback out of a console script.
     try:
         import uvicorn
     except ModuleNotFoundError as exc:

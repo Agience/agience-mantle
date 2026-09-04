@@ -291,32 +291,29 @@ try:
     R["store"] = {"documents": len(CORPUS), "blind_tokens_written": written,
                   "blind_tokens_total": sum(written.values()), "root": root}
 
-    # ⛔ TWO DIFFERENT CLAIMS, MEASURED SEPARATELY, because conflating them let one of them be
-    # false for as long as this test has existed.
+    # Two separate claims, measured separately, because one is true and the other is not.
     #
-    # CORPUS TEXT must never be at rest. That is what "encrypted index" means and it is the
-    # property the whole SSE design buys: terms reach the store already HMAC-blinded under a key
-    # the store cannot derive, and entries arrive AES-GCM sealed. This holds.
+    # Corpus text is never at rest. That is what "encrypted index" means and it is the property the
+    # SSE design buys: terms reach the store already HMAC-blinded under a key the store cannot
+    # derive, and entries arrive AES-GCM sealed.
     #
-    # IDENTIFIERS are at rest, in cleartext, in every backend. `principal_id` and `artifact_id`
-    # arrive as cleartext strings from the caller and each store writes them somewhere it can look
-    # them up by: the file store escaped them into directory and file NAMES (reversible —
-    # `decode_component` is its inverse), S3 interpolates them RAW into object keys
+    # Identifiers are at rest, in cleartext, in every backend. `principal_id` and `artifact_id`
+    # arrive as cleartext strings from the caller, and each store writes them somewhere it can look
+    # them up by: the file store escapes them into directory and file names (reversibly —
+    # `decode_component` is its inverse), S3 interpolates them raw into object keys
     # (`{prefix}/{principal_id}/sse/manifests/{artifact_id}.enc`), and `SqlitePostingStore` keeps
-    # them as TEXT columns. Nothing changed about what is revealed; what changed is that SQLite
-    # keeps it in file CONTENT while the other two keep it in NAMES — and this check only ever
-    # read content, so it reported clean over a tree whose directory listing said `store-owner`.
+    # them as TEXT columns. SQLite keeps them in file content while the other two keep them in
+    # names, so a check that reads only file content reports clean over a tree whose directory
+    # listing says `store-owner`. This walk reads both.
     #
-    # Asserted rather than deleted, and asserted in the positive: the ids ARE expected here. A
-    # future change that blinds them will fail this and should, because that is a property worth
-    # noticing the arrival of.
+    # Asserted in the positive: the ids are expected here. A change that blinds them fails this
+    # test, which is the point — that is a property worth noticing the arrival of.
     #
-    # ⚠ FIXING IT PROPERLY IS NOT A STORE CHANGE. Blinding an id requires a key, and a store holds
-    # none by design — it receives ciphertext and opaque tokens and nothing else. So the blinding
-    # belongs where the keys are (`indexer` / `narrowing`, which already derive per-owner SSE
-    # keys), applies to all three backends at once, and needs a full reindex to migrate. An unkeyed
-    # hash inside one store would make this check pass while confirming membership for anyone who
-    # can guess an id, which is worse than the honest version.
+    # Blinding an id is not a store change. It requires a key, and a store holds none by design: it
+    # receives ciphertext and opaque tokens and nothing else. The blinding belongs where the keys
+    # are (`indexer` / `narrowing`, which already derive per-owner SSE keys), applies to all three
+    # backends at once, and needs a full reindex to migrate. An unkeyed hash inside one store would
+    # make this check pass while still confirming membership to anyone who can guess an id.
     files = []
     for dirpath, _d, filenames in os.walk(root):
         files.extend(os.path.join(dirpath, f) for f in filenames)
