@@ -24,7 +24,46 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 from mantle.db import schema
+
+
+def _planner_covers_expression_indexes() -> bool:
+    """Whether this SQLite will answer from an expression index without reading the table.
+
+    Older planners scan the table for an expression index even when every column the query
+    needs is in the index, so the covering assertion below measures the planner as much as the
+    schema. This probe is the control: a minimal, unambiguously coverable expression index. If
+    the planner cannot cover that, it cannot cover `ix_v_collection` either, and the property is
+    unavailable in this environment rather than absent from the schema.
+    """
+    c = sqlite3.connect(":memory:")
+    try:
+        c.execute("CREATE TABLE probe(id TEXT PRIMARY KEY, doc TEXT)")
+        c.executemany("INSERT INTO probe VALUES (?,?)",
+                      [("a%d" % i, '{"k":"v"}') for i in range(2000)])
+        c.execute("CREATE INDEX ix_probe ON probe(json_extract(doc, '$.k'))")
+        c.commit()
+        c.execute("ANALYZE")
+        plan = " / ".join(r[-1] for r in c.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT COUNT(*) FROM probe WHERE json_extract(doc, '$.k') = 'v'"))
+        return "COVERING INDEX" in plan
+    finally:
+        c.close()
+
+
+#: Skips rather than weakening the assertion, so a regression in `ix_v_collection` still fails on
+#: any planner that can express the property. The reason names the SQLite version, because that is
+#: the thing that differs.
+_NEEDS_COVERING_PLANNER = pytest.mark.skipif(
+    not _planner_covers_expression_indexes(),
+    reason="SQLite %s does not plan a covering scan for any expression index, so it cannot show "
+           "one for ix_v_collection; the index is still used, and the per-row JSON parse this "
+           "file measures is a property of the planner here rather than of the schema"
+           % sqlite3.sqlite_version,
+)
 
 HAS = ("SELECT COUNT(*) FROM vertex v "
        "WHERE COALESCE(json_extract(v.doc,'$.collection_id'),'') <> ''")
@@ -67,6 +106,7 @@ def _store(tmp_path, with_index: bool):
     return c
 
 
+@_NEEDS_COVERING_PLANNER
 def test_the_index_covers_both_directions(tmp_path) -> None:
     """Both questions must be answered from the index, without reading the table."""
     c = _store(tmp_path, with_index=True)
