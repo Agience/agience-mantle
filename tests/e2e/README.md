@@ -27,14 +27,14 @@ It exercises the full matrix the platform is meant to guarantee:
 
 ## Running it
 
-The suite needs a **live stack**, and the compose stack that provides it lives in the sibling
-**`agience-observe`** repo — Origin, Mantle, MinIO and the init container that writes the keyset
-and the single-use bootstrap token. From `agience-observe/`:
+The suite needs a **live stack**: an Origin to issue tokens, a Mantle to test, and an
+S3-compatible bucket for content and SSE cells. Every endpoint is an environment variable
+(see the table below), so the suite runs against whatever stack you bring up — a local
+`mantle-serve` beside your own issuer, or a deployment.
 
 ```bash
-# fresh stack (bootstrap available). Search is lexical BM25/SSE.
-# The compose file reads its overrides from Origin's .env.
-docker compose --env-file ../agience-origin/.env -f docker-compose.local.yml up -d --build
+# Mantle, from a checkout or an install:
+MANTLE_LATTICE_PATH=<tmp.db> KEYS_DIR=<tmp-keys> mantle-serve
 ```
 
 Then, from this directory:
@@ -56,7 +56,7 @@ The lazy-materialization assertions only mean something when the stack runs with
 `MANTLE_LAZY_INDEX=on`. Bring the stack up with that env set and tell the suite:
 
 ```bash
-MANTLE_LAZY_INDEX=on docker compose ... up -d
+MANTLE_LAZY_INDEX=on mantle-serve
 E2E_LAZY_INDEX=1 pytest -m lazy
 ```
 
@@ -114,13 +114,13 @@ operator named by `AGIENCE_OPERATOR_ID`. The single remaining Mantle→Origin ca
 ## Notes / limits
 
 - **Reset:** the operator identity is deterministic, so reruns against a live
-  stack are idempotent; for a clean slate wipe `agience-observe/.data-local` and
+  stack are idempotent; for a clean slate wipe the stack's data root (`E2E_DATA_DIR`) and
   rebuild. Every user/collection is uniquely suffixed, so tests stay isolated.
 - **Search backend:** the lattice + MinIO must be up or `POST /artifacts/recall` answers
   503, which the suite treats as a skip. There is no plaintext fallback index to degrade
   to. Recall narrows lexically and NO COSINE ranks what survives, for two independent reasons:
   the only provider Mantle builds returns empty vectors, per the no-models rule, and ranking
-  needs a provisioned AnchorSet, which a stack brought up from `docker compose` does not have.
+  needs a provisioned AnchorSet, which a freshly-started stack does not have.
   Supplying a query `vector` does not change that — it removes the first reason and leaves the
   second. What orders the result instead is the narrowing's own answer: `ordering: "coverage"`
   and an integer count of matched query stems as each hit's `score`. Every assertion in

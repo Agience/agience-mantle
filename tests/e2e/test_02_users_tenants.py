@@ -13,13 +13,15 @@ import pytest
 from _api import Api
 
 
-def test_first_visible_provisions_and_returns_array(user_factory):
-    """A brand-new user's first /artifacts/visible triggers seed provisioning and
-    returns a JSON array (never 401/500)."""
+def test_first_visible_provisions_and_returns_a_page(user_factory):
+    """A brand-new user's first /artifacts/visible triggers seed provisioning and answers
+    with the list envelope (never 401/500)."""
     u = user_factory("prov")
     r = u["api"].get("/artifacts/visible", params={"action": "read"})
     assert r.status_code == 200, r.text
-    assert isinstance(r.json(), list)
+    body = r.json()
+    assert set(body) == {"items", "total", "has_more"}, body
+    assert isinstance(body["items"], list)
 
 
 @pytest.mark.external_issuer
@@ -30,7 +32,7 @@ def test_external_issuer_token_is_accepted(second_issuer):
     token = second_issuer.mint(sub, email=f"{sub}@tenant-b.test", name="Tenant B User")
     r = Api(token).get("/artifacts/visible", params={"action": "read"})
     assert r.status_code == 200, r.text
-    assert isinstance(r.json(), list)
+    assert isinstance(r.json()["items"], list)
 
 
 @pytest.mark.external_issuer
