@@ -41,7 +41,7 @@ def test_children_listing(user):
     a = user["api"].create_child(coll["id"], name="c1", content="one")
     r = user["api"].get(f"/artifacts/{coll['id']}/children", params={"workspace_id": coll["id"]})
     assert r.status_code == 200, r.text
-    ids = {c.get("id") for c in r.json()}
+    ids = {c.get("id") for c in r.json()["items"]}
     assert a["id"] in ids
 
 
@@ -59,7 +59,7 @@ def test_batch_fetch(user):
     b = user["api"].create_child(coll["id"], name="c2", content="two")
     r = user["api"].post("/artifacts/batch", json={"artifact_ids": [a["id"], b["id"], "does-not-exist"]})
     assert r.status_code == 200, r.text
-    got = {d.get("id") for d in r.json().get("artifacts", [])}
+    got = {d.get("id") for d in r.json()["items"]}
     assert {a["id"], b["id"]} <= got
     assert "does-not-exist" not in got  # inaccessible/missing silently skipped
 
