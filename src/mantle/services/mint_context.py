@@ -330,7 +330,7 @@ def _stamp_rung(ctx: Dict[str, Any]) -> None:
     and claims need an authority, so the rung is derived server-side from the authenticated context
     and a client's self-declared rung is ignored: a raw client `POST` is forced to `UNKNOWN`. This
     function runs inside the store, holding the authenticated acting principal, which is the only
-    place that derivation is honest.
+    place that derivation can be made.
 
     `prism.mass.authorize_and_stamp` is *"the one call a server write path makes"*. This is that
     path, so this is that call.
