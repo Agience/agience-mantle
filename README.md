@@ -552,11 +552,6 @@ Security issues → **connect@agience.ai** (do not open a public issue).
 
 **Apache License 2.0.** See [LICENSE](LICENSE) and [NOTICE](NOTICE). Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
 
-**Trademarks.** "Agience" and the Agience logo are trademarks of Ikailo Inc. Apache-2.0 §6 licenses
-copyright and patent, **not** the marks — take the code, build on it, ship it; call your product
-your own name. Worth stating on a permissive repository precisely because permissive is otherwise
-read as "everything is granted".
-
 ## Star History
 
 <a href="https://www.star-history.com/?repos=Agience%2Fagience-mantle&type=date&legend=top-left">
