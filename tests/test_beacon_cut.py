@@ -3,9 +3,9 @@
 # ---------------------------------------------------------------------------
 """Parity suite for `mantle/search/beacon/cut.py`, the RAG-facing screen math held in mantle,
 where it is Apache-2.0 and public, rather than in the downstream consumer's trade-secret
-`adaptive_beacon.py` (a third-party white-label pilot). The giveaway is only honest if what is given away answers identically to
-what the pilot runs, so every moved function is held bit-equal to an oracle kept verbatim in this
-file.
+`adaptive_beacon.py` (a third-party white-label pilot). The giveaway holds only if what is given
+away answers identically to what the pilot runs, so every moved function is held bit-equal to an
+oracle kept verbatim in this file.
 
 The sections, in order:
 
@@ -18,11 +18,10 @@ The sections, in order:
   3. Absence stays absence. An empty or single-candidate input produces a computed null, never a
      plausible number in its place.
   4. The measured degeneracy. Pins `heads > n_features`, a real defect reproduced deliberately
-     rather than repaired, because repairing it would move a live pilot's answers. Two OTHER
-     defects in the same file were repaired on 2026-08-22 — see the oracle header — and section 4a
-     pins what that repair moved.
-  5. The dependency floor. beacon acquires no edge to `beam` or `prism` through the
-     new module.
+     rather than repaired, because repairing it would move a live pilot's answers. Two other
+     defects in the same file carry repairs — see the oracle header — and section 4a pins the
+     delta between the pre-repair bodies, kept in this file, and the ones in use.
+  5. The dependency floor. beacon acquires no edge to `beam` or `prism` through `cut`.
 
 What these checks cannot show: the oracle is a verbatim copy of the source implementation, so
 agreement proves the move was faithful. It does not prove either is correct on a real corpus — a
@@ -73,24 +72,23 @@ def _o_resolved_rank(M) -> int:
 #
 # These two oracle bodies are maintained here rather than copied verbatim from the source, which is
 # the arrangement this file states above: "if `cut.py` changes deliberately, these bodies change in
-# the same commit and every moved number is
-# explained."
+# the same commit and every moved number is explained."
 #
-# What was wrong. Both defects had one shape — the lock returned a cut where it had found nothing
-# to cut at:
+# They carry two repairs, both of one shape — a lock that returns a cut where it found nothing to
+# cut at:
 #
-#   1. The median floor hid the break it was looking for. The break that ends a top cluster sits
-#      BETWEEN the cluster and what follows, which is exactly the boundary the floor excludes. On
-#      `[9,8,8,1,1,1,1,1]` the region is `[9,8,8]`, offering only the ratios 1.125 and 1.000, so it
-#      cut after the 9 and kept one item of an obvious three; the real break, 8 -> 1 at a ratio of
-#      8, was on the other side. Repaired by carrying one element below the floor into the region,
-#      used to find the break and never itself kept.
-#   2. A tied group was cut to one arbitrary member: all ratios are 1.0 and `argmax` lands on index
-#      0. `[9,9,9,5,5,5,1,1]` kept 1 of 3; `[1]*9` kept 1 of 9; and the tie test needed a tolerance
-#      derived from the dtype, because identical rows give powers differing in the last bits and a
-#      ratio of `1 + 4e-15` is still greater than 1.
+#   1. The median floor hides the break it is looking for. The break that ends a top cluster sits
+#      between the cluster and what follows, which is exactly the boundary the floor excludes. On
+#      `[9,8,8,1,1,1,1,1]` the region is `[9,8,8]`, offering only the ratios 1.125 and 1.000, so a
+#      cut there falls after the 9 and keeps one item of an obvious three; the real break, 8 -> 1
+#      at a ratio of 8, is on the other side. Repaired by carrying one element below the floor into
+#      the region, where it locates the break and is never itself kept.
+#   2. A tied group cuts to one arbitrary member: all ratios are 1.0 and `argmax` lands on index
+#      0. `[9,9,9,5,5,5,1,1]` keeps 1 of 3; `[1]*9` keeps 1 of 9. Repaired with a tie test whose
+#      tolerance is derived from the dtype, because identical rows give powers differing in the
+#      last bits and a ratio of `1 + 4e-15` is still greater than 1.
 #
-# What moved, and it is a live pilot's behaviour on these shapes:
+# What the repair moves, and it is a live pilot's behaviour on these shapes:
 #
 #       spectrum                    before   after
 #       [9, 9, 9, 5, 5, 5, 1, 1]         1       3
@@ -101,12 +99,12 @@ def _o_resolved_rank(M) -> int:
 #       [10, 9, 1, 1e-3, 1e-9]           1       2
 #
 # On retrieval-shaped input it reaches about one spectrum in twenty (19 of 400 measured), and on
-# every one of those it keeps MORE, never fewer — median 6 -> 8. That is the defect being undone:
-# the old lock was cutting clusters short, and the recovered items sit between the first element
-# and the real break. Whether they help is a question about a corpus and is not settled here; it is
-# a recall-up change to a precision-oriented lock, and the labelled benches are where that gets
-# adjudicated. The parity sweep below still passes bit-equal over its whole corpus, which is why
-# the defects survived this long: the tests agreed because the inputs never reached them.
+# every one of those it keeps more, never fewer — median 6 -> 8: the pre-repair lock cuts clusters
+# short, and the recovered items sit between the first element and the real break. Whether they
+# help is a question about a corpus and is not settled here; it is a recall-up change to a
+# precision-oriented lock, and the labelled benches are where that gets adjudicated. The parity
+# sweep below passes bit-equal over its whole corpus either way — its inputs do not reach these
+# shapes.
 #
 # `test_the_repair_is_what_changed_and_nothing_else` pins the before-and-after so the delta is
 # checkable rather than asserted.
@@ -624,11 +622,10 @@ def test_more_heads_than_features_yields_an_all_zero_screen_and_keeps_one_item()
         "the all-zero screen is gone — if `head_screen` now refuses or bounds the head count, "
         "that is the repair, and this test is what has to move with it")
     kept = cut.select(E, q, heads=64)
-    # Repaired 2026-08-22: this asserted `[19]` — the last candidate by `argsort`, kept because an
-    # all-zero spectrum has nothing strictly above its median. The lock now reports that it found
-    # no break and keeps everything, so the degeneracy is still here (the screen is still all
-    # zeros) without a confident cut being produced out of nothing. Bounding `H <= n_features` in
-    # `head_screen` is a separate repair this test awaits.
+    # An all-zero spectrum has nothing strictly above its median, so the lock reports that it found
+    # no break and keeps everything: the degeneracy is still here (the screen is still all zeros)
+    # without a confident cut being produced out of nothing. Bounding `H <= n_features` in
+    # `head_screen` is a separate repair.
     assert kept.tolist() == list(range(20)), (
         "the degenerate path no longer keeps everything; whatever changed, it changed what a live "
         "pilot would produce")
@@ -638,7 +635,7 @@ def test_more_heads_than_features_yields_an_all_zero_screen_and_keeps_one_item()
 
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════
-# 4a · What the 2026-08-22 repair moved, and what it did not
+# 4a · What the repair moved, and what it did not
 # ═════════════════════════════════════════════════════════════════════════════════════════════
 
 _REPAIR_DELTA = {
@@ -655,7 +652,7 @@ def test_the_repair_is_what_changed_and_nothing_else() -> None:
     """The before-and-after, pinned on the shapes the repair targets.
 
     The pre-repair bodies are kept in this file so this is a measurement rather than a claim. On
-    every one of these the old lock returned a cut it reported no evidence for."""
+    every one of these the pre-repair lock returns a cut it reports no evidence for."""
     for spectrum, (before, after) in _REPAIR_DELTA.items():
         a = np.array(spectrum, dtype=np.float64)
         assert int(_pre_repair_top_break(a)[0].sum()) == before, (spectrum, "before")
@@ -665,16 +662,16 @@ def test_the_repair_is_what_changed_and_nothing_else() -> None:
 def test_the_repair_reaches_about_one_in_twenty_real_spectra_and_only_ever_keeps_MORE() -> None:
     """How far the repair reaches, measured rather than assumed — and it is not zero.
 
-    It reaches roughly 5% of the synthetic pools below — a figure later shown to be an artefact of
-    the generator, which plants near-identical rows and so manufactures the defect's own trigger.
-    On real corpora it reads 0.0% (144 cached bge-m3 spectra) and 0.2% (832 lattice-path spectra).
-    The assertion here is about this generator and is kept because it pins what the repair does; it
-    is not a deployment estimate.
+    It reaches roughly 5% of the synthetic pools below — a figure that is an artefact of the
+    generator, which plants near-identical rows and so manufactures the defect's own trigger. On
+    real corpora it reads 0.0% (144 cached bge-m3 spectra) and 0.2% (832 lattice-path spectra).
+    The assertion here is about this generator and pins what the repair does; it is not a
+    deployment estimate.
 
-    The direction is one-way and is the defect being undone: on every differing draw the repaired
-    lock keeps more, never fewer (19/19 over 400 draws, median 6 -> 8). That is what "the median
-    floor hid the break" means in practice — the old lock cuts clusters short, and the items it now
-    recovers are the ones between the first element and the real break.
+    The direction is one-way: on every differing draw the repaired lock keeps more, never fewer
+    (19/19 over 400 draws, median 6 -> 8). That is what the median floor hiding the break means in
+    practice — the pre-repair lock cuts clusters short, and the items the repaired one recovers are
+    the ones between the first element and the real break.
 
     Whether the recovered items help is a question about a corpus and cannot be settled here.
     It is a recall-up change to a precision-oriented lock; the labelled benches are where that gets
@@ -804,7 +801,7 @@ def _lock_corpus():
 
 
 def test_the_shared_lock_corpus_reads_the_way_both_sides_recorded_it() -> None:
-    """76 cases: every shape the 2026-08-22 defects lived in, plus 60 screen-shaped spectra."""
+    """76 cases: every shape the two repaired defects live in, plus 60 screen-shaped spectra."""
     for case in _lock_corpus():
         s = np.array(case["scores"], dtype=np.float64)
         for fn, name in ((cut.gap_split, "gap_split"), (cut.top_break, "top_break")):
@@ -815,7 +812,7 @@ def test_the_shared_lock_corpus_reads_the_way_both_sides_recorded_it() -> None:
 
 
 def test_the_corpus_covers_the_shapes_the_repair_moved() -> None:
-    """A corpus of easy cases certifies nothing. These are the ones that moved on 2026-08-22."""
+    """A corpus of easy cases certifies nothing. These are the shapes the repair moved."""
     names = {c["name"] for c in _lock_corpus()}
     assert {"plateau-3", "plateau-4", "flat", "cluster-with-inner-wobble",
             "tail-artifact", "near-tie", "all-zero", "empty"} <= names
