@@ -662,6 +662,7 @@ def put_bytes_encrypted(content_key: str, data: bytes, content_type: str,
 
 
 def get_bytes_decrypted(content_key: str, owner_id: Optional[str], *,
+                        probing: bool = False,
                         cas_ref: Optional[str] = None,
                         collection_id: Optional[str] = None) -> bytes:
     """Read the bytes back, decrypting for *owner_id*. Local CAS first, object store behind it.
@@ -701,7 +702,7 @@ def get_bytes_decrypted(content_key: str, owner_id: Optional[str], *,
                             cas_ref, type(exc).__name__, exc)
             else:
                 return _decrypt_envelope(cas_ref, blob, owner_id, require_encrypted=True,
-                                         collection_id=collection_id)
+                                         collection_id=collection_id, probing=probing)
 
     if not content_key or not edge_store_configured():
         # `content_key` is the object store's whole address; without one there is nothing to ask
@@ -736,12 +737,14 @@ def get_bytes_decrypted(content_key: str, owner_id: Optional[str], *,
             f"return unauthenticated bytes as content"
         )
     return _decrypt_envelope(content_key, raw, owner_id, require_encrypted=True,
+                             probing=probing,
                              collection_id=collection_id)
 
 
 def _decrypt_envelope(name: str, raw: bytes, owner_id: str, *,
                       require_encrypted: bool = False,
-                      collection_id: Optional[str] = None) -> bytes:
+                      collection_id: Optional[str] = None,
+                      probing: bool = False) -> bytes:
     """Open the per-principal envelope, or raise. One implementation for both tiers, so neither
     can drift into returning ciphertext the other would refuse.
 
@@ -750,13 +753,30 @@ def _decrypt_envelope(name: str, raw: bytes, owner_id: str, *,
     passing it is what MIGRATES the corpus rather than breaking it: objects written before the
     scope was threaded through still open, and `content_crypto.legacy_aad_reads` counts how many
     remain.
+
+    *probing* says the caller is trying ORDERED CANDIDATES and this miss is expected.
+
+    ⛔ WITHOUT IT, A HEALTHY READ LOGS AN ERROR. `doc_boundary` opens a body by trying the stamped
+    principal, then the collection scope, then `created_by` — a documented strategy, and the whole
+    point is that the earlier ones may miss. Each miss came through here and was logged at ERROR
+    with a traceback, so a node whose every read SUCCEEDED still produced one error per read:
+    744 of them in a day on this node, against zero actual failures ("content hydration failed"
+    never appeared once). Errors that are emitted by correct behaviour are how people learn to
+    ignore the log.
+
+    The final failure is still an error — `doc_boundary` raises the last exception and logs it
+    when no candidate opened the blob. What is demoted here is only an attempt the caller has
+    already said it expects to miss.
     """
     try:
         from mantle.services import content_crypto
         return content_crypto.decrypt_content(owner_id, raw, require_encrypted=require_encrypted,
                                               collection_id=collection_id)
     except Exception as exc:
-        logger.error("failed to decrypt stored content %s", name, exc_info=True)
+        if probing:
+            logger.debug("candidate %s did not open stored content %s", owner_id, name)
+        else:
+            logger.error("failed to decrypt stored content %s", name, exc_info=True)
         raise ContentDecryptionError(
             f"stored object {name!r} could not be decrypted; refusing to "
             f"return ciphertext as content"

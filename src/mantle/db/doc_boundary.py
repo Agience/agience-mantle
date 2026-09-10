@@ -245,8 +245,15 @@ def decrypt_artifact_content(raw: dict, *, strict: bool = True) -> None:
             last = None
             for principal in candidates:
                 try:
+                    # `probing=True`: a miss here is EXPECTED — that is what an ordered
+                    # candidate list means. Without it every read of a body whose first
+                    # candidate misses logged an ERROR with a traceback, so a node with zero
+                    # actual failures still emitted one error per read (744 in a day here).
+                    # The real failure is still reported: `last` is re-raised below and the
+                    # WARNING under it names the artifact.
                     raw["content"] = get_bytes_decrypted(
                         content_key or "", principal, cas_ref=ref, collection_id=scope,
+                        probing=True,
                     ).decode("utf-8")
                     last = None
                     break

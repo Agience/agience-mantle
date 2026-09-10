@@ -36,12 +36,40 @@ def _doc(**over):
 
 
 def _opens_only_for(*principals):
-    """A `get_bytes_decrypted` that answers for these principals and raises for any other."""
-    def fake(content_key, owner_id, *, cas_ref=None, collection_id=None):
+    """A `get_bytes_decrypted` that answers for these principals and raises for any other.
+
+    ⚠ `**kwargs` IS DELIBERATE. This stub stands in for a real function, and pinning its exact
+    keywords means every new parameter on the real one breaks these tests with a TypeError that
+    looks like a content failure — which is what happened when `probing` was added: three tests
+    failed reporting "could not be read", none of which was about reading. The stub cares only
+    about WHICH PRINCIPAL is asked for; everything else the caller passes is not its business.
+
+    `test_the_stub_matches_the_real_signature` below keeps that from hiding a genuine mismatch.
+    """
+    def fake(content_key, owner_id, *, cas_ref=None, collection_id=None, **kwargs):
         if owner_id in principals:
             return b"the article body"
         raise RuntimeError("no master key exists for principal %r" % owner_id)
     return fake
+
+
+def test_the_stub_matches_the_real_signature():
+    """The stub must be callable the way `doc_boundary` really calls it.
+
+    ⛔ A STUB THAT NO LONGER MATCHES ITS ORIGINAL PINS A PATH NOBODY TAKES. `**kwargs` above makes
+    the stub tolerant, and tolerance is exactly what would let it keep passing after the real
+    function grew a parameter the caller now depends on. This asserts the two agree on the named
+    ones instead of trusting the swallow.
+    """
+    import inspect
+
+    from mantle.services.content_service import get_bytes_decrypted
+
+    real = inspect.signature(get_bytes_decrypted).parameters
+    stub = inspect.signature(_opens_only_for()).parameters
+    for name in ("content_key", "owner_id", "cas_ref", "collection_id"):
+        assert name in real, "the real function no longer takes %r — this stub is stale" % name
+        assert name in stub, "the stub does not accept %r" % name
 
 
 class TestTheReadFindsTheSealingPrincipal:
