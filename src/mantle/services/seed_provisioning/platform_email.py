@@ -270,5 +270,24 @@ def _provision(
         for resource, invoke in ((op_id, True), (authz_id, False), (cs_id, False), (rt_id, False)):
             db_upsert_user_collection_grant(
                 db, user_id=grantee, collection_id=resource, granted_by=operator,
-                can_read=True, can_invoke=invoke, name="Platform email sender",
+                can_read=True, can_invoke=invoke,
+                # ⛔ THE OPERATOR NEEDS `can_admin` OR THIS GRAPH CAN NEVER BE CHANGED.
+                #
+                # `grant_service.can_admin` is "A GRANT with can_admin — no creator fast-path",
+                # and `effective_flags` says why: "created_by is provenance and grants no access,
+                # so the creator holds exactly what their explicit grant gives, minted at
+                # creation." Granting only read therefore froze the graph: measured 2026-09-11,
+                # NO principal held can_admin on any of the four artifacts, so
+                # `POST /grants` and `POST /grants/keys` both answered 403 — to the operator, on
+                # artifacts he created. Delegating a send, or revoking one, was impossible without
+                # deleting and re-provisioning.
+                #
+                # The refusal even names a creator path that does not exist ("Only the resource
+                # creator or an admin can manage grants"), so it reads as a bug in the caller.
+                #
+                # ⚠ THE OPERATOR ONLY. The system principal keeps read+invoke — it performs
+                # background sends, which needs neither. Whoever may widen access to a credential
+                # should be the person, not the automation that uses it.
+                can_admin=(grantee == operator),
+                name="Platform email sender",
             )
