@@ -334,6 +334,29 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("Platform issuer seed failed (non-fatal; manifest fallback)", exc_info=True)
 
+    # Platform outbound email: the operator → authorizer → credential graph that `iris:send_email`
+    # resolves. Same shape as the issuer seed above, and for the same reasons — no request context
+    # at startup, artifacts written through the ordinary path, non-fatal so a failure cannot stop
+    # the process booting.
+    #
+    # ⛔ THIS CALL DID NOT EXIST. `seed_provisioning/platform_email.py` documents itself as
+    # "Idempotent, non-fatal, runs every startup" and defines `ensure_platform_email_sender`, and
+    # nothing in the tree called it — not here, not in the package's `__all__`, nowhere. So the
+    # graph was never created on any deployment, `IRIS_AUTHORIZER_ARTIFACT_ID` had nothing to point
+    # at, and `iris:send_email` answered "No authorizer configured" with the credentials correctly
+    # configured in the environment the whole time. A provisioner that is never invoked fails in
+    # the one way nothing reports: it logs nothing, because it does not run.
+    #
+    # It self-heals rotated credentials by re-writing the values each boot, which is only true
+    # while it is actually called each boot.
+    try:
+        from mantle.services.seed_provisioning.platform_email import ensure_platform_email_sender
+        from mantle.services.system_identity import system_acting_context
+        with system_acting_context(scope="platform.email-seed"):
+            ensure_platform_email_sender(store_db)
+    except Exception:
+        logger.warning("Platform email provisioning failed (non-fatal)", exc_info=True)
+
     # Load trusted-issuer artifacts into the token verifier. The authority manifest
     # + AGIENCE_TRUSTED_ISSUERS env are the bootstrap seed; governable issuer
     # artifacts in the store are the source of truth going forward (the verifier
