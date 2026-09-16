@@ -81,6 +81,7 @@ from mantle.services.dependencies import (
 )
 from mantle.search.field_filters import filterable_field_names as _filterable_field_names
 from mantle.api.errors import ERROR_DESCRIPTIONS as _ERROR_DESCRIPTIONS
+from mantle.api.unknown_fields import CountsUnknownFields
 
 #: Derived from the entity rather than restated — see the note above the import. Kept below the
 #: import block: a statement between imports makes every later module-level import an `E402`.
@@ -290,7 +291,7 @@ _PATCH_LEAVE = (" Omitted — or `null`, which is the same request — leaves it
                 "no way to CLEAR a field.")
 
 
-class UpdateArtifactRequest(BaseModel):
+class UpdateArtifactRequest(CountsUnknownFields):
     """Fields to change on an artifact. Every field is optional; omitted means "leave alone".
 
     There is no concurrency control on this request: no `If-Match`, no version and no `updated_at`
@@ -2773,7 +2774,7 @@ async def recall_artifacts(
 # Specialized Request Models (defined early so static-path endpoints can use them)
 # =============================================================================
 
-class UploadInitiateRequest(BaseModel):
+class UploadInitiateRequest(CountsUnknownFields):
     """Initiate an S3 upload for an artifact."""
     filename: str
     content_type: str
@@ -2827,7 +2828,7 @@ class UploadPart(BaseModel):
     ETag: str = Field(description="The entity tag the store returned for this part.")
 
 
-class UploadStatusRequest(BaseModel):
+class UploadStatusRequest(CountsUnknownFields):
     """Update upload progress/completion."""
     status: Optional[str] = Field(
         None,
@@ -2867,13 +2868,13 @@ class UploadStatusRequest(BaseModel):
     )
 
 
-class ReorderRequest(BaseModel):
+class ReorderRequest(CountsUnknownFields):
     """Reorder artifacts in a workspace."""
     ordered_ids: List[str]
     order_version: Optional[int] = None
 
 
-class BatchFetchRequest(BaseModel):
+class BatchFetchRequest(CountsUnknownFields):
     """Batch fetch artifacts by IDs."""
     artifact_ids: List[str] = Field(
         ...,

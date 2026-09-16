@@ -37,7 +37,6 @@ def test_resolve_exact_with_inheritance(tmp_path: Path, monkeypatch: pytest.Monk
 
     monkeypatch.setenv("AGIENCE_TYPES_PATHS", str(root))
     monkeypatch.setenv("AGIENCE_TYPES_DISABLE_BUILTIN", "1")
-    monkeypatch.setattr(types_service, "_default_server_ui_roots", lambda: [])
 
     # Act
     res = types_service.resolve_type_definition("text/plain; charset=utf-8")
@@ -73,7 +72,6 @@ def test_resolve_falls_back_to_wildcard(tmp_path: Path, monkeypatch: pytest.Monk
 
     monkeypatch.setenv("AGIENCE_TYPES_PATHS", str(root))
     monkeypatch.setenv("AGIENCE_TYPES_DISABLE_BUILTIN", "1")
-    monkeypatch.setattr(types_service, "_default_server_ui_roots", lambda: [])
 
     res = types_service.resolve_type_definition("text/csv")
     assert res is not None
@@ -108,95 +106,10 @@ def test_resolve_capability_target_from_handler_tool(tmp_path: Path, monkeypatch
     assert target == "extract_text"
 
 
-def test_resolve_event_target_from_behaviors_handler_ref(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    root = tmp_path / "types"
-
-    _write_json(
-        root / "application" / "vnd.test+json" / "type.json",
-        {"content_type": "application/vnd.test+json", "version": 1},
-    )
-    _write_json(
-        root / "application" / "vnd.test+json" / "behaviors.json",
-        {"version": 1, "events": {"on_commit": {"handler": "handlers/on_commit.json"}}},
-    )
-    _write_json(
-        root / "application" / "vnd.test+json" / "handlers" / "on_commit.json",
-        {
-            "capability": "on_commit",
-            "implementation": {"kind": "mcp-tool", "tool": "on_commit"},
-        },
-    )
-
-    monkeypatch.setenv("AGIENCE_TYPES_PATHS", str(root))
-    monkeypatch.setenv("AGIENCE_TYPES_DISABLE_BUILTIN", "1")
-
-    target = types_service.resolve_event_target("application/vnd.test+json", "on_commit")
-    assert target == "on_commit"
 
 
-def test_resolve_event_binding_prefers_event_server_over_handler_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    root = tmp_path / "types"
-
-    _write_json(
-        root / "application" / "vnd.test+json" / "type.json",
-        {"content_type": "application/vnd.test+json", "version": 1},
-    )
-    _write_json(
-        root / "application" / "vnd.test+json" / "behaviors.json",
-        {
-            "version": 1,
-            "events": {
-                "on_commit": {
-                    "handler": "handlers/on_commit.json",
-                    "server": "event-server",
-                }
-            },
-        },
-    )
-    _write_json(
-        root / "application" / "vnd.test+json" / "handlers" / "on_commit.json",
-        {
-            "capability": "on_commit",
-            "implementation": {
-                "kind": "mcp-tool",
-                "tool": "on_commit",
-                "server": "handler-server",
-            },
-        },
-    )
-
-    monkeypatch.setenv("AGIENCE_TYPES_PATHS", str(root))
-    monkeypatch.setenv("AGIENCE_TYPES_DISABLE_BUILTIN", "1")
-
-    binding = types_service.resolve_event_binding("application/vnd.test+json", "on_commit")
-    assert binding == {"tool": "on_commit", "server_artifact_id": "event-server"}
 
 
-def test_resolve_event_binding_supports_direct_tool_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    root = tmp_path / "types"
-
-    _write_json(
-        root / "application" / "vnd.test+json" / "type.json",
-        {"content_type": "application/vnd.test+json", "version": 1},
-    )
-    _write_json(
-        root / "application" / "vnd.test+json" / "behaviors.json",
-        {
-            "version": 1,
-            "events": {
-                "on_commit": {
-                    "tool": "direct_commit_tool",
-                    "server_artifact_id": "direct-server",
-                }
-            },
-        },
-    )
-
-    monkeypatch.setenv("AGIENCE_TYPES_PATHS", str(root))
-    monkeypatch.setenv("AGIENCE_TYPES_DISABLE_BUILTIN", "1")
-
-    binding = types_service.resolve_event_binding("application/vnd.test+json", "on_commit")
-    assert binding == {"tool": "direct_commit_tool", "server_artifact_id": "direct-server"}
 
 
 def test_resolve_type_definition_reports_event_validation_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -238,65 +151,8 @@ def test_resolve_type_definition_reports_event_validation_errors(tmp_path: Path,
     assert any("references missing handler 'missing'" in msg for msg in res.validation_errors)
 
 
-def test_get_field_index_hints_extracts_per_field_hints(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    root = tmp_path / "types"
-
-    _write_json(
-        root / "application" / "vnd.example+json" / "type.json",
-        {
-            "content_type": "application/vnd.example+json",
-            "version": 1,
-            "context_schema": {
-                "title": {"index": ["lexical"]},
-                "description": {"index": ["lexical", "semantic"]},
-                "offers": {"index": ["semantic"]},
-                "location": {"index": ["geo"]},
-                "price": {"index": ["numeric"]},
-                "no_hints": {"type": "string"},
-                "bad_hint": {"index": ["bogus"]},
-                "free_form_string": "string — some prose",
-            },
-        },
-    )
-
-    monkeypatch.setenv("AGIENCE_TYPES_PATHS", str(root))
-    monkeypatch.setenv("AGIENCE_TYPES_DISABLE_BUILTIN", "1")
-    monkeypatch.setattr(types_service, "_default_server_ui_roots", lambda: [])
-    types_service.invalidate_type_cache()
-
-    hints = types_service.get_field_index_hints("application/vnd.example+json")
-
-    assert hints == {
-        "title": ["lexical"],
-        "description": ["lexical", "semantic"],
-        "offers": ["semantic"],
-        "location": ["geo"],
-        "price": ["numeric"],
-    }
-    assert "no_hints" not in hints
-    assert "free_form_string" not in hints
-    assert "bad_hint" not in hints  # unknown hint kinds dropped silently
 
 
-def test_get_field_index_hints_returns_empty_when_no_schema(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    root = tmp_path / "types"
-
-    _write_json(
-        root / "application" / "vnd.bare+json" / "type.json",
-        {"content_type": "application/vnd.bare+json", "version": 1},
-    )
-
-    monkeypatch.setenv("AGIENCE_TYPES_PATHS", str(root))
-    monkeypatch.setenv("AGIENCE_TYPES_DISABLE_BUILTIN", "1")
-    monkeypatch.setattr(types_service, "_default_server_ui_roots", lambda: [])
-    types_service.invalidate_type_cache()
-
-    assert types_service.get_field_index_hints("application/vnd.bare+json") == {}
-    assert types_service.get_field_index_hints("application/vnd.unknown+json") == {}
 
 
 # ---------------------------------------------------------------------------
@@ -410,95 +266,10 @@ def _clean_runtime_types():
     types_service.invalidate_type_cache()
 
 
-def test_runtime_full_type_overlays_and_applies_inherits(_clean_runtime_types, monkeypatch):
-    """A server-owned type (no filesystem base of its own) resolves from its pushed
-    definition and still inherits its declared parent (a supplied base type)."""
-    monkeypatch.setenv("AGIENCE_TYPES_PATHS", str(types_root()))
-    types_service.invalidate_type_cache()
-
-    types_service.register_runtime_type(
-        "application/vnd.agience.demo+json",
-        {
-            "content_type": "application/vnd.agience.demo+json",
-            "inherits": ["application/json"],
-            "ui": {"label": "Demo", "viewer": "json", "resource_uri": "ui://demo/x.html"},
-        },
-        "chorus/test",
-    )
-
-    res = types_service.resolve_type_definition_cached("application/vnd.agience.demo+json")
-    assert res is not None
-    assert res.definition["ui"]["resource_uri"] == "ui://demo/x.html"
-    # inherits applied: the core application/json base contributed to sources.
-    assert any("application" in str(s) and "json" in str(s) for s in res.sources)
-
-    # Upsert: a re-push (server restart / edit) replaces the prior overlay.
-    types_service.register_runtime_type(
-        "application/vnd.agience.demo+json",
-        {"content_type": "application/vnd.agience.demo+json", "ui": {"label": "Demo v2", "viewer": "json"}},
-        "chorus/test",
-    )
-    res2 = types_service.resolve_type_definition_cached("application/vnd.agience.demo+json")
-    assert res2 is not None
-    assert res2.definition["ui"]["label"] == "Demo v2"
 
 
-def test_runtime_overlay_merges_onto_core_base(_clean_runtime_types, monkeypatch):
-    """A partial overlay (just a viewer pointer) merges onto a filesystem base type —
-    the base is preserved and the overlay wins on the keys it sets."""
-    monkeypatch.setenv("AGIENCE_TYPES_PATHS", str(types_root()))
-    types_service.invalidate_type_cache()
-
-    types_service.register_runtime_type(
-        "application/vnd.agience.collection+json",
-        {"ui": {"resource_uri": "ui://test/collection.html", "resource_server": "test"}},
-        "chorus/test",
-    )
-
-    res = types_service.resolve_type_definition_cached("application/vnd.agience.collection+json")
-    assert res is not None
-    # overlay applied
-    assert res.definition["ui"]["resource_uri"] == "ui://test/collection.html"
-    # core base preserved (collection declares operations in package/types)
-    assert isinstance(res.definition.get("operations"), dict)
-    assert "commit" in res.definition["operations"]
-    canonical = types_root().resolve()
-    assert any(canonical in Path(s).resolve().parents or Path(s).resolve() == canonical for s in res.sources)
 
 
-def test_lazy_loader_resolves_third_party_type_on_miss(_clean_runtime_types, monkeypatch):
-    """A third-party type is not pre-registered: on a resolution miss the lazy
-    loader fetches it on demand (and the result is cached so it fires once). A type
-    present on the supplied filesystem base never triggers the loader (no DB hit)."""
-    monkeypatch.setenv("AGIENCE_TYPES_PATHS", str(types_root()))
-    types_service.invalidate_type_cache()
-    calls: list[str] = []
-
-    def loader(content_type: str) -> bool:
-        calls.append(content_type)
-        if content_type == "application/vnd.thirdparty.crm+json":
-            types_service.register_runtime_type(
-                content_type,
-                {"content_type": content_type, "ui": {"label": "CRM", "viewer": "record"}},
-                "app:crm",
-            )
-            return True
-        return False
-
-    types_service.set_lazy_type_loader(loader)
-
-    res = types_service.resolve_type_definition_cached("application/vnd.thirdparty.crm+json")
-    assert res is not None
-    assert res.definition["ui"]["label"] == "CRM"
-
-    # Cached → the loader fires at most once for the resolved type.
-    types_service.resolve_type_definition_cached("application/vnd.thirdparty.crm+json")
-    assert calls.count("application/vnd.thirdparty.crm+json") == 1
-
-    # A type on the supplied filesystem base resolves without ever touching the lazy loader.
-    res_core = types_service.resolve_type_definition_cached("application/vnd.agience.collection+json")
-    assert res_core is not None
-    assert "application/vnd.agience.collection+json" not in calls
 
 
 

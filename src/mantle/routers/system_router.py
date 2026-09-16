@@ -59,6 +59,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from mantle.api.errors import ERROR_DESCRIPTIONS
+from mantle.api.unknown_fields import CountsUnknownFields
 from mantle.db.store import Database
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -117,7 +118,7 @@ router = APIRouter(prefix="/system", tags=["System"])
 # Schemas
 # =============================================================================
 
-class IssuerCreateRequest(BaseModel):
+class IssuerCreateRequest(CountsUnknownFields):
     """Declare a token issuer this node will trust."""
     issuer: str = Field(..., description="The `iss` claim value to trust.")
     audience: Optional[str] = Field(

@@ -34,58 +34,24 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-# There is no builtin `package/types` root in this image: a type tree belongs to the deployment
-# rather than to Mantle, and nothing mounts one in by default. Filesystem type resolution is opt-in
-# via `AGIENCE_TYPES_PATHS`, so nothing is read from a location no deployment supplies. Servers
-# self-register the types they own via `register_runtime_type`, with Mantle staying passive — see
-# `_default_server_ui_roots` below.
+# ⭐ MANTLE DOES NOT HOLD A TYPE REGISTRY. CRYSTAL DOES, and says so in its own words:
+# "Types and personas are the gateway's own state — personas self-register their type definitions
+# and endpoint here (POST /register); Mantle never sees them" (`crystal/main.py`). What survives
+# here is one narrow filesystem lookup, kept because `ingest_runner_service` asks it which handler
+# extracts text for a content type.
+#
+# ⛔ A RUNTIME REGISTRY, A LAZY LOADER, CACHES AND BULK LISTERS ALL LIVED HERE AND NONE OF THEM HAD
+# A PRODUCTION CALLER. Removed 2026-09-14. The registration and loader entry points were reached
+# only from this module's own tests, `main.py` wired neither, and the persistence their docstrings
+# promised was never written — so the registry was empty on every node, the loader was never
+# installed, and resolution answered `None` for every type.
+# The docstrings described a Mantle that does not exist, and cost a session's work to disprove.
+#
+# ⚠ THE FILESYSTEM BASE IS EMPTY IN A DEFAULT DEPLOYMENT TOO. Resolution reads only the roots named
+# by `AGIENCE_TYPES_PATHS`, which no node sets, so `resolve_capability_target` returns `None` and
+# its caller takes the fallback branch. That is the current behaviour, unchanged by this cut.
 
 
-def _default_server_ui_roots() -> List[Path]:
-    """Deprecated — always empty. Mantle does not scan a server's filesystem for
-    server-owned types; that would couple Mantle to that server's tree and require it
-    in Mantle's image. Servers self-register the types they own instead (Mantle
-    stays passive): each type arrives as a pushed
-    ``application/vnd.agience.type+json`` and is held in the in-memory runtime
-    registry (``_runtime_types``), persisted via ``type_registry_store`` so a
-    Mantle restart rehydrates without contacting any server. See
-    ``register_runtime_type``."""
-    return []
-
-
-def get_types_roots() -> List[Path]:
-    """Return search roots for the folder-based type system.
-
-    Order matters: earlier roots take precedence.
-
-    Env vars:
-    - AGIENCE_TYPES_PATHS: roots (os.pathsep-separated). The only filesystem source of type
-      definitions (see the note above `_default_server_ui_roots`). Empty is the normal state:
-      server-owned types are self-registered, not scanned.
-    """
-    roots: List[Path] = []
-    seen: set[Path] = set()
-
-    def add_root(path: Path) -> None:
-        resolved = path.resolve()
-        if resolved in seen:
-            return
-        seen.add(resolved)
-        roots.append(resolved)
-
-    extra = os.getenv("AGIENCE_TYPES_PATHS", "")
-    if extra:
-        for raw in extra.split(os.pathsep):
-            raw = (raw or "").strip()
-            if not raw:
-                continue
-            p = Path(raw)
-            if not p.is_absolute():
-                p = _repo_root() / p
-            if p.exists() and p.is_dir():
-                add_root(p)
-
-    return roots
 
 
 def _merge_ordered_roots() -> List[Path]:
@@ -93,12 +59,8 @@ def _merge_ordered_roots() -> List[Path]:
     LATER over EARLIER.
 
     There is exactly one filesystem source — ``AGIENCE_TYPES_PATHS`` — which is unset by
-    default, making the filesystem base empty in the default deployment. Server-owned
-    types are NOT on the filesystem: they are self-registered at runtime and overlaid ON
-    TOP of these roots in :func:`resolve_type_definition` (an "Open-with"-style chain:
-    filesystem base < runtime/self-registered). A type lives canonically in exactly ONE
-    place; higher layers contribute partial overrides (e.g. just a viewer), never a full
-    duplicate.
+    default, making the filesystem base empty in the default deployment. Server-owned types
+    are not here and never were: a persona registers what it owns with the gateway.
     """
     roots: List[Path] = []
     seen: set[Path] = set()
@@ -110,8 +72,6 @@ def _merge_ordered_roots() -> List[Path]:
         seen.add(resolved)
         roots.append(resolved)
 
-    # Server-owned types are NOT read from the filesystem here. Servers self-register
-    # them; resolution overlays the pushed runtime defs (see resolve_type_definition).
     extra = os.getenv("AGIENCE_TYPES_PATHS", "")
     if extra:
         for raw in extra.split(os.pathsep):
@@ -138,9 +98,8 @@ def _content_type_to_rel_folder(content_type: str) -> Optional[Path]:
 def _find_type_folder(roots: Iterable[Path], content_type: str) -> Optional[Tuple[Path, str]]:
     """Return (folder_path, source_label) for the highest-priority definition.
 
-    Root ordering from ``get_types_roots()`` defines the priority. There is one
-    filesystem source (``AGIENCE_TYPES_PATHS``), unset by default; server-owned
-    definitions arrive as a runtime overlay, not as a root here.
+    Root ordering from ``_merge_ordered_roots()`` defines the priority. There is one
+    filesystem source, ``AGIENCE_TYPES_PATHS``, unset by default.
     """
     rel = _content_type_to_rel_folder(content_type)
     if rel is None:
@@ -349,15 +308,8 @@ def _collect_type_validation_errors(definition: Dict[str, Any]) -> List[str]:
 def resolve_type_definition(content_type: str, *, roots: Optional[List[Path]] = None) -> Optional[TypeResolutionResult]:
     """Resolve a type definition.
 
-    Resolution is an "Open-with"-style override chain (LOWEST first):
-    ``filesystem (AGIENCE_TYPES_PATHS) < self-registered (runtime)``, then layered
-    over any ``inherits`` parents (child wins). Mirrors the Facet content-types
-    plugin so the platform and the frontend resolve types identically.
-
-    The runtime overlay (server self-registered types, ``_runtime_types``) is
-    applied ONLY on the default-roots path (``roots is None``). When an explicit
-    ``roots`` list is passed (tests), resolution is pure-filesystem — no runtime
-    overlay — so callers can probe folder semantics in isolation.
+    Filesystem roots (``AGIENCE_TYPES_PATHS``, base-first, deep-merged), then layered over
+    any ``inherits`` parents (child wins).
 
     Matching: exact ``top/subtype`` else category wildcard ``top/*``
     (``_wildcard`` folder). The wildcard fallback is whole-resolution, never
@@ -367,11 +319,9 @@ def resolve_type_definition(content_type: str, *, roots: Optional[List[Path]] = 
     if not content_type:
         return None
 
-    use_runtime = roots is None
     merge_roots = roots if roots is not None else _merge_ordered_roots()
 
-    # Own-definition: core/local filesystem layers (base-first, deep-merged),
-    # then the self-registered runtime overlay (highest, deep-merged on top).
+    # Own-definition: filesystem layers, base-first, deep-merged.
     def _gather(target: str) -> Tuple[Optional[Dict[str, Any]], List[str]]:
         acc: Optional[Dict[str, Any]] = None
         srcs: List[str] = []
@@ -383,22 +333,6 @@ def resolve_type_definition(content_type: str, *, roots: Optional[List[Path]] = 
             folder_def, folder_sources = _load_folder_definition(folder)
             acc = folder_def if acc is None else _deep_merge(acc, folder_def)
             srcs.extend(folder_sources)
-        if use_runtime:
-            rt = _runtime_types.get(target)
-            # Lazy path: only when the type is absent from BOTH the core
-            # filesystem and the warm cache do we hit the artifact store — an
-            # O(1) on-demand fetch for the long tail of third-party types
-            # ("find them via artifacts, in context"). Core types never trigger a
-            # DB hit; resolved/missing results are cached so it fires at most once.
-            if rt is None and acc is None and _lazy_type_loader is not None:
-                try:
-                    if _lazy_type_loader(target):
-                        rt = _runtime_types.get(target)
-                except Exception:
-                    logger.warning("Lazy type loader failed for %s", target, exc_info=True)
-            if rt is not None:
-                acc = rt.definition if acc is None else _deep_merge(acc, rt.definition)
-                srcs = srcs + rt.sources
         return acc, srcs
 
     own, sources = _gather(content_type)
@@ -470,391 +404,48 @@ def resolve_capability_target(
     return _resolve_handler_target(handler_obj)
 
 
-def resolve_event_target(
-    content_type: str,
-    event_name: str,
-    *,
-    roots: Optional[List[Path]] = None,
-) -> Optional[str]:
-    """Resolve a declared target for a lifecycle event.
-
-    Supports:
-    - Draft event contract: behaviors.events.<event>.tool
-    - Existing file-ref form: behaviors.events.<event>.handler -> handlers/<capability>.json
-    """
-    binding = resolve_event_binding(content_type, event_name, roots=roots)
-    if not isinstance(binding, dict):
-        return None
-    tool = binding.get("tool")
-    return tool if isinstance(tool, str) and tool.strip() else None
 
 
-def resolve_event_binding(
-    content_type: str,
-    event_name: str,
-    *,
-    roots: Optional[List[Path]] = None,
-) -> Optional[Dict[str, str]]:
-    """Resolve a lifecycle event binding (tool + optional server)."""
-    if not event_name:
-        return None
-
-    res = resolve_type_definition(content_type, roots=roots)
-    if res is None:
-        return None
-
-    behaviors = res.definition.get("behaviors")
-    if not isinstance(behaviors, dict):
-        return None
-
-    events = behaviors.get("events")
-    if not isinstance(events, dict):
-        return None
-
-    event_obj = events.get(event_name)
-    if not isinstance(event_obj, dict):
-        return None
-
-    direct_tool = event_obj.get("tool")
-    if isinstance(direct_tool, str) and direct_tool.strip():
-        binding: Dict[str, str] = {"tool": direct_tool.strip()}
-        direct_server = event_obj.get("server") or event_obj.get("server_artifact_id")
-        if isinstance(direct_server, str) and direct_server.strip():
-            binding["server_artifact_id"] = direct_server.strip()
-        return binding
-
-    handler_ref = event_obj.get("handler")
-    if not isinstance(handler_ref, str) or not handler_ref.strip():
-        return None
-
-    # Common form: "handlers/open.json" -> capability "open"
-    cap = Path(handler_ref).stem
-    handlers = res.definition.get("handlers")
-    if not isinstance(handlers, dict):
-        return None
-    handler_obj = handlers.get(cap)
-    if not isinstance(handler_obj, dict):
-        return None
-
-    # Event-level server (if provided) overrides handler-level server.
-    binding = _resolve_handler_binding(handler_obj)
-    if not binding:
-        return None
-
-    event_server = event_obj.get("server") or event_obj.get("server_artifact_id")
-    if isinstance(event_server, str) and event_server.strip():
-        binding["server_artifact_id"] = event_server.strip()
-
-    return binding
 
 
 # ---------------------------------------------------------------------------
 # Operations schema (Phase 0 — Enterprise Eventing refactor)
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
-class OperationSpec:
-    """Normalized view of an `operations.{op_name}` entry in type.json."""
-
-    name: str
-    enabled: bool
-    requires_grant: str
-    dispatch: Dict[str, Any]
-    input_schema: Dict[str, Any]
-    output_schema: Dict[str, Any]
-    emits: List[Dict[str, Any]]
-    observe: Optional[Dict[str, Any]]
-    audit: bool
 
 
-_OP_NAME_TO_GRANT_FLAG = {
-    "create": "create",
-    "read": "read",
-    "update": "update",
-    "delete": "delete",
-    "invoke": "invoke",
-    "add": "add",
-    "search": "search",
-    "own": "own",
-}
 
 
 # ---------------------------------------------------------------------------
 # Runtime type registration (MCP server discovery)
 # ---------------------------------------------------------------------------
 
-# Self-registered types — an in-memory CACHE of definitions a server owns, keyed
-# by content type. NOT a formal global registry: it holds only what has actually
-# been touched (warm platform set + lazily-resolved app types), never the whole
-# (eventual millions-strong) universe.
-_runtime_types: Dict[str, TypeResolutionResult] = {}
-
-# Optional lazy loader: ``fn(content_type) -> bool``. Called on a resolution MISS
-# (type not in the core filesystem and not already cached) to fetch the type's
-# definition from its artifact on demand — the "find them via artifacts, lazily,
-# in context" path for the long tail of app/third-party types. The loader should
-# register what it finds (``register_runtime_type``) and return True, or return
-# False if no such type-def artifact exists. Wired at startup (see main.py).
-_lazy_type_loader: Optional[Any] = None
 
 
-def set_lazy_type_loader(loader: Optional[Any]) -> None:
-    """Install the lazy type loader (see ``_lazy_type_loader``). Pass None to clear."""
-    global _lazy_type_loader
-    _lazy_type_loader = loader
 
 
-def _parse_raw_type_definition(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Parse a raw type.json dict into the standard definition shape.
-
-    Mirrors ``_load_folder_definition`` logic: pops ``ui`` and ``operations``
-    from the type block and promotes them to top-level keys.
-    """
-    type_json = dict(raw)  # don't mutate the caller's dict
-    ui_json = type_json.pop("ui", None)
-    operations_json = type_json.pop("operations", None)
-    relationships_json = type_json.pop("relationships", None)
-
-    definition: Dict[str, Any] = {"type": type_json, "handlers": {}}
-    if ui_json is not None:
-        definition["ui"] = ui_json
-    if operations_json is not None:
-        definition["operations"] = operations_json
-    if relationships_json is not None:
-        definition["relationships"] = relationships_json
-    return definition
 
 
-def register_runtime_type(
-    content_type: str,
-    raw_definition: Dict[str, Any],
-    source: str,
-) -> None:
-    """Register (or re-register) a type a server OWNS — the self-registration path.
-
-    ``raw_definition`` is the full ``type.json`` the owning server published. It
-    is parsed into the standard definition shape and stored as the runtime
-    OVERLAY for this content type. Resolution layers it on top of whatever
-    filesystem base exists (see :func:`resolve_type_definition`) — normally none —
-    so a server may publish either a full type it owns outright (e.g. ``chat``) or a
-    partial override of a supplied base (e.g. a viewer for ``application/json``).
-
-    Upsert semantics: a re-push (server restart / edit) replaces the prior
-    overlay — last publish wins — and the per-type cache entry is invalidated.
-    """
-    key = _normalize_content_type(content_type)
-    if not key:
-        return
-
-    definition = _parse_raw_type_definition(raw_definition)
-    _runtime_types[key] = TypeResolutionResult(
-        content_type=key,
-        definition=definition,
-        sources=[source],
-        validation_errors=_collect_type_validation_errors(definition),
-    )
-    _type_cache.pop(key, None)  # invalidate the merged cache for this type
-    logger.info("Registered runtime type '%s' from %s", key, source)
 
 
-def clear_runtime_types() -> None:
-    """Clear all runtime-registered types (for tests)."""
-    _runtime_types.clear()
+
 
 
 # Process-wide type resolution cache. Keyed by content type. Cleared via invalidate_type_cache().
-_type_cache: Dict[str, Optional[TypeResolutionResult]] = {}
 
 
-def resolve_type_definition_cached(content_type: str) -> Optional[TypeResolutionResult]:
-    """Cached variant of `resolve_type_definition` using default roots.
-
-    Resolution = the filesystem base (empty unless ``AGIENCE_TYPES_PATHS`` is set)
-    overlaid with the self-registered
-    runtime types, then ``inherits`` parents — all handled inside
-    :func:`resolve_type_definition`. This wrapper only adds a process-wide cache,
-    keyed by content type, invalidated per-type on (re-)registration and wholesale
-    via :func:`invalidate_type_cache` (e.g. on an admin reload). Tests that mutate
-    type files should call ``invalidate_type_cache()`` in setup.
-    """
-    key = _normalize_content_type(content_type)
-    if key in _type_cache:
-        return _type_cache[key]
-    res = resolve_type_definition(key)
-    _type_cache[key] = res
-    return res
 
 
-def invalidate_type_cache() -> None:
-    """Clear the cached type resolutions. Call after hot-reloading type files."""
-    _type_cache.clear()
 
 
 # Recognized index-hint names per Step 1.7. Hints not in this set are ignored
 # by the indexer. New hint kinds (e.g. "vector", "fulltext") get added here as
 # they're introduced.
-INDEX_HINT_KINDS = frozenset({"lexical", "semantic", "geo", "numeric", "temporal"})
 
 
-def get_field_index_hints(content_type: str) -> Dict[str, List[str]]:
-    """Return per-field index hints from a type's ``context_schema``.
-
-    Per Step 1.7 (context-schema-driven indexing), a type may declare which of
-    its context fields participate in which kind of index by shaping its
-    schema entries as::
-
-        "context_schema": {
-          "title":       { "index": ["lexical"] },
-          "description": { "index": ["lexical", "semantic"] },
-          "offers":      { "index": ["semantic"] },
-          "location":    { "index": ["geo"] }
-        }
-
-    This helper returns ``{field_name: [hint, ...]}`` for every top-level field
-    that declares an ``index`` array. Returns an empty dict when no hints are
-    declared — callers should fall back to default indexing in that case.
-
-    Hints not in :data:`INDEX_HINT_KINDS` are dropped silently so the indexer
-    never sees an unknown kind. Inheritance is honoured because resolution goes
-    through :func:`resolve_type_definition_cached`, which merges parents.
-    """
-    res = resolve_type_definition_cached(content_type)
-    if res is None:
-        return {}
-
-    # `_load_folder_definition` keeps top-level type.json fields under
-    # `definition["type"]` (only `ui`, `operations`, `relationships`, `preview`,
-    # `behaviors` are promoted). `context_schema` stays nested.
-    type_block = res.definition.get("type")
-    schema = type_block.get("context_schema") if isinstance(type_block, dict) else None
-    if not isinstance(schema, dict):
-        return {}
-
-    hints: Dict[str, List[str]] = {}
-    for field_name, field_def in schema.items():
-        if not isinstance(field_def, dict):
-            continue
-        raw = field_def.get("index")
-        if not isinstance(raw, list):
-            continue
-        accepted = [h for h in raw if isinstance(h, str) and h in INDEX_HINT_KINDS]
-        if accepted:
-            hints[field_name] = accepted
-    return hints
 
 
-def resolve_operation(content_type: str, op_name: str) -> Optional[OperationSpec]:
-    """Resolve an operation specification for a content type + op name.
-
-    Walks `definition["operations"][op_name]` from the (cached) type
-    resolution and normalizes it into an `OperationSpec`. Returns `None` if
-    the type doesn't declare the operation.
-    """
-    if not op_name:
-        return None
-
-    res = resolve_type_definition_cached(content_type)
-    if res is None:
-        return None
-
-    ops = res.definition.get("operations")
-    if not isinstance(ops, dict):
-        return None
-
-    op = ops.get(op_name)
-    if not isinstance(op, dict):
-        return None
-
-    enabled = bool(op.get("enabled", True))
-
-    requires_grant = op.get("requires_grant")
-    if not isinstance(requires_grant, str) or not requires_grant.strip():
-        requires_grant = _OP_NAME_TO_GRANT_FLAG.get(op_name, "read")
-
-    dispatch = op.get("dispatch")
-    if not isinstance(dispatch, dict):
-        dispatch = {"kind": "artifact_crud"} if op_name in _OP_NAME_TO_GRANT_FLAG else {}
-
-    input_schema = op.get("input_schema") if isinstance(op.get("input_schema"), dict) else {}
-    output_schema = op.get("output_schema") if isinstance(op.get("output_schema"), dict) else {}
-
-    emits_raw = op.get("emits")
-    emits: List[Dict[str, Any]] = []
-    if isinstance(emits_raw, list):
-        for entry in emits_raw:
-            if isinstance(entry, dict) and isinstance(entry.get("event"), str):
-                emits.append({
-                    "event": entry["event"],
-                    "phase": entry.get("phase", "after"),
-                    "optional": bool(entry.get("optional", False)),
-                })
-
-    observe = op.get("observe") if isinstance(op.get("observe"), dict) else None
-    audit = bool(op.get("audit", False))
-
-    return OperationSpec(
-        name=op_name,
-        enabled=enabled,
-        requires_grant=requires_grant,
-        dispatch=dispatch,
-        input_schema=input_schema,
-        output_schema=output_schema,
-        emits=emits,
-        observe=observe,
-        audit=audit,
-    )
 
 
-def list_available_content_types(*, roots: Optional[List[Path]] = None) -> List[str]:
-    """List content type patterns available across roots (exact + wildcards)."""
-    roots = roots if roots is not None else get_types_roots()
-    content_types: List[str] = []
-    seen: set[str] = set()
-
-    for root in roots:
-        if not root.exists() or not root.is_dir():
-            continue
-        for top in sorted([p for p in root.iterdir() if p.is_dir()]):
-            for sub in sorted([p for p in top.iterdir() if p.is_dir()]):
-                if sub.name.startswith("."):
-                    continue
-                if sub.name == "_wildcard":
-                    content_type = f"{top.name}/*"
-                else:
-                    content_type = f"{top.name}/{sub.name}"
-                if content_type not in seen:
-                    seen.add(content_type)
-                    content_types.append(content_type)
-
-    return content_types
 
 
-def list_resolved_type_definitions() -> List[Dict[str, Any]]:
-    """Resolve every available content type (filesystem roots + runtime-registered)
-    to its merged definition. This is the single RUNTIME source the frontend
-    hydrates its content-type registry from — so Facet never compiles in (scans)
-    server-owned type definitions at build time.
-
-    Mantle is a blind relay: each entry carries the merged ``definition`` (incl.
-    the ``ui`` block) verbatim. The viewer pointer (``ui.resource_uri`` /
-    ``ui.resource_server``) is declared by the OWNING SERVER in its own
-    ``type.json`` — Mantle never infers it.
-
-    Sources are the union of the core filesystem types and the self-registered
-    runtime types; each is resolved through the same merge so an overlay (e.g. a
-    server viewer on a core type) appears folded into the one entry.
-    """
-    out: List[Dict[str, Any]] = []
-    seen: set[str] = set()
-    content_types = set(list_available_content_types()) | set(_runtime_types.keys())
-    for ct in sorted(content_types):
-        res = resolve_type_definition_cached(ct)
-        if res is None or res.content_type in seen:
-            continue
-        seen.add(res.content_type)
-        out.append({
-            "content_type": res.content_type,
-            "definition": res.definition,
-            "validation_errors": res.validation_errors,
-        })
-    return out

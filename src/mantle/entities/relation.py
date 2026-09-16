@@ -1,47 +1,56 @@
-"""Edge relation kinds — the information-centric typing of graph edges.
+"""What an edge records about itself — observed, never enumerated.
 
-Build-side vocabulary of the Information Gauge DB design. An edge is named for *what it does to
-information*, never by a physics analogy. Five kinds exist across the field, but only two are
-carried by the ``edges`` (``collection_artifacts``) collection; the rest are represented in their
-own subsystems:
+An edge carries what was **observed** when it was written, verbatim. It does not carry a type drawn
+from a list, because there is no list: the kinds of relation a corpus contains are a property of the
+corpus, discovered by reading it, and they are unbounded.
 
-- ``grant``      — access / authority: the structural, grant-propagating edge.        (edges collection)
-- ``derivation`` — a content transform (an operator produced this), identity kept.     (edges collection)
-- ``temporal``   — order / causal precedence.  Represented by the ``root_id`` version
-  chain + ``created_time`` — not a stored edge.
-- ``semantic``   — ontological position (anchor-relative embedding affinity).
-  Represented in the AnchorSet / vector index — not a stored edge.
-- ``lifecycle``  — a state transition (e.g. commit).  Represented in the commit
-  records (``entities/commit.py``) + the artifact ``state`` — not a stored edge.
+Why there is no vocabulary here
+-------------------------------
+A fixed set of relation kinds is a decision made in advance, on other data, about what relationships
+are possible — which is the same objection as a hand-set threshold, at the scale of an ontology. It
+fails in both directions. A corpus whose relations do not fit the list has them flattened into the
+nearest member, and the distinction is lost at write time where nothing can recover it. A corpus
+with fewer distinct relations than the list carries a vocabulary asserting structure it does not
+have.
 
-Phase 0 records ``relation`` on the edges that exist and leaves the vocabulary in
-place for the rest; typing them is a later formalization, not a schema change here.
+Nothing in a trained network has an edge-type table either. What such a system calls a relation is a
+direction that emerged, and how many of them there are is bounded by nothing declared in advance. An
+edge store that asserts a closed vocabulary cannot represent that, and a store built to hold what a
+corpus actually contains must not.
+
+So this module classifies nothing. `observed_relation` returns what the writer saw, and a reader
+that wants to know what *kind* of relation an edge is measures it from the records at either end.
+
+What the store does hold
+------------------------
+Two open, uninterpreted strings, and both are the writer's:
+
+- `label` — on the edge row, carried by `LatticeGraphStore`. Already open, already unbounded; a
+  corpus build routinely writes tens of distinct labels, and `count_edges_by_label` indexes whatever
+  is there without knowing the set in advance.
+- `relationship` — what the writer recorded about *this* edge's role, or `None`.
+
+Neither is a type, neither is validated against a set, and no read in this package branches on the
+value of either.
 """
 from __future__ import annotations
 
-from enum import Enum
+
+def observed_relation(*, origin: bool, relationship: str | None) -> str | None:
+    """What was observed about this edge, returned unchanged.
+
+    `relationship` is the writer's own word for what this edge records, and it is passed through
+    verbatim — not mapped, not normalised, not checked against a set. `None` means nothing was
+    observed, which is a fact about the edge and is reported as itself rather than filled in with a
+    default.
+
+    `origin` is accepted because callers have it to hand and an edge's containment role is part of
+    what was observed. It is deliberately not used to *derive* a kind: deriving one would be this
+    module classifying, which is the thing it does not do.
+    """
+    return relationship
 
 
-class Relation(str, Enum):
-    """The information-centric kind of a relation between measurements."""
-
-    GRANT = "grant"            # WHO   — access / authority (the confining, grant-propagating edge)
-    TEMPORAL = "temporal"      # WHEN  — order / causal precedence / version chain
-    SEMANTIC = "semantic"      # WHERE — ontological position (anchor-relative affinity)
-    LIFECYCLE = "lifecycle"    # WHAT  — a state transition (e.g. commit)
-    DERIVATION = "derivation"  # HOW   — a content transform (operator), identity preserved
-
-
-# The kinds that the `edges` (collection_artifacts) collection actually stores.
-EDGE_RELATIONS = frozenset({Relation.GRANT.value, Relation.DERIVATION.value})
-
-
-def derive_relation(*, origin: bool, relationship: str | None) -> str:
-    """Best-effort ``relation`` for a ``collection_artifacts`` edge from its
-    existing signals. An operator-produced edge is a ``derivation``; every other
-    edge in this collection is part of the access/containment topology, so it is a
-    ``grant`` (origin edges propagate grants; plain links still sit in the access
-    structure). ``origin`` is accepted for future refinement and forward-compat."""
-    if relationship == "operator":
-        return Relation.DERIVATION.value
-    return Relation.GRANT.value
+#: Retained so callers written against the previous name keep working. It is the same function:
+#: nothing is derived, and the word is kept only to avoid breaking an import.
+derive_relation = observed_relation

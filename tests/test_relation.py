@@ -1,30 +1,63 @@
-"""Edge relation typing — the information-centric `relation` kind on edges.
+"""Edge relations are observed, never enumerated — and the vocabulary is open.
 
-Phase 0 of the Information Gauge DB build. Pure-logic tests for `derive_relation`
-(the mapping from an edge's existing signals to its relation kind) and the enum
-contract; the live backfill is exercised at startup (`_backfill_edge_fields`).
+These tests pin the property that matters: the store does not decide what kinds of relation exist.
+A test that asserted a fixed set of kinds would be the forcing itself, written down and made
+permanent, so what is asserted here is the absence of one.
 """
-from mantle.entities.relation import EDGE_RELATIONS, Relation, derive_relation
+import mantle.entities.relation as relation_module
+from mantle.entities.relation import derive_relation, observed_relation
 
 
-def test_relation_vocabulary_is_information_centric():
-    # No physics names; the five information-centric kinds, valence borrowed elsewhere.
-    assert {r.value for r in Relation} == {
-        "grant", "temporal", "semantic", "lifecycle", "derivation"
-    }
+def test_what_was_observed_is_returned_unchanged():
+    """Whatever the writer recorded is what comes back. No mapping, no normalisation."""
+    for word in ("operator", "reference", "cites", "rebuts", "was-measured-by", "小分類", "🜃"):
+        assert observed_relation(origin=False, relationship=word) == word
+        assert observed_relation(origin=True, relationship=word) == word
 
 
-def test_edges_collection_only_stores_grant_and_derivation():
-    assert EDGE_RELATIONS == {"grant", "derivation"}
+def test_the_vocabulary_is_open():
+    """An unseen word is carried, not rejected and not mapped to a nearest member.
+
+    This is the whole property. A closed vocabulary fails in both directions — a corpus whose
+    relations do not fit has them flattened at write time, where nothing downstream can recover the
+    distinction; a corpus with fewer kinds carries a vocabulary asserting structure it lacks.
+    """
+    invented = "a-relation-nobody-declared-in-advance"
+    assert observed_relation(origin=False, relationship=invented) == invented
 
 
-def test_operator_edges_are_derivations():
-    assert derive_relation(origin=False, relationship="operator") == "derivation"
-    assert derive_relation(origin=True, relationship="operator") == "derivation"
+def test_nothing_observed_is_reported_as_nothing():
+    """`None` is a fact about the edge, not a gap to be filled with a default."""
+    assert observed_relation(origin=True, relationship=None) is None
+    assert observed_relation(origin=False, relationship=None) is None
 
 
-def test_containment_edges_are_grants():
-    # origin containment and plain links both sit in the access/grant topology.
-    assert derive_relation(origin=True, relationship=None) == "grant"
-    assert derive_relation(origin=False, relationship=None) == "grant"
-    assert derive_relation(origin=True, relationship="reference") == "grant"
+def test_containment_does_not_derive_a_kind():
+    """`origin` is part of what was observed and is not used to classify.
+
+    An edge's containment role is real and the store records it in its own column. Turning it into
+    a relation *kind* would be this module classifying, and the same edge would then carry two
+    disagreeing accounts of what it is.
+    """
+    assert observed_relation(origin=True, relationship=None) == observed_relation(
+        origin=False, relationship=None
+    )
+    assert observed_relation(origin=True, relationship="cites") == observed_relation(
+        origin=False, relationship="cites"
+    )
+
+
+def test_there_is_no_enumeration_to_import():
+    """The closed vocabulary is gone, and its absence is asserted rather than assumed.
+
+    `Relation` and `EDGE_RELATIONS` were a five-member enum and a two-member frozenset over it.
+    Either one reappearing would restore a fixed set of possible relations, so their absence is
+    checked here — a module attribute is easy to add back by habit, and this is what notices.
+    """
+    assert not hasattr(relation_module, "Relation")
+    assert not hasattr(relation_module, "EDGE_RELATIONS")
+
+
+def test_the_previous_name_still_resolves():
+    """`derive_relation` is retained as an alias so existing imports keep working."""
+    assert derive_relation is observed_relation

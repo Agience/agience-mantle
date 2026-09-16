@@ -224,6 +224,14 @@ mantle-wal-checkpoint = "mantle.scripts.wal_checkpoint:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+# ⚠ `include` ANCHORS DISCOVERY, and without it this distribution is safe only by accident of
+# layout. `src/` happens to hold nothing but `mantle/` today; the day it also holds `tests/` or
+# `types/`, setuptools writes those into `top_level.txt` and ships them, and `pip install
+# agience-mantle` installs a top-level `tests` module into site-packages that squats the name for
+# every other package in the environment. agience-crystal 0.1.0 did exactly that and its
+# `top_level.txt` still shows it. Crystal, chorus and ember each carry this line for that reason;
+# adding it changes nothing about the current wheel (verified 2026-09-16, file list identical).
+include = ["mantle*"]
 
 # A glob covers only the package it names. `mantle = [...]` matches files directly in `src/mantle/`
 # and does not descend into subpackages, each of which is a package in its own right and needs its

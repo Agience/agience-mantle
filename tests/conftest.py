@@ -288,21 +288,6 @@ def override_dependencies():
     app.dependency_overrides.clear()
 
 @pytest.fixture(autouse=True)
-def _reset_runtime_types():
-    """Self-registered (runtime) content types live in a process-global registry.
-    Reset it around every test so one test's pushed/seeded types never leak into
-    another (and so resolution sees only the core filesystem base by default)."""
-    from mantle.services import types_service
-    types_service.clear_runtime_types()
-    types_service.invalidate_type_cache()
-    types_service.set_lazy_type_loader(None)
-    yield
-    types_service.clear_runtime_types()
-    types_service.invalidate_type_cache()
-    types_service.set_lazy_type_loader(None)
-
-
-@pytest.fixture(autouse=True)
 def _reset_indexed_geometry():
     """A test starts from a store that has never been indexed under any AnchorSet.
 

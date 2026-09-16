@@ -682,10 +682,7 @@ def count_other_containers_for_root(db: LatticeDatabase, root_id: str,
 # pruned by each edge's `propagate` action mask. Plus the artifact lifecycle utilities that ride
 # these edges (archive / batch-commit / delete-by-root / remove-edges).
 # ─────────────────────────────────────────────────────────────────────────────
-try:
-    from mantle.entities.relation import derive_relation
-except ImportError:
-    from mantle.entities.relation import derive_relation
+from mantle.entities.relation import observed_relation
 
 
 def get_edge(db: LatticeDatabase, collection_id: str, root_id: str) -> Optional[Dict[str, Any]]:
@@ -700,7 +697,7 @@ def get_edge(db: LatticeDatabase, collection_id: str, root_id: str) -> Optional[
         "origin": bool(_eprop(e, "is_origin")),
         "propagate": _prop_mask(e),
         "relationship": rel,
-        "relation": derive_relation(origin=bool(_eprop(e, "is_origin")), relationship=rel),
+        "relation": observed_relation(origin=bool(_eprop(e, "is_origin")), relationship=rel),
     }
 
 

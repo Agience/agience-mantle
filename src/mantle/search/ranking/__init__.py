@@ -13,7 +13,7 @@ Every part of it degrades to a measured statement rather than a guess:
     nothing reachable          -> the same, `{"reach": "unreached"}` with the count
     two ingests, one concept   -> the rows fold to one and the account names what was folded
     no synset in the ranking   -> the cut has no frame to read and falls back to `_knee`
-    no instrument registered   -> the cut falls back to `_knee`, a proportional-drop rule
+    no instrument registered   -> the cut falls back to `_knee`, a between-class-variance split
 
 So the base install ranks lexically and cuts by `_knee`; attaching the ontology (the `match` seam)
 turns on reach, and attaching an instrument turns the cut into the aperture's own `k_signal`. That
@@ -187,10 +187,13 @@ def _knee(scores: Sequence[float], *, frame=None) -> int:
 def _relevance_cut(scores: Sequence[float], *, query: str | None = None, frame=None) -> int:
     """Where the relevance signal ends — the derived span count. A seam.
 
-    Default: `_knee` (a proportional-drop rule, unit-tested). Optionally `adaptive_cut` — the aperture
-    gates whether there is coherent signal above its derived noise floor (`K_signal`) and the
-    scale-invariant relative gap says where: model-free, no embedding, no tunable constant. Gated by
-    `EMBER_ADAPTIVE_MODE` (off|on|shadow), default off, so the serve path is byte-for-byte `_knee`.
+    Baseline: `_knee`, which defers to `prism.resolution.signal_end` — the instrument's certified
+    `k_signal` when a frame is present, and otherwise a maximum-between-class-variance split.
+    Optionally `adaptive_cut` — the aperture gates whether there is coherent signal above its derived
+    noise floor (`K_signal`) and the scale-invariant relative gap says where: model-free, no
+    embedding, no tunable constant. Gated by `EMBER_ADAPTIVE_MODE` (off|on|shadow), and
+    `prism.adaptive_cut._DEFAULT_MODE` is `on`, so the adaptive pick is what the serve path returns
+    unless the variable says otherwise.
     `shadow` serves `_knee` unchanged and records the adaptive pick alongside it
     (`EMBER_ADAPTIVE_SHADOW_LOG`) for a label-free A/B."""
     baseline = _knee(scores, frame=frame)

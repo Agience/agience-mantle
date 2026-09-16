@@ -221,15 +221,15 @@ def test_erasure_takes_what_is_grounded_and_leaves_the_rest(db):
 
 
 def test_delete_person_removes_the_record(db):
-    pid = lattice_identity.create_person(db, {"id": "p-1", "email": "jane@x.com",
+    pid = lattice_identity.create_person(db, {"id": "p-1", "email": "jane@example.com",
                                               "oidc_subject": "sub-1"})
     assert pid == "p-1"
-    assert lattice_identity.get_person_by_email(db, "jane@x.com") is not None
+    assert lattice_identity.get_person_by_email(db, "jane@example.com") is not None
 
     assert lattice_identity.delete_person(db, "p-1") is True
 
     assert lattice_identity.get_person_by_id(db, "p-1") is None
-    assert lattice_identity.get_person_by_email(db, "jane@x.com") is None
+    assert lattice_identity.get_person_by_email(db, "jane@example.com") is None
     assert lattice_identity.count_people(db) == 0
 
 
@@ -252,8 +252,8 @@ def test_create_person_error_does_not_log_the_email(db, caplog, monkeypatch):
     monkeypatch.setattr(lattice_identity._PEOPLE, "put",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     with caplog.at_level(logging.ERROR):
-        assert lattice_identity.create_person(db, {"id": "p-9", "email": "jane@x.com"}) is None
-    assert "jane@x.com" not in caplog.text
+        assert lattice_identity.create_person(db, {"id": "p-9", "email": "jane@example.com"}) is None
+    assert "jane@example.com" not in caplog.text
     assert "p-9" in caplog.text
 
 

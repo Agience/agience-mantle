@@ -2176,6 +2176,7 @@ def update_upload_status(
     from mantle.services.content_service import (
         complete_multipart,
         head_object,
+        local_content_has,
         persist_object_to_durable,
     )
     from mantle.services.ingest_runner_service import describe_content_processing
@@ -2250,12 +2251,32 @@ def update_upload_status(
                 normalized.sort(key=lambda x: x["PartNumber"])
                 complete_multipart(key, multipart_id, normalized)
 
+        # ⛔ THE LOCAL CAS IS THE STORE; THE OBJECT STORE IS ITS MIRROR, AND THIS GATE HELD THE
+        # MIRROR TO BE THE STORE. `head_object` asks S3/MinIO and nothing else, so on a node with
+        # no object store — a configuration `PUT /artifacts/{id}/content` explicitly supports, in
+        # its own words "a node with no object store is a complete configuration: the write
+        # succeeds, nothing warns" — every upload wrote its bytes, verified them, and was then
+        # refused completion because the mirror had never been asked to hold them. The artifact
+        # stayed in `uploading` forever and the card never left Draft. Measured end to end
+        # 2026-09-13.
+        #
+        # ⚠ ASK THE TIERS IN THE ORDER THE READ PATH ASKS THEM. `GET /artifacts/{id}/content`
+        # resolves "local CAS first, object store behind it — the one tiered path, so this finds
+        # what a write on this node stored, with or without a mirror". A completion check that
+        # consults only the mirror can refuse content the very next read serves.
         head = head_object(key)
-        if not head:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Object not found in S3")
+        local_ref = ctx.get("content_cas_ref")
+        if not head and not (isinstance(local_ref, str) and local_content_has(local_ref)):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Upload content not found in this node's CAS or its object store",
+            )
 
-        ctx["size"] = head.get("ContentLength", ctx.get("size"))
-        ctx["content_type"] = head.get("ContentType", ctx.get("content_type"))
+        # Only the mirror can restate these; the local path already recorded them on the way in
+        # (`_record_content_ref`), so absent a mirror the values the write set are kept.
+        if head:
+            ctx["size"] = head.get("ContentLength", ctx.get("size"))
+            ctx["content_type"] = head.get("ContentType", ctx.get("content_type"))
         ctx["processing"] = describe_content_processing(ctx.get("content_type") or "", upload_complete=True)
 
         try:

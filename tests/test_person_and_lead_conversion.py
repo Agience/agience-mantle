@@ -41,7 +41,7 @@ def test_ensure_person_artifact_creates(monkeypatch):
     monkeypatch.setattr(up, "db_get_grants_for_principal_resource", lambda db, g, r: [])
     monkeypatch.setattr(up, "db_create_grant", lambda db, g: grants.append(g))
 
-    ctx = UserContext(id="u-1", email="jane@x.com", name="Jane", inbox_id="inbox-1")
+    ctx = UserContext(id="u-1", email="jane@example.com", name="Jane", inbox_id="inbox-1")
     up._ensure_person_artifact(MagicMock(), ctx)
 
     assert len(created) == 1
@@ -52,7 +52,7 @@ def test_ensure_person_artifact_creates(monkeypatch):
     ctxd = json.loads(e.context)
     assert ctxd["identity"]["agience_root_id"] == "u-1"
     assert ctxd["display_name"] == "Jane"
-    assert ctxd["email"] == "jane@x.com"
+    assert ctxd["email"] == "jane@example.com"
     # Homed in People, not the inbox.
     assert edges == [("people-col", e.id)]
     assert e.collection_id == "people-col"
@@ -114,7 +114,7 @@ def test_person_display_name_falls_back_to_email_local_part(monkeypatch):
     monkeypatch.setattr(up, "db_add_artifact_to_collection", lambda db, c, ch, **kw: None)
     monkeypatch.setattr(up, "db_get_grants_for_principal_resource", lambda db, g, r: [])
     monkeypatch.setattr(up, "db_create_grant", lambda db, g: None)
-    up._ensure_person_artifact(MagicMock(), UserContext(id="u-2", email="bob@acme.com", inbox_id="i"))
+    up._ensure_person_artifact(MagicMock(), UserContext(id="u-2", email="bob@acme.example", inbox_id="i"))
     assert json.loads(created[0].context)["display_name"] == "bob"
 
 
@@ -181,15 +181,15 @@ def test_convert_leads_matches_by_email(monkeypatch):
     monkeypatch.setattr(up, "db_list_collection_artifacts",
                         lambda db, c: [{"root_id": "lead-1"}, {"root_id": "lead-2"}, {"root_id": "lead-3"}])
     leads = {
-        "lead-1": _lead({"type": "lead", "source": "website-contact"}, {"email": "Jane@X.com", "name": "Jane"}),
-        "lead-2": _lead({"type": "lead"}, {"email": "other@x.com"}),                       # email mismatch
-        "lead-3": _lead({"type": "lead", "person_id": "someone"}, {"email": "jane@x.com"}),  # already converted
+        "lead-1": _lead({"type": "lead", "source": "website-contact"}, {"email": "Jane@Example.com", "name": "Jane"}),
+        "lead-2": _lead({"type": "lead"}, {"email": "other@example.com"}),                       # email mismatch
+        "lead-3": _lead({"type": "lead", "person_id": "someone"}, {"email": "jane@example.com"}),  # already converted
     }
     monkeypatch.setattr(up, "db_get_artifact", lambda db, rid: leads.get(rid))
     updated: list = []
     monkeypatch.setattr(up, "db_update_artifact", lambda db, e: updated.append(e))
 
-    n = up._convert_leads_for_person(MagicMock(), "u-1", "jane@x.com")
+    n = up._convert_leads_for_person(MagicMock(), "u-1", "jane@example.com")
 
     assert n == 1
     assert len(updated) == 1
@@ -201,7 +201,7 @@ def test_convert_leads_matches_by_email(monkeypatch):
 
 def test_convert_leads_noop_without_email_or_collection(monkeypatch):
     monkeypatch.setattr(up, "get_id_optional", lambda slug: None)
-    assert up._convert_leads_for_person(MagicMock(), "u-1", "jane@x.com") == 0
+    assert up._convert_leads_for_person(MagicMock(), "u-1", "jane@example.com") == 0
     monkeypatch.setattr(up, "get_id_optional", lambda slug: "leads-col")
     assert up._convert_leads_for_person(MagicMock(), "u-1", "") == 0
 
@@ -239,6 +239,6 @@ def test_provision_user_never_logs_the_email(caplog):
             patch.object(up, "_convert_leads_for_person"),
             patch("mantle.services.person_service.get_user_by_id", return_value=None),
         ):
-            up.provision_user(MagicMock(), "u-1", email="jane@x.com", name="Jane")
+            up.provision_user(MagicMock(), "u-1", email="jane@example.com", name="Jane")
 
-    assert "jane@x.com" not in caplog.text
+    assert "jane@example.com" not in caplog.text

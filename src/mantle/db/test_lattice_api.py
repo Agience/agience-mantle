@@ -579,7 +579,7 @@ def test_get_edge_and_relationship_target(db):
     api.add_artifact_to_collection(db, "col-E", "root-T", relationship="operator")
     e = api.get_edge(db, "col-E", "root-T")
     assert e is not None and e["relationship"] == "operator" and e["origin"] is True
-    assert e["relation"] == "derivation"           # operator edge = derivation
+    assert e["relation"] == "operator"             # what was observed, returned unchanged
     assert api.get_edge(db, "col-E", "nope") is None
     assert api.get_relationship_target(db, "col-E", "operator") == "root-T"
     assert api.get_relationship_target(db, "col-E", "missing") is None

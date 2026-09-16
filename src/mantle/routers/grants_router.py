@@ -25,6 +25,7 @@ from mantle.db.backend import (
 )
 from mantle.entities.grant import Grant as GrantEntity
 from mantle.api.errors import ERROR_DESCRIPTIONS
+from mantle.api.unknown_fields import CountsUnknownFields
 
 logger = logging.getLogger(__name__)
 
@@ -94,11 +95,11 @@ def _errors(*codes: int, ok: Optional[type] = None, ok_code: int = 200) -> dict:
 # Request / Response Models
 # =============================================================================
 
-class ClaimInviteRequest(BaseModel):
+class ClaimInviteRequest(CountsUnknownFields):
     token: str
 
 
-class CreateGrantRequest(BaseModel):
+class CreateGrantRequest(CountsUnknownFields):
     resource_id: str
     # CRUDEASIO
     can_create: bool = False
@@ -647,7 +648,7 @@ def _role_from_bits(body: CreateGrantRequest) -> Optional[str]:
 # different permission levels; the bundle's own bits are the ceiling over all of them.
 
 
-class CreateGrantKeyRequest(BaseModel):
+class CreateGrantKeyRequest(CountsUnknownFields):
     name: str
     #: Omit for a bundle — a bundle root reaches nothing itself and exists to carry
     #: members. Provide one for a plain single-resource key.
@@ -666,7 +667,7 @@ class CreateGrantKeyRequest(BaseModel):
     notes: Optional[str] = None
 
 
-class AddBundleMemberRequest(BaseModel):
+class AddBundleMemberRequest(CountsUnknownFields):
     resource_id: str
     role: Optional[str] = None
     can_create: bool = False

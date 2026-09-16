@@ -9,7 +9,7 @@ oracle kept verbatim in this file.
 
 The sections, in order:
 
-  1. The parity sweep. Sweeps all thirteen moved functions against the oracle over a shared corpus
+  1. The parity sweep. Sweeps all six moved functions against the oracle over a shared corpus
      of inputs, bit-equal — never `approx`, because comparing two numbers with a tolerance is how a
      divergence hides.
   2. No tuned constants. Asserts each derivation moves with its inputs — a derivation that returns
@@ -770,8 +770,8 @@ def test_the_cut_is_not_re_exported_from_the_package_promise() -> None:
     on and cannot be changed without breaking them. `cut` is reached by its own path, exactly as
     `instrument` is.
 
-    Fails if thirteen names are added to `mantle.search.beacon.__all__` as a convenience and the
-    published surface doubles by accident. Widening it is a separate deliberate act."""
+    Fails if `cut`'s seven names are added to `mantle.search.beacon.__all__` as a convenience,
+    taking the published surface from six to thirteen. Widening it is a separate deliberate act."""
     from mantle.search import beacon
     assert set(beacon.__all__).isdisjoint(set(cut.__all__))
 
@@ -779,7 +779,7 @@ def test_the_cut_is_not_re_exported_from_the_package_promise() -> None:
 # ═════════════════════════════════════════════════════════════════════════════════════════════
 # 6 · The shared corpus — the contract with the sibling implementation
 # ═════════════════════════════════════════════════════════════════════════════════════════════
-# `tests/lock_corpus.json` holds the same 6,400 cases as the sibling implementation's corpus. Both
+# `tests/lock_corpus.json` holds the same 76 cases as the sibling implementation's corpus. Both
 # read it, so a change to the lock on either side fails on BOTH rather than only where somebody
 # happened to write a test. That is the difference between a conformance test and a contract: the
 # sibling's suite already measured this side, and nothing measured that one.
