@@ -132,7 +132,7 @@ USER_READABLE_SEED_SLUGS = [
     ANCHORSET_COLLECTION_SLUG,
 ]
 
-# Collections whose committed artifacts are materialized into the user's inbox workspace.
+# Collections whose live artifacts are materialized into the user's inbox workspace.
 # Inbox Seeds currently contains curated collection artifacts (for example Start Here and
 # Platform Artifacts). Their member artifacts remain in their own collections and are not
 # flattened into every inbox workspace.

@@ -153,9 +153,11 @@ def test_enforcement_precedes_the_acting_principal():
 
     from mantle.services import dependencies
 
+    # `enforce_token_bounds` is the scope check plus the nonce check, shared with `/events`.
+    assert "_enforce_token_scope(" in inspect.getsource(dependencies.enforce_token_bounds)
     src = inspect.getsource(dependencies.get_auth)
-    assert "_enforce_token_scope" in src, "get_auth no longer enforces token scope at all"
-    assert src.index("_enforce_token_scope") < src.index("set_acting_principal("), (
+    assert "enforce_token_bounds(" in src, "get_auth no longer enforces token scope at all"
+    assert src.index("enforce_token_bounds(") < src.index("set_acting_principal("), (
         "the scope check runs AFTER the acting principal is published, so a refused token has "
         "already been granted key-custody standing")
 

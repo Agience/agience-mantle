@@ -36,7 +36,7 @@ def _container_with(db, n, user="u"):
         aid = "m%d" % i
         store.create_artifact(db, ArtifactEntity(
             id=aid, root_id=aid, collection_id=cid, created_by=user,
-            state=ArtifactEntity.STATE_COMMITTED, name=aid))
+            state=ArtifactEntity.STATE_LIVE, name=aid))
     return cid
 
 

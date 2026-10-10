@@ -397,7 +397,11 @@ async def get_invite_details_endpoint(
     if not auth.user_id:
         raise HTTPException(status_code=401, detail="User identification required")
     from mantle.services import grant_service
-    details = await offload_sync(grant_service.get_invite_details, store_db, token, auth.user_id)
+    # The same verified-address gate as `/claim`, so the details agree with what a claim would do.
+    _claimant_email = auth.email if getattr(auth, "email_verified", False) else ""
+    details = await offload_sync(
+        grant_service.get_invite_details, store_db, token, auth.user_id, _claimant_email
+    )
     if not details:
         raise HTTPException(status_code=404, detail="Invite not found or expired")
     return details
@@ -438,7 +442,7 @@ async def claim_invite_endpoint(
     try:
         # The address is passed only if the issuer vouched for it. Unverified, it is a string the
         # user chose, and matching an invite on it would let anyone claim an invite addressed to
-        # anyone else. Withheld, the claim falls back to asking Origin — the full-platform path.
+        # anyone else. Withheld, an email or domain invite does not match.
         _claimant_email = auth.email if getattr(auth, "email_verified", False) else ""
         created = await offload_sync(
             grant_service.claim_invite, store_db, auth.user_id, body.token, _claimant_email

@@ -82,7 +82,7 @@ def test_archived_versions_are_not_listed_as_separate_artifacts(lattice):
     The sensor artifacts are exactly this shape — one per property, re-versioned on every real
     change — so this is not hypothetical for the caller that found the bug.
     """
-    lattice.artifacts.put_artifact({"id": "s-1", "content_type": SENSOR, "state": "committed"})
+    lattice.artifacts.put_artifact({"id": "s-1", "content_type": SENSOR, "state": "live"})
     lattice.artifacts.put_artifact(
         {"id": "s-1@old", "root_id": "s-1", "content_type": SENSOR, "state": "archived"})
     assert _ids_of_content_type(lattice, SENSOR) == {"s-1"}

@@ -144,36 +144,13 @@ def _returned_keys(fn_name: str):
 def test_the_scan_finds_the_documented_routes():
     """A guard that reaches nothing reports green for ever."""
     doc = _documented()
-    #: 9 → 11 → 10 on 2026-08-26, and the last step was a retreat taken on evidence.
-    #: `list_visible` and `list_children` gained `PageResponse` and kept it — the `_page`
-    #: resolution above already understood them.
-    #:
-    #: `create_artifact` lost its envelope, and so did the read and update that were about
-    #: to gain one. Declaring them required enumerating a literal, and that literal truncated
-    #: the artifact document: `created_by` on every response, plus `modified_by`,
-    #: `content_ref`, and seventeen store-level fields on a task artifact.
-    #:
-    #: This gate is right that an unreadable return must not carry a documented envelope.
-    #: The mistake was making the return readable by making the document closed — a
-    #: hand-written `response_model`, doing the filtering this codebase refuses. An open
-    #: document cannot be declared as a closed one without becoming one.
-    #:
-    #: 11 → 16 on 2026-08-26, and all five artifact routes came back — `create_artifact`,
-    #: `read_artifact`, `update_artifact`, `upload_status` and `revert_artifact_endpoint`. The
-    #: retreat above turned out to rest on a false choice: the envelope was never blocked by the
-    #: document being open, it was blocked by this gate only knowing how to read a literal.
-    #:
-    #: Two changes made them readable without closing anything. `ArtifactResponse` gained
-    #: `extra="allow"`, so the spec says `additionalProperties: true` — twelve keys guaranteed,
-    #: more may arrive — and this gate learned to resolve `_artifact_body(…)` /
-    #: `_artifact_detail_body(…)`, whose guaranteed key sets are derived from the models.
-    #:
-    #: And widening it found a real defect it was built to find: `update_artifact`’s
-    #: top-level branch, `upload_status` and `revert` each returned a raw `to_dict`, which
-    #: omits unset fields. Declaring `ok=` on those would have promised twelve always-present
-    #: keys while shipping a shape that varied with the data. All three now go through the
-    #: helper. A gate that can read more finds more.
-    assert len(doc) == 16, "expected 16 documented envelopes, found %d: %r" % (len(doc), doc)
+    #: Fifteen: every route that declares an `ok=` envelope and returns something this scan can
+    #: read. The list routes return through `_page`; the artifact routes through
+    #: `_artifact_body(…)` / `_artifact_detail_body(…)`, whose guaranteed key sets are derived from
+    #: the models. `ArtifactResponse` is `extra="allow"`, so the spec says
+    #: `additionalProperties: true` — twelve keys guaranteed, more may arrive — which declares the
+    #: document without closing it.
+    assert len(doc) == 15, "expected 15 documented envelopes, found %d: %r" % (len(doc), doc)
 
 
 @pytest.mark.parametrize("handler,model_name", sorted(_documented().items()))

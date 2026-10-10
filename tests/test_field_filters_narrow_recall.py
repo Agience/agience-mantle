@@ -141,7 +141,7 @@ def _doc(artifact_id: str) -> dict:
         "created_by": "user-bob",
         "created_time": created,
         "modified_time": created,
-        "state": "committed",
+        "state": "live",
         "context": {"title": title, "tags": tags, "description": "a filed artifact"},
         "content": _TEXT[artifact_id],
     }
@@ -742,7 +742,7 @@ class TestTheEchoReportsWhatNarrowed:
         begin with. The claim is about filters, so it is made with one.
         """
         with pytest.raises(QueryFilterError):
-            _accessor(stack).search(_query(f"{TERM} state:draft"))
+            _accessor(stack).search(_query(f"{TERM} state:archived"))
 
 
 # ---------------------------------------------------------------------------
@@ -872,17 +872,17 @@ class TestUnsupportedInputIsRefusedByName:
 class TestStateIsARequestFieldNotAFilter:
     """The overlap, resolved in one direction.
 
-    `state` selects the index SEGMENT — `committed`, `draft` and `archived` are separately
-    keyed encrypted trees under distinct object-storage prefixes, chosen when the accessor is
-    built and before any query runs. A `state:draft` filter could not narrow a committed-segment
-    recall to drafts: no draft is in the tree being read, so there is nothing to narrow. Two
-    spellings of one control where only one of them can work is the incoherence, so the query
-    spelling is refused and pointed at the request field.
+    `state` selects the index SEGMENT — `live` and `archived` are separately keyed encrypted
+    trees under distinct object-storage prefixes, chosen when the accessor is built and before
+    any query runs. A `state:archived` filter could not narrow a live-segment recall to archived
+    artifacts: none is in the tree being read, so there is nothing to narrow. Two spellings of
+    one control where only one of them can work is the incoherence, so the query spelling is
+    refused and pointed at the request field.
     """
 
     def test_a_state_filter_is_refused(self):
         with pytest.raises(QueryFilterError) as exc:
-            compile_filters(parse_query("budget state:draft").filters)
+            compile_filters(parse_query("budget state:archived").filters)
         assert "state" in str(exc.value)
         assert "segment" in str(exc.value)
 
@@ -908,7 +908,7 @@ class TestStateIsARequestFieldNotAFilter:
         from mantle.search.query_parser import QueryParser
 
         assert not hasattr(QueryParser, "STANDARD_FIELDS")
-        assert parse_query("state:draft x").filters, (
+        assert parse_query("state:archived x").filters, (
             "`state` is a field the resolver refuses BY NAME, so the parser must still hand "
             "it on — a grammar that dropped it would turn the refusal into a silent search"
         )
@@ -1078,7 +1078,7 @@ class TestTheRecallApiContract:
 
     @patch("mantle.search.mantle.wiring.build_sse_search_accessor")
     async def test_a_state_filter_is_a_400_pointing_at_the_request_field(self, builder, client):
-        resp, _ = await self._post(client, builder, {"query_text": "budget state:draft"})
+        resp, _ = await self._post(client, builder, {"query_text": "budget state:archived"})
         assert resp.status_code == 400
         assert "request field" in resp.json()["detail"]
 
@@ -1086,7 +1086,7 @@ class TestTheRecallApiContract:
     async def test_the_state_request_field_still_works(self, builder, client):
         """The refusal above is only coherent if the field it names does the job."""
         resp, _ = await self._post(
-            client, builder, {"query_text": "budget", "state": "draft"},
+            client, builder, {"query_text": "budget", "state": "archived"},
         )
         assert resp.status_code == 200
 

@@ -76,7 +76,7 @@ class FileCellStore:
         root: Index root directory. Created eagerly, so a bad path fails at wiring time
             where the caller can still answer 503, rather than on the first index write.
         prefix: Sub-tree under ``root``, mirroring the S3 key prefix so the per-segment
-            (``committed`` / ``draft`` / ``archived``) index trees stay physically
+            (``live`` / ``archived``) index trees stay physically
             separate. Defaults to ``"mantle-cells"``.
     """
 

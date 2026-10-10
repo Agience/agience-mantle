@@ -59,7 +59,7 @@ def test_creating_the_resource_grants_nothing_by_itself(db):
     what their explicit grant gives them — `create_new_collection` mints one, so nothing regresses
     for a normally-created resource, but the fast-path must not exist."""
     from mantle.db.backend import create_grant  # noqa: F401  (ensures the module import path is live)
-    db.artifacts.put_artifact({"id": RESOURCE, "state": "committed", "created_by": OWNER,
+    db.artifacts.put_artifact({"id": RESOURCE, "state": "live", "created_by": OWNER,
                                "content_type": "application/vnd.agience.collection+json"})
     assert gs.can_share(db, OWNER, RESOURCE) is False
     assert gs.can_admin(db, OWNER, RESOURCE) is False
@@ -158,7 +158,7 @@ def test_a_targeted_invite_refuses_the_wrong_identity(db):
     _invite, token = gs.create_invite(db, user_id=OWNER, resource_id=RESOURCE, role="viewer",
                                       target_email="intended@example.com")
     with pytest.raises(gs.InviteIdentityMismatch):
-        gs.claim_invite(db, STRANGER, token)          # no person record -> no email -> no match
+        gs.claim_invite(db, STRANGER, token)          # no verified email -> no match
 
 
 def test_an_unknown_role_is_refused(db):

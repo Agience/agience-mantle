@@ -465,10 +465,7 @@ def get_invite_details(db: Database, raw_token: str, user_id: str,
     """Full invite details after verifying caller identity. None if invalid.
 
     ``claimant_email`` must be a verified address (the caller names that gate — see
-    `_verify_target_match`). It is a parameter rather than a free variable, and defaulting to `""`
-    keeps the single caller working and takes the Origin-lookup branch, which reads a verified
-    address off the person
-    record rather than trusting anything the request supplied.
+    `_verify_target_match`). Empty, an email or domain invite reports an identity mismatch.
     """
     try:
         invite = _lookup_active_invite(db, raw_token)
@@ -504,16 +501,20 @@ def _verify_target_match(db: Database, user_id: str, invite: GrantEntity,
                         claimant_email: str = "") -> None:
     """Raise InviteIdentityMismatch unless *user_id* matches the invite target.
 
-    `claimant_email` is the caller's own verified address, which is why this works
-    standalone: Mantle already verified a token carrying that address, so claim
-    resolution doesn't need an HTTP round trip to Origin. (The fallback below still
-    calls `person_service.get_user_by_id` — an HTTP GET to
-    `{ORIGIN_URI}/internal/persons/{id}` — when no verified email is passed.)
+    `claimant_email` is the caller's own verified address — the only address an email or
+    domain invite is matched against. Mantle already verified a token carrying it, so claim
+    resolution needs no round trip to Origin.
+
+    With no verified address an email or domain invite does not match. The address on the
+    Origin person record is not a substitute: `/internal/persons/{id}` returns the address
+    without saying whether it was verified, and matching an invite on an unverified address
+    lets anyone who can put an arbitrary address on an account claim an invite sent to it.
 
     The caller must pass only a verified address. `grants_router` gates on
     `auth.email_verified`; this function trusts what it is handed, which is why the
     gate is named at the call site rather than left implicit.
     """
+    del db
     match = False
     target_type = invite.target_entity_type
     target = invite.target_entity or ""
@@ -522,19 +523,6 @@ def _verify_target_match(db: Database, user_id: str, invite: GrantEntity,
         match = user_id == target
     elif target_type in ("email", "domain"):
         email = (claimant_email or "").strip().lower()
-        if not email:
-            # Fallback: ask Origin. Correct on the full platform, unreachable standalone — which is
-            # why the verified token claim is preferred above rather than added below.
-            person = None
-            try:
-                from mantle.services.person_service import get_user_by_id
-                # No subject token: this function is handed a `user_id` and a verified email, not
-                # a request, so it has no bearer to forward. That is a second reason the arm
-                # above is the preferred one — it needs no Origin call and therefore no scoping.
-                person = get_user_by_id(db=db, id=user_id)
-            except Exception:
-                person = None
-            email = (getattr(person, "email", None) or "").lower() if person else ""
         if email:
             if target_type == "email":
                 match = email == target.lower()

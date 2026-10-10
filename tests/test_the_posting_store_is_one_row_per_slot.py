@@ -139,16 +139,16 @@ def test_the_index_survives_a_reopen(tmp_path):
 
 
 def test_segments_do_not_see_each_other(tmp_path):
-    """`committed` / `draft` / `archived` stay physically separate — one file each, which is what
-    the file store's `prefix` did with one directory tree each."""
-    committed = SqlitePostingStore(str(tmp_path / "mantle-sse.db"))
-    draft = SqlitePostingStore(str(tmp_path / "mantle-sse-draft.db"))
+    """`live` / `archived` stay physically separate — one file each, which is what the file
+    store's `prefix` did with one directory tree each."""
+    live = SqlitePostingStore(str(tmp_path / "mantle-sse.db"))
+    archived = SqlitePostingStore(str(tmp_path / "mantle-sse-archived.db"))
     try:
-        committed.put_posting("owner-A", TOKEN_A, b"committed")
-        assert draft.get_posting("owner-A", TOKEN_A) is None
+        live.put_posting("owner-A", TOKEN_A, b"live")
+        assert archived.get_posting("owner-A", TOKEN_A) is None
     finally:
-        committed.close()
-        draft.close()
+        live.close()
+        archived.close()
 
 
 def test_list_owners_covers_manifest_only_owners(store):

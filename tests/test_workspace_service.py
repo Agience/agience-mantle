@@ -5,13 +5,11 @@ Covers the artifact-lifecycle spine:
   - Workspace CRUD: create, get/owner-mismatch 404, update, delete
   - Artifact create / list / get with collection-scope guard
   - update_artifact state transitions:
-      draft  → edited (dirty in-place)
-      committed → _ensure_draft promotes to new draft (no committed mutation)
-      archive toggle
+      live → edited in place, on the lineage's newest live row, no second row
+      archive toggle, and unarchive back to live
       no-op when nothing dirty
       409 on editing archived
-  - delete_artifact removes edges only when no other versions remain
-  - revert_artifact drops draft and returns latest committed
+  - delete_artifact removes edges only when no other live versions remain
   - move_workspace_artifact picks a fractional mid_key between neighbours
 """
 
@@ -116,7 +114,7 @@ def _full_grant() -> GrantEntity:
 def _artifact(
     aid: str = "a-1",
     root_id: str | None = None,
-    state: str = ArtifactEntity.STATE_DRAFT,
+    state: str = ArtifactEntity.STATE_LIVE,
     collection_id: str = "ws-1",
     context: str = '{"content_type":"text/plain"}',
     content: str = "hello",
@@ -299,8 +297,8 @@ class TestWorkspaceCrud:
         file, could only be forgotten by being erased.
 
         The segment move is half the fix and the half that matters for recall: each state is a
-        separately keyed tree, so an archived artifact is not filtered out of a committed
-        search, it is absent from the tree being searched.
+        separately keyed tree, so an archived artifact is not filtered out of a live search, it
+        is absent from the tree being searched.
         """
         db = MagicMock()
         ws = _ws()
@@ -318,18 +316,15 @@ class TestWorkspaceCrud:
         # The container id is the artifact's OWN id: a top-level artifact is its own
         # container, and passing `collection_id` (empty here) would move nothing.
         assert enqueue.call_args.args[1] == "ws-1"
-        assert enqueue.call_args.kwargs["vacate"] == ["committed", "draft"]
+        assert enqueue.call_args.kwargs["vacate"] == ["live"]
 
-    def test_update_workspace_unarchives_to_committed_not_draft(self):
-        """Unarchiving a top-level artifact returns it to `committed`.
-
-        Deliberately different from `update_artifact`, which unarchives a collection member to
-        `draft`. That is right for a member because a commit path is waiting for it; a
-        top-level artifact has none — `create_container` writes `committed` directly and
-        nothing here promotes a draft — so unarchiving into draft would strand it in a segment
-        the default recall does not search and no path could move it out of.
-        """
+    def test_update_workspace_unarchives_to_live(self):
+        """Unarchiving a top-level artifact returns it to `live`, the segment the default recall
+        reads, and moves its index entry out of `archived`."""
         db = MagicMock()
+        # A retired lineage: the row supersedes nothing and no other version is live.
+        db.artifacts.get_artifact.return_value = {}
+        db.artifacts.versions_of.return_value = []
         ws = _ws()
         ws.state = CollectionEntity.STATE_ARCHIVED
         with (
@@ -338,9 +333,9 @@ class TestWorkspaceCrud:
             patch("mantle.search.ingest.pipeline_unified.enqueue_index_artifact") as enqueue,
         ):
             out = ws_svc.update_workspace(
-                db, "user-1", "ws-1", name=None, description=None, state="committed",
+                db, "user-1", "ws-1", name=None, description=None, state="live",
             )
-        assert out.state == CollectionEntity.STATE_COMMITTED
+        assert out.state == CollectionEntity.STATE_LIVE
         assert enqueue.call_args.kwargs["vacate"] == ["archived"]
 
     def test_update_workspace_refuses_to_edit_an_archived_artifact(self):
@@ -422,14 +417,19 @@ class TestArtifactCrud:
 class TestUpdateArtifactStateMachine:
     @pytest.fixture(autouse=True)
     def _silence_side_effects(self):
+        # `get_current_in_collection` answers None unless a test says otherwise: the target the
+        # caller named is then the one edited. `db` is a MagicMock, so the real lineage read has
+        # nothing to read.
         with (
             patch("mantle.services.workspace_service._emit_event"),
+            patch("mantle.services.workspace_service.store.get_current_in_collection",
+                  return_value=None),
         ):
             yield
 
     def test_archive_toggle_marks_archived(self):
         db = MagicMock()
-        art = _artifact(state=ArtifactEntity.STATE_DRAFT)
+        art = _artifact(state=ArtifactEntity.STATE_LIVE)
         with (
             patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
             patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
@@ -442,25 +442,31 @@ class TestUpdateArtifactStateMachine:
         assert out.state == ArtifactEntity.STATE_ARCHIVED
         upd.assert_called_once()
 
-    def test_unarchive_back_to_draft(self):
+    def test_unarchive_lands_in_the_default_recall_segment(self):
+        """`state: "live"` on an archived member restores it to `live`, the segment `recall`
+        reads by default, and moves its index entry out of `archived`."""
         db = MagicMock()
+        # A retired lineage: the row supersedes nothing and no other version is live.
+        db.artifacts.get_artifact.return_value = {}
+        db.artifacts.versions_of.return_value = []
         art = _artifact(state=ArtifactEntity.STATE_ARCHIVED)
         with (
             patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
             patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
             patch("mantle.services.workspace_service.store.update_artifact"),
+            patch("mantle.search.ingest.pipeline_unified.enqueue_index_artifact") as idx,
         ):
             out = ws_svc.update_artifact(
-                db, "user-1", "ws-1", "a-1",
-                state=ArtifactEntity.STATE_DRAFT, reindex=False,
+                db, "user-1", "ws-1", "a-1", state=ArtifactEntity.STATE_LIVE,
             )
-        assert out.state == ArtifactEntity.STATE_DRAFT
+        assert out.state == ArtifactEntity.STATE_LIVE
+        assert idx.call_args.kwargs["vacate"] == ["archived"]
 
-    def test_archive_reindexes_and_vacates_committed_and_draft(self):
+    def test_archive_reindexes_and_vacates_live(self):
         """Archiving (re)indexes into the archived segment and, in the same job,
-        vacates the segments the root is leaving (committed + draft)."""
+        vacates the segment the root is leaving."""
         db = MagicMock()
-        art = _artifact(state=ArtifactEntity.STATE_DRAFT)
+        art = _artifact(state=ArtifactEntity.STATE_LIVE)
         with (
             patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
             patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
@@ -471,7 +477,7 @@ class TestUpdateArtifactStateMachine:
                 db, "user-1", "ws-1", "a-1", state=ArtifactEntity.STATE_ARCHIVED,
             )
         idx.assert_called_once()
-        assert idx.call_args.kwargs["vacate"] == ["committed", "draft"]
+        assert idx.call_args.kwargs["vacate"] == ["live"]
 
     def test_editing_archived_without_unarchive_raises_409(self):
         db = MagicMock()
@@ -486,26 +492,26 @@ class TestUpdateArtifactStateMachine:
                 )
         assert ei.value.status_code == 409
 
-    def test_editing_committed_promotes_to_new_draft_with_same_root(self):
+    def test_editing_live_writes_it_in_place(self):
+        """No second row: the live version itself takes the edit and stays live."""
         db = MagicMock()
-        committed = _artifact(state=ArtifactEntity.STATE_COMMITTED)
-        # No existing draft for this root.
+        live = _artifact(state=ArtifactEntity.STATE_LIVE)
         with (
             patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
-            patch("mantle.services.workspace_service.store.get_artifact", return_value=committed),
-            patch("mantle.services.workspace_service.store.get_draft_artifact", return_value=None),
+            patch("mantle.services.workspace_service.store.get_artifact", return_value=live),
+            patch("mantle.services.workspace_service.store.get_current_in_collection",
+                  return_value=live),
             patch("mantle.services.workspace_service.store.create_artifact") as create_new,
-            patch("mantle.services.workspace_service.store.update_artifact"),
+            patch("mantle.services.workspace_service.store.update_artifact") as upd,
         ):
             out = ws_svc.update_artifact(
                 db, "user-1", "ws-1", "a-1", content="edited", reindex=False
             )
-        # A new draft was created with the same root_id, distinct id.
-        create_new.assert_called_once()
-        new_draft = create_new.call_args[0][1]
-        assert new_draft.root_id == committed.root_id
-        assert new_draft.id != committed.id
-        assert new_draft.state == ArtifactEntity.STATE_DRAFT
+        create_new.assert_not_called()
+        upd.assert_called_once()
+        assert upd.call_args.args[1] is live
+        assert out.id == live.id
+        assert out.state == ArtifactEntity.STATE_LIVE
         assert out.content == "edited"
 
     @pytest.mark.real_content_store
@@ -525,66 +531,85 @@ class TestUpdateArtifactStateMachine:
         assert ref == "cas/" + "d" * 64
         assert echoed == content, "the caller keeps the body for indexing and the API response"
         assert put_cas.call_args.kwargs["cas"] is True
-    def test_editing_committed_reuses_existing_draft(self):
+    def test_an_edit_goes_to_the_newest_live_row_of_the_lineage(self):
+        """A caller naming an older row of a lineage — a store that has not been migrated
+        can hold an older `draft` beside a newer `committed` row, or the reverse — edits the
+        newest live row, the one recall hydrates. The edit is an in-place rewrite of the root's
+        index entry, and it vacates nothing."""
         db = MagicMock()
-        committed = _artifact(aid="committed-id", state=ArtifactEntity.STATE_COMMITTED)
-        existing_draft = _artifact(aid="draft-id", root_id=committed.root_id)
+        older = _artifact(aid="older-id")
+        newest = _artifact(aid="newest-id", root_id=older.root_id)
         with (
             patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
-            patch("mantle.services.workspace_service.store.get_artifact", return_value=committed),
+            patch("mantle.services.workspace_service.store.get_artifact", return_value=older),
             patch(
-                "mantle.services.workspace_service.store.get_draft_artifact",
-                return_value=existing_draft,
+                "mantle.services.workspace_service.store.get_current_in_collection",
+                return_value=newest,
             ),
             patch("mantle.services.workspace_service.store.create_artifact") as create_new,
-            patch("mantle.services.workspace_service.store.update_artifact"),
-        ):
-            ws_svc.update_artifact(
-                db, "user-1", "ws-1", "committed-id", content="x", reindex=False
-            )
-        create_new.assert_not_called()
-
-    def test_root_id_update_prefers_existing_draft_in_workspace(self):
-        db = MagicMock()
-        draft = _artifact(aid="draft-id", root_id="root-1", content="old")
-        with (
-            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
-            patch("mantle.services.workspace_service.store.get_artifact", return_value=None),
-            patch("mantle.services.workspace_service.store.get_draft_artifact", return_value=draft) as get_draft,
-            patch("mantle.services.workspace_service.store.get_latest_committed_artifact") as get_committed,
             patch("mantle.services.workspace_service.store.update_artifact") as upd,
+            patch("mantle.search.ingest.pipeline_unified.enqueue_index_artifact") as idx,
         ):
             out = ws_svc.update_artifact(
-                db, "user-1", "ws-1", "root-1", content="new", reindex=False
+                db, "user-1", "ws-1", "older-id", content="x",
             )
-        get_draft.assert_called_once_with(db, "root-1", "ws-1")
-        get_committed.assert_not_called()
-        upd.assert_called_once()
-        assert out.id == "draft-id"
-        assert out.content == "new"
+        create_new.assert_not_called()
+        assert upd.call_args.args[1] is newest
+        assert out.id == "newest-id"
+        assert out.state == ArtifactEntity.STATE_LIVE
+        assert idx.call_args.kwargs.get("vacate") is None
+        assert idx.call_args.kwargs["replace"] is True
 
-    def test_root_id_update_falls_back_to_latest_committed(self):
+    def test_an_edit_redirected_to_another_row_checks_update_on_that_row(self):
+        """The caller's `update` was checked on the id it named; the row actually written is
+        checked too, and a refusal there writes nothing."""
         db = MagicMock()
-        committed = _artifact(aid="committed-id", root_id="root-1", state=ArtifactEntity.STATE_COMMITTED)
+        older = _artifact(aid="older-id")
+        newest = _artifact(aid="newest-id", root_id=older.root_id)
+        checked = []
+
+        def _check(auth, artifact_id, action, _db):
+            checked.append((artifact_id, action))
+            raise HTTPException(404, "Not found")
+
+        with (
+            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
+            patch("mantle.services.workspace_service.store.get_artifact", return_value=older),
+            patch("mantle.services.workspace_service.store.get_current_in_collection",
+                  return_value=newest),
+            patch("mantle.services.dependencies.check_access", side_effect=_check),
+            patch("mantle.services.workspace_service.store.update_artifact") as upd,
+        ):
+            with pytest.raises(HTTPException) as exc:
+                ws_svc.update_artifact(db, "user-1", "ws-1", "older-id", content="x",
+                                       reindex=False, auth=object())
+        assert exc.value.status_code == 404
+        assert checked == [("newest-id", "update")]
+        upd.assert_not_called()
+
+    def test_root_id_update_resolves_the_newest_live_version(self):
+        db = MagicMock()
+        live = _artifact(aid="live-id", root_id="root-1")
         with (
             patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
             patch("mantle.services.workspace_service.store.get_artifact", return_value=None),
-            patch("mantle.services.workspace_service.store.get_draft_artifact", return_value=None) as get_draft,
             patch(
-                "mantle.services.workspace_service.store.get_latest_committed_artifact",
-                return_value=committed,
-            ) as get_committed,
+                "mantle.services.workspace_service.store.get_latest_live_artifact",
+                return_value=live,
+            ) as get_live,
+            patch("mantle.services.workspace_service.store.get_current_in_collection",
+                  return_value=live),
             patch("mantle.services.workspace_service.store.create_artifact") as create_new,
             patch("mantle.services.workspace_service.store.update_artifact"),
         ):
             out = ws_svc.update_artifact(
                 db, "user-1", "ws-1", "root-1", content="edited", reindex=False
             )
-        assert get_draft.call_args_list[0].args == (db, "root-1", "ws-1")
-        get_committed.assert_called_once_with(db, "root-1", "ws-1")
-        create_new.assert_called_once()
+        get_live.assert_called_once_with(db, "root-1", "ws-1")
+        create_new.assert_not_called()
+        assert out.id == "live-id"
         assert out.root_id == "root-1"
-        assert out.state == ArtifactEntity.STATE_DRAFT
+        assert out.state == ArtifactEntity.STATE_LIVE
         assert out.content == "edited"
 
     def test_noop_when_nothing_dirty(self):
@@ -602,7 +627,7 @@ class TestUpdateArtifactStateMachine:
         assert out is art
 
     def test_update_content_persists_new_value(self):
-        """Editing content on a draft artifact stores the new value and marks dirty."""
+        """Editing content stores the new value and marks dirty."""
         db = MagicMock()
         art = _artifact(content="old content")
         with (
@@ -617,7 +642,7 @@ class TestUpdateArtifactStateMachine:
         assert out.content == "new content"
 
     def test_update_context_persists_new_value(self):
-        """Editing context on a draft artifact stores the new value and marks dirty."""
+        """Editing context stores the new value and marks dirty."""
         db = MagicMock()
         art = _artifact(context='{"content_type":"text/plain","title":"old"}')
         with (
@@ -649,44 +674,29 @@ class TestUpdateArtifactStateMachine:
         upd.assert_called_once()
         assert out.content == "new"
 
-    def test_commit_draft_flips_state_and_reindexes(self):
-        """PATCH state:committed on a draft flips it to committed and triggers indexing."""
+    def test_live_on_a_live_artifact_is_a_noop(self):
+        """PATCH state:live on a live artifact changes nothing and writes nothing."""
         db = MagicMock()
-        art = _artifact(state=ArtifactEntity.STATE_DRAFT)
+        art = _artifact(state=ArtifactEntity.STATE_LIVE)
         with (
             patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
             patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
-            patch("mantle.services.workspace_service.store.update_artifact") as upd,
-            patch("mantle.search.ingest.pipeline_unified.enqueue_index_artifact") as idx,
-        ):
-            out = ws_svc.update_artifact(
-                db, "user-1", "ws-1", "a-1", state=ArtifactEntity.STATE_COMMITTED
-            )
-        assert out.state == ArtifactEntity.STATE_COMMITTED
-        upd.assert_called_once()
-        idx.assert_called_once()
-
-    def test_commit_already_committed_is_noop(self):
-        """PATCH state:committed on an already-committed artifact is a no-op."""
-        db = MagicMock()
-        art = _artifact(state=ArtifactEntity.STATE_COMMITTED)
-        with (
-            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
-            patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
+            patch("mantle.services.workspace_service.store.get_current_in_collection",
+                  return_value=art),
             patch("mantle.services.workspace_service.store.update_artifact") as upd,
         ):
             out = ws_svc.update_artifact(
-                db, "user-1", "ws-1", "a-1", state=ArtifactEntity.STATE_COMMITTED
+                db, "user-1", "ws-1", "a-1", state=ArtifactEntity.STATE_LIVE
             )
-        assert out.state == ArtifactEntity.STATE_COMMITTED
+        assert out.state == ArtifactEntity.STATE_LIVE
         upd.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# delete_artifact / revert_artifact
+# delete_artifact
 # ---------------------------------------------------------------------------
 
-class TestDeleteRevert:
+class TestDelete:
     @pytest.fixture(autouse=True)
     def _silence(self):
         with (
@@ -703,7 +713,6 @@ class TestDeleteRevert:
             patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
             patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
             patch("mantle.services.workspace_service.store.list_version_history", return_value=[art]),
-            patch("mantle.services.workspace_service.store.get_draft_artifact", return_value=art),
             patch("mantle.services.workspace_service.store.list_collection_artifacts", return_value=[]),
             patch("mantle.services.workspace_service.store.delete_artifact"),
             patch("mantle.services.workspace_service.store.remove_all_edges_for_root") as remove_edges,
@@ -722,7 +731,6 @@ class TestDeleteRevert:
             patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
             patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
             patch("mantle.services.workspace_service.store.list_version_history", return_value=[art]),
-            patch("mantle.services.workspace_service.store.get_draft_artifact", return_value=art),
             patch("mantle.services.workspace_service.store.list_collection_artifacts",
                   return_value=[{"id": "child-1", "root_id": "child-root-1"}]),
             patch("mantle.services.workspace_service.store.delete_artifact"),
@@ -743,7 +751,6 @@ class TestDeleteRevert:
             patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
             patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
             patch("mantle.services.workspace_service.store.list_version_history", return_value=[art]),
-            patch("mantle.services.workspace_service.store.get_draft_artifact", return_value=art),
             patch("mantle.services.workspace_service.store.list_collection_artifacts",
                   return_value=[{"id": "child-1", "root_id": "child-root-1"}]),
             patch("mantle.services.workspace_service.store.delete_artifact"),
@@ -794,52 +801,15 @@ class TestDeleteRevert:
                 "mantle.services.workspace_service.store.list_version_history",
                 return_value=[art, sibling],
             ),
-            patch("mantle.services.workspace_service.store.get_draft_artifact", return_value=art),
             patch("mantle.services.workspace_service.store.delete_artifact"),
             patch("mantle.services.workspace_service.store.remove_all_edges_for_root") as remove_edges,
         ):
             ws_svc.delete_artifact(db, "user-1", "ws-1", "a-1")
         remove_edges.assert_not_called()
 
-    def test_revert_drops_draft_returns_committed(self):
-        db = MagicMock()
-        draft = _artifact(state=ArtifactEntity.STATE_DRAFT)
-        committed = _artifact(aid="committed-id", root_id=draft.root_id, state=ArtifactEntity.STATE_COMMITTED)
-        with (
-            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
-            patch("mantle.services.workspace_service.store.get_artifact", return_value=draft),
-            patch(
-                "mantle.services.workspace_service.store.get_latest_committed_artifact",
-                return_value=committed,
-            ),
-            patch("mantle.services.workspace_service.store.delete_artifact") as del_a,
-        ):
-            out = ws_svc.revert_artifact(db, db, "user-1", "ws-1", "a-1")
-        assert out is committed
-        del_a.assert_called_once_with(db, draft.id)
-
-    def test_revert_returns_target_when_not_a_draft(self):
-        db = MagicMock()
-        committed = _artifact(state=ArtifactEntity.STATE_COMMITTED)
-        with (
-            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
-            patch("mantle.services.workspace_service.store.get_artifact", return_value=committed),
-        ):
-            out = ws_svc.revert_artifact(db, db, "user-1", "ws-1", "a-1")
-        assert out is committed
-
-    def test_revert_returns_none_when_no_committed_anchor(self):
-        db = MagicMock()
-        draft = _artifact(state=ArtifactEntity.STATE_DRAFT)
-        with (
-            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
-            patch("mantle.services.workspace_service.store.get_artifact", return_value=draft),
-            patch(
-                "mantle.services.workspace_service.store.get_latest_committed_artifact",
-                return_value=None,
-            ),
-        ):
-            assert ws_svc.revert_artifact(db, db, "user-1", "ws-1", "a-1") is None
+    def test_there_is_no_revert(self):
+        """Nothing is a draft, so there is no draft delta to discard."""
+        assert not hasattr(ws_svc, "revert_artifact")
 
 
 # ---------------------------------------------------------------------------
@@ -851,6 +821,13 @@ class TestDeleteRevert:
 # ---------------------------------------------------------------------------
 
 class TestRemoveArtifactFromWorkspace:
+    """Unlinking is the container's; destroying the artifact is the artifact's own right.
+
+    An artifact HOMED in the container loses its index entry there whatever else happens, because
+    recall reads the entry from the home collection. The lineage is then destroyed only when no
+    other container holds the root and the caller may delete it; otherwise the row is kept.
+    """
+
     @pytest.fixture(autouse=True)
     def _silence(self):
         with patch("mantle.services.workspace_service._emit_event"):
@@ -868,113 +845,73 @@ class TestRemoveArtifactFromWorkspace:
                 ws_svc.remove_artifact_from_container(db, "user-1", "ws-1", "missing")
         assert ei.value.status_code == 404
 
-    def test_removes_edge_for_committed_artifact(self):
-        """Committed artifact: edge removed, artifact doc kept."""
+    def test_a_member_linked_in_from_elsewhere_loses_only_its_edge(self):
+        """Homed in another container: nothing of it lives here but the edge."""
         db = MagicMock()
-        art = _artifact(state=ArtifactEntity.STATE_COMMITTED)
+        art = _artifact(state=ArtifactEntity.STATE_LIVE, collection_id="other-ws")
         with (
-            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
             patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
             patch("mantle.services.workspace_service.store.get_edge",
-                  return_value={"root_id": art.root_id, "origin": True}),
+                  return_value={"root_id": art.root_id, "origin": False}),
             patch("mantle.services.workspace_service.store.remove_artifact_from_collection") as rm_edge,
-            patch("mantle.services.workspace_service.store.delete_artifact") as del_art,
+            patch("mantle.services.workspace_service.store.get_current_in_collection",
+                  return_value=None) as get_current,
+            patch("mantle.services.workspace_service.store.delete_artifacts_by_root") as destroy,
+            patch("mantle.search.ingest.pipeline_unified.delete_artifact_from_index") as deindex,
         ):
             result = ws_svc.remove_artifact_from_container(db, "user-1", "ws-1", "a-1")
 
         rm_edge.assert_called_once_with(db, "ws-1", art.root_id)
-        del_art.assert_not_called()
+        get_current.assert_called_once_with(db, "ws-1", art.root_id)
+        destroy.assert_not_called()
+        deindex.assert_not_called()
         assert result.id == art.id
 
-    def test_removes_edge_and_deletes_draft_doc(self):
-        """Draft artifact owned by this workspace: edge removed and draft doc deleted."""
+    def _homed(self, *, others: int, may_delete):
+        """Remove an artifact homed in ws-1, with the two facts the destroy turns on."""
         db = MagicMock()
-        art = _artifact(state=ArtifactEntity.STATE_DRAFT, collection_id="ws-1")
+        art = _artifact(state=ArtifactEntity.STATE_LIVE, collection_id="ws-1")
+        access = (patch("mantle.services.dependencies.check_access", return_value=None)
+                  if may_delete else
+                  patch("mantle.services.dependencies.check_access",
+                        side_effect=HTTPException(status_code=404, detail="Not found")))
         with (
-            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
             patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
             patch("mantle.services.workspace_service.store.get_edge", return_value={"_id": "ws-1/a-1"}),
             patch("mantle.services.workspace_service.store.remove_artifact_from_collection") as rm_edge,
             patch("mantle.services.workspace_service.store.get_current_in_collection", return_value=art),
-            patch("mantle.services.workspace_service.store.delete_artifact") as del_art,
-            patch("mantle.search.ingest.pipeline_unified.delete_artifact_from_index"),
-            # Authorized caller: the draft cleanup is a deletion and needs `delete` on the
-            # artifact itself — `evict` on the container authorizes the unlink, not the
-            # destruction of a version. Passing no `auth` fails closed, which is what the
-            # companion test below asserts.
-            patch("mantle.services.dependencies.check_access", return_value=None),
+            patch("mantle.services.workspace_service.store.count_other_containers_for_root",
+                  return_value=others),
+            patch("mantle.services.workspace_service.store.delete_artifacts_by_root") as destroy,
+            patch("mantle.services.workspace_service.store.remove_all_edges_for_root"),
+            patch("mantle.search.ingest.pipeline_unified.delete_artifact_from_index") as deindex,
+            access,
         ):
-            result = ws_svc.remove_artifact_from_container(
-                db, "user-1", "ws-1", "a-1", auth=object())
-
+            ws_svc.remove_artifact_from_container(
+                db, "user-1", "ws-1", "a-1", auth=object() if may_delete is not None else None)
         rm_edge.assert_called_once_with(db, "ws-1", art.root_id)
-        del_art.assert_called_once_with(db, art.id)
-        assert result.id == art.id
+        deindex.assert_called_once_with(art.id, art.root_id, collection_id="ws-1")
+        return db, art, destroy
 
-    def test_an_unauthorized_caller_unlinks_but_does_NOT_delete_the_draft(self):
-        """The assertion that catches the gap `evict`-only authorization would leave open.
+    def test_an_exclusive_member_the_caller_may_delete_is_destroyed(self):
+        db, art, destroy = self._homed(others=0, may_delete=True)
+        destroy.assert_called_once_with(db, art.root_id)
 
-        `evict` on the container is not enough on its own: a caller who could evict could destroy
-        a draft version homed there — another user's unfinished work — under a container
-        permission, with the artifact's own grants never consulted.
+    def test_an_unauthorized_caller_unlinks_but_does_NOT_destroy(self):
+        """`evict` on the container is not enough on its own: a caller who could evict could
+        otherwise destroy another user's artifact under a container permission, with the
+        artifact's own grants never consulted. The edge and the index entry still go."""
+        _db, _art, destroy = self._homed(others=0, may_delete=False)
+        destroy.assert_not_called()
 
-        The edge must still come off (that is a container property); the draft must survive.
-        """
-        db = MagicMock()
-        art = _artifact(state=ArtifactEntity.STATE_DRAFT, collection_id="ws-1")
-        with (
-            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
-            patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
-            patch("mantle.services.workspace_service.store.get_edge", return_value={"_id": "ws-1/a-1"}),
-            patch("mantle.services.workspace_service.store.remove_artifact_from_collection") as rm_edge,
-            patch("mantle.services.workspace_service.store.get_current_in_collection", return_value=art),
-            patch("mantle.services.workspace_service.store.delete_artifact") as del_art,
-            patch("mantle.search.ingest.pipeline_unified.delete_artifact_from_index"),
-            patch("mantle.services.dependencies.check_access",
-                  side_effect=HTTPException(status_code=404, detail="Not found")),
-        ):
-            ws_svc.remove_artifact_from_container(db, "user-1", "ws-1", "a-1", auth=object())
+    def test_no_auth_at_all_also_keeps_the_row(self):
+        """Fails CLOSED on the absence of a caller context, not open."""
+        _db, _art, destroy = self._homed(others=0, may_delete=None)
+        destroy.assert_not_called()
 
-        rm_edge.assert_called_once_with(db, "ws-1", art.root_id)
-        del_art.assert_not_called()
-
-    def test_no_auth_at_all_also_leaves_the_draft(self):
-        """Fails CLOSED on the absence of a caller context, not open. "Could not tell" must never
-        resolve to "delete it"."""
-        db = MagicMock()
-        art = _artifact(state=ArtifactEntity.STATE_DRAFT, collection_id="ws-1")
-        with (
-            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
-            patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
-            patch("mantle.services.workspace_service.store.get_edge", return_value={"_id": "ws-1/a-1"}),
-            patch("mantle.services.workspace_service.store.remove_artifact_from_collection"),
-            patch("mantle.services.workspace_service.store.get_current_in_collection", return_value=art),
-            patch("mantle.services.workspace_service.store.delete_artifact") as del_art,
-        ):
-            ws_svc.remove_artifact_from_container(db, "user-1", "ws-1", "a-1")
-
-        del_art.assert_not_called()
-
-    def test_falls_back_to_get_current_when_not_in_workspace(self):
-        """Artifact in different collection: fallback to get_current_in_collection."""
-        db = MagicMock()
-        art = _artifact(state=ArtifactEntity.STATE_COMMITTED, collection_id="other-ws")
-        with (
-            patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
-            patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
-            patch("mantle.services.workspace_service.store.get_edge",
-                  return_value={"root_id": art.root_id, "origin": True}),
-            patch(
-                "mantle.services.workspace_service.store.get_current_in_collection",
-                return_value=_artifact(state=ArtifactEntity.STATE_COMMITTED),
-            ) as get_current,
-            patch("mantle.services.workspace_service.store.remove_artifact_from_collection"),
-            patch("mantle.services.workspace_service.store.delete_artifact") as del_art,
-        ):
-            ws_svc.remove_artifact_from_container(db, "user-1", "ws-1", "a-1")
-
-        get_current.assert_called_once_with(db, "ws-1", "a-1")
-        del_art.assert_not_called()
+    def test_a_member_another_container_holds_is_kept(self):
+        _db, _art, destroy = self._homed(others=1, may_delete=True)
+        destroy.assert_not_called()
 
 
 class TestMoveAndOrder:

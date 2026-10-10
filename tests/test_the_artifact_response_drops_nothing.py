@@ -49,7 +49,7 @@ def test_the_declared_keys_are_ones_the_serialiser_actually_emits():
 
     That distinction is the whole correction: sweeping constructor arguments is what missed
     `created_by` and produced a "fixed key set" that dropped it."""
-    a = Artifact(id="x", state="committed", name="n", description="d", content="c",
+    a = Artifact(id="x", state="live", name="n", description="d", content="c",
                  content_type="t", collection_id="col", context="{}")
     a.created_by = "u"
     a.modified_by = "u"
@@ -61,7 +61,7 @@ def test_the_declared_keys_are_ones_the_serialiser_actually_emits():
 
 @pytest.mark.parametrize("doc", [
     {"id": "a"},
-    {"id": "a", "state": "committed"},
+    {"id": "a", "state": "live"},
     {"id": "a", "name": "n", "description": "d", "content_type": "t"},
     {},
 ])
@@ -105,7 +105,7 @@ def test_nothing_is_lost_for_any_combination_the_entity_can_produce():
                 collection_id="col", context="{}")
     for r in range(len(opts) + 1):
         for combo in itertools.combinations(opts, r):
-            a = Artifact(id="x", state="committed", **{k: opts[k] for k in combo})
+            a = Artifact(id="x", state="live", **{k: opts[k] for k in combo})
             a.created_by = "u"
             d = a.to_dict()
             body = _artifact_body(d)

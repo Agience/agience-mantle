@@ -221,7 +221,7 @@ class StoreAnchorRepo:
                 ),
                 created_by=_ANCHOR_CREATED_BY,
                 content_type=COLLECTION_CONTENT_TYPE,
-                state=CollectionEntity.STATE_COMMITTED,
+                state=CollectionEntity.STATE_LIVE,
                 created_time=now, modified_time=now,
             ))
             _persist_seed_ids(self._db, {ANCHORSET_COLLECTION_SLUG: cid})
@@ -336,7 +336,7 @@ class StoreAnchorRepo:
             collection_id=cid,
             content="",
             context=json.dumps(anchor.to_context(), separators=(",", ":")),
-            state=Artifact.STATE_COMMITTED,
+            state=Artifact.STATE_LIVE,
             created_by=_ANCHOR_CREATED_BY,
             name=anchor.label,
             content_type=ANCHOR_CONTENT_TYPE,

@@ -51,7 +51,7 @@ def test_mantle_rejects_garbage_token():
 
 
 def _a_collection(user) -> str:
-    """A committed top-level collection the user owns (see test_03_collections)."""
+    """A top-level collection the user owns (see test_03_collections)."""
     return user["api"].create_collection(f"key-{uuid.uuid4().hex[:6]}")["id"]
 
 

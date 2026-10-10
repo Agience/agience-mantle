@@ -1,7 +1,7 @@
-"""Commit lifecycle + first-observation (lazy materialization).
+"""Born findable + first-observation (lazy materialization).
 
-Commit: a child is born `draft`; `PATCH {state: committed}` promotes it. The
-committed segment is what `state="committed"` search sees.
+A child is born `live`, the segment a default search reads, with no promotion step between
+saving it and finding it.
 
 First-observation (only meaningful under `MANTLE_LAZY_INDEX=on`, gate with
 `E2E_LAZY_INDEX=1`): a `lazy` child is latent — absent from search — until its
@@ -21,7 +21,7 @@ import _config as cfg
 def _find(api, token, scope, tries=6, delay=0.5) -> bool:
     """Search a few times (indexing can lag the write)."""
     for _ in range(tries):
-        r = api.search(token, state="committed", scope=scope)
+        r = api.search(token, scope=scope)
         if r.status_code == 503:
             pytest.skip("search backend unavailable")
         if r.status_code == 200:
@@ -32,34 +32,29 @@ def _find(api, token, scope, tries=6, delay=0.5) -> bool:
     return False
 
 
-def test_state_transition_draft_to_committed(user):
-    coll = user["api"].create_collection(f"commit-{uuid.uuid4().hex[:6]}")
-    child = user["api"].create_child(coll["id"], name="doc", content="draft body")
-    assert child.get("state") == "draft"
-
-    r = user["api"].commit(child["id"])
-    assert r.status_code == 200, r.text
-    assert r.json().get("state") == "committed"
+def test_a_child_is_born_live(user):
+    coll = user["api"].create_collection(f"live-{uuid.uuid4().hex[:6]}")
+    child = user["api"].create_child(coll["id"], name="doc", content="a body")
+    assert child.get("state") == "live"
 
     # Read-back confirms the persisted state.
     got = user["api"].get_artifact(child["id"]).json()
-    assert got.get("state") == "committed"
+    assert got.get("state") == "live"
+
+
+def test_draft_is_refused(user):
+    coll = user["api"].create_collection(f"live-{uuid.uuid4().hex[:6]}")
+    child = user["api"].create_child(coll["id"], name="doc", content="a body")
+    r = user["api"].patch(f"/artifacts/{child['id']}", json={"state": "draft"})
+    assert r.status_code == 422, r.text
 
 
 @pytest.mark.search
-def test_commit_makes_it_searchable(user):
+def test_a_new_child_is_searchable_with_no_further_step(user):
     tok = f"zqc{uuid.uuid4().hex[:8]}"
-    coll = user["api"].create_collection(f"commit-{uuid.uuid4().hex[:6]}")
-    child = user["api"].create_child(coll["id"], name="doc", content=f"commit me {tok}")
-
-    # Draft: not in the committed segment.
-    r = user["api"].search(tok, state="committed", scope=[coll["id"]])
-    if r.status_code == 503:
-        pytest.skip("search backend unavailable")
-    assert not r.json().get("hits"), "draft leaked into committed search"
-
-    user["api"].commit(child["id"])
-    assert _find(user["api"], tok, [coll["id"]]), "committed artifact not searchable"
+    coll = user["api"].create_collection(f"live-{uuid.uuid4().hex[:6]}")
+    user["api"].create_child(coll["id"], name="doc", content=f"find me {tok}")
+    assert _find(user["api"], tok, [coll["id"]]), "a new artifact is not searchable"
 
 
 @pytest.mark.lazy
@@ -70,11 +65,10 @@ def test_first_observation_materializes(user):
 
     tok = f"zql{uuid.uuid4().hex[:8]}"
     coll = user["api"].create_collection(f"lazy-{uuid.uuid4().hex[:6]}")
-    # Latent from birth: lazy child, committed but not yet indexed.
+    # Latent from birth: lazy child, live but not yet indexed.
     child = user["api"].create_child(coll["id"], name="doc", content=f"latent {tok}", index="lazy")
-    user["api"].commit(child["id"])
 
-    r = user["api"].search(tok, state="committed", scope=[coll["id"]])
+    r = user["api"].search(tok, scope=[coll["id"]])
     if r.status_code == 503:
         pytest.skip("search backend unavailable")
     assert not r.json().get("hits"), "latent (lazy) artifact should be invisible pre-observation"
@@ -94,8 +88,7 @@ def test_warm_bulk_materializes(user):
     toks = []
     for _ in range(3):
         t = f"zqw{uuid.uuid4().hex[:8]}"
-        c = user["api"].create_child(coll["id"], name="doc", content=f"warm {t}", index="lazy")
-        user["api"].commit(c["id"])
+        user["api"].create_child(coll["id"], name="doc", content=f"warm {t}", index="lazy")
         toks.append(t)
 
     r = user["api"].post(f"/artifacts/{coll['id']}/warm")

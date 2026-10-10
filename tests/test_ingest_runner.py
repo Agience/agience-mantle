@@ -15,7 +15,7 @@ class FakeArtifact:
         self.context = json.dumps(context_dict or {})
         self.content = content
         self.collection_id = "ws-1"
-        self.state = "draft"
+        self.state = "live"
 
     def to_dict(self):
         return {"id": self.id, "context": self.context, "content": self.content}

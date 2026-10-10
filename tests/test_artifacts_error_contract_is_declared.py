@@ -39,8 +39,8 @@ def artifact_ops():
            for method, op in item.items()
            if isinstance(op, dict) and "Artifacts" in (op.get("tags") or [])}
     # Pinned, so a new operation cannot arrive without being covered by the checks below.
-    assert len(ops) == 19, (
-        "expected 19 artifact operations, found %d — this suite's subject moved" % len(ops))
+    assert len(ops) == 18, (
+        "expected 18 artifact operations, found %d — this suite's subject moved" % len(ops))
     return ops
 
 
@@ -234,16 +234,6 @@ def test_every_query_parameter_is_described(artifact_ops):
         "query parameters a client can only guess at:" + chr(10) + "  " + joined)
 
 
-def test_revert_declares_its_designed_no_op(artifact_ops):
-    """. `204` was the one undeclared code that was definitely INTENTIONAL — described in
-    the handler docstring and specified in the design doc, and absent from the spec. A generated
-    client therefore had no branch for the designed no-op and would treat it as unexpected."""
-    op = artifact_ops[("/artifacts/{artifact_id}/revert", "post")]
-    assert "204" in op["responses"], sorted(op["responses"])
-    said = op["responses"]["204"].get("description", "")
-    assert "no committed version" in said.lower(), said
-
-
 def test_no_handler_re_raises_http_without_translating_the_rest():
     """`except HTTPException: raise` never stands alone.
 
@@ -278,21 +268,6 @@ def test_no_handler_re_raises_http_without_translating_the_rest():
     assert not lonely, (
         "a bare `except HTTPException: raise` that translates nothing else:" + chr(10) + "  "
         + (chr(10) + "  ").join(lonely))
-
-
-def test_revert_declares_the_top_level_refusal(artifact_ops):
-    """. A top-level artifact has no containing workspace, so there is no workspace-scoped
-    draft to revert.
-
-    Measured 2026-08-26: the handler's `or doc.get("_key")` fallback was dead — `_key` is never
-    present on a lattice artifact doc (every other reader spells it `id or _key`, so `_key` aliases
-    the artifact's OWN id, not its container). The caller therefore got `404 Workspace not found`,
-    which names a missing workspace when the truth is that this kind of artifact has none. Had the
-    clause fired it would have been worse: passing the artifact's own id as the workspace is
-    rejected by `revert_artifact`'s own `target.collection_id != workspace_id` check, so the route
-    would have answered `204 nothing to revert` for an artifact that had something to revert."""
-    op = artifact_ops[("/artifacts/{artifact_id}/revert", "post")]
-    assert "400" in op["responses"], sorted(op["responses"])
 
 
 def test_the_dead_key_fallback_is_gone():

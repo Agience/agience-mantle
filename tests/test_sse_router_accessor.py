@@ -167,7 +167,7 @@ class _FakeEmbeddings:
 
 
 def _accessor(*, lightcone=None, store_db=None, embeddings=None,
-              narrower=None, ranker=None, segment="committed") -> MantleSseSearchAccessor:
+              narrower=None, ranker=None, segment="live") -> MantleSseSearchAccessor:
     """An accessor wired the way `build_sse_search_accessor` wires one: a narrower and a
     ranker, and nothing else — `candidates()` runs on the same two."""
     return MantleSseSearchAccessor(
@@ -198,7 +198,7 @@ def _make_query(
 
 
 def _make_artifact_doc(artifact_id, *, title="", description="", tags=None,
-                      content="", state="committed", modified="2025-01-01T00:00:00Z") -> dict:
+                      content="", state="live", modified="2025-01-01T00:00:00Z") -> dict:
     return {
         "id": artifact_id,
         "root_id": artifact_id,
@@ -368,20 +368,20 @@ class TestHydration:
         assert hit.description == "A MANTLE-SSE module"
         assert hit.tags == ["search", "encrypted"]
         assert hit.content == "some content text"
-        assert hit.state == "committed"
+        # The doc records the legacy `committed`; a hit names only the states that exist.
+        assert hit.state == "live"
         # The score IS the cosine — there is no fusion constant between them.
         assert hit.score == pytest.approx(0.77)
         assert hit.metadata["vector_score"] == pytest.approx(0.77)
         assert result.ordering == "semantic"
 
-    def test_a_draft_hit_hydrates_the_draft_not_the_committed_row(self):
-        """Edit-after-commit: the draft segment's hit must return the DRAFT's bytes.
+    def test_a_forked_legacy_lineage_hydrates_its_newest_live_row(self):
+        """A lineage a store that has not been migrated can hold: a draft under a NEW id,
+        newer than the committed row at the root. Both read as live, and the live segment's hit
+        returns the NEWEST row's bytes — the version an edit wrote and indexed.
 
-        This is the one path in the API that forks a lineage. `_ensure_draft` writes the edit
-        to a NEW id under the same `root_id` and leaves the committed row exactly where it is,
-        while both index arms key on `root_id`. So the draft segment holds the root, and a
-        hydration that reads the row sitting AT the root id returns the version the editor
-        replaced — recall answering with the new version's tokens and the old version's
+        Both index arms key on `root_id`, so a hydration that reads the row sitting AT the root
+        id would return the older version — recall answering with the new tokens and the old
         content, which is indistinguishable from a correct answer at the call site.
 
         Nothing widens here: the light cone authorizes the root, grants are held on the root,
@@ -404,44 +404,46 @@ class TestHydration:
             store_db=store_db,
             narrower=_FakeNarrower(matches={"root-1"}),
             ranker=_FakeRanker(hits=[_make_hit("root-1", 0.9)]),
-            segment="draft",
+            segment="live",
         )
         result = acc.search(_make_query("runbook"))
         assert len(result.hits) == 1
         assert result.hits[0].content == "the edited body"
-        assert result.hits[0].state == "draft"
+        assert result.hits[0].state == "live"
         # The lineage is what was authorized and what is reported; the version is what moved.
         assert result.hits[0].root_id == "root-1"
         assert result.hits[0].version_id == "draft-1"
 
-    def test_a_committed_hit_still_hydrates_the_committed_row(self):
-        """The same forked lineage, read from the committed segment, answers unchanged.
+    def test_an_archived_hit_hydrates_the_archived_row_not_the_live_head(self):
+        """The archived segment answers with the archived version of the lineage.
 
-        The counterpart of the test above, and the reason resolution is per-STATE rather than
-        to a global head: a global head would hand the draft to a committed search, which is
-        the same class of error in the other direction.
+        The counterpart of the test above, and the reason resolution is per-SEGMENT rather than
+        to a global head: the live head is exactly the version an archived search did not ask
+        for.
         """
-        committed = _make_artifact_doc(
-            "root-1", title="Runbook", content="the old committed body", state="committed",
+        head = _make_artifact_doc(
+            "root-1", title="Runbook", content="the current body", state="live",
         )
-        draft = _make_artifact_doc(
-            "draft-1", title="Runbook", content="the edited body", state="draft",
+        old = _make_artifact_doc(
+            "snap-1", title="Runbook", content="the retired body", state="archived",
         )
-        draft["root_id"] = "root-1"
+        old["root_id"] = "root-1"
         store_db = _FakeStoreDB(
-            {"root-1": committed, "draft-1": draft},
-            versions={"root-1": [committed, draft]},
+            {"root-1": head, "snap-1": old},
+            versions={"root-1": [old, head]},
         )
-        acc = _accessor(
-            lightcone=_FakeLightCone(authorized=["root-1"]),
-            store_db=store_db,
-            narrower=_FakeNarrower(matches={"root-1"}),
-            ranker=_FakeRanker(hits=[_make_hit("root-1", 0.9)]),
-            segment="committed",
-        )
-        result = acc.search(_make_query("runbook"))
-        assert result.hits[0].content == "the old committed body"
-        assert result.hits[0].version_id == "root-1"
+        for segment, content, version in (("archived", "the retired body", "snap-1"),
+                                          ("live", "the current body", "root-1")):
+            acc = _accessor(
+                lightcone=_FakeLightCone(authorized=["root-1"]),
+                store_db=store_db,
+                narrower=_FakeNarrower(matches={"root-1"}),
+                ranker=_FakeRanker(hits=[_make_hit("root-1", 0.9)]),
+                segment=segment,
+            )
+            result = acc.search(_make_query("runbook"))
+            assert result.hits[0].content == content, segment
+            assert result.hits[0].version_id == version, segment
 
     def test_missing_doc_yields_empty_metadata(self):
         # A ranked hit references an artifact removed between ranking and hydration —
@@ -465,7 +467,7 @@ class TestHydration:
             "root_id": "art-1",
             "context": "{not json",
             "content": "",
-            "state": "committed",
+            "state": "live",
             "created_by": "user-1",
             "principal_id": "user-1",
         }}
@@ -626,7 +628,7 @@ class TestOrdering:
             "art-dated": _make_artifact_doc("art-dated", modified="2025-01-01T00:00:00Z"),
             "art-undated": {
                 "id": "art-undated", "root_id": "art-undated",
-                "context": "{}", "content": "", "state": "committed",
+                "context": "{}", "content": "", "state": "live",
                 "created_by": "user-1", "principal_id": "user-1",
             },
         }
@@ -777,14 +779,14 @@ class TestScopeFiltering:
             "art-A": {
                 "id": "art-A", "root_id": "art-A",
                 "context": '{"title": "Alpha Article"}',
-                "content": "", "state": "committed",
+                "content": "", "state": "live",
                 "created_by": "user-1", "principal_id": "user-1",
                 "collection_id": "col-A",
             },
             "art-B": {
                 "id": "art-B", "root_id": "art-B",
                 "context": '{"title": "Beta Article"}',
-                "content": "", "state": "committed",
+                "content": "", "state": "live",
                 "created_by": "user-1", "principal_id": "user-1",
                 "collection_id": "col-B",
             },

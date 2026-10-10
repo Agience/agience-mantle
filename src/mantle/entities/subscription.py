@@ -101,7 +101,7 @@ class Subscription:
         """The artifact's `context` — the whole subscription, as one JSON document.
 
         `content_type` is repeated inside it because the store's typed reads look on both sides:
-        `list_committed_artifacts_by_context_content_type` narrows on the indexed column and then
+        `list_live_artifacts_by_context_content_type` narrows on the indexed column and then
         confirms against the context, so a subscription that set only one of the two would be
         findable by exactly one of the two paths.
         """
@@ -148,7 +148,7 @@ class Subscription:
             context=self.to_context(),
             content="",
             created_by=self.owner_id,
-            state=Artifact.STATE_COMMITTED,
+            state=Artifact.STATE_LIVE,
         )
 
     def _overlay_onto(self, existing: Any) -> Any:
@@ -159,10 +159,16 @@ class Subscription:
         subscription owns (:data:`OWNED_FIELDS`). Nothing else has to be enumerated, so a field
         added to `Artifact` tomorrow is preserved here without anyone remembering to come back —
         which is the property the two hand-copied fields did not have.
+
+        The context is the subscription's keys over the stored server-owned facets
+        (`mint_context.with_client_keys`), so the facets the store recorded survive the save.
         """
+        from mantle.services import mint_context as _mc
+        stored = getattr(existing, "context", None)
         mine = self.to_artifact()
         for field in self.OWNED_FIELDS:
             setattr(existing, field, getattr(mine, field))
+        existing.context = _mc.with_client_keys(stored, json.loads(mine.context))
         return existing
 
     @classmethod
@@ -275,7 +281,7 @@ def list_subscriptions(db: Any, *, owner_id: Optional[str] = None) -> List[Subsc
     from mantle.db import backend as store
 
     out: List[Subscription] = []
-    for doc in store.list_committed_artifacts_by_context_content_type(
+    for doc in store.list_live_artifacts_by_context_content_type(
             db, SUBSCRIPTION_CONTENT_TYPE, created_by=owner_id):
         sub = Subscription.from_artifact(doc)
         if sub is not None:

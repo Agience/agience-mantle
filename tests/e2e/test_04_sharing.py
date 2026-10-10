@@ -31,7 +31,6 @@ def test_read_grant_propagates_to_children(user_factory):
 
     coll = owner["api"].create_collection(f"shared-{uuid.uuid4().hex[:6]}")
     child = owner["api"].create_child(coll["id"], name="doc", content="shared content")
-    owner["api"].commit(child["id"])
 
     # Before the grant: reader is confined out (404, not 403).
     assert reader["api"].get_artifact(coll["id"]).status_code == 404
@@ -39,7 +38,7 @@ def test_read_grant_propagates_to_children(user_factory):
     r = _grant(owner["api"], resource_id=coll["id"], grantee_id=reader["person_id"], can_read=True)
     assert r.status_code in (200, 201), r.text
 
-    # After: reader sees the collection AND (propagation) its committed child.
+    # After: reader sees the collection AND (propagation) its child.
     assert reader["api"].get_artifact(coll["id"]).status_code == 200
     assert reader["api"].get_artifact(child["id"]).status_code == 200
     visible_ids = {a.get("id") for a in reader["api"].visible()}
@@ -51,7 +50,6 @@ def test_read_only_grantee_cannot_write(user_factory):
     reader = user_factory("reader")
     coll = owner["api"].create_collection(f"ro-{uuid.uuid4().hex[:6]}")
     child = owner["api"].create_child(coll["id"], name="doc", content="v1")
-    owner["api"].commit(child["id"])
     _grant(owner["api"], resource_id=coll["id"], grantee_id=reader["person_id"], can_read=True)
 
     # can_read but not can_update → PATCH is masked as 404 (confinement), never 200.

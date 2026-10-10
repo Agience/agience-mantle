@@ -47,6 +47,12 @@ METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
 
+#: The most messages one batch may carry. Each message dispatches a tool under the caller's
+#: principal, so an uncapped batch turns one request — one rate-limiter hit — into as many
+#: store operations as the body can hold. A larger batch is refused whole, before any message
+#: runs, rather than truncated: a partial batch would answer some ids and silently drop others.
+MAX_BATCH = 32
+
 
 def _result(req_id: Any, result: Dict[str, Any]) -> Dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "result": result}
@@ -147,14 +153,10 @@ TOOLS: List[Dict[str, Any]] = [
             "Store something in the lattice — a conversation, a note, a document — and get the "
             "stored artifact back, including the `id` to read it by. The creator receives an "
             "owner grant on it, so what you write here you can read and recall afterwards.\n"
-            "Omit `container_id` for a top-level artifact: it is COMMITTED and immediately "
-            "recallable. Supply `container_id` to file the artifact inside that collection "
-            "instead — the caller needs create permission on it, and a member of a collection "
-            "starts as a DRAFT, which is indexed in a separate segment and is found by `recall` "
-            "only with `state: \"draft\"` until something commits it — UNLESS you also pass "
-            "`identity`, which writes the member COMMITTED and overwrites it in place, because "
-            "an identity names something that lives outside the store rather than a draft you "
-            "are working on here.\n"
+            "Omit `container_id` for a top-level artifact; supply it to file the artifact inside "
+            "that collection instead — the caller needs create permission on it. Either way the "
+            "artifact is live and immediately recallable, and later edits through "
+            "`update_artifact` stay recallable: they rewrite the live version in place.\n"
             "PASS `identity` WHEN THIS THING MAY BE STORED AGAIN — a file you will re-capture, a "
             "session you will extend, a note you will revise. It makes the write idempotent, so "
             "the second call updates the first artifact rather than leaving two copies with "
@@ -221,7 +223,7 @@ TOOLS: List[Dict[str, Any]] = [
                     "type": "string",
                     "description": (
                         "Artifact id of a collection to file this inside. Omit for a top-level "
-                        "artifact; see the draft note above before supplying one."
+                        "artifact."
                     ),
                 },
                 "vector": {
@@ -258,9 +260,8 @@ TOOLS: List[Dict[str, Any]] = [
             "the content the vector describes has changed: the semantic arm reindexes with "
             "the rest of the write, and omitting it leaves the old vector describing new "
             "content.\n"
-            "Setting `state` to `\"committed\"` is how a draft (an artifact filed inside a "
-            "collection via `create_artifact`'s `container_id`) becomes findable by `recall` "
-            "without the `state: \"draft\"` argument."
+            "An edit rewrites the live version in place, so `recall` finds the new content "
+            "with no further step."
         ),
         "inputSchema": {
             "type": "object",
@@ -280,10 +281,12 @@ TOOLS: List[Dict[str, Any]] = [
                     "description": "MIME label. See `create_artifact` for what an omission vs. an explicit value means.",
                 },
                 "state": {
-                    "type": "string",
+                    "type": "string", "enum": ["live", "archived", "committed"],
                     "description": (
-                        "New lifecycle state, e.g. `\"committed\"` to promote a draft. Not the "
-                        "`state` argument `recall` takes — this one is written, that one is read."
+                        "New lifecycle state: `\"archived\"` to retire an artifact, `\"live\"` "
+                        "to restore one. `\"committed\"` is a deprecated alias of `\"live\"`. "
+                        "Not the `state` argument `recall` takes — this one is written, that one "
+                        "is read."
                     ),
                 },
                 "context": {
@@ -403,13 +406,14 @@ TOOLS: List[Dict[str, Any]] = [
                     ),
                 },
                 "state": {
-                    "type": "string", "enum": ["committed", "draft", "archived"],
-                    "default": "committed",
+                    "type": "string", "enum": ["live", "archived", "committed", "draft"],
+                    "default": "live",
                     "description": (
                         "Which index segment to search. Each artifact state is its own "
                         "separately keyed tree, so this selects the corpus rather than filtering "
-                        "one — an artifact created inside a collection is a draft and is found "
-                        "only with `draft`."
+                        "one. Creates and edits write `live`; `archived` holds retired and "
+                        "superseded versions. `committed` and `draft` are deprecated aliases of "
+                        "`live`."
                     ),
                 },
                 "sort": {
@@ -780,7 +784,8 @@ def _as_text(data: Any) -> str:
               "Accepted. A batch of nothing but notifications has no response to return, so the "
               "body is empty by construction rather than by omission."},
         400: {"description":
-              "The envelope itself is unusable — unparseable JSON, or an empty batch. The body is "
+              "The envelope itself is unusable — unparseable JSON, an empty batch, or a batch of "
+              "more than `MAX_BATCH` (32) messages. The body is "
               "a JSON-RPC error object. A failing tool does not arrive here: that answers `200` "
               "with an error member, which is what JSON-RPC specifies."},
     },
@@ -800,6 +805,11 @@ async def mcp_post(request: Request,
     if isinstance(body, list):
         if not body:
             return JSONResponse(_error(None, INVALID_REQUEST, "empty batch"), status_code=400)
+        if len(body) > MAX_BATCH:
+            return JSONResponse(
+                _error(None, INVALID_REQUEST, f"batch of {len(body)} exceeds the limit of {MAX_BATCH}"),
+                status_code=400,
+            )
         out = [r for r in
                [await _dispatch(m, auth=auth, store_db=store_db, request=request) for m in body] if r is not None]
         # A batch of nothing but notifications gets 202 and no body — same rule as a single one.

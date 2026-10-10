@@ -232,7 +232,7 @@ def _reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
         try:
             from mantle.search.mantle.wiring import build_sse_indexer
             from mantle.services.dependencies import get_store_db as _gsd_idx
-            shared_indexer = build_sse_indexer(next(_gsd_idx()), segment="committed")
+            shared_indexer = build_sse_indexer(next(_gsd_idx()), segment="live")
         except Exception:
             logger.warning("Reindex: no shared SSE indexer; falling back to one transaction per "
                            "artifact (correct, and slower)", exc_info=True)

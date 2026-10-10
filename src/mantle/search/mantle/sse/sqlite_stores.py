@@ -135,7 +135,7 @@ class SqlitePostingStore:
     creates the lattice schema in its constructor and drives proper-time allocators, neither of
     which belongs in a rebuildable derived index.
 
-    Segments (``committed`` / ``draft`` / ``archived``) stay physically separate by being separate
+    Segments (``live`` / ``archived``) stay physically separate by being separate
     files, which is what the file store's `prefix` did with directories.
     """
 

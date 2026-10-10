@@ -27,7 +27,6 @@
 #   GET    /artifacts/{id}/content              → Proxied download (decrypts on the byte path)
 #   PUT    /artifacts/{id}/content              → Proxied upload (encrypts on the byte path)
 #   PATCH  /artifacts/{id}/children/order       → Reorder a container's children
-#   POST   /artifacts/{id}/revert               → Restore the last committed version
 #   POST   /artifacts/{id}/warm                 → Materialize a collection's latent artifacts
 #   GET    /artifacts/{artifact_id}/commits     → List commits for collection (id must be one)
 #   GET    /artifacts/{id}/access-log           → The artifact's own access history
@@ -50,7 +49,7 @@ import logging
 #: function-local import would make every call pay for it while leaving a missing name to
 #: surface as a NameError inside whatever exception handler happened to surround the call.
 import os
-from typing import Annotated, Any, Dict, List, Literal, Optional, Set, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 #: `ACTIONS` is imported at MODULE scope so the `action` parameter can publish its own enum.
 #: `attenuation` imports nothing but stdlib, so there is no cycle to defer around.
@@ -58,9 +57,11 @@ from mantle.attenuation import ACTIONS
 from mantle.search.lazy import INDEX_HINTS
 #: The artifact-state vocabulary, imported so `PATCH` can publish and enforce it. The entity is
 #: the authority on what state an artifact is in. `search.mantle.wiring`'s `VALID_SEGMENTS` is the
-#: index's own mirror of the same three states; reconciling the two reaches into the search arm and
+#: index's own mirror of the same two states; reconciling the two reaches into the search arm and
 #: is not this route's call to take.
 from mantle.entities.artifact import Artifact as _ArtifactStates
+from mantle.db.constants import LEGACY_LIVE_STATES as _LEGACY_LIVE_STATES
+from mantle.services.mint_context import client_part as _mc_client_part
 
 from mantle.db.store import Database
 from mantle.search.beacon.density import dense_excerpt, dense_windows
@@ -86,6 +87,22 @@ from mantle.api.unknown_fields import CountsUnknownFields
 #: Derived from the entity rather than restated — see the note above the import. Kept below the
 #: import block: a statement between imports makes every later module-level import an `E402`.
 _ARTIFACT_STATES = sorted(_ArtifactStates.VALID_STATES)
+#: What `PATCH` accepts: the states, plus `committed` as a deprecated alias of `live`, which
+#: clients still send to restore an archived artifact. `draft` is refused.
+_PATCH_STATE_ALIASES = {"committed": _ArtifactStates.STATE_LIVE}
+_PATCH_STATES = sorted(set(_ARTIFACT_STATES) | set(_PATCH_STATE_ALIASES))
+
+
+def _public_state(doc: Any) -> Any:
+    """Rewrite a legacy stored `committed` or `draft` on an outgoing document to `live`, in place.
+
+    A response names only the states that exist (`Artifact.VALID_STATES`). A store that has not
+    been migrated still holds the legacy values, and several routes return raw stored documents,
+    so the rewrite happens where a document leaves. A value on another axis (a grant's lifecycle)
+    is left alone."""
+    if isinstance(doc, dict) and doc.get("state") in _LEGACY_LIVE_STATES:
+        doc["state"] = _ArtifactStates.STATE_LIVE
+    return doc
 
 
 logger = logging.getLogger(__name__)
@@ -235,7 +252,11 @@ class CreateArtifactRequest(BaseModel):
             "Caller metadata about this artifact, as an OBJECT. A JSON STRING is still accepted "
             "and is deprecated: it exists because this field predates the object form, and 39 "
             "call sites across seven repos still send one. Both are normalised to the same "
-            "stored shape, so the two forms cannot disagree."
+            "stored shape, so the two forms cannot disagree.\n\n"
+            "With an `identity` that names an existing artifact, the write is an update, and the "
+            "context is handled as `PATCH` handles it: omitted (or null) keeps the stored context, "
+            "and one you send, `\"\"` and `{}` included, replaces your keys. A `content_type` "
+            "sent with it sets a `content_type` key the stored context carries, as `PATCH` does."
         ),
     )
     content: Optional[str] = None
@@ -310,7 +331,16 @@ class UpdateArtifactRequest(CountsUnknownFields):
             "Caller metadata about this artifact, as an OBJECT. A JSON STRING is still accepted "
             "and is deprecated: it exists because this field predates the object form, and 39 "
             "call sites across seven repos still send one. Both are normalised to the same "
-            "stored shape, so the two forms cannot disagree."
+            "stored shape, so the two forms cannot disagree.\n\n"
+            "The context you send REPLACES your keys: a key you do not send is removed. Keys the "
+            "store owns — the mint's record (`minted_by`, `minted`, `placement`, `addressing`, "
+            "`screen`, `enriched`), the rung (`provenance`, `provenance_history`), the content "
+            "address and the upload bookkeeping — are ignored and keep their stored values. "
+            "`\"\"` and `{}` both state no keys, so both remove all of yours; omit `context` (or "
+            "send null) to leave it as it is.\n\n"
+            "Your keys are read from the top level, and stored there. `caller` is reserved: the "
+            "store never writes it, and reads a `caller` object you send only when the top level "
+            "holds none of your keys."
         ),
     )
     content: Optional[str] = Field(
@@ -325,27 +355,34 @@ class UpdateArtifactRequest(CountsUnknownFields):
         #:
         #: Enforcement is load-bearing rather than cosmetic. `update_workspace` assigns `ws.state`
         #: directly and its only test is whether the artifact is archived, so on an archived
-        #: artifact an accepted misspelling such as `"drft"` takes the un-archive branch and moves
-        #: it to committed — a state the caller never asked for, answered `200`. The validator
+        #: artifact an accepted misspelling such as `"arcived"` would take the un-archive branch
+        #: and move it to live — a state the caller never asked for, answered `200`. The validator
         #: below is what makes that unreachable.
         description="Move the artifact between index segments: "
                     + ", ".join("`%s`" % v for v in _ARTIFACT_STATES)
                     + ". Each is a separately keyed encrypted tree, so a state change re-indexes "
-                      "rather than re-labels.",
-        json_schema_extra={"enum": _ARTIFACT_STATES},
+                      "rather than re-labels. `committed` is accepted as a deprecated alias of "
+                      "`live`; `draft` is refused, since nothing is a draft.",
+        #: OpenAPI has no per-value deprecation, so the alias is named in `x-deprecated-values`
+        #: beside the enum as well as in the description.
+        json_schema_extra={"enum": _PATCH_STATES,
+                           "x-deprecated-values": sorted(_PATCH_STATE_ALIASES)},
     )
 
     @field_validator("state")
     @classmethod
     def _state_must_be_known(cls, v):
-        if v is not None and v not in _ARTIFACT_STATES:
+        if v is None:
+            return v
+        if v not in _PATCH_STATES:
             raise ValueError("must be one of %s" % ", ".join(_ARTIFACT_STATES))
-        return v
+        return _PATCH_STATE_ALIASES.get(v, v)
     content_type: Optional[str] = Field(
         None,
         description="The MIME-ish label carried with the artifact. Mantle treats it as an opaque "
                     "label and does not interpret it, so changing it re-labels the artifact and "
-                    "converts nothing." + _PATCH_LEAVE,
+                    "converts nothing. A stored context that carries a `content_type` key takes "
+                    "the same value." + _PATCH_LEAVE,
     )
     name: Optional[str] = Field(
         None, description="The artifact's display name." + _PATCH_LEAVE,
@@ -480,15 +517,17 @@ class ArtifactRecallRequest(BaseModel):
         ),
     )
     state: str = Field(
-        "committed",
+        "live",
         description=(
-            "Which index SEGMENT to recall from — `committed` (default), `draft` or `archived`.\n\n"
+            "Which index SEGMENT to recall from — `live` (default) or `archived`. `committed` and"
+            " `draft` are deprecated aliases of `live`.\n\n"
             "Each is a separately keyed encrypted tree under its own object-storage prefix"
-            "(`search/mantle/wiring._segment_prefixes`), selected when the accessor is built and before"
-            "any query runs. That is why there is no `state:` query filter: a filter narrows a set of"
-            "retrieved artifacts, and no draft is in the committed tree to be narrowed out of."
-            "`state:draft` in `query_text` is a 400 pointing back at this field."
+            " (`search/mantle/wiring._segment_prefixes`), selected when the accessor is built and"
+            " before any query runs. That is why there is no `state:` query filter: a filter narrows"
+            " a set of retrieved artifacts, and no archived artifact is in the live tree to be"
+            " narrowed out of. `state:archived` in `query_text` is a 400 pointing back at this field."
         ),
+        json_schema_extra={"x-deprecated-values": ["committed", "draft"]},
     )
     # No `content_types` field: it would do nothing if present, since the handler never passes
     # it on and `SearchQuery` has nowhere to put it, so it would narrow no recall. The one way to
@@ -739,6 +778,22 @@ def _find_artifact(db: Database, artifact_id: str) -> Optional[dict]:
     return None
 
 
+def _find_archived_artifact(db: Database, artifact_id: str) -> Optional[dict]:
+    """The archived artifact ``artifact_id`` names — the row at that id, else the newest version
+    under that root — or ``None``. The read a restore needs, since `_find_artifact` returns no
+    archived artifact."""
+    from mantle.db.backend import _decrypt_artifact_content as _decrypt_doc
+    from mantle.db.backend import get_raw_artifact
+    doc = get_raw_artifact(db, artifact_id)
+    if not doc:
+        versions = db.artifacts.versions_of(artifact_id) or []
+        doc = versions[-1] if versions else None
+    if not doc or doc.get("state") != "archived":
+        return None
+    _decrypt_doc(doc)
+    return doc
+
+
 def _normalize_artifact_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize an artifact document for API responses.
 
@@ -758,6 +813,8 @@ def _normalize_artifact_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
 
     if normalized.get("context") is None:
         normalized["context"] = ""
+
+    _public_state(normalized)
 
     if normalized.get("content") is None:
         normalized["content"] = ""
@@ -815,6 +872,8 @@ def _page(items: list, *, total: Optional[int], has_more: bool) -> Dict[str, Any
     known the caller's `has_more` is `offset + limit < total`; where `total` is `None` — `/visible`
     on a truncated cone — page length is the only signal left and is used instead.
     """
+    for item in items:
+        _public_state(item)
     return {"items": items, "total": total, "has_more": has_more}
 
 
@@ -1062,7 +1121,8 @@ class ArtifactResponse(BaseModel):
     id: str
     root_id: Optional[str] = None
     collection_id: Optional[str] = None
-    state: Optional[str] = None
+    state: Optional[str] = Field(
+        None, description="`live` or `archived`. A stored legacy value is answered as `live`.")
     content: Optional[str] = None
     context: Optional[str] = None
     created_time: Optional[str] = None
@@ -1097,7 +1157,7 @@ def _artifact_body(doc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     The result is that every key the document carries survives, and the declared ones are
     guaranteed present so a caller can rely on them without testing for existence.
     """
-    d = dict(doc or {})
+    d = _public_state(dict(doc or {}))
     for k in _ARTIFACT_KEYS:
         d.setdefault(k, None)
     return d
@@ -1131,7 +1191,7 @@ def _artifact_detail_body(doc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     model promising two fields it cannot find. Deriving `_ARTIFACT_DETAIL_KEYS` from
     `ArtifactDetailResponse` guarantees a field added to the model on the same commit.
     """
-    d = dict(doc or {})
+    d = _public_state(dict(doc or {}))
     for k in _ARTIFACT_DETAIL_KEYS:
         d.setdefault(k, None)
     return d
@@ -1281,7 +1341,7 @@ def _ids_of_content_type(store_db, content_type: str) -> set:
     artifacts carry the type rather than to how much the caller can see, so intersecting it with
     the authorized set replaces "hydrate everything the caller can read" with two set operations.
 
-    Archived versions are excluded. A versioned artifact has one committed row and N archived
+    Archived versions are excluded. A versioned artifact has one live row and N archived
     snapshots sharing its root, so including them would make a listing report the same thing once
     per past version. The sensor artifacts are exactly this shape: one per property, re-versioned
     on every real change.
@@ -1618,11 +1678,11 @@ async def _default_create_artifact(
                        "the id of an artifact this call writes, source_artifact_id links one that "
                        "already exists. Supply one.")
 
-    context_str = _merge_content_type_into_context(
-        _context_as_stored(parsed.context), parsed.content_type)
+    sent_context = _context_as_stored(parsed.context)
+    context_str = _merge_content_type_into_context(sent_context, parsed.content_type)
     # Every create passes through here, top-level and child alike, so this is the one place the
     # store can guarantee an artifact is minted with the context it was minted in. See `_mint_context`.
-    context_str = _mint_context(
+    context_str, minted = _mint_context(
         context_str,
         db=store_db,
         artifact_id=_derived_identity_id(auth.user_id, parsed.identity),
@@ -1631,6 +1691,11 @@ async def _default_create_artifact(
         container_id=parsed.container_id,
     )
     vector = _parse_supplied_vector(parsed.vector, parsed.space_id)
+    # What an identity that names an existing artifact updates the context with, decided by
+    # `parsed.context` alone: a request that sent none states no context and the stored one is
+    # kept, whatever else it sent. `content_type` is applied as its own field. A context it did
+    # send, `""` included, replaces the client's keys, as `PATCH` does.
+    update_context = (context_str or "") if sent_context is not None else None
 
     from mantle.services import workspace_service
 
@@ -1657,7 +1722,9 @@ async def _default_create_artifact(
                 derived_id,
                 name=parsed.name,
                 description=parsed.description,
-                context=context_str,
+                # An identity that names an existing artifact is an update: the client's keys
+                # are merged over the stored server-owned facets, and nothing is re-minted.
+                caller_context=update_context,
                 vector=vector,
                 content=parsed.content,
                 content_type=parsed.content_type,
@@ -1686,6 +1753,7 @@ async def _default_create_artifact(
             description=parsed.description,
             vector=vector,
             artifact_id=derived_id,
+            minted=minted,
         )
         return entity.to_dict()
 
@@ -1700,16 +1768,12 @@ async def _default_create_artifact(
     if parsed.identity:
         # Identity works inside a collection, and it names the root.
         #
-        # A member born as a draft acquires a second live version on edit-after-commit, so "the
-        # artifact for this identity" would not be one row. That holds for a member with a draft
-        # lifecycle and not for what `identity` describes:
-        # a mirror of something that lives outside the store — a file, a session, a commit —
-        # which has exactly one true version because the writer is restating it.
-        #
-        # The version ambiguity was never in the identity, it was in the lifecycle. Naming the
-        # ROOT removes it: the root is what edges, grants and both search arms are already keyed
-        # on (`pipeline_unified` indexes by `root_id`), and `upsert_identity_member` writes the
-        # committed version in place instead of forking a draft. Ordinary members are untouched.
+        # `identity` names a mirror of something that lives outside the store — a file, a
+        # session, a commit — which has exactly one true version because the writer is
+        # restating it. Naming the ROOT is what makes that one row: the root is what edges,
+        # grants and both search arms are already keyed on (`pipeline_unified` indexes by
+        # `root_id`), and `upsert_identity_member` writes the live version in place. A
+        # member created without `identity` takes `create_workspace_artifact` instead.
         #
         # Why this is worth supporting: without it every hook artifact is top-level, and a
         # top-level artifact is its own origin root — which is the SSE principal
@@ -1728,13 +1792,16 @@ async def _default_create_artifact(
             auth.user_id,
             parsed.container_id,
             derived_root,
-            context=context_str or "",
+            # ``None`` when the request sent no context: a re-capture that restates only the
+            # body keeps the context it has. An explicit context replaces the client's keys.
+            context=update_context,
             content=parsed.content or "",
             content_type=parsed.content_type,
             name=parsed.name,
             description=parsed.description,
             vector=vector,
             report=upsert,
+            minted=minted,
         )
         if report is not None and upsert.get("created") is False:
             report["created"] = False
@@ -1765,6 +1832,7 @@ async def _default_create_artifact(
         description=parsed.description,
         index=parsed.index,
         vector=vector,
+        minted=minted,
     )
     return entity.to_dict()
 
@@ -1832,7 +1900,7 @@ def _link_source_artifact(
     """
     from mantle.db.backend import (
         get_artifact as _get_artifact,
-        get_latest_committed_artifact,
+        get_latest_live_artifact,
         add_artifact_to_collection,
     )
 
@@ -1842,7 +1910,7 @@ def _link_source_artifact(
 
     source = _get_artifact(store_db, parsed.source_artifact_id)
     if not source:
-        source = get_latest_committed_artifact(store_db, parsed.source_artifact_id)
+        source = get_latest_live_artifact(store_db, parsed.source_artifact_id)
     if not source:
         raise HTTPException(status_code=404, detail="Source artifact not found")
     root_id = source.root_id or source.id
@@ -1881,8 +1949,14 @@ def _mint_context(
     content_type: Optional[str],
     content: Optional[str],
     container_id: Optional[str],
-) -> Optional[str]:
-    """Stamp the db-level context onto every create. The thin arm; see `services/mint_context`.
+) -> Tuple[Optional[str], Any]:
+    """Mint the db-level context for a create. The thin arm; see `services/mint_context`.
+
+    Returns ``(caller_context, minted)``: the client's own context as JSON with its server-owned
+    keys removed (`mint_context.client_part`), and the mint as a `mint_context.Minted`, which is
+    what the service stores. The mint travels as an object rather than as JSON so that nothing a
+    client sends can be taken for one. ``minted`` is ``None`` when the mint failed; the service
+    then mints for itself (a container) or stores the client's keys (a member).
 
     On the write path rather than in an ingest service, because a caller can always write around
     an ingest service and context is not derivable from a row afterwards: a mint that does not
@@ -1895,22 +1969,16 @@ def _mint_context(
     built on and shipped by anyone, and chorus is AGPL: a mint that needed a tekton would put an
     AGPL service on the critical path of an Apache store.
 
-    The caller's context is preserved verbatim under `caller` and never merged into the facets
-    the store observed. A caller may assert any `sha256` it likes, and the store's own must stay
-    evidence about the bytes it actually holds.
+    The caller's keys are stored at the top level beside the facets the store observed, and never
+    replace one: a caller may assert any `sha256` it likes, and the store's own must stay evidence
+    about the bytes it actually holds. A non-JSON context is kept whole under `_opaque`: it is the
+    caller's statement about its own artifact and this function is not entitled to discard it.
     """
     from mantle.services import mint_context as _mc
 
-    caller_ctx: Dict[str, Any] = {}
-    if context_str:
-        try:
-            parsed_ctx = json.loads(context_str)
-            if isinstance(parsed_ctx, dict):
-                caller_ctx = parsed_ctx
-        except (json.JSONDecodeError, TypeError):
-            # Opaque, non-JSON context. Kept whole rather than dropped: it is the caller's
-            # statement about its own artifact and this function is not entitled to discard it.
-            caller_ctx = {"_opaque": context_str}
+    caller_ctx = _mc.client_part(context_str, allow=_mc.CLAIMABLE_ON_CREATE)
+    own = _mc.client_part(context_str)
+    caller_json = json.dumps(own) if context_str else None
     try:
         minted = _mc.mint(
             db,
@@ -1921,13 +1989,12 @@ def _mint_context(
             caller=caller_ctx or None,
         )
     except Exception:  # noqa: BLE001
-        # A description must never fail a write. The caller's context stands unchanged, and the
-        # coverage gate reports the miss — which is the honest outcome, and distinguishable from
-        # a mint that recorded an empty screen.
-        logger.warning("mint_context failed; the write proceeds with the caller's context only",
+        # A description must never fail a write. The client's own keys stand, its server-owned
+        # ones still removed, and the coverage gate reports the miss.
+        logger.warning("mint_context failed; the write proceeds with the caller's own keys only",
                        exc_info=True)
-        return context_str
-    return json.dumps(minted)
+        return caller_json, None
+    return caller_json, _mc.Minted(minted)
 
 
 # ---------- GET /artifacts/{artifact_id} — Read ----------
@@ -2109,11 +2176,9 @@ async def list_children(
     ),
     workspace_id: Optional[str] = Query(
         None,
-        description="Include draft children homed in this workspace. A workspace you cannot read "
-                    "is ignored rather than refused: you get the committed children and no error, "
-                    "because answering 403 would confirm the workspace exists to someone with no "
-                    "access to it. An empty draft list is therefore indistinguishable from no "
-                    "access; read the workspace directly when you need that distinction.",
+        description="Deprecated and ignored: there are no draft children to include. Accepted "
+                    "so a client that still sends it gets the same listing.",
+        deprecated=True,
     ),
     limit: int = Query(100, ge=1, le=1000, description="Page size."),
     offset: int = Query(0, ge=0, description="How many children to skip."),
@@ -2129,30 +2194,17 @@ async def list_children(
     Optional filters:
 
     - content_type: filter children by their content_type
-    - workspace_id: include draft children from this workspace
 
-    Each child is enriched with `committed_collection_ids` — the set of committed
-    containers it currently appears in.
+    `workspace_id` is accepted and ignored.
+
+    Each child is enriched with `committed_collection_ids` — the set of containers it currently
+    appears in. It is a membership list: it says nothing about any row's state.
     """
     await offload_sync(check_access, auth, artifact_id, "read", store_db)
 
-    # A draft is workspace-private. Only surface drafts linked into this container
-    # when the caller passes a workspace_id they can READ — then drafts homed in
-    # THAT workspace (the caller's own) show here, never anyone else's.
-    draft_workspace_id: Optional[str] = None
-    if workspace_id:
-        try:
-            await offload_sync(check_access, auth, workspace_id, "read", store_db)
-            draft_workspace_id = workspace_id
-        except HTTPException:
-            draft_workspace_id = None  # no access → don't include its drafts
-
     # An edge scan plus a lineage resolution per member — unbounded in the container's size,
     # and it runs before the page is taken.
-    children = await offload_sync(
-        store.list_collection_artifacts,
-        store_db, artifact_id, draft_workspace_id=draft_workspace_id,
-    )
+    children = await offload_sync(store.list_collection_artifacts, store_db, artifact_id)
 
     # Filter out operator edges (relationship != null means non-containment)
     children = [c for c in children if not c.get("relationship")]
@@ -2254,6 +2306,10 @@ async def update_artifact(
     await offload_sync(check_access, auth, artifact_id, "update", store_db)
 
     doc = await offload_sync(_find_artifact, store_db, artifact_id)
+    if not doc and body.state == _ArtifactStates.STATE_LIVE:
+        # A restore (`live`, or its deprecated alias `committed`) names an archived artifact,
+        # which `_find_artifact` does not return. The update below takes the un-archive branch.
+        doc = await offload_sync(_find_archived_artifact, store_db, artifact_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -2286,7 +2342,9 @@ async def update_artifact(
             artifact_id,
             name=body.name,
             description=body.description,
-            context=context,
+            # The client's context is merged over the stored server-owned facets, never stored
+            # as sent (`mint_context.merge_caller_update`).
+            caller_context=context,
             vector=vector,
             content=body.content,
             content_type=body.content_type,
@@ -2312,11 +2370,12 @@ async def update_artifact(
         artifact_id,
         name=body.name,
         description=body.description,
-        context=context,
+        caller_context=context,
         content=body.content,
         state=body.state,
         content_type=body.content_type,
         vector=vector,
+        auth=auth,
     )
     #: Through `_artifact_body`, because a raw `to_dict` omits unset fields and this route
     #: declares `ok=`: without it the response shape would vary with the data while the spec
@@ -2661,7 +2720,12 @@ async def recall_artifacts(
     # the lattice) aren't satisfied, search returns 503 — there's no plaintext
     # fallback by design.
     from mantle.search.mantle.wiring import VALID_SEGMENTS, build_sse_search_accessor
-    segment = (body.state or "committed").lower()
+    # `committed` and `draft` are deprecated aliases of `live`: both read the live segment, which
+    # is the one every write indexes into. The light cone narrows a recall exactly as it narrows
+    # the default, so an alias reaches nothing the default does not.
+    segment = (body.state or "live").lower()
+    if segment in ("committed", "draft"):
+        segment = "live"
     if segment not in VALID_SEGMENTS:
         raise HTTPException(
             status_code=400,
@@ -2706,7 +2770,7 @@ async def recall_artifacts(
     except QueryFilterError as e:
         # A filter naming a field this node refuses, an operator it does not support, or a
         # query that is nothing but filters. Caught BEFORE the blanket 500 below and ahead of
-        # it in the except chain: a caller who wrote `state:draft` needs to be told to send the
+        # it in the except chain: a caller who wrote `state:archived` needs to be told to send the
         # `state` request field, and a 500 would read as "the server broke" for a fixable
         # request. A MISTYPED field (`typ:pdf`) does not arrive here at all — it is not a field,
         # so it is a search term, which is the trade that keeps `https://…` searchable. It is also
@@ -2863,9 +2927,26 @@ class UploadStatusRequest(CountsUnknownFields):
             "Top-level keys to merge into the artifact's context. A shallow merge: each key"
             " replaces its whole value, so a nested object is overwritten rather than merged"
             " into. Not part of the upload's own state, which is `status`, `progress` and"
-            " `parts`."
+            " `parts`. A key the store owns — the mint's record, the rung, the content address,"
+            " the upload bookkeeping — is refused with `422` naming it, rather than dropped: a"
+            " patch names its keys one by one, so one naming a store-owned key is a mistake the"
+            " caller can fix. The refusal is the ordinary request-validation `422`, located at"
+            " `body.context_patch`. The keys you set are written both at the top level and as"
+            " `caller`, like every write of your keys."
         ),
     )
+
+    @field_validator("context_patch")
+    @classmethod
+    def _no_store_owned_keys(cls, v):
+        # Refused in the model, so the answer is FastAPI's declared validation-error shape.
+        if v:
+            from mantle.services.mint_context import SERVER_OWNED_KEYS
+            owned = sorted(k for k in v if k in SERVER_OWNED_KEYS)
+            if owned:
+                raise ValueError("context_patch cannot set keys the store owns: %s"
+                                 % ", ".join(owned))
+        return v
 
 
 class ReorderRequest(CountsUnknownFields):
@@ -3018,7 +3099,9 @@ async def upload_initiate(
             content_type=body.content_type,
             size=body.size,
             order_key=body.order_key,
-            context=_context_as_stored(body.context),
+            # A dict, as the service merges it into the upload's own context, with the
+            # server-owned keys removed: this is a client's context like any other door's.
+            context=_mc_client_part(body.context) or None,
         )
     except HTTPException:
         raise
@@ -3087,6 +3170,8 @@ async def upload_status(
             status_value=body.status,
             progress=body.progress,
             parts=body.parts,
+            # Store-owned keys are refused by the request model
+            # (`UploadStatusRequest._no_store_owned_keys`).
             context_patch=body.context_patch,
         )
     except HTTPException:
@@ -3281,7 +3366,7 @@ async def get_artifact_content(
         )
     except ContentStoreUnavailable as exc:
         # Not a server fault and not a lost object: this node holds no copy and has no object
-        # store to look in. 404 is the honest answer, and it names where the bytes may still be.
+        # store to look in. 404 is the accurate answer, and it names where the bytes may still be.
         logger.info("content download unavailable for %s: %s", artifact_id, exc)
         raise HTTPException(
             status_code=404,
@@ -3299,7 +3384,7 @@ async def get_artifact_content(
     # make. The type is neutralised at serve time instead.
     #
     # `nosniff`, set globally in `main.py`, does not cover this: it stops a browser guessing a
-    # type, and the exposure here is a type honestly declared `text/html`. `sandbox` gives the
+    # type, and the exposure here is a type openly declared `text/html`. `sandbox` gives the
     # response a unique origin with scripting off, so stored markup cannot run against a viewer's
     # session on this node, while images and PDFs still render. It applies to every response,
     # because an artifact with no filename is sent with no `Content-Disposition` and a browser
@@ -3312,8 +3397,26 @@ async def get_artifact_content(
         # `attachment` is the default, because a download is the safe assumption for a store
         # holding arbitrary uploaded bytes. `inline` lets a viewer render an image or a PDF in
         # place without re-hosting the bytes.
-        headers["Content-Disposition"] = '%s; filename="%s"' % (disposition, fn)
+        headers["Content-Disposition"] = _content_disposition(disposition, str(fn))
     return Response(content=data, media_type=ctx.get("content_type") or "application/octet-stream", headers=headers)
+
+
+def _content_disposition(disposition: str, filename: str) -> str:
+    """A `Content-Disposition` value naming ``filename`` (RFC 6266).
+
+    The filename is client-written context, so it is never placed in the header as given. The
+    quoted `filename` parameter carries an ASCII rendering with quotes, backslashes, semicolons,
+    control characters and non-ASCII replaced by `_`, which no filename can use to end the quoted
+    string or add a parameter, even for a parser that splits on `;` without honouring quotes;
+    `filename*` carries the full name, UTF-8 and percent-encoded, which browsers prefer when
+    present."""
+    from urllib.parse import quote
+
+    ascii_name = "".join(
+        c if 0x20 <= ord(c) < 0x7F and c not in '"\\;' else "_" for c in filename
+    ) or "download"
+    return '%s; filename="%s"; filename*=UTF-8\'\'%s' % (
+        disposition, ascii_name, quote(filename, safe=""))
 
 
 def _refuse_oversize(declared, artifact_id: str) -> None:
@@ -3498,7 +3601,8 @@ async def put_artifact_content(
     # `content_key` is recorded even when it is derived here rather than read from the context.
     # It is the object store's whole address, so an upload that did not write it back left the
     # download route reading `ctx["content_key"] is None` — a 404 on content that was stored.
-    await offload_sync(_record_content_ref, store_db, doc, content_key, ref, digest, ctype)
+    await offload_sync(_record_content_ref, store_db, doc, content_key, ref, digest, ctype,
+                       len(body))
 
     return {"stored": True, "size": len(body), "content_key": content_key,
             "content_ref": ref, "deduplicated": False,
@@ -3609,7 +3713,8 @@ def _record_mirror_pending(store_db: Database, artifact_id: str, content_key: st
 
 
 def _record_content_ref(store_db: Database, doc: Dict[str, Any], content_key: str,
-                        ref: Optional[str], digest: str, content_type: str) -> None:
+                        ref: Optional[str], digest: str, content_type: str,
+                        nbytes: Optional[int] = None) -> None:
     """Write both of the content's addresses onto the artifact's context, through the entity
     boundary.
 
@@ -3636,6 +3741,10 @@ def _record_content_ref(store_db: Database, doc: Dict[str, Any], content_key: st
                 ctx = {}
         ctx["content_key"] = content_key
         ctx["content_sha256"] = digest
+        if nbytes is not None:
+            ctx["content_bytes"] = nbytes
+        else:
+            ctx.pop("content_bytes", None)
         if ref:
             ctx["content_cas_ref"] = ref
         else:
@@ -3643,7 +3752,11 @@ def _record_content_ref(store_db: Database, doc: Dict[str, Any], content_key: st
             # would point the next read at bytes that are not this artifact's content.
             ctx.pop("content_cas_ref", None)
         ctx.setdefault("content_type", content_type)
-        entity.context = json.dumps(ctx)
+        # The mint's `addressing` names these bytes too (`mint_context.readdressed`: ``digest`` is
+        # the plaintext SHA-256, as the mint's is), and the client keys are stored at the top
+        # level (`mint_context.normalised`).
+        from mantle.services import mint_context as _mc
+        entity.context = _mc.normalised(_mc.readdressed(ctx, sha256=digest, nbytes=nbytes))
         store.update_artifact(store_db, entity)
     except Exception:
         logger.warning("could not record the content address on artifact %s — the bytes are "
@@ -3747,85 +3860,6 @@ async def reorder_children(
 
     # The version AFTER the write, so a client chaining reorders can pass it straight back.
     return {"order_version": await offload_sync(store.order_fingerprint, store_db, artifact_id)}
-
-
-# ---------- POST /artifacts/{artifact_id}/revert — Phase D.1 dedicated route ----------
-
-@router.post("/{artifact_id}/revert",
-    # The 204 is declared, so a generated client has a branch for the designed no-op.
-    responses=_errors(
-        400, 401, 404, 500,
-        no_content="Nothing to revert: this artifact has no committed version yet, so there is "
-                   "no state to restore. This is the designed no-op, NOT a failure — the draft "
-                   "is left exactly as it was.",
-        ok=ArtifactResponse,
-    ),
-)
-async def revert_artifact_endpoint(
-    artifact_id: Annotated[str, Path(description=_ARTIFACT_PARAM)],
-    auth: AuthContext = Depends(get_auth),
-    store_db: Database = Depends(get_store_db),
-):
-    """Restore the artifact's last committed version, discarding the draft delta.
-
-    This is a distinct endpoint rather than routing through `op/revert`: revert
-    touches version history (it doesn't just flip a state field) so it warrants
-    its own verb. If the artifact has no committed version yet, returns
-    `204 No Content` per the design doc's "no-op" rule.
-    """
-    if not auth.user_id:
-        raise HTTPException(status_code=401, detail="User identification required")
-
-    await offload_sync(check_access, auth, artifact_id, "update", store_db)
-
-    doc = await offload_sync(_find_artifact, store_db, artifact_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Not found")
-
-    # `collection_id` only, with no `_key` fallback: `_key` is an alias for the artifact's own id
-    # rather than for its container, so falling back to it would pass the artifact's own id as
-    # the workspace, which `revert_artifact` rejects by construction
-    # (`target.collection_id != workspace_id`).
-    #
-    # A top-level artifact has no workspace, and the branch below says that rather than letting
-    # an empty `workspace_id` surface as `404 Workspace not found`.
-    workspace_id = doc.get("collection_id") or ""
-    if not workspace_id:
-        raise HTTPException(
-            status_code=400,
-            detail="This artifact is top-level and has no containing workspace, so there is no "
-                   "workspace-scoped draft to revert. Revert applies to an artifact inside a "
-                   "container.",
-        )
-
-    from mantle.services.workspace_service import revert_artifact
-
-    try:
-        result = await offload_sync(
-            revert_artifact,
-            workspace_db=store_db,
-            collection_db=store_db,
-            user_id=auth.user_id,
-            workspace_id=workspace_id,
-            artifact_id=artifact_id,
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        # Paired with the `except HTTPException: raise` above, which on its own is a no-op
-        # wrapper. Without this clause a store-level failure reaches FastAPI's default handler
-        # with no log line and no message a caller could act on.
-        logger.error("Failed to revert artifact %s: %s", artifact_id, exc, exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to revert artifact")
-
-    if result is None:
-        # No committed version exists — revert is a no-op per the design.
-        from fastapi import Response
-        return Response(status_code=204)
-    #: Through `_artifact_body`, because a raw `to_dict` omits unset fields and this route
-    #: declares `ok=`: without it the response shape would vary with the data while the spec
-    #: promises the declared keys are always present.
-    return _artifact_body(result.to_dict())
 
 
 # =============================================================================

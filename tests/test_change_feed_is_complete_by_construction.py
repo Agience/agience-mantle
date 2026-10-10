@@ -92,10 +92,6 @@ WRITE_SITES: dict[tuple[str, str], tuple[str, str]] = {
     ("db/lattice_api.py", "update_collection"): (
         BOUNDARY, "a container update IS an artifact update — the rename/description edit that a "
                   "live tree is likeliest to be showing stale."),
-    ("db/lattice_api.py", "batch_commit_drafts"): (
-        BOUNDARY, "writes each doc directly rather than through update_artifact, so it emits one "
-                  "artifact.updated per document — a subscriber filters per artifact, and a "
-                  "batch-shaped event would reach nobody watching one artifact in the batch."),
     ("db/lattice_api.py", "archive_artifact"): (
         BOUNDARY, "soft delete. Emits artifact.deleted, not updated: every container read filters "
                   "archived versions out, so from a subscriber's side the artifact has left. The "
@@ -109,14 +105,12 @@ WRITE_SITES: dict[tuple[str, str], tuple[str, str]] = {
     ("db/lattice_api.py", "delete_collection"): (
         SERVICE, "same shape as delete_artifact, for a container."),
     ("db/lattice_api.py", "delete_artifacts_by_root"): (
-        SERVICE, "whole-lineage delete behind revert / remove; the service emits one "
+        SERVICE, "whole-lineage delete behind remove; the service emits one "
                  "artifact.deleted for the root rather than one per version."),
     ("services/workspace_service.py", "delete_artifact"): (
         SERVICE, "emits artifact.deleted with the container the db layer no longer has."),
     ("services/workspace_service.py", "remove_artifact_from_container"): (
         SERVICE, "detach; emits artifact.deleted against the container it was removed from."),
-    ("services/workspace_service.py", "revert_artifact"): (
-        SERVICE, "drops the draft and emits artifact.updated for the version now current."),
     ("services/workspace_service.py", "delete_workspace"): (
         SERVICE, "emits one artifact.deleted per root and then one for the workspace itself. Per "
                  "root and not just for the container, because a subscriber told only that the "
@@ -203,6 +197,13 @@ WRITE_SITES: dict[tuple[str, str], tuple[str, str]] = {
         BOUNDARY, "curation move — two events for one write, artifact.deleted against the old "
                   "container and artifact.created against the new, because a watcher of either "
                   "one learns only about its own side."),
+    ("system/manage_state_collapse.py", "apply"): (
+        BOUNDARY, "the state-collapse migration writing stored docs directly. Emits one "
+                  "artifact.updated per lineage it settles, for the version now current — a "
+                  "subscriber filters per artifact. The older rows it archives in the same pass "
+                  "are superseded versions of that root, as `vertex._snapshot_prior` writes them, "
+                  "and the bulk relabel of `committed` to `live` changes no value any reader "
+                  "returns."),
     ("shard/erasure.py", "erase"): (
         BOUNDARY, "the erasure path. Emits artifact.deleted per erased id, carrying an id and a "
                   "verb and nothing off the erased doc — a subscriber holding derived state is "
@@ -625,7 +626,7 @@ async def test_archiving_tells_the_container_the_artifact_is_gone(store, bus):
 
     queue = await bus.subscribe_filtered(bus.EventFilter(event_names=["artifact.*"]))
     artifact = Artifact(id="a-1", collection_id="col-1", name="doomed", content="",
-                        created_by="u-1", state="committed")
+                        created_by="u-1", state="live")
     lattice_api.create_artifact(store, artifact)
     await _drain(queue, expect=1)
     lattice_api.create_grant(store, Grant(
@@ -659,67 +660,68 @@ async def test_a_refused_archive_announces_nothing(store, bus):
     assert queue.empty(), "a write that was refused still announced itself"
 
 
-# ── the batch commit ──────────────────────────────────────────────────────────────────────────
+# ── the state collapse ────────────────────────────────────────────────────────────────────────
+
+def _as_legacy_draft(store, aid):
+    """Rewrite a stored row to the legacy `draft`, as a store that has not been migrated holds
+    it. A raw substrate write, so it announces nothing."""
+    store.artifacts.put_artifact(dict(store.artifacts.get_artifact(aid), state="draft"))
+
 
 @pytest.mark.asyncio
-async def test_a_batch_commit_emits_one_event_per_document(store, bus):
-    """Per document, because a subscriber filters per artifact.
-
-    One batch-shaped event would carry ids nobody's filter selects on, so a subscriber watching a
-    single artifact in the batch would learn nothing about the commit of the artifact it watches.
-    """
+async def test_the_state_collapse_emits_one_event_per_settled_lineage(store, bus):
+    """Per lineage, because a subscriber filters per artifact."""
     from mantle.entities.artifact import Artifact
     from mantle.db import lattice_api
+    from mantle.system import manage_state_collapse as tool
 
     queue = await bus.subscribe_filtered(bus.EventFilter(event_names=["artifact.*"]))
     for aid in ("d-1", "d-2"):
         lattice_api.create_artifact(store, Artifact(
-            id=aid, root_id=aid, collection_id="col-1", name=aid, content="",
-            created_by="u-1", state="draft"))
-    lattice_api.create_artifact(store, Artifact(
-        id="d-3", root_id="d-3", collection_id="col-other", name="d-3", content="",
-        created_by="u-1", state="draft"))
-    await _drain(queue, expect=3)
+            id=aid, root_id=aid, collection_id="col-1", name=aid, content="", created_by="u-1"))
+    await _drain(queue, expect=2)
+    for aid in ("d-1", "d-2"):
+        _as_legacy_draft(store, aid)
 
-    n = lattice_api.batch_commit_drafts(
-        store, "col-1", ["d-1", "d-2", "d-3", "ghost"], "u-2", "2026-07-22T12:00:00+00:00")
-    assert n == 2
+    tool.apply(store, tool.report(store, measure_prefixes=False)["groups"],
+               reindex=lambda art: None)
 
     events = await _drain(queue, expect=2)
     assert [e.name for e in events] == ["artifact.updated", "artifact.updated"]
-    assert sorted(e.artifact_id for e in events) == ["d-1", "d-2"], \
-        "the out-of-collection draft was not committed, so it must not be announced"
-    assert all(_artifact_of(e).get("state") == "committed" for e in events)
-    assert all(e.actor_id == "u-2" for e in events)
+    assert sorted(e.artifact_id for e in events) == ["d-1", "d-2"]
+    assert all(_artifact_of(e).get("state") == "live" for e in events)
     assert queue.empty()
 
 
 @pytest.mark.asyncio
-async def test_a_batch_commit_puts_no_ciphertext_on_the_feed(store, bus, content_key):
-    """The commit writes the stored doc back, and a stored doc holds `content` encrypted.
+async def test_the_state_collapse_puts_no_ciphertext_on_the_feed(store, bus, content_key):
+    """The migration writes the stored doc back, and a stored doc holds `content` encrypted.
 
     Forwarding it verbatim would hand every subscriber a base64 blob it has no key for — worse
     than an absent field, because it reads as content rather than as something to go and fetch.
     """
     from mantle.entities.artifact import Artifact
     from mantle.db import lattice_api
+    from mantle.system import manage_state_collapse as tool
 
     queue = await bus.subscribe_filtered(bus.EventFilter(event_names=["artifact.*"]))
     lattice_api.create_artifact(store, Artifact(
         id="d-9", root_id="d-9", collection_id="col-1", name="d-9",
-        content="the-plaintext-marker", created_by="u-1", state="draft"))
+        content="the-plaintext-marker", created_by="u-1"))
     await _drain(queue, expect=1)
+    _as_legacy_draft(store, "d-9")
 
     stored = store.artifacts.get_artifact("d-9")
     assert stored.get("content_encrypted") is True, "the fixture did not exercise the envelope"
 
-    lattice_api.batch_commit_drafts(store, "col-1", ["d-9"], "u-2", "2026-07-22T12:00:00+00:00")
+    tool.apply(store, tool.report(store, measure_prefixes=False)["groups"],
+               reindex=lambda art: None)
     (event,) = await _drain(queue, expect=1)
 
     artifact = _artifact_of(event)
     assert "content" not in artifact and "content_encrypted" not in artifact
     assert stored["content"] not in json.dumps(event.payload), \
-        "the commit event carried the stored ciphertext"
+        "the migration event carried the stored ciphertext"
 
 
 # ── the workspace delete ──────────────────────────────────────────────────────────────────────

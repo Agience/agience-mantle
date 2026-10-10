@@ -1,19 +1,22 @@
 """ONE meaning for a doc that carries no `state`, and every reader derives from it.
 
-`state` partitions the search index into three separately-keyed encrypted trees, one per state.
-So "what state is a doc with no `state` field in" is not a stylistic question: two readers that
-answer it differently move an artifact between encrypted index trees on a write that changed
-nothing.
+`state` partitions the search index into separately-keyed encrypted trees, one per state (`live`,
+`archived`). So "what state is a doc with no `state` field in" is not a stylistic question: two
+readers that answer it differently move an artifact between encrypted index trees on a write that
+changed nothing.
 
-The concrete failure this file pins: a doc written without `state` (`lattice_api.mark_materialized`
-writes one; so does any raw `put_artifact`) is returned by `list_artifacts()` and filed by the
-indexer under **committed**. Round-tripping that same doc through `Artifact.from_dict` →
-`to_dict` used to materialise `state: "draft"`, so a pure read-modify-write relocated the artifact
-into the draft tree. Nothing about the artifact changed; only which key opened it.
+The failure this file pins: a doc written without `state` (`lattice_api.mark_materialized` writes
+one; so does any raw `put_artifact`) is returned by `list_artifacts()` and filed by the indexer
+under **live**. Round-tripping that same doc through `Artifact.from_dict` → `to_dict` must file it
+in the same tree; a round trip that materialised any other state would relocate the artifact
+although nothing about it changed, only which key opened it.
 
-The single source is `db.constants.STATE_WHEN_ABSENT`. It lives at the store layer because that is
-the layer that stands alone (`db/vertex.py` cannot import `entities`) and because the fact is about
-a STORED DOC, not about an entity.
+The same reading covers the legacy values: a stored `committed` or `draft` reads, round-trips and
+indexes as `live`.
+
+The single source is `db.constants.STATE_WHEN_ABSENT` (with `state_of`). It lives at the store
+layer because that is the layer that stands alone (`db/vertex.py` cannot import `entities`) and
+because the fact is about a STORED DOC, not about an entity.
 """
 from __future__ import annotations
 
@@ -49,9 +52,9 @@ def _segment(doc: dict) -> str:
 def test_stateless_doc_round_trip_does_not_change_index_segment():
     """Read a stateless doc, write it back unchanged, and it must still index into the same tree.
 
-    A segment change here is not a cosmetic difference: the three segments are encrypted under
-    separate keys, so an artifact that moves is an artifact whose postings were re-keyed by a
-    write that carried no edit.
+    A segment change here is not a cosmetic difference: the segments are encrypted under separate
+    keys, so an artifact that moves is an artifact whose postings were re-keyed by a write that
+    carried no edit.
     """
     raw = _stateless_doc()
     before = _segment(raw)
@@ -68,31 +71,36 @@ def test_stateless_doc_round_trip_does_not_change_index_segment():
 # The single source, and each derived site
 # ---------------------------------------------------------------------------
 
-def test_absent_state_resolves_to_committed():
-    """The chosen default, named once.
-
-    `revise()` — the store's own versioning primitive — writes `state = "committed"`
-    unconditionally, and both null-safe SQL predicates keep a stateless row as live rather than
-    archived. `draft` is an affirmative claim that an unpublished edit exists; absence cannot
-    assert it.
-    """
-    assert K.STATE_WHEN_ABSENT == Artifact.STATE_COMMITTED
+def test_absent_state_resolves_to_live():
+    """The chosen default, named once. Both null-safe SQL predicates keep a stateless row as live
+    rather than archived, and every write path writes `live`."""
+    assert K.STATE_WHEN_ABSENT == Artifact.STATE_LIVE == "live"
 
 
-def test_state_of_reads_absence_as_the_default():
+def test_state_of_reads_absence_and_the_legacy_values_as_live():
     assert K.state_of(_stateless_doc()) == K.STATE_WHEN_ABSENT
-    assert K.state_of({"state": "draft"}) == "draft"
+    assert K.state_of({"state": "draft"}) == "live"
+    assert K.state_of({"state": "committed"}) == "live"
     assert K.state_of({"state": "archived"}) == "archived"
-    # An empty string is not one of the three states; it is absence spelled differently.
+    # An empty string is not a state; it is absence spelled differently.
     assert K.state_of({"state": ""}) == K.STATE_WHEN_ABSENT
+    # A value on another axis (a grant's lifecycle) is not an artifact state and passes through.
+    assert K.state_of({"state": "active"}) == "active"
 
 
-@pytest.mark.parametrize("state", ["draft", "committed", "archived"])
+@pytest.mark.parametrize("state", ["live", "archived"])
 def test_a_recorded_state_survives_the_round_trip(state):
     """The default applies to ABSENCE only — it never overrides a state the doc records."""
     doc = dict(_stateless_doc(), state=state)
     assert Artifact.from_dict(doc).to_dict()["state"] == state
     assert _segment(Artifact.from_dict(doc).to_dict()) == state
+
+
+@pytest.mark.parametrize("legacy", ["committed", "draft"])
+def test_a_legacy_state_round_trips_and_indexes_as_live(legacy):
+    doc = dict(_stateless_doc(), state=legacy)
+    assert _segment(doc) == "live"
+    assert Artifact.from_dict(doc).to_dict()["state"] == "live"
 
 
 def test_entity_layer_derives_from_the_single_source():
@@ -105,13 +113,10 @@ def test_index_segment_derives_from_the_single_source():
     assert _segment_for_state("not-a-state") == K.STATE_WHEN_ABSENT
 
 
-def test_a_new_artifact_is_still_a_draft():
-    """Constructing a fresh artifact and reading a stored doc are different questions.
-
-    A newly created artifact IS a draft — that is an affirmative claim the constructor makes. The
-    default here is only about a doc that reached the store WITHOUT the field.
-    """
-    assert Artifact().state == Artifact.STATE_DRAFT
+def test_a_new_artifact_is_live():
+    """A newly constructed artifact is live — the same answer absence gets, so creating an
+    artifact and reading a stored doc cannot file it into different trees."""
+    assert Artifact().state == Artifact.STATE_LIVE == K.STATE_WHEN_ABSENT
 
 
 # ---------------------------------------------------------------------------

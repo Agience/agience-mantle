@@ -48,39 +48,61 @@ CRUDEASIO = ("create", "read", "update", "delete",
 
 # ── artifact lineage state ───────────────────────────────────────────────────
 #
+# An artifact version is `live` or `archived`. There is no promotion state: every write path
+# writes `live`, and `archived` marks a superseded version or a retired artifact.
+#
+# `committed` and `draft` are LEGACY recorded values: a store holds them on every row
+# `system/manage_state_collapse` has not relabelled, and a mesh peer that has not run it sends
+# them. Every reader treats both as `live` (`state_of`, `live_states`), so a
+# legacy row reads the same before and after its migration.
+STATE_LIVE = "live"
+STATE_ARCHIVED = "archived"
+LEGACY_LIVE_STATES = ("committed", "draft")
+#: Every recorded value that reads as `live`.
+LIVE_STATES = (STATE_LIVE,) + LEGACY_LIVE_STATES
+
 # The one answer to "what state is a doc with no `state` field in".
 #
-# `state` partitions the search index into three separately-keyed encrypted trees, one per state,
-# so this is not a stylistic default: two readers that answer it differently move an artifact
+# `state` partitions the search index into separately-keyed encrypted trees, one per state, so
+# this is not a stylistic default: two readers that answer it differently move an artifact
 # between encrypted trees on a write that changed nothing. Every reader derives from here.
 #
-# ABSENCE IS COMMITTED. Three facts fix the value:
-#
-#   * `vertex.revise()` — the store's own versioning primitive — writes `state = "committed"`
-#     unconditionally, so the raw write path's output is committed.
-#   * Both head-only SQL predicates are `json_extract(doc,'$.state') IS NOT 'archived'`, which is
-#     null-safe on purpose: a stateless row is LIVE, not filtered out.
-#   * `draft` is an affirmative claim — "an unpublished edit exists". Absence of the field cannot
-#     make that claim. (`Artifact()` still constructs a draft; creating an artifact and reading a
-#     stored doc are different questions.)
+# ABSENCE IS LIVE. Both head-only SQL predicates are `json_extract(doc,'$.state') IS NOT
+# 'archived'`, which is null-safe on purpose: a stateless row is live, not filtered out.
 #
 # It lives at the store layer because the fact is about a STORED DOC, and because this is the
 # layer both sides can reach: `db/vertex.py` stands alone and cannot import `entities`.
-STATE_WHEN_ABSENT = "committed"
+STATE_WHEN_ABSENT = STATE_LIVE
 
 
 def state_of(doc: Dict[str, Any]) -> str:
-    """The lineage state of a doc, with absence resolved to `STATE_WHEN_ABSENT`.
+    """The lineage state of a doc: absence resolves to `STATE_WHEN_ABSENT`, and a legacy
+    `committed` or `draft` resolves to `live`.
 
-    Falsy, not `is None` — an empty string is absence spelled differently, and it is not one of
-    the three states, so resolving the two the same way is what keeps a doc from landing in no
-    segment at all.
+    Falsy, not `is None` — an empty string is absence spelled differently, and it is not a state,
+    so resolving the two the same way is what keeps a doc from landing in no segment at all.
 
     NOT for the `state:*` counters or the `state=` SQL filter: those partition on the value a row
     RECORDS, over a mixed plane (people, grants, commits, markers all live in `vertex`), and are
-    documented at their call sites.
+    documented at their call sites. Values outside the artifact axis (a grant's lifecycle) pass
+    through unchanged.
     """
-    return str(doc.get("state") or STATE_WHEN_ABSENT)
+    s = str(doc.get("state") or STATE_WHEN_ABSENT)
+    return STATE_LIVE if s in LEGACY_LIVE_STATES else s
+
+
+def live_states(state: Optional[str]) -> Optional[tuple]:
+    """The recorded values a query for `state` matches.
+
+    `live` matches `live` and the legacy `committed` and `draft`, so a store holding rows written
+    before the migration answers a live query completely. `committed` is read as `live` for
+    callers that still send it. Every other value, `draft` included, matches exactly what it
+    names: the migration tool finds legacy drafts by asking for `draft`. `None` stays `None`."""
+    if state is None:
+        return None
+    if state in (STATE_LIVE, "committed"):
+        return LIVE_STATES
+    return (state,)
 
 # ── edge forces (contract §2, `edge.force`) ──────────────────────────────────
 EDGE_FORCES = ("grant", "temporal", "semantic", "lifecycle", "derivation")

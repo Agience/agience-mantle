@@ -40,7 +40,7 @@ def _run(*, origin_parent, may_delete, cascade=True, others=0):
     db = MagicMock()
     with (
         patch.object(ws_svc.store, "get_origin_parent", return_value=origin_parent),
-        patch.object(ws_svc, "_may_delete_draft", return_value=may_delete) as asked,
+        patch.object(ws_svc, "_may_delete_artifact", return_value=may_delete) as asked,
         patch.object(ws_svc.store, "count_other_containers_for_root", return_value=others),
         patch.object(ws_svc.store, "delete_artifacts_by_root") as destroy,
         patch.object(ws_svc.store, "remove_all_edges_for_root"),
@@ -126,5 +126,5 @@ def test_the_default_branch_destroys_nothing_at_all():
 
 
 def test_the_fail_closed_helper_still_fails_closed():
-    """`_may_delete_draft` is what the guard leans on for a linked member."""
-    assert ws_svc._may_delete_draft(MagicMock(), None, "a-1") is False
+    """`_may_delete_artifact` is what the guard leans on for a linked member."""
+    assert ws_svc._may_delete_artifact(MagicMock(), None, "a-1") is False

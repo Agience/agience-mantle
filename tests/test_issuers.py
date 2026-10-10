@@ -17,7 +17,7 @@ def _issuer_artifact(iss="https://idp.test", *, created_by="SYS", role="external
     ctx = {"content_type": ISSUER_CONTENT_TYPE, "issuer": iss,
            "audience": "client-1", "jwks": {"keys": [{"kid": "k1"}]}, "role": role}
     ctx.update(extra)
-    return Artifact(id="i-1", collection_id="c", state="committed",
+    return Artifact(id="i-1", collection_id="c", state="live",
                     created_by=created_by, context=json.dumps(ctx),
                     content_type=ISSUER_CONTENT_TYPE)
 
@@ -28,7 +28,7 @@ class TestLoadIssuerConfigs:
         # confer trust, since create is label-blind).
         with (
             patch("mantle.services.peer_signing.get_system_principal_id", return_value=None),
-            patch("mantle.db.backend.list_committed_artifacts_by_context_content_type") as q,
+            patch("mantle.db.backend.list_live_artifacts_by_context_content_type") as q,
         ):
             assert load_issuer_configs(object()) == []
             q.assert_not_called()
@@ -36,7 +36,7 @@ class TestLoadIssuerConfigs:
     def test_maps_system_owned_committed_artifacts(self):
         with (
             patch("mantle.services.peer_signing.get_system_principal_id", return_value="SYS"),
-            patch("mantle.db.backend.list_committed_artifacts_by_context_content_type",
+            patch("mantle.db.backend.list_live_artifacts_by_context_content_type",
                   return_value=[_issuer_artifact()]) as q,
         ):
             cfgs = load_issuer_configs(object())
@@ -52,7 +52,7 @@ class TestLoadIssuerConfigs:
         art.context = json.dumps({"content_type": ISSUER_CONTENT_TYPE})  # no issuer
         with (
             patch("mantle.services.peer_signing.get_system_principal_id", return_value="SYS"),
-            patch("mantle.db.backend.list_committed_artifacts_by_context_content_type",
+            patch("mantle.db.backend.list_live_artifacts_by_context_content_type",
                   return_value=[art]),
         ):
             assert load_issuer_configs(object()) == []
@@ -148,7 +148,7 @@ class TestAdminCreateRevoke:
                 jwks={"keys": []}, audience="aud-1")
         a = captured["art"]
         assert a.created_by == "SYS"               # trusted by the loader
-        assert a.state == "committed"
+        assert a.state == "live"
         assert a.content_type == ISSUER_CONTENT_TYPE
         ctx = json.loads(a.context)
         assert ctx["issuer"] == "https://idp.test"
@@ -195,7 +195,7 @@ class TestAdminCreateRevoke:
 
     def test_revoke_archives_issuer(self):
         from mantle.services import issuers
-        art = Artifact(id="i-1", state="committed", created_by="SYS",
+        art = Artifact(id="i-1", state="live", created_by="SYS",
                        context=json.dumps({"content_type": ISSUER_CONTENT_TYPE, "issuer": "x"}))
         updated = {}
         with (
@@ -208,7 +208,7 @@ class TestAdminCreateRevoke:
 
     def test_revoke_rejects_non_issuer(self):
         from mantle.services import issuers
-        art = Artifact(id="x", state="committed",
+        art = Artifact(id="x", state="live",
                        context=json.dumps({"content_type": "text/plain"}))
         with patch("mantle.db.backend.get_artifact", return_value=art):
             assert issuers.revoke_issuer_artifact(object(), "x", by="a") is False

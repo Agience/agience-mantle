@@ -45,7 +45,7 @@ def export_shard(
     version: int,
     authority_id: str,
     priv: Ed25519PrivateKey,
-    state: str = "committed",
+    state: str = "live",
     content_field: str = "content",
     limit: Optional[int] = None,
     skip_existing: bool = False,
@@ -96,7 +96,7 @@ def import_shard(
             into_artifact_store.put_artifact({
                 "id": aid,
                 "content_type": "text/plain",
-                "state": "committed",
+                "state": "live",
                 # offer is not carried in the manifest leaf; a fuller manifest would
                 # include it. Import is content-first; describe re-runs on demand.
                 "context": text.split("\n", 1)[0][:200],

@@ -342,26 +342,31 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
         # this table, most of them carrying no `state` at all, and grants carry one on an
         # orthogonal axis (a grant lifecycle — see `revise`, which refuses a caller-supplied
         # `state` for exactly this collision). Defaulting them would fold every person and every
-        # commit row into `state:committed`, which `scripts/collect_usage_metrics` reports as
-        # `committed_artifact_versions_total`.
+        # commit row into `state:live`, which `scripts/collect_usage_metrics` reports as
+        # `live_artifact_versions_total`.
         #
         # So a doc that records no state is counted in no `state:*` bucket and in no
         # `committed_only` bucket, and `count(state=…)` stays exactly the O(1) sibling of
         # `list_artifacts(state=…)` — both answer "what does the row record". The absent-state
         # default is a claim about artifact docs, and this path cannot tell an artifact doc from a
         # person doc: `root_id` and `collection_id` are both populated on non-artifacts.
+        #
+        # The `committed_only` buckets count rows recording `live` or the legacy `committed`. A
+        # legacy `draft` row was never counted there, and counting it now would make its later
+        # rewrite or delete subtract a row that was never added; it enters the bucket when the
+        # migration rewrites it to `live`, through this same path.
         for doc, sign in ((old, -1), (new, 1)):
             if doc is None:
                 continue
             ct = old_ct if sign < 0 else new_ct
-            committed = doc.get("state") == "committed"
+            live = doc.get("state") in (K.STATE_LIVE, "committed")
             if ct:
                 add(_schema.c_ct(str(ct)), sign)
             if doc.get("state"):
                 add("state:" + str(doc["state"]), sign)
             if doc.get("collection_id"):
                 add(_schema.c_collection(str(doc["collection_id"])), sign)
-                if committed:
+                if live:
                     add(_schema.c_collection(str(doc["collection_id"]),
                                              committed_only=True), sign)
             # The provenance null-audit. Counted here, on the single write path, so a
@@ -370,7 +375,7 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
             for field in K.NULL_AUDIT_FIELDS:
                 if K.is_missing(doc.get(field)):
                     add(_schema.c_missing(field), sign)
-                    if committed:
+                    if live:
                         add(_schema.c_missing(field, committed_only=True), sign)
         return {k: v for k, v in d.items() if v}
 
@@ -785,16 +790,21 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
             if val is not None:
                 where.append(col + " = ?")
                 params.append(val)
-        for field, val in (("state", state), ("collection_id", collection_id)):
-            if val is not None:
-                where.append("json_extract(doc, '$.%s') = ?" % field)
-                params.append(val)
+        if collection_id is not None:
+            where.append("json_extract(doc, '$.collection_id') = ?")
+            params.append(collection_id)
+        # `state="live"` (or the legacy `"committed"`) matches every recorded value that reads as
+        # live — `K.live_states` — so a store holding unmigrated rows answers completely.
+        states = K.live_states(state)
+        if states is not None:
+            where.append("json_extract(doc, '$.state') IN (%s)" % ",".join("?" * len(states)))
+            params.extend(states)
         # Head-only by default: exclude archived unless the caller asked for a specific state or for
         # history. `IS NOT` is null-safe — a row with no `state` is kept, which is
-        # `K.STATE_WHEN_ABSENT` ("committed") expressed as a predicate.
+        # `K.STATE_WHEN_ABSENT` ("live") expressed as a predicate.
         #
-        # The `state = ?` filter above is deliberately NOT widened by that default: it partitions
-        # on the recorded value, the same reading the `state:*` counters take (see
+        # The `state IN (…)` filter above is deliberately NOT widened by that default: it partitions
+        # on the recorded values, the same reading the `state:*` counters take (see
         # `_counter_deltas`), so `count(state=…)` and this list agree row for row.
         if state is None and not include_archived:
             where.append("json_extract(doc, '$.state') IS NOT 'archived'")
@@ -834,10 +844,106 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
         return [{"_seq": int(r["_seq"]), "doc": json.loads(r["doc"])} for r in rows]
 
     def count(self, *, state: Optional[str] = None) -> int:
-        """Total vertices, or vertices in one `state`. Read off an incrementally
-        maintained counter — this store issues no `count(*)` on any path."""
-        name = ("state:" + state) if state else _schema.c_vertex_total()
-        return _seq.counter_of(self.db, name)
+        """Total vertices, or vertices in one `state`. Read off incrementally maintained
+        counters — this store issues no `count(*)` on any path.
+
+        `state="live"` (or the legacy `"committed"`) sums the `state:*` counters of every recorded
+        value that reads as live (`K.live_states`), the same set `list_artifacts(state=…)` matches.
+        `count_recorded` reads one recorded value exactly."""
+        if not state:
+            return _seq.counter_of(self.db, _schema.c_vertex_total())
+        return sum(self.count_recorded(s) for s in K.live_states(state))
+
+    def count_recorded(self, state: str) -> int:
+        """Vertices whose doc records exactly `state`. One counter lookup; no legacy mapping."""
+        return _seq.counter_of(self.db, "state:" + state)
+
+    #: The pair the `committed_only` buckets both count (`_counter_deltas`): a relabel inside it
+    #: moves no counter but the two `state:*` counters it names, so it runs as one set UPDATE.
+    RELABEL_SET_UPDATE = ("committed", K.STATE_LIVE)
+
+    def relabel_state(self, old: str, new: str = K.STATE_LIVE, *, batch: int = 5000,
+                      limit: Optional[int] = None,
+                      exclude_origin: Optional[str] = None) -> Dict[str, Any]:
+        """Rewrite `doc.state` from a legacy `old` (`committed` or `draft`) to `live` on every row
+        that records `old`. The bulk path of the state-collapse migration.
+
+        Keyset batches in `id` order. Each batch is two steps:
+
+          1. the next `batch` candidate ids, SELECTed on a plain read cursor — no transaction and
+             no write lock. There is no index on `$.state`, so this is the step that walks the
+             table, and it is the one that must not hold the lock while it does;
+          2. one write transaction that rewrites exactly those ids (`id IN (…)`, in chunks of
+             `IN_CHUNK`), each still guarded by `$.state = old`, so a row another writer changed
+             since step 1 is skipped rather than overwritten.
+
+        Counters move in the same transaction by what was actually rewritten:
+
+          · `committed` → `live` is one `json_set` UPDATE per chunk; its row count is the delta
+            for `state:committed` and `state:live`, and nothing else moves (`RELABEL_SET_UPDATE`).
+          · `draft` → `live` rewrites row by row and applies `_counter_deltas` for each, because
+            a legacy draft is outside the `committed_only` buckets and enters them here.
+
+        What it deliberately leaves alone: `_seq`, `_origin` and the merkle leaf. A relabel is not
+        an authored event — the value reads the same before and after (`K.state_of`) — and
+        stamping 5.6M rows would republish every one of them. The leaf hashes `(id, _seq)` only
+        (`K.row_hash`). Each node relabels its own copy of every row, whoever authored it; a
+        replica that arrives later from an unmigrated peer is normalised on ingest (`mesh/sync`).
+        The task sidecar and `listkey` do not read `state`.
+
+        `exclude_origin` leaves rows authored by that origin alone (the migration settles its own
+        drafts as authored writes first). `limit` stops after that many rows. A run stopped
+        between batches resumes by running again. Returns `{"relabelled": n, "batches": k}`."""
+        if old not in K.LEGACY_LIVE_STATES or new != K.STATE_LIVE:
+            raise ValueError("relabel_state(%r, %r): only a legacy %s to %r" % (
+                old, new, " or ".join(K.LEGACY_LIVE_STATES), K.STATE_LIVE))
+        set_update = (old, new) == self.RELABEL_SET_UPDATE
+        batch = max(1, int(batch))
+        done, batches, cursor = 0, 0, ""
+        origin_clause = " AND _origin IS NOT ?" if exclude_origin is not None else ""
+        while limit is None or done < limit:
+            take = batch if limit is None else min(batch, limit - done)
+            params: List[Any] = [cursor, old]
+            if exclude_origin is not None:
+                params.append(exclude_origin)
+            params.append(take)
+            ids = [r[0] for r in self.db.read().execute(
+                "SELECT id FROM vertex WHERE id > ? AND json_extract(doc, '$.state') = ?"
+                + origin_clause + " ORDER BY id LIMIT ?", params).fetchall()]
+            if not ids:
+                break
+            n = 0
+            with self.db.write() as cur:
+                for i in range(0, len(ids), IN_CHUNK):
+                    chunk = ids[i:i + IN_CHUNK]
+                    marks = ",".join("?" * len(chunk))
+                    if set_update:
+                        c = cur.execute(
+                            "UPDATE vertex SET doc = json_set(doc, '$.state', ?) "
+                            "WHERE id IN (%s) AND json_extract(doc, '$.state') = ?" % marks,
+                            [new] + chunk + [old])
+                        k = c.rowcount if c.rowcount is not None and c.rowcount >= 0 else 0
+                        _seq.bump(cur, "state:" + old, -k)
+                        _seq.bump(cur, "state:" + new, k)
+                        n += k
+                        continue
+                    rows = cur.execute(
+                        "SELECT id, ct, doc FROM vertex WHERE id IN (%s) "
+                        "AND json_extract(doc, '$.state') = ?" % marks, chunk + [old]).fetchall()
+                    for r in rows:
+                        prev = json.loads(r["doc"])
+                        doc = dict(prev)
+                        doc["state"] = new
+                        cur.execute("UPDATE vertex SET doc = ? WHERE id = ?",
+                                    (json.dumps(doc), r["id"]))
+                        for name, delta in self._counter_deltas(prev, doc, r["ct"],
+                                                                r["ct"]).items():
+                            _seq.bump(cur, name, delta)
+                        n += 1
+            done += n
+            batches += 1
+            cursor = ids[-1]
+        return {"relabelled": done, "batches": batches}
 
     def delete_artifact(self, artifact_id: str, *, accounted: bool = True) -> None:
         with self.db.write() as cur:
@@ -1037,9 +1143,10 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
     def count_in_collection(self, collection_id: str, *, committed_only: bool = False) -> int:
         """Members of one collection. Counter lookup, O(1).
 
-        `committed_only` exists because two kinds of caller need different things:
+        `committed_only` counts only rows recording `live` (or the legacy `committed`; see
+        `_counter_deltas`). It exists because two kinds of caller need different things:
         `advance_curriculum` uses the count as a resume offset and must count every
-        state — filtering to committed there under-counts, hands the ingester a low
+        state — filtering to live there under-counts, hands the ingester a low
         offset, and re-ingests records it already has."""
         return _seq.counter_of(
             self.db, _schema.c_collection(collection_id, committed_only=committed_only))
@@ -1093,7 +1200,7 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
         params: List[Any] = [content_type]
         if not include_archived:
             # `IS NOT` is null-safe — a row with no `state` is kept: `K.STATE_WHEN_ABSENT`
-            # ("committed") as a predicate.
+            # ("live") as a predicate.
             where += " AND json_extract(doc, '$.state') IS NOT 'archived'"
         params.append(cap + 1)
         rows = self.db.read().execute(
@@ -1255,10 +1362,10 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
         The shape matches `entities/artifact.py` and Ember's `LocalCache.revise`:
           · the new version is a new row with its own `id`, sharing `root_id`;
           · the prior head is archived, never deleted — it stays queryable forever;
-          · `version_id` is the committed head ("version_id is latest").
+          · `version_id` is the live head ("version_id is latest").
 
-        `state` here means lineage position (draft/committed/archived) and is the method's own
-        output — a revision is by definition the new committed head. The same field also carries
+        `state` here means lineage position (live/archived) and is the method's own
+        output — a revision is by definition the new live head. The same field also carries
         grant lifecycle, two orthogonal axes on one name, so a caller passing `state` in `changes`
         is refused rather than silently overridden.
 
@@ -1266,9 +1373,9 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
         if "state" in changes:
             raise ValueError(
                 "revise() does not accept `state` (%r): it is RESERVED. `state` is lineage "
-                "position and revise() sets it — the new version is the committed head. Accepting "
+                "position and revise() sets it — the new version is the live head. Accepting "
                 "a caller-supplied `state` here would let a revision to 'revoked' be silently "
-                "overwritten by the forced 'committed', reinstating access that had been revoked. "
+                "overwritten by the forced 'live', reinstating access that had been revoked. "
                 "Set lifecycle on a field of your own, or archive via "
                 "put_artifact()." % (changes["state"],))
         prev = self.get_artifact(artifact_id)
@@ -1287,7 +1394,7 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
         doc = dict(prev)
         doc.update(changes)
         doc["root_id"] = root
-        doc["state"] = "committed"
+        doc["state"] = K.STATE_LIVE
         if author:
             doc["created_by"] = author
         canon = {k: v for k, v in doc.items()
@@ -1300,7 +1407,7 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
             return prev                      # identical content — the revision is a no-op
 
         # Order matters: write the new version before archiving the old. A crash between them
-        # leaves two committed versions (visible, reconcilable) rather than none (an artifact
+        # leaves two live versions (visible, reconcilable) rather than none (an artifact
         # that momentarily does not exist for readers resolving the head).
         self.put_artifact(doc)
         old = dict(prev)

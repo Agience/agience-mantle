@@ -78,6 +78,7 @@ from pathlib import Path  # noqa: E402
 
 from fastapi import FastAPI, HTTPException, Request  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from starlette.requests import HTTPConnection  # noqa: E402
 from fastapi.responses import HTMLResponse, JSONResponse  # noqa: E402
 
 from mantle.db.backend import init_store, check_store_health  # noqa: E402  (lattice-backed store)
@@ -598,33 +599,12 @@ except Exception:
 # ----------------------------
 # Error logging handlers
 # ----------------------------
-
-# Fields whose values must never appear in logs.
-# `key` covers the once-only raw token in the POST /grants/keys response body.
-# `api_key`/`apikey` stay on the redaction list so a stale client that still sends
-# one never gets it written to the log.
-_REDACT_KEYS = frozenset({"password", "secret", "token", "api_key", "apikey",
-                          "access_token", "refresh_token", "credential",
-                          "passkey_credential", "passkey_challenge",
-                          "key", "grant_key"})
-
-def _redact_body(raw: bytes, max_len: int = 2048) -> str:
-    """Return a log-safe representation of a request body.
-
-    JSON bodies have sensitive fields replaced with '***'. Non-JSON
-    bodies are truncated to *max_len* bytes.
-    """
-    if not raw:
-        return ""
-    try:
-        import json as _json
-        obj = _json.loads(raw)
-        if isinstance(obj, dict):
-            obj = {k: ("***" if k.lower() in _REDACT_KEYS else v)
-                   for k, v in obj.items()}
-        return _json.dumps(obj, ensure_ascii=False)[:max_len]
-    except Exception:
-        return repr(raw[:max_len])
+# The handlers log the request line and the route's ids, never the request body. A refusal must
+# cost the node nothing it did not already spend: the body of a refused request is unread when
+# the refusal is raised — a 401 is decided from the headers — and reading it here would make
+# every refusal buffer and parse whatever the caller chose to send, an unauthenticated caller
+# included. It also keeps request content (passwords, keys, tokens) out of the log by
+# construction rather than by a redaction list.
 
 
 _PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource"
@@ -706,12 +686,8 @@ def oauth_protected_resource(request: Request):
 
 @app.exception_handler(HTTPException)
 async def http_exception_logger(request: Request, exc: HTTPException):
-    try:
-        body = await request.body()
-    except Exception:
-        body = b""
     logger.warning(
-        "HTTP %s %s %s user=%s ws=%s artifact=%s detail=%r body=%s",
+        "HTTP %s %s %s user=%s ws=%s artifact=%s detail=%r",
         exc.status_code,
         request.method,
         request.url.path,
@@ -719,7 +695,6 @@ async def http_exception_logger(request: Request, exc: HTTPException):
         request.path_params.get("workspace_id"),
         request.path_params.get("artifact_id"),
         exc.detail,
-        _redact_body(body),
     )
     # `exc.headers` is carried through: `HTTPException(headers=…)` is part of the API, and rebuilding
     # the response without them would silently drop any header a raise site set — a `Retry-After` or
@@ -754,18 +729,13 @@ async def http_exception_logger(request: Request, exc: HTTPException):
 
 @app.exception_handler(Exception)
 async def unhandled_exception_logger(request: Request, exc: Exception):
-    try:
-        body = await request.body()
-    except Exception:
-        body = b""
     logger.exception(
-        "HTTP 500 %s %s user=%s ws=%s artifact=%s body=%s error=%s",
+        "HTTP 500 %s %s user=%s ws=%s artifact=%s error=%s",
         request.method,
         request.url.path,
         getattr(request.state, "user_id", None),
         request.path_params.get("workspace_id"),
         request.path_params.get("artifact_id"),
-        _redact_body(body),
         repr(exc),
     )
     return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
@@ -811,15 +781,26 @@ async def _security_headers(request: Request, call_next):
 # how much the process remembered about it.
 #
 # AGIENCE_TRUSTED_PROXIES names the peers whose word about the client is worth taking, as
-# addresses or CIDR blocks. Unset means take nobody's — a node with no edge in front of it
-# must not be talked out of the address it can actually see. The failure direction of getting
-# this wrong is deliberate: an edge that is not listed makes every client share the edge's one
-# address, so the limiter over-counts and refuses traffic, rather than under-counting and
-# admitting a flood. A limiter that fails open is the thing this section exists to prevent.
+# addresses or CIDR blocks. Unset means loopback only (`_LOOPBACK_PROXIES`): the edge on the
+# same host reaches the node over loopback and sets `X-Forwarded-For` to the client it saw, and
+# no peer off the machine can present a loopback source address, so that word is taken without
+# configuration. Set, the list replaces the default rather than extending it — an edge on
+# another host (or a container bridge) is named there, loopback included if it is still wanted —
+# and `none` trusts nobody. The failure direction of getting this wrong is deliberate: an edge
+# that is not listed makes every client share the edge's one address, so the limiter over-counts
+# and refuses traffic, rather than under-counting and admitting a flood. A limiter that fails
+# open is the thing this section exists to prevent.
+#
+# The WebSocket `/events` handshake is counted in the same window by `_WebSocketRateLimit`: an
+# `@app.middleware("http")` never sees a websocket scope, and every handshake costs a token
+# resolution.
 # ----------------------------
 _RL_WINDOW_S = 60.0
 _RL_MAX = int(os.getenv("AGIENCE_RATE_LIMIT_PER_MIN", "600"))
 _RL_EXEMPT = frozenset(("/status", "/version", "/openapi.json", "/docs"))
+
+#: The same-host edge: every loopback address, IPv4 and IPv6.
+_LOOPBACK_PROXIES = "127.0.0.0/8,::1"
 
 
 def _parse_trusted_proxies(raw: str) -> tuple:
@@ -844,7 +825,17 @@ def _parse_trusted_proxies(raw: str) -> tuple:
     return tuple(nets)
 
 
-_RL_TRUSTED_PROXIES = _parse_trusted_proxies(os.getenv("AGIENCE_TRUSTED_PROXIES", ""))
+def _trusted_proxies_from_env(raw) -> tuple:
+    """The trusted-proxy list a node runs with: loopback when unset, `none` for nobody."""
+    raw = (raw or "").strip()
+    if not raw:
+        return _parse_trusted_proxies(_LOOPBACK_PROXIES)
+    if raw.lower() == "none":
+        return ()
+    return _parse_trusted_proxies(raw)
+
+
+_RL_TRUSTED_PROXIES = _trusted_proxies_from_env(os.getenv("AGIENCE_TRUSTED_PROXIES"))
 
 #: One sliding window per client, ordered by last touch — an `OrderedDict`, not a `dict`, and
 #: that is what bounds it. See `_rl_evict_expired`.
@@ -859,6 +850,10 @@ def _is_trusted_proxy(host) -> bool:
         addr = ipaddress.ip_address(host)
     except ValueError:
         return False
+    # A dual-stack listener reports an IPv4 peer as `::ffff:a.b.c.d`; it is the IPv4 address.
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
     return any(addr in net for net in _RL_TRUSTED_PROXIES)
 
 
@@ -915,31 +910,59 @@ def _rl_evict_expired(cutoff: float) -> None:
         _RL_HITS.popitem(last=False)
 
 
+def _rl_admit(client: str) -> bool:
+    """Count one hit for `client`; False when its window is already full (the hit is not kept)."""
+    now = time.monotonic()
+    cutoff = now - _RL_WINDOW_S
+    _rl_evict_expired(cutoff)
+    dq = _RL_HITS.get(client)
+    if dq is None:
+        dq = deque()
+        _RL_HITS[client] = dq
+    else:
+        # Re-seat at the back so the eviction sweep above keeps its prefix property.
+        _RL_HITS.move_to_end(client)
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+    if len(dq) >= _RL_MAX:
+        return False
+    dq.append(now)
+    return True
+
+
 @app.middleware("http")
 async def _rate_limit(request: Request, call_next):
     if _RL_MAX <= 0 or request.url.path in _RL_EXEMPT:
         return await call_next(request)
-    ip = _rate_limit_client(request)
-    now = time.monotonic()
-    cutoff = now - _RL_WINDOW_S
-    _rl_evict_expired(cutoff)
-    dq = _RL_HITS.get(ip)
-    if dq is None:
-        dq = deque()
-        _RL_HITS[ip] = dq
-    else:
-        # Re-seat at the back so the eviction sweep above keeps its prefix property.
-        _RL_HITS.move_to_end(ip)
-        while dq and dq[0] < cutoff:
-            dq.popleft()
-    if len(dq) >= _RL_MAX:
+    if not _rl_admit(_rate_limit_client(request)):
         return JSONResponse(
             status_code=429,
             content={"detail": "Rate limit exceeded"},
             headers={"Retry-After": str(int(_RL_WINDOW_S))},
         )
-    dq.append(now)
     return await call_next(request)
+
+
+class _WebSocketRateLimit:
+    """The same window for WebSocket handshakes, which the HTTP middleware above never sees.
+
+    A refused handshake is closed before it is accepted, so the client receives HTTP 403 and the
+    route — and the token resolution it starts with — never runs.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "websocket" and _RL_MAX > 0:
+            if not _rl_admit(_rate_limit_client(HTTPConnection(scope))):
+                # 1013: "try again later".
+                await send({"type": "websocket.close", "code": 1013})
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(_WebSocketRateLimit)
 
 # SessionMiddleware lives in Origin alongside the OAuth flows. Mantle carries no OAuth
 # PKCE state cookie: it does not serve /auth/authorize.

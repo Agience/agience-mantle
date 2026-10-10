@@ -53,7 +53,7 @@ def _call_link(parsed, source_entity, check_access_mock, add_edge_mock):
     with (
         patch.object(artifacts_router, "check_access", check_access_mock),
         patch("mantle.db.backend.get_artifact", return_value=source_entity),
-        patch("mantle.db.backend.get_latest_committed_artifact", return_value=source_entity),
+        patch("mantle.db.backend.get_latest_live_artifact", return_value=source_entity),
         patch("mantle.db.backend.add_artifact_to_collection", add_edge_mock),
     ):
         return artifacts_router._link_source_artifact(

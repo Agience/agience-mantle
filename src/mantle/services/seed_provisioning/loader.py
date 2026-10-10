@@ -43,6 +43,7 @@ from mantle.entities.artifact import Artifact as ArtifactEntity
 from mantle.entities.collection import Collection as CollectionEntity, COLLECTION_CONTENT_TYPE
 from mantle import config
 from mantle.config import AGIENCE_PLATFORM_USER_ID
+from mantle.services import mint_context as _mc
 from mantle.services.platform_topology import get_id_optional, register_id
 
 logger = logging.getLogger(__name__)
@@ -370,7 +371,7 @@ def _apply_artifact_card(
                 description=description,
                 created_by=AGIENCE_PLATFORM_USER_ID,
                 content_type=content_type,
-                state=CollectionEntity.STATE_COMMITTED,
+                state=CollectionEntity.STATE_LIVE,
                 created_time=now,
                 modified_time=now,
             )
@@ -392,12 +393,16 @@ def _apply_artifact_card(
         # `artifact.path`, which is a field of the _RawArtifact this was called with and
         # not of the entity being built. Rebinding would make every create failure raise
         # AttributeError out of the handler and abort the whole seed run.
+        # Stored as written, except that client keys a seed holds under `caller` are stored at
+        # the top level with no `caller`, as every write stores them (`mint_context.normalised`).
+        written = (json.dumps(context, separators=(",", ":"), ensure_ascii=False)
+                   if isinstance(context, (dict, list)) else context)
         entity = ArtifactEntity(
             id=artifact_uuid,
             root_id=artifact_uuid,
             collection_id=_primary_collection_id(body),
-            state=ArtifactEntity.STATE_COMMITTED,
-            context=json.dumps(context, separators=(",", ":"), ensure_ascii=False) if isinstance(context, (dict, list)) else context,
+            state=ArtifactEntity.STATE_LIVE,
+            context=_mc.normalised(written),
             content=content,
             content_type=content_type,
             created_by=AGIENCE_PLATFORM_USER_ID,

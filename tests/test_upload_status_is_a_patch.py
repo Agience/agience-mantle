@@ -45,7 +45,7 @@ def upload(db):
     ctx = {"upload": {"status": "complete", "s3_key": "k", "mode": "single", "progress": 1.0}}
     store.create_artifact(db, ArtifactEntity(
         id=aid, root_id=aid, collection_id=cid, created_by="u",
-        state=ArtifactEntity.STATE_COMMITTED, name=aid,
+        state=ArtifactEntity.STATE_LIVE, name=aid,
         context=json.dumps(ctx)))
     return cid, aid
 

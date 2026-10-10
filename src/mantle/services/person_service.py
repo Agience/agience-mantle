@@ -58,9 +58,6 @@ def get_user_by_id(db, id: str,  # noqa: A002 — keep `id` for compat
         caller (`auth.user_id`), so its bearer is by construction the subject's own token.
       * ``services/grant_service._send_invite_email`` does NOT. It runs several frames below the
         route, off the invite-creation path, and is handed a `user_id` rather than a request.
-      * ``services/grant_service._verify_target_match`` does NOT, on its fallback arm only — and
-        that arm is already the one the caller works to avoid, by passing the claimant's verified
-        email off the token so no lookup happens at all.
       * ``services/seed_provisioning/user_provisioning`` does NOT. It is bootstrap, running under
         no user's request.
 

@@ -1117,18 +1117,23 @@ def _hits(path):
 
 
 def test_counters_track_inserts_updates_and_deletes():
+    """`state:*` counts the recorded value (`count_recorded`); `count(state="live")` sums every
+    value that reads as live, the legacy `draft` included. The `committed_only` bucket counts
+    `live` and the legacy `committed`, never a legacy `draft`."""
     L = _fresh()
-    L.artifacts.put_many([_doc(i, collection_id="c1", state="committed") for i in range(20)])
+    L.artifacts.put_many([_doc(i, collection_id="c1", state="live") for i in range(20)])
     L.artifacts.put_many([_doc(100 + i, collection_id="c1", state="draft") for i in range(5)])
     assert L.artifacts.count() == 25
-    assert L.artifacts.count(state="committed") == 20
+    assert L.artifacts.count_recorded("live") == 20
+    assert L.artifacts.count(state="live") == 25
     assert L.artifacts.count_in_collection("c1") == 25
     assert L.artifacts.count_in_collection("c1", committed_only=True) == 20
     assert L.artifacts.count_by_content_type("text/markdown") == 25
 
     L.artifacts.put_artifact(_doc(0, collection_id="c1", state="draft"))   # re-state
     assert L.artifacts.count() == 25, "upsert must not double-count"
-    assert L.artifacts.count(state="committed") == 19
+    assert L.artifacts.count_recorded("live") == 19
+    assert L.artifacts.count(state="live") == 25
     assert L.artifacts.count_in_collection("c1", committed_only=True) == 19
 
     L.artifacts.delete_artifact("a0001")
@@ -1170,7 +1175,7 @@ def test_count_missing_field_agrees_with_the_keyset_fallback():
     that makes adding the typed method safe. Mirrors the keyset fallback walk."""
     L = _fresh()
     L.artifacts.put_many([_doc(i, cited_from=("c" if i % 3 else ""),
-                               state=("committed" if i % 2 else "draft"))
+                               state=("live" if i % 2 else "draft"))
                           for i in range(60)])
     fallback, after = 0, ""
     while True:
@@ -1189,9 +1194,9 @@ def test_count_missing_field_default_is_the_safe_superset():
     the consumer is `invariant_holds == 0`, so a superset can false-alarm but can
     never report clean over dirty."""
     L = _fresh()
-    L.artifacts.put_many([_doc(1, state="committed"),          # missing, committed
-                          _doc(2, state="draft"),              # missing, not committed
-                          _doc(3, state="committed", provenance="p")])
+    L.artifacts.put_many([_doc(1, state="live"),               # missing, live
+                          _doc(2, state="draft"),              # missing, a legacy draft: not counted
+                          _doc(3, state="live", provenance="p")])
     superset = L.artifacts.count_missing_field("provenance")
     exact = L.artifacts.count_missing_field("provenance", committed_only=True)
     assert exact == 1, exact
@@ -1523,7 +1528,7 @@ def test_first_version_is_its_own_root():
     """Mantle's rule (`entities/artifact.py:73`), honoured by the lattice store too: a doc
     that names no root is its own first version."""
     L = _fresh()
-    L.artifacts.put_artifact({"id": "a1", "content_type": "text/markdown", "state": "committed",
+    L.artifacts.put_artifact({"id": "a1", "content_type": "text/markdown", "state": "live",
                     "content": "one", "created_by": "u",
                     "created_time": "2026-01-01T00:00:00+00:00"})
     assert L.db.read().execute(
@@ -1535,7 +1540,7 @@ def test_the_lineage_handle_cannot_be_repointed():
     row into a different version history while the rows it left behind still claim it — a split
     lineage that no query can detect, because both halves look internally consistent."""
     L = _fresh()
-    base = {"content_type": "text/markdown", "state": "committed", "created_by": "u",
+    base = {"content_type": "text/markdown", "state": "live", "created_by": "u",
             "created_time": "2026-01-01T00:00:00+00:00"}
     L.artifacts.put_artifact(dict(base, id="a1", content="one"))
     L.artifacts.put_artifact(dict(base, id="a2", root_id="a1", content="two"))
@@ -1551,7 +1556,7 @@ def test_versions_of_walks_the_lineage_in_seq_order():
     """The `y` colimit: one artifact, many versions. Ordered by `(_origin,_seq)` — the version
     identity — not by `created_time`, which is a writer's claim."""
     L = _fresh()
-    base = {"content_type": "text/markdown", "state": "committed", "created_by": "u",
+    base = {"content_type": "text/markdown", "state": "live", "created_by": "u",
             "created_time": "2026-01-01T00:00:00+00:00"}
     L.artifacts.put_artifact(dict(base, id="a1", content="one"))
     L.artifacts.put_artifact(dict(base, id="a2", root_id="a1", content="two"))
@@ -1618,7 +1623,7 @@ def test_versions_of_many_returns_exactly_what_versions_of_returns_per_root():
     """The plural must not be a second opinion. Same rows, same `(_origin, _seq)` order within
     each lineage, and a root with no versions absent rather than mapped to `[]`."""
     L = _fresh()
-    base = {"content_type": "text/markdown", "state": "committed", "content": "x"}
+    base = {"content_type": "text/markdown", "state": "live", "content": "x"}
     L.artifacts.put_artifact(dict(base, id="r1"))
     L.artifacts.put_artifact(dict(base, id="r1v2", root_id="r1"))
     L.artifacts.put_artifact(dict(base, id="r2"))
@@ -1657,7 +1662,7 @@ def test_backfill_root_id_reports_what_remains_not_just_what_it_filled():
     """`filled: 0` is ambiguous on its own (already complete, or never ran?), so the assertion that
     matters is `remaining == 0`."""
     L = _fresh()
-    L.artifacts.put_artifact({"id": "a1", "content_type": "text/markdown", "state": "committed",
+    L.artifacts.put_artifact({"id": "a1", "content_type": "text/markdown", "state": "live",
                     "content": "one", "created_by": "u",
                     "created_time": "2026-01-01T00:00:00+00:00"})
     with L.db.write() as cur:                       # simulate a pre-migration row
@@ -1680,7 +1685,7 @@ def test_revise_creates_a_new_version_and_never_destroys_the_old():
     """`revise()` must create a new version while leaving the prior row intact: a caller
     reading the original id afterward still sees the pre-revision content, archived."""
     L = _fresh()
-    L.artifacts.put_artifact({"id": "a1", "content_type": "text/markdown", "state": "committed",
+    L.artifacts.put_artifact({"id": "a1", "content_type": "text/markdown", "state": "live",
                               "content": "VERSION ONE", "created_by": "u",
                               "created_time": "2026-01-01T00:00:00+00:00"})
     v2 = L.artifacts.revise("a1", {"content": "VERSION TWO"})
@@ -1700,7 +1705,7 @@ def test_revise_version_id_is_derived_not_counted():
     same id for different content, and the store would silently keep one. The id is the
     fingerprint of the doc, so identical content is idempotent and different content cannot collide."""
     L = _fresh()
-    L.artifacts.put_artifact({"id": "a1", "content_type": "text/markdown", "state": "committed",
+    L.artifacts.put_artifact({"id": "a1", "content_type": "text/markdown", "state": "live",
                               "content": "one", "created_by": "u",
                               "created_time": "2026-01-01T00:00:00+00:00"})
     v2 = L.artifacts.revise("a1", {"content": "two"})
@@ -1771,7 +1776,7 @@ def test_list_by_content_type_can_still_enumerate_everything():
     L.artifacts.revise("a1", {"content": "two"})
     docs, exhaustive = L.artifacts.list_by_content_type("text/markdown", include_archived=True)
     assert exhaustive and len(docs) == 2
-    assert {d.get("state") for d in docs} == {"archived", "committed"}
+    assert {d.get("state") for d in docs} == {"archived", "live"}
 
 
 def test_revise_refuses_an_unknown_artifact():
@@ -1816,7 +1821,7 @@ def test_the_lattice_store_has_no_network_dependency():
         import tempfile
         L = lat.open_lattice(os.path.join(_tmpdir("s38-"), "s38.db"), origin="s38")
         L.artifacts.put_artifact({"id": "x1", "content_type": "text/markdown",
-                                  "state": "committed", "content": "local only",
+                                  "state": "live", "content": "local only",
                                   "created_by": "u",
                                   "created_time": "2026-01-01T00:00:00+00:00"})
         assert L.artifacts.get_artifact("x1")["content"] == "local only"
@@ -1835,7 +1840,7 @@ def test_same_content_ref_is_a_redescribe_not_a_new_version():
     (offer/context) is a redescribe, applied in place — no snapshot, no forked lineage. The
     offers pass does this 6.11M times, and it must stay a no-op-shaped in-place update."""
     L = _fresh()
-    base = {"id": "a1", "content_type": "text/markdown", "state": "committed", "created_by": "u",
+    base = {"id": "a1", "content_type": "text/markdown", "state": "live", "created_by": "u",
             "created_time": "2026-01-01T00:00:00+00:00", "content_ref": "cas/" + "a" * 64}
     L.artifacts.put_artifact(dict(base, context="first offer"))
     L.artifacts.put_artifact(dict(base, context="re-described offer"))   # same content_ref
@@ -1849,7 +1854,7 @@ def test_changed_content_ref_snapshots_the_prior_and_handle_stays_latest():
     `revise()` call) snapshots the prior version under a derived archived id and keeps the
     handle pointing at the latest. Nothing is overwritten in the silent-loss sense."""
     L = _fresh()
-    base = {"id": "a1", "content_type": "text/markdown", "state": "committed", "created_by": "u",
+    base = {"id": "a1", "content_type": "text/markdown", "state": "live", "created_by": "u",
             "created_time": "2026-01-01T00:00:00+00:00"}
     L.artifacts.put_artifact(dict(base, content_ref="cas/" + "1" * 64, content="VERSION ONE"))
     L.artifacts.put_artifact(dict(base, content_ref="cas/" + "2" * 64, content="VERSION TWO"))
@@ -1871,7 +1876,7 @@ def test_content_change_is_idempotent_no_snapshot_per_oscillation():
     """The snapshot id is derived from the old content_ref, so re-applying the same change does not
     mint a snapshot each time: two writes of the same content leave exactly one snapshot."""
     L = _fresh()
-    base = {"id": "a1", "content_type": "text/markdown", "state": "committed", "created_by": "u",
+    base = {"id": "a1", "content_type": "text/markdown", "state": "live", "created_by": "u",
             "created_time": "2026-01-01T00:00:00+00:00"}
     L.artifacts.put_artifact(dict(base, content_ref="cas/" + "1" * 64, content="ONE"))
     L.artifacts.put_artifact(dict(base, content_ref="cas/" + "2" * 64, content="TWO"))
@@ -1884,7 +1889,7 @@ def test_versioning_needs_no_forced_route_put_artifact_alone_suffices():
     """A caller that only ever calls `put_artifact` still gets full version retention: no
     `revise()` call is required, and no forced route exists to work around."""
     L = _fresh()
-    base = {"id": "doc", "content_type": "text/markdown", "state": "committed", "created_by": "u",
+    base = {"id": "doc", "content_type": "text/markdown", "state": "live", "created_by": "u",
             "created_time": "2026-01-01T00:00:00+00:00"}
     for i, ref in enumerate(("1", "2", "3")):
         L.artifacts.put_artifact(dict(base, content_ref="cas/" + ref * 64, content="v%d" % i))

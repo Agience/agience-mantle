@@ -23,9 +23,9 @@ def test_collect_usage_metrics_returns_stable_metric_set(tmp_path, monkeypatch):
 
     api.create_collection(db, Artifact(id="ws-1", collection_id="", content="",
                                        content_type=WORKSPACE_CONTENT_TYPE,
-                                       state="committed", created_by="u1"))
+                                       state="live", created_by="u1"))
     api.create_artifact(db, Artifact(id="a-1", collection_id="ws-1", content="x",
-                                     content_type="text/markdown", state="committed",
+                                     content_type="text/markdown", state="live",
                                      created_by="u1", origin_root="ws-1"))
     api.add_artifact_to_collection(db, "ws-1", "a-1")
     api.create_grant(db, Grant(id="g-1", resource_id="ws-1", grantee_type="user",
@@ -39,7 +39,7 @@ def test_collect_usage_metrics_returns_stable_metric_set(tmp_path, monkeypatch):
 
     assert set(metrics) == {
         "users_total", "workspaces_total", "workspace_artifacts_total",
-        "collections_total", "committed_artifact_versions_total",
+        "collections_total", "live_artifact_versions_total",
         "grants_total", "commits_total",
     }
     assert metrics["users_total"] == 1
@@ -47,7 +47,7 @@ def test_collect_usage_metrics_returns_stable_metric_set(tmp_path, monkeypatch):
     assert metrics["workspace_artifacts_total"] == 1     # the membership edge
     assert metrics["grants_total"] == 1
     assert metrics["commits_total"] == 1
-    assert metrics["committed_artifact_versions_total"] >= 2   # ws + artifact (+ commit plane rows are committed-by-absence? no: typed docs carry no state)
+    assert metrics["live_artifact_versions_total"] >= 2   # ws + artifact; typed docs carry no state
 
 
 def test_generate_usage_snapshot_computes_overages_and_infers_ids(tmp_path):

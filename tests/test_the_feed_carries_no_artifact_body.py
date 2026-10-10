@@ -159,26 +159,34 @@ async def test_a_container_write_announces_the_container_and_not_its_body(store,
 # ═════════════════════════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.asyncio
-async def test_a_batch_commit_announces_neither_plaintext_nor_ciphertext(store, bus, content_key):
-    """The commit writes the stored doc back, so its emit starts from ciphertext rather than
-    plaintext. Neither belongs on the feed: a base64 blob no subscriber holds a key for is worse
-    than an absent field, because it reads as content instead of as something to go and fetch."""
+async def test_the_state_collapse_announces_neither_plaintext_nor_ciphertext(store, bus,
+                                                                            content_key):
+    """The state-collapse migration writes the stored doc back, so its emit starts from
+    ciphertext rather than plaintext. Neither belongs on the feed: a base64 blob no subscriber
+    holds a key for is worse than an absent field, because it reads as content instead of as
+    something to go and fetch."""
+    from mantle.system import manage_state_collapse as tool
+
     queue = await bus.subscribe_filtered(bus.EventFilter(event_names=["artifact.*"]))
     lattice_api.create_artifact(store, Artifact(
-        id="d-1", root_id="d-1", collection_id="col-1", name="draft", content=SECRET,
-        created_by="u-1", state="draft"))
+        id="d-1", root_id="d-1", collection_id="col-1", name="legacy", content=SECRET,
+        created_by="u-1"))
     await _drain(queue, expect=1)
+    # The legacy `draft` a store that has not been migrated holds; a raw write, announced by
+    # nothing.
+    store.artifacts.put_artifact(dict(store.artifacts.get_artifact("d-1"), state="draft"))
 
     stored = store.artifacts.get_artifact("d-1")
     assert stored["content_encrypted"] is True
 
-    assert lattice_api.batch_commit_drafts(
-        store, "col-1", ["d-1"], "u-2", "2026-07-22T12:00:00+00:00") == 1
+    out = tool.apply(store, tool.report(store, measure_prefixes=False)["groups"],
+                     reindex=lambda art: None)
+    assert out["settled"]["A"] == 1
 
     (event,) = await _drain(queue, expect=1)
-    _assert_no_body(event, where="batch_commit_drafts")
+    _assert_no_body(event, where="manage_state_collapse.apply")
     assert stored["content"] not in json.dumps(event.payload), \
-        "the commit event carried the stored ciphertext"
+        "the migration event carried the stored ciphertext"
 
 
 @pytest.mark.asyncio
@@ -186,7 +194,7 @@ async def test_an_archive_announces_neither_plaintext_nor_ciphertext(store, bus,
     queue = await bus.subscribe_filtered(bus.EventFilter(event_names=["artifact.*"]))
     lattice_api.create_artifact(store, Artifact(
         id="a-9", collection_id="col-1", name="doomed", content=SECRET,
-        created_by="u-1", state="committed"))
+        created_by="u-1", state="live"))
     await _drain(queue, expect=1)
     lattice_api.create_grant(store, Grant(
         id="g-1", resource_id="col-1", grantee_type="user", grantee_id="u-9",
@@ -235,7 +243,7 @@ async def test_a_logged_event_still_identifies_what_changed(store, bus, content_
 
     lattice_api.create_artifact(store, Artifact(
         id="a-desc", collection_id="col-1", name="q3", content=SECRET, created_by="u-1",
-        content_type="text/markdown", state="draft"))
+        content_type="text/markdown", state="live"))
     (event,) = await _drain(queue, expect=1)
 
     artifact = _artifact_of(event)
@@ -245,7 +253,7 @@ async def test_a_logged_event_still_identifies_what_changed(store, bus, content_
     assert artifact["id"] == "a-desc"
     assert artifact["collection_id"] == "col-1"
     assert artifact["name"] == "q3"
-    assert artifact["state"] == "draft"
+    assert artifact["state"] == "live"
     assert artifact["content_type"] == "text/markdown", \
         "the content TYPE is a descriptor, not a body — a subscriber filters on it"
 
@@ -304,3 +312,46 @@ def test_a_peer_cannot_inject_a_body_through_the_back_plane():
         "payload": {"artifact": {"id": "a-1", "content": SECRET, "content_encrypted": True}},
     })
     assert event.payload == {"artifact": {"id": "a-1"}}
+
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════
+# 5 · The feed names only the states that exist
+# ═════════════════════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", ["committed", "draft"])
+async def test_a_raw_stored_doc_on_the_feed_carries_live(store, bus, legacy):
+    """Curation (`shard/curate._announce`) emits the stored doc it moved, and a store written
+    that has not been migrated records `committed` or `draft` there. The feed carries `live`."""
+    from mantle.db.doc_boundary import emit_artifact_change
+
+    queue = await bus.subscribe_filtered(bus.EventFilter(event_names=["artifact.*"]))
+    emit_artifact_change({"id": "c-1", "root_id": "c-1", "collection_id": "col-1",
+                          "state": legacy, "content": SECRET}, "artifact.created")
+    (event,) = await _drain(queue, expect=1)
+    assert _artifact_of(event)["state"] == "live"
+    _assert_no_body(event, where="curation emit")
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_log_row_carries_live(store, bus):
+    """A durable-log row that carries a legacy state is read back as `live`."""
+    log = event_bus.open_event_log(store)
+    event_bus.set_event_log(log)
+    head = log.head()
+    with store.conn.write() as cur:
+        cur.execute(
+            "INSERT INTO event_log(_origin, _seq, event_id, name, ts, container_id, artifact_id, "
+            "content_type, actor_id, containers, payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (log.origin, 1, "e-old", "artifact.updated", 0.0, "col-1", "o-1", None, "u-1",
+             json.dumps(["col-1"]),
+             json.dumps({"artifact": {"id": "o-1", "state": "committed", "content": SECRET}})))
+    (event,) = log.read_since(head)
+    assert _artifact_of(event)["state"] == "live"
+    assert SECRET not in json.dumps(event.payload)
+
+
+def test_a_payload_with_nothing_to_change_is_passed_through_unchanged():
+    """The control, and the cost bound: an ordinary event is not copied."""
+    payload = {"artifact": {"id": "x", "state": "live"}}
+    assert event_bus.redact_content(payload) is payload

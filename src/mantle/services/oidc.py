@@ -10,9 +10,9 @@ Each issuer in ``config.TRUSTED_ISSUERS`` declares::
 
 If only ``issuer`` is given, the JWKS URL is discovered from
 ``<issuer>/.well-known/openid-configuration``. Keys are cached and refreshed on a
-kid miss (key rotation). The verifier checks signature + issuer + audience; the
-caller maps the token's stable subject to a Mantle user (first-login provisioning
-handles new users — the same path as platform users).
+kid miss (key rotation), at most once per issuer per ``_JWKS_MIN_REFETCH_S``. The
+verifier checks signature + issuer + audience; the caller maps the token's stable
+subject to a Mantle user (first-login provisioning handles new users — the same path as platform users).
 """
 from __future__ import annotations
 
@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 
 _JWKS_TTL_S = 3600.0
 _FETCH_TIMEOUT_S = 5.0
+#: Minimum spacing between JWKS fetches for one issuer, forced refetches on an unknown `kid`
+#: included. See `OidcVerifier._keys`.
+_JWKS_MIN_REFETCH_S = 30.0
 _ALGS = ["RS256", "RS384", "RS512", "ES256"]
 
 
@@ -69,6 +72,8 @@ class OidcVerifier:
             d for d in (issuers or []) if isinstance(d, dict) and d.get("issuer")
         ]
         self._jwks_cache: Dict[str, tuple] = {}   # issuer -> (keys, fetched_at)
+        self._last_fetch: Dict[str, float] = {}   # issuer -> last JWKS fetch attempt
+        self._fetch_locks: Dict[str, threading.Lock] = {}  # issuer -> held while fetching
         self._lock = threading.Lock()
         self._last_refresh = 0.0
         # Build the trust maps from the env seed + manifest anchors (no DB yet).
@@ -231,13 +236,45 @@ class OidcVerifier:
         return None
 
     def _keys(self, iss: str, cfg: dict, *, force: bool) -> List[dict]:
+        """The issuer's keys: inline, cached, or fetched — at most one fetch per issuer per
+        `_JWKS_MIN_REFETCH_S`.
+
+        A `kid` is the token's own unverified header, so a caller can name a fresh unknown one on
+        every request, and each miss asks for a forced refetch. The spacing is what stops that
+        from becoming one outbound JWKS fetch per request: inside it, a forced or cold read
+        answers from the cache (or with nothing), and a rotated key is picked up by the first
+        miss after it. The spacing counts fetch attempts, failed ones included, so an issuer that
+        is down is not hammered either.
+
+        `_lock` guards only the cache and the attempt clock; the network I/O runs outside it, so
+        a slow issuer holds up only callers waiting on that issuer's first keys, never another
+        issuer's verification. A caller that arrives while the first fetch for a cold issuer is in
+        flight waits for that fetch rather than starting a second one.
+        """
         inline = cfg.get("jwks")
         if isinstance(inline, dict):
             return inline.get("keys", [])
         with self._lock:
             cached = self._jwks_cache.get(iss)
-            if cached and not force and (time.time() - cached[1]) < _JWKS_TTL_S:
+            now = time.time()
+            if cached and not force and (now - cached[1]) < _JWKS_TTL_S:
                 return cached[0]
+            fetch_lock = self._fetch_locks.setdefault(iss, threading.Lock())
+            throttled = (now - self._last_fetch.get(iss, float("-inf"))) < _JWKS_MIN_REFETCH_S
+            if not throttled:
+                self._last_fetch[iss] = now
+                # Taken while `_lock` is held, so a caller that sees the attempt clock set also
+                # finds the fetch lock held and waits on it below.
+                fetch_lock.acquire()
+        if throttled:
+            if cached:
+                return cached[0]
+            with fetch_lock:
+                pass
+            with self._lock:
+                cached = self._jwks_cache.get(iss)
+            return cached[0] if cached else []
+        try:
             jwks_uri = cfg.get("jwks_uri") or self._discover_jwks_uri(iss)
             if not jwks_uri:
                 return cached[0] if cached else []
@@ -245,11 +282,14 @@ class OidcVerifier:
                 r = httpx.get(jwks_uri, timeout=_FETCH_TIMEOUT_S)
                 r.raise_for_status()
                 keys = r.json().get("keys", [])
-                self._jwks_cache[iss] = (keys, time.time())
-                return keys
             except Exception as exc:
                 logger.warning("oidc: JWKS fetch failed for %s (%s): %r", iss, jwks_uri, exc)
                 return cached[0] if cached else []
+            with self._lock:
+                self._jwks_cache[iss] = (keys, time.time())
+            return keys
+        finally:
+            fetch_lock.release()
 
     @staticmethod
     def _discover_jwks_uri(iss: str) -> Optional[str]:

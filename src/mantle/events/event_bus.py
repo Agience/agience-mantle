@@ -100,6 +100,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from mantle.attenuation import Mask, compose
+from mantle.db.constants import LEGACY_LIVE_STATES, STATE_LIVE
 
 logger = logging.getLogger(__name__)
 
@@ -151,18 +152,29 @@ def redacted_artifact(doc: Mapping[str, Any]) -> Dict[str, Any]:
     """One artifact descriptor with its body removed — the form the feed carries.
 
     Identity, container, state, provenance and content type all survive, because those are what a
-    subscriber acts on. Only :data:`FEED_BODY_FIELDS` is dropped.
+    subscriber acts on. Only :data:`FEED_BODY_FIELDS` is dropped, and a legacy stored `state`
+    (`committed`, `draft`) is carried as `live`: the feed names only the states that exist, like
+    every API response.
 
     A copy, never an in-place edit: the caller is usually holding the entity dict of a live write,
     and the announcement must not be able to damage the thing it announces.
     """
-    return {k: v for k, v in dict(doc).items() if k not in FEED_BODY_FIELDS}
+    out = {k: v for k, v in dict(doc).items() if k not in FEED_BODY_FIELDS}
+    if out.get("state") in LEGACY_LIVE_STATES:
+        out["state"] = STATE_LIVE
+    return out
+
+
+def _carries_legacy_state(doc: Any) -> bool:
+    return isinstance(doc, Mapping) and doc.get("state") in LEGACY_LIVE_STATES
 
 
 def redact_content(payload: Any) -> Any:
-    """An event payload with every artifact body removed.
+    """An event payload with every artifact body removed, and every artifact's legacy `state`
+    carried as `live` (:func:`redacted_artifact`).
 
-    The enforcement point, applied at publish rather than at each emit site. Emits arrive from the
+    The enforcement point, applied at publish rather than at each emit site, and again to a row
+    read back from the durable log, which may predate either rule. Emits arrive from the
     persistence boundary, from the services, and from the shard tools; a rule enforced at those
     sites is a rule the next site can forget, and the durable log — which is fed here — would keep
     the omission forever.
@@ -181,7 +193,9 @@ def redact_content(payload: Any) -> Any:
     if isinstance(artifacts, (list, tuple)):
         carries_body = carries_body or any(
             isinstance(a, Mapping) and any(f in a for f in FEED_BODY_FIELDS) for a in artifacts)
-    if not carries_body:
+    legacy = _carries_legacy_state(artifact) or (
+        isinstance(artifacts, (list, tuple)) and any(_carries_legacy_state(a) for a in artifacts))
+    if not carries_body and not legacy:
         return payload
 
     out = {k: v for k, v in payload.items() if k not in FEED_BODY_FIELDS}
@@ -918,6 +932,8 @@ class EventLog:
             payload = json.loads(row[10])
         except Exception:
             payload = {}
+        # A replayed row is held to the rule a published one is (`redact_content`).
+        payload = redact_content(payload)
         try:
             containers = tuple(json.loads(row[9] or "[]"))
         except Exception:

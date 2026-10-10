@@ -49,7 +49,7 @@ def collect_usage_metrics() -> dict[str, int]:
         "workspaces_total": _count_ct(db, WORKSPACE_CONTENT_TYPE),
         "workspace_artifacts_total": int(db.graph.count_edges()),   # membership edges
         "collections_total": _count_ct(db, COLLECTION_CONTENT_TYPE),
-        "committed_artifact_versions_total": int(db.artifacts.count(state="committed")),
+        "live_artifact_versions_total": int(db.artifacts.count(state="live")),
         "grants_total": _count_ct(db, _GRANT_CT),
         "commits_total": _count_ct(db, _COMMIT_CT),
     }

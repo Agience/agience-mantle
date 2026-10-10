@@ -83,6 +83,7 @@ What this module will NOT do
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -105,6 +106,222 @@ ARM_THIN = "mantle.mint_context"
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ── who owns which top-level key ──────────────────────────────────────────────────────────────
+#
+# A stored context has two authors. The store writes the facets below — the mint's record, the
+# rung it derived, the content address and the upload bookkeeping — and a client writes the rest.
+# A client never writes a server-owned key: every door that accepts a client's context removes
+# them (`client_part`), and every write keeps the stored server-owned facets and replaces only the
+# client's keys (`with_client_keys`, `merge_caller_update`).
+#
+# Whether a context was minted is never inferred from its JSON. A client can send any key it
+# likes, `minted_by` included, so a mint the router has already made reaches the service as a
+# `Minted` — an object, which no request body can construct.
+#: What the mint writes: how the artifact was made, and the rung it earned. Always the mint's.
+MINT_KEYS = frozenset({
+    ARM_KEY, "minted", "placement", "addressing", "screen", ENRICHED_KEY, "caller",
+    "provenance", "provenance_history", "provenance_evidence",
+})
+#: What the store's own write paths record about the bytes and their upload. A client never
+#: writes these; an in-process writer (the upload path, the content routes) does. `access`,
+#: `content_source` and `uri` are among them because the download-URL answer reads them: a
+#: client-written `access: "public"` with a `uri` would send every reader to an address the
+#: client chose, as though it were the artifact's own download.
+BOOKKEEPING_KEYS = frozenset({
+    "content_key", "content_cas_ref", "content_sha256", "content_bytes", "upload", "processing",
+    "storage", "access", "content_source", "uri",
+})
+SERVER_OWNED_KEYS = MINT_KEYS | BOOKKEEPING_KEYS
+#: The one server-owned key a client may SEND on a create: `provenance` there is the claim
+#: `_stamp_rung` authorizes against the principal (`prism.mass.authorize_and_stamp`). It is not
+#: stored as sent: the top-level `provenance` is the derived rung, and a claim the principal had
+#: not earned is kept in `provenance_history`.
+CLAIMABLE_ON_CREATE = frozenset({"provenance"})
+
+
+class Minted:
+    """A context `mint` made in this process, handed from the router to a service by reference.
+
+    A typed parameter rather than ambient request state: the handoff is visible in every
+    signature it crosses, it cannot leak into a nested write the request happens to make, and a
+    test can pass one directly. JSON cannot construct it, which is the whole point — a string or a
+    dict arriving in a request body is a client's claim, however it is spelled."""
+
+    __slots__ = ("_ctx",)
+
+    def __init__(self, ctx: Mapping[str, Any]) -> None:
+        self._ctx = dict(ctx)
+
+    def context(self) -> Dict[str, Any]:
+        return dict(self._ctx)
+
+
+def parse_context(value: Any) -> Dict[str, Any]:
+    """A context as a dict: a dict as given, JSON parsed, anything else kept whole under
+    `_opaque` rather than dropped (it is the writer's statement about its own artifact)."""
+    if value is None or value == "":
+        return {}
+    if isinstance(value, Mapping):
+        return dict(value)
+    try:
+        parsed = json.loads(value)
+    except (ValueError, TypeError):
+        return {"_opaque": value}
+    return dict(parsed) if isinstance(parsed, dict) else {"_opaque": value}
+
+
+def client_part(value: Any, *, allow: Iterable[str] = ()) -> Dict[str, Any]:
+    """The keys of a client-supplied context a client may write: every server-owned key removed,
+    except the ones named in ``allow``."""
+    keep = frozenset(allow)
+    return {k: v for k, v in parse_context(value).items()
+            if k not in SERVER_OWNED_KEYS or k in keep}
+
+
+# ── the client's keys: stored once, at the top level ────────────────────────────────────────
+#
+# A stored context holds the client's keys at the top level, beside the server-owned facets, and
+# nowhere else. Every write of a client key goes through `with_client_keys`, which puts them
+# there and removes any `caller`:
+#
+#     create (router)              `mint`                       client keys from the request
+#     create (in-process member)   `workspace_service._mint_member_context`
+#     PATCH, identity update,      `merge_caller_update`        the request's context
+#       identity upsert overwrite                                (`update_keys`)
+#     every in-process context     `normalised`                 upload status (incl.
+#       write                                                    `context_patch`), bindings,
+#                                                                card actions, PUT /content
+#
+# `caller` is reserved: the store reads it and never writes it, and a client key of that name is
+# removed like any other server-owned key. A stored context may hold client keys under `caller`
+# with none at the top level, or some in each; `client_view` reads the top level, and `caller`
+# for a key the top level does not hold. An update is read the same way against the context it
+# updates (`update_keys`): its `caller` supplies only a key that neither its own top level nor
+# the stored top level holds.
+
+
+def client_view(value: Any) -> Dict[str, Any]:
+    """The client's current keys in a stored context: the top level's, and `caller`'s for a key
+    the top level does not hold, the server-owned keys removed."""
+    ctx = parse_context(value)
+    caller = ctx.get("caller")
+    nested = client_part(caller) if isinstance(caller, Mapping) else {}
+    return {**nested, **client_part(ctx)}
+
+
+def with_client_keys(stored: Any, keys: Mapping[str, Any]) -> str:
+    """``stored`` with its client keys replaced by ``keys``: the stored server-owned facets as
+    they were, less any `caller`, and ``keys`` (less any server-owned ones) at the top level."""
+    out = {k: v for k, v in parse_context(stored).items()
+           if k in SERVER_OWNED_KEYS and k != "caller"}
+    out.update(client_part(keys))
+    return json.dumps(out)
+
+
+def normalised(value: Any) -> Any:
+    """A context written in-process, with its client keys at the top level and no `caller`. What
+    the writer set at the top level wins over a `caller` it did not touch (`client_view`).
+
+    A context that is not a JSON object (an opaque string) has no keys to place and is returned
+    as given, and so is one already in this shape, so a write that changed nothing stays a
+    write that changed nothing."""
+    ctx = parse_context(value)
+    if set(ctx) == {"_opaque"}:
+        return value
+    out = with_client_keys(ctx, client_view(ctx))
+    if isinstance(value, str) and json.loads(out) == ctx:
+        return value
+    return out
+
+
+def update_keys(update: Any, stored: Any = None) -> Dict[str, Any]:
+    """The client keys a context update states, read against the context it updates (``stored``).
+
+    ======================================  ==================================================
+    the update's top level holds a client   its top-level client keys, and each client key of
+    key                                     its `caller` that neither its top level nor
+                                            ``stored``'s top level holds
+    it holds none                           the client keys of its `caller`
+    ======================================  ==================================================
+
+    A `caller` that is not a JSON object states no keys, and a key the update states nowhere is
+    not stated. So a key ``stored`` holds at the top level is decided by the update's top level
+    alone, and `caller` supplies a key only where ``stored`` has none at the top level: on a
+    stored context, a key it holds under `caller` alone."""
+    upd = parse_context(update)
+    top = client_part(upd)
+    caller = upd.get("caller")
+    nested = client_part(caller) if isinstance(caller, Mapping) else {}
+    if not top:
+        return nested
+    held = client_part(stored)
+    return {**{k: v for k, v in nested.items() if k not in held}, **top}
+
+
+def merge_caller_update(stored: Any, update: Any) -> str:
+    """A client's context update applied to a stored context.
+
+    The stored server-owned facets stay exactly as they were, and the client's keys are replaced
+    wholesale by the ones the update states (`update_keys`, read against ``stored``): a key it
+    does not state is removed.
+    They are stored at the top level, with no `caller` (`with_client_keys`).
+
+    Nothing is re-minted and no rung is re-derived: an update records what the client changed
+    and nothing it asked for about how the artifact was made. The rung derived at create stands,
+    with a claim the principal had not earned in `provenance_history`."""
+    return with_client_keys(stored, update_keys(update, stored))
+
+
+def with_content_type(stored: Any, content_type: str) -> Any:
+    """``stored`` with its client `content_type` key set to ``content_type``, when it holds one.
+
+    A write that applies an artifact's content type as its own field keeps the context's key in
+    agreement with it: the content routes read the key (`workspace_service._store_content_in_s3`
+    types the stored object by it). A context with no such key, or with this value already, is
+    returned as given; one that changes is stored with its client keys at the top level
+    (`with_client_keys`)."""
+    ctx = parse_context(stored)
+    keys = client_view(ctx)
+    if "content_type" not in keys or keys["content_type"] == content_type:
+        return stored
+    keys["content_type"] = content_type
+    return with_client_keys(ctx, keys)
+
+
+def readdressed(stored: Any, content: Any = None, *, sha256: Optional[str] = None,
+                nbytes: Optional[int] = None) -> str:
+    """A stored context after its content was replaced.
+
+    `addressing` describes the bytes the mint saw, so a content overwrite recomputes its
+    `sha256` and `bytes` — otherwise one context would name two contents, the mint's and the one
+    `content_cas_ref` points at. From the new plaintext (``content``, text or bytes) when the
+    writer holds it; otherwise from what the writer measured (``sha256``, ``nbytes``), and a
+    measure it does not have is removed rather than left describing the old bytes.
+
+    `enriched` is DROPPED rather than recomputed: it is the sharp arm's description of the old
+    bytes, recomputing it needs the seam (`_enrich`) and a request that may not have one, and an
+    absent `enriched` reads as "no enrichment for these bytes", which is true. A context the store
+    never minted has no `addressing` and is returned as it was, less any `enriched`.
+
+    The client keys are stored at the top level with no `caller` (`with_client_keys`), as on every
+    write."""
+    ctx = parse_context(stored)
+    ctx.pop(ENRICHED_KEY, None)
+    addressing = ctx.get("addressing")
+    if isinstance(addressing, dict):
+        addressing = dict(addressing)
+        if content is not None:
+            raw = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+            sha256, nbytes = hashlib.sha256(raw).hexdigest(), len(raw)
+        for key, value in (("sha256", sha256), ("bytes", nbytes)):
+            if value is None:
+                addressing.pop(key, None)
+            else:
+                addressing[key] = value
+        ctx["addressing"] = addressing
+    return with_client_keys(ctx, client_view(ctx))
 
 
 def _acting() -> Dict[str, Any]:
@@ -177,7 +394,7 @@ def _siblings(db: Any, collection_id: Optional[str], *, limit: int) -> Optional[
     try:
         edges = db.graph.edges_of(collection_id, direction="out",
                                   limit=max(1, int(limit)), partial_ok=True)
-    except Exception:  # noqa: BLE001 — a store that cannot answer records no screen, honestly
+    except Exception:  # noqa: BLE001 — a store that cannot answer records no screen at all
         return None
     out = []
     for e in edges or []:
@@ -201,19 +418,19 @@ def mint(
     """The db-level context for one mint. Complete on its own; enriched in place if a seam is filled.
 
     `caller` is whatever the writer already knows and the store cannot — a source path, a connector,
-    a session id. It is recorded verbatim under `caller` and never merged into the db-level facets,
-    so a reader can always tell what the store OBSERVED from what a caller ASSERTED.
+    a session id. Its keys are written at the top level beside the facets, less the server-owned
+    ones (`client_part`). Its `provenance` is the claim the rung is derived against
+    (`_stamp_rung`), not a key stored as sent. No client key ever replaces a db-level facet, so a
+    reader can always tell what the store OBSERVED from what a caller ASSERTED.
 
     Every facet is omitted when unobservable. There are no defaults.
     """
-    # Idempotent, so the mint can be wired at every door without double-stamping.
-    # The router covers every external writer, but an in-process caller reaches the service
-    # functions directly — and that is not a hypothetical hole, it is how 2.9M vertices got into
-    # this store with no context at all (`index_namespace.py`: "bulk-ingested straight into the
-    # lattice"). So the service primitives stamp too, and a context already carrying this arm's
-    # mark passes through untouched rather than being re-derived with a later timestamp.
-    if isinstance(caller, Mapping) and caller.get(ARM_KEY) == ARM_THIN:
-        return dict(caller)
+    # Every call mints. The router mints each create and hands the result to the service as a
+    # `Minted`; a service primitive reached in-process without one mints here — which is what
+    # keeps a bulk ingest that skips the router from landing with no context at all. `caller`'s
+    # keys are recorded as given, minus the server-owned keys (`client_part`): a dict that carries
+    # `minted_by` is a client's claim, not a mint.
+    claim = client_part(caller, allow=CLAIMABLE_ON_CREATE).get("provenance") if caller else None
 
     ctx: Dict[str, Any] = {ARM_KEY: ARM_THIN}
 
@@ -263,9 +480,9 @@ def mint(
         ctx["screen"] = screen
 
     if caller:
-        ctx["caller"] = dict(caller)
+        ctx.update(client_part(caller))
 
-    _stamp_rung(ctx)
+    _stamp_rung(ctx, claim)
 
     enriched = _enrich(ctx, artifact_id=artifact_id, content_type=content_type,
                        content=content, db=db)
@@ -314,7 +531,7 @@ def _load_context_host() -> None:
 
 
 
-def _stamp_rung(ctx: Dict[str, Any]) -> None:
+def _stamp_rung(ctx: Dict[str, Any], claim: Any = None) -> None:
     """Stamp the provenance rung this write earned, server-side, from the principal.
 
     The store has no mass. Measured on 71/home: not one vertex carries `mass > 0` — of 2.17M rows,
@@ -333,14 +550,17 @@ def _stamp_rung(ctx: Dict[str, Any]) -> None:
     place that derivation can be made.
 
     `prism.mass.authorize_and_stamp` is *"the one call a server write path makes"*. This is that
-    path, so this is that call.
+    path, so this is that call. It reads the claim from a context's top-level `provenance`, so
+    ``claim`` (the caller's, if it sent one) is handed to it there, and the principal is the
+    authenticated acting principal recorded under `minted`. The earned channel lands at the top
+    level (`provenance`), with the claim kept in `provenance_history` when the two differ.
 
     It does NOT invent mass. It records the channel the write earned; corroboration accumulates
     within a band and never re-rungs. A store that has verified nothing still reads low, correctly.
     """
     try:
         from prism.mass import authorize_and_stamp
-    except Exception:  # noqa: BLE001 — a store without prism.mass records no rung, honestly
+    except Exception:  # noqa: BLE001 — a store without prism.mass records no rung at all
         return
     minted = ctx.get("minted") or {}
     ptype = str(minted.get("principal_type") or "unknown")
@@ -350,11 +570,12 @@ def _stamp_rung(ctx: Dict[str, Any]) -> None:
     pid = minted.get("principal_id")
     is_delegated = bool(actor and pid and str(actor) != str(pid))
     try:
-        stamped = authorize_and_stamp(dict(ctx), principal_type=ptype, is_delegated=is_delegated)
+        stamped = authorize_and_stamp({"provenance": claim} if claim else {},
+                                      principal_type=ptype, is_delegated=is_delegated)
         if isinstance(stamped, Mapping):
-            for k, v in stamped.items():
-                if k not in ctx:
-                    ctx[k] = v
+            for k in ("provenance", "provenance_history"):
+                if k in stamped:
+                    ctx[k] = stamped[k]
     except Exception as exc:  # noqa: BLE001
         logger.warning("rung stamping failed (%s: %s); the mint records no rung rather than a "
                        "guessed one", type(exc).__name__, exc)

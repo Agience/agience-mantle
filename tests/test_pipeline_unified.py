@@ -7,7 +7,7 @@ These tests cover the public surface:
 - ``_extract_artifact_fields`` produces the long-form per-field text
   dict the SSE indexer wants.
 - ``index_artifact`` calls the SSE + MANTLE hooks routed to the segment
-  for the artifact's state (committed/draft/archived — each a separate
+  for the artifact's state (live/archived — each a separate
   index) and does not touch the other segments; vacating a segment on a
   state transition is ``move_artifact_segments``'s job.
 - ``index_artifacts_batch`` aggregates across the list (all states).
@@ -36,11 +36,11 @@ def _archived_artifact():
     )
 
 
-def _committed_artifact(*, content="hello world"):
+def _live_artifact(*, content="hello world"):
     return SimpleNamespace(
         id="art-1",
         root_id="art-1",
-        state="committed",
+        state="live",
         created_by="user-1",
         modified_by="user-1",
         collection_id="ws-1",
@@ -101,7 +101,7 @@ class TestExtractArtifactFields:
     def test_extracts_title_description_tags_content(self):
         from mantle.search.ingest import pipeline_unified
 
-        artifact = _committed_artifact()
+        artifact = _live_artifact()
         with patch.object(
             pipeline_unified, "extract_text_from_artifact",
             return_value="hello world",
@@ -120,7 +120,7 @@ class TestExtractArtifactFields:
         artifact = SimpleNamespace(
             id="ws-1",
             root_id="ws-1",
-            state="draft",
+            state="live",
             created_by="user-1",
             collection_id="ws-1",
             context="",
@@ -140,7 +140,7 @@ class TestExtractArtifactFields:
     def test_invalid_context_json_handled(self):
         from mantle.search.ingest import pipeline_unified
 
-        artifact = _committed_artifact()
+        artifact = _live_artifact()
         artifact.context = "{not json"
         with patch.object(
             pipeline_unified, "extract_text_from_artifact", return_value="x",
@@ -157,7 +157,7 @@ class TestExtractArtifactFields:
         artifact = SimpleNamespace(
             id="art-empty",
             root_id="art-empty",
-            state="draft",
+            state="live",
             created_by="user-1",
             collection_id="ws-1",
             context="{}",
@@ -206,7 +206,7 @@ class TestIndexArtifact:
     def test_skips_artifact_with_no_fields(self):
         from mantle.search.ingest import pipeline_unified
 
-        artifact = _committed_artifact()
+        artifact = _live_artifact()
         with (
             patch.object(
                 pipeline_unified, "_extract_artifact_fields", return_value={},
@@ -223,10 +223,10 @@ class TestIndexArtifact:
         sse.assert_not_called()
         vec_mock.assert_not_called()
 
-    def test_calls_both_arms_for_committed_artifact(self):
+    def test_calls_both_arms_for_live_artifact(self):
         from mantle.search.ingest import pipeline_unified
 
-        artifact = _committed_artifact()
+        artifact = _live_artifact()
         with (
             patch.object(pipeline_unified, "_sse_index_artifact") as sse,
             patch.object(pipeline_unified, "_mantle_index_artifact") as vec_mock,
@@ -241,19 +241,19 @@ class TestIndexArtifact:
         assert not outcome.failed and not outcome.wrote_nothing
         sse.assert_called_once()
         vec_mock.assert_called_once()
-        # Routed to the committed segment.
-        assert sse.call_args.kwargs["segment"] == "committed"
-        assert vec_mock.call_args.kwargs["segment"] == "committed"
+        # Routed to the live segment.
+        assert sse.call_args.kwargs["segment"] == "live"
+        assert vec_mock.call_args.kwargs["segment"] == "live"
         # Both arms get the same fields dict.
         assert sse.call_args[0][2] == vec_mock.call_args[0][2]
 
     def test_does_not_touch_other_segments(self):
         """index_artifact writes only its state's segment — vacating another
         segment is a transition-time concern (move_artifact_segments), since a
-        root can hold a committed version AND a draft at once."""
+        root can hold a live version AND an archived one at once."""
         from mantle.search.ingest import pipeline_unified
 
-        artifact = _committed_artifact()
+        artifact = _live_artifact()
         with (
             patch.object(pipeline_unified, "_sse_index_artifact"),
             patch.object(pipeline_unified, "_mantle_index_artifact"),
@@ -273,7 +273,7 @@ class TestIndexArtifactsBatch:
     def test_iterates_all_states(self):
         from mantle.search.ingest import pipeline_unified
 
-        committed = _committed_artifact()
+        live = _live_artifact()
         archived = _archived_artifact()
         with (
             patch.object(pipeline_unified, "_sse_index_artifact") as sse,
@@ -284,21 +284,21 @@ class TestIndexArtifactsBatch:
             ),
         ):
             ok = pipeline_unified.index_artifacts_batch(
-                [committed, archived], "ws-1",
+                [live, archived], "ws-1",
             )
         assert ok is True
         # Both states indexed now, each into its own segment.
         assert sse.call_count == 2
         assert vec_mock.call_count == 2
         segs = {c.kwargs["segment"] for c in sse.call_args_list}
-        assert segs == {"committed", "archived"}
+        assert segs == {"live", "archived"}
 
 
 class TestMoveArtifactSegments:
     def test_removes_root_from_named_segments_only(self):
         from mantle.search.ingest import pipeline_unified
 
-        artifact = _committed_artifact()  # root_id="art-1", collection_id="ws-1"
+        artifact = _live_artifact()  # root_id="art-1", collection_id="ws-1"
         with (
             patch("mantle.services.dependencies.get_store_db", return_value=iter([object()])),
             patch("mantle.search.mantle.wiring.build_indexer", return_value=object()),
@@ -313,7 +313,7 @@ class TestMoveArtifactSegments:
     def test_noop_when_index_backend_unavailable(self):
         from mantle.search.ingest import pipeline_unified
 
-        artifact = _committed_artifact()
+        artifact = _live_artifact()
         with (
             patch("mantle.services.dependencies.get_store_db", return_value=iter([object()])),
             patch("mantle.search.mantle.wiring.build_indexer", return_value=None),
@@ -341,11 +341,11 @@ class TestDeleteArtifact:
                 principal_id="user-1", collection_id="ws-1",
             )
         assert ok is True
-        # A hard delete purges all three segments.
+        # A hard delete purges live, archived and the legacy draft segment.
         assert vec_mock.call_count == 3
         assert sse.call_count == 3
         assert {c.kwargs["segment"] for c in vec_mock.call_args_list} == {
-            "committed", "draft", "archived",
+            "live", "draft", "archived",
         }
         for c in vec_mock.call_args_list:
             assert c.args == ("user-1", "ws-1", "art-1")
@@ -366,7 +366,7 @@ class TestDeleteArtifact:
         from mantle.search.ingest import pipeline_unified
 
         sse_index = _FakeSseIndex()
-        artifact = _committed_artifact()
+        artifact = _live_artifact()
 
         with (
             patch("mantle.services.dependencies.get_store_db", side_effect=_fake_get_store_db),
@@ -428,7 +428,7 @@ class TestGetArtifactEmbeddings:
     def test_returns_only_this_artifacts_chunks_ordered(self):
         from mantle.search.ingest import pipeline_unified
 
-        artifact = _committed_artifact()   # root_id="art-1", collection_id="ws-1", committed
+        artifact = _live_artifact()   # root_id="art-1", collection_id="ws-1", live
         idx = MagicMock()
         idx.collection_chunks.return_value = [
             {"artifact_id": "art-1", "chunk_id": 1, "embedding": [0.2], "model_id": "m"},
@@ -454,7 +454,7 @@ class TestGetArtifactEmbeddings:
             patch("mantle.services.dependencies.get_store_db", return_value=iter([object()])),
             patch("mantle.search.mantle.wiring.build_indexer", return_value=None),
         ):
-            assert pipeline_unified.get_artifact_embeddings(_committed_artifact(), "ws-1") == []
+            assert pipeline_unified.get_artifact_embeddings(_live_artifact(), "ws-1") == []
 
 
 # ---------------------------------------------------------------------------
@@ -480,7 +480,7 @@ class TestIndexOutcomeReporting:
         ):
             sse.return_value = pipeline_unified.ARM_FAILED      # e.g. GrantDenied
             vec_mock.return_value = pipeline_unified.ARM_SKIPPED  # e.g. no AnchorSet
-            outcome = pipeline_unified.index_artifact(_committed_artifact(), "ws-1")
+            outcome = pipeline_unified.index_artifact(_live_artifact(), "ws-1")
 
         assert outcome.failed
         assert bool(outcome) is False
@@ -499,7 +499,7 @@ class TestIndexOutcomeReporting:
         ):
             sse.return_value = pipeline_unified.ARM_WRITTEN
             vec_mock.return_value = pipeline_unified.ARM_SKIPPED
-            outcome = pipeline_unified.index_artifact(_committed_artifact(), "ws-1")
+            outcome = pipeline_unified.index_artifact(_live_artifact(), "ws-1")
 
         assert not outcome.failed
         assert not outcome.wrote_nothing
@@ -518,7 +518,7 @@ class TestIndexOutcomeReporting:
             sse.return_value = pipeline_unified.ARM_FAILED
             vec_mock.return_value = pipeline_unified.ARM_FAILED
             ok = pipeline_unified.index_artifacts_batch(
-                [_committed_artifact()], "ws-1",
+                [_live_artifact()], "ws-1",
             )
 
         # Fails if this returns `True` unconditionally, so a bulk index in which
@@ -536,7 +536,7 @@ class TestPlatformTrustConfigIsNotASearchTarget:
 
     @staticmethod
     def _issuer_artifact():
-        art = _committed_artifact()
+        art = _live_artifact()
         art.content_type = "application/vnd.agience.issuer+json"
         art.collection_id = ""
         return art
@@ -563,7 +563,7 @@ class TestPlatformTrustConfigIsNotASearchTarget:
         the index and every assertion above still passes."""
         from mantle.search.ingest import pipeline_unified
 
-        assert pipeline_unified.is_indexable(_committed_artifact())
+        assert pipeline_unified.is_indexable(_live_artifact())
         assert not pipeline_unified.is_indexable(self._issuer_artifact())
 
 
@@ -582,7 +582,7 @@ class TestASecretIsNotASearchTarget:
     def _credential_artifact():
         from mantle.services.bootstrap_types import CREDENTIAL_CONTENT_TYPE
 
-        art = _committed_artifact()
+        art = _live_artifact()
         art.content_type = CREDENTIAL_CONTENT_TYPE
         return art
 
@@ -633,7 +633,7 @@ class TestALexiconEntrysNamesAreIndexed:
         return SimpleNamespace(
             id="wn-oewn-14672278-n",
             root_id="wn-oewn-14672278-n",
-            state="committed",
+            state="live",
             created_by="ingest",
             collection_id="stage.0.lexicon",
             context="",
@@ -719,7 +719,7 @@ class TestAMergedConceptIsIndexable:
         return SimpleNamespace(
             id="concept-be603d8ac3dd0185fcf653e18a8dc72d",
             root_id="concept-be603d8ac3dd0185fcf653e18a8dc72d",
-            state="committed",
+            state="live",
             created_by="op.consolidate.colimit",
             collection_id="stage.0.lexicon",
             context="",
@@ -744,7 +744,7 @@ class TestAMergedConceptIsIndexable:
         return SimpleNamespace(
             id="cn-12_hour_clock",
             root_id="cn-12_hour_clock",
-            state="committed",
+            state="live",
             created_by="ingest.conceptnet",
             collection_id="stage.2.world",
             context="",

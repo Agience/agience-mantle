@@ -264,22 +264,48 @@ class _LazyDb:
 # Per-state index segments
 #
 # Each artifact state indexes into its own physically separate index tree, keyed
-# by the storage prefix. `committed` keeps the original prefixes so the existing
-# committed index needs NO migration; `draft` and `archived` are sibling trees
-# alongside it. A query opts into a non-committed segment explicitly (search is
-# committed-only by default). The per-principal master keys + cell AAD are shared
-# across segments — separation is purely at the object-storage namespace.
+# by the storage prefix. `live` is stored under the unsuffixed prefixes (`mantle-cells`,
+# `mantle-sse`), the ones the legacy `committed` segment used, so its data needs no
+# migration; `archived` is a sibling tree alongside it. A query opts into the archived segment explicitly
+# (search reads `live` by default). The per-principal master keys + cell AAD are
+# shared across segments — separation is purely at the object-storage namespace.
+#
+# The legacy segment name `committed` is `live`. The legacy `draft` segment is written by
+# nothing and read by nothing: every read resolves it to `live` (`normalise_segment`), and a
+# state maps to `live` before it names a segment (`pipeline_unified._segment_for_state`). Its
+# prefixes stay addressable (`_segment_prefixes("draft")`) for two operator and cleanup paths:
+# REMOVING a root from them (`pipeline_unified.move_artifact_segments`,
+# `delete_artifact_from_index`), because the cells there carry chunk text, and
+# `system/manage_sse_index --segment draft`, which opens the legacy draft posting store to
+# migrate or inspect it. Deleting the prefixes themselves is the operator's call
+# (`system/manage_state_collapse` reports their size).
 # ---------------------------------------------------------------------------
-VALID_SEGMENTS = ("committed", "draft", "archived")
+VALID_SEGMENTS = ("live", "archived")
+#: The legacy draft segment, addressable for removal and for `manage_sse_index` only.
+LEGACY_DRAFT_SEGMENT = "draft"
+#: `(cell_prefix, sse_prefix)` the draft segment was stored under.
+LEGACY_DRAFT_PREFIXES = ("mantle-cells-draft", "mantle-sse-draft")
+
+
+def normalise_segment(segment: str) -> str:
+    """The segment a READ of ``segment`` uses: a legacy `committed` or `draft` reads ``live``."""
+    return "live" if segment in ("committed", LEGACY_DRAFT_SEGMENT) else segment
 
 
 def _segment_prefixes(segment: str) -> tuple[str, str]:
-    """Return ``(cell_prefix, sse_prefix)`` for an artifact-state index segment."""
+    """Return ``(cell_prefix, sse_prefix)`` for an artifact-state index segment.
+
+    `committed` is `live`. `draft` names the legacy draft prefixes, which only a removal asks
+    for; a read normalises first (`normalise_segment`)."""
+    if segment == LEGACY_DRAFT_SEGMENT:
+        return LEGACY_DRAFT_PREFIXES
+    if segment == "committed":
+        segment = "live"
     if segment not in VALID_SEGMENTS:
         raise ValueError(
             f"invalid index segment {segment!r} (expected one of {VALID_SEGMENTS})"
         )
-    if segment == "committed":
+    if segment == "live":
         return "mantle-cells", "mantle-sse"
     return f"mantle-cells-{segment}", f"mantle-sse-{segment}"
 
@@ -371,7 +397,7 @@ def _build_file_cell_store(cell_prefix: str) -> Optional[CellStore]:
     return store
 
 
-def _build_cell_store(segment: str = "committed") -> Optional[CellStore]:
+def _build_cell_store(segment: str = "live") -> Optional[CellStore]:
     """Construct the cell store for one index segment.
 
     Both backends implement the same :class:`CellStore` Protocol and both receive the same
@@ -413,7 +439,7 @@ def _build_cell_store(segment: str = "committed") -> Optional[CellStore]:
     return S3CellStore(s3_client, bucket=bucket, prefix=cell_prefix)
 
 
-def cell_storage_available(segment: str = "committed") -> bool:
+def cell_storage_available(segment: str = "live") -> bool:
     """Is there anywhere to write the cell index right now?
 
     The vector-arm counterpart of :func:`sse_index_storage_available`, and measured the same
@@ -432,7 +458,7 @@ def cell_storage_available(segment: str = "committed") -> bool:
 
 
 def build_indexer(
-    store_db: object, *, segment: str = "committed"
+    store_db: object, *, segment: str = "live"
 ) -> Optional[MantleIndexer]:
     """Construct a production-wired :class:`MantleIndexer` for one index segment."""
     oracle = _build_oracle()
@@ -586,7 +612,7 @@ def _report_analyzer_generation(store: Any, where: str) -> None:
     )
 
 
-def _build_sse_store(segment: str = "committed") -> Optional[PostingStore]:
+def _build_sse_store(segment: str = "live") -> Optional[PostingStore]:
     """Construct the posting store for one index segment.
 
     One store, where there were two. The second was the per-owner BM25 corpus-statistics blob;
@@ -629,7 +655,7 @@ def _build_sse_store(segment: str = "committed") -> Optional[PostingStore]:
     return store
 
 
-def sse_index_storage_available(segment: str = "committed") -> bool:
+def sse_index_storage_available(segment: str = "live") -> bool:
     """Is there anywhere to write the SSE index right now?
 
     The question a full reindex has to ask before it scans anything. It measures the
@@ -644,7 +670,7 @@ def sse_index_storage_available(segment: str = "committed") -> bool:
 
 
 def build_sse_indexer(
-    store_db: object, *, segment: str = "committed"
+    store_db: object, *, segment: str = "live"
 ) -> Optional[SseIndexer]:
     """Construct a production-wired :class:`SseIndexer` for one index segment.
 
@@ -660,7 +686,7 @@ def build_sse_indexer(
 
 
 def build_digest_refresher(
-    members_provider, *, read, engine_id: str, segment: str = "committed"
+    members_provider, *, read, engine_id: str, segment: str = "live"
 ):
     """Construct the collection-digest refresher, or ``None`` if a prerequisite is missing.
 
@@ -690,7 +716,7 @@ def build_digest_refresher(
 
 
 def build_collection_proximity_narrower(
-    members_of, *, probe_factory, segment: str = "committed"
+    members_of, *, probe_factory, segment: str = "live"
 ):
     """Construct the query-side proximity narrower, or ``None`` if a prerequisite is missing.
 
@@ -744,6 +770,7 @@ def _build_query_stack(segment: str) -> Optional[_QueryStack]:
     every recall on it narrows correctly and comes back ordered by how much of the query each
     hit matched. See :mod:`mantle.search.anchors.store`.
     """
+    segment = normalise_segment(segment)
     oracle = _build_oracle()
     posting_store = _build_sse_store(segment)
     cells = _build_cell_store(segment)
@@ -755,13 +782,13 @@ def _build_query_stack(segment: str) -> Optional[_QueryStack]:
 def build_sse_search_accessor(
     store_db: object,
     *,
-    segment: str = "committed",
+    segment: str = "live",
 ) -> Optional[MantleSseSearchAccessor]:
     """Construct a router-shape (``SearchQuery → SearchResult``) SSE accessor.
 
-    ``segment`` selects which per-state index to query — ``committed`` (default),
-    ``draft``, or ``archived``. Composes the narrower, the ranker and the light-cone resolver
-    with a ``SearchHit`` hydrator over the lattice. This is the canonical search backend the
+    ``segment`` selects which per-state index to query — ``live`` (default) or
+    ``archived``; a legacy ``committed`` or ``draft`` reads ``live``. Composes the narrower,
+    the ranker and the light-cone resolver with a ``SearchHit`` hydrator over the lattice. This is the canonical search backend the
     artifacts router uses, on both of its entry points.
 
     There is no ``field_boosts`` or ``rrf_k`` parameter. A field boost is a BM25 weight and a
@@ -786,7 +813,7 @@ def build_sse_search_accessor(
         # The accessor hydrates by lineage, so it needs the same segment the stack queries:
         # a hit names a `root_id`, and this is what says which of that root's versions was
         # the one indexed here.
-        segment=segment,
+        segment=normalise_segment(segment),
     )
 
 

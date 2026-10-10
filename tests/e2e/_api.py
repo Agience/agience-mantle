@@ -74,7 +74,7 @@ class Api:
     COLLECTION_TYPE = "application/vnd.agience.collection+json"
 
     def create_collection(self, name: str, *, content_type: str | None = None) -> dict:
-        """Top-level container → committed. Returns the created doc."""
+        """Top-level container → live. Returns the created doc."""
         r = self.post("/artifacts", json={
             "name": name, "content_type": content_type or self.COLLECTION_TYPE,
         })
@@ -83,7 +83,7 @@ class Api:
 
     def create_child(self, container_id: str, *, name: str = "", content: str = "",
                      content_type: str = "text/plain", index: str | None = None) -> dict:
-        """Child in a container → draft. `index` ∈ {eager, lazy, None}."""
+        """Child in a container → live. `index` ∈ {eager, lazy, None}."""
         body: dict = {"container_id": container_id, "name": name,
                       "content": content, "content_type": content_type}
         if index is not None:
@@ -95,9 +95,6 @@ class Api:
     def get_artifact(self, artifact_id: str) -> httpx.Response:
         return self.get(f"/artifacts/{artifact_id}")
 
-    def commit(self, artifact_id: str) -> httpx.Response:
-        return self.patch(f"/artifacts/{artifact_id}", json={"state": "committed"})
-
     def visible(self, *, content_type: str | None = None, action: str = "read") -> list:
         params = {"action": action}
         if content_type:
@@ -106,7 +103,7 @@ class Api:
         r.raise_for_status()
         return r.json()
 
-    def search(self, query_text: str, *, state: str = "committed",
+    def search(self, query_text: str, *, state: str = "live",
                scope: list[str] | None = None, size: int = 20) -> httpx.Response:
         body: dict = {"query_text": query_text, "state": state, "size": size}
         if scope is not None:

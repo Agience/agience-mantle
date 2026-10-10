@@ -22,6 +22,27 @@ import pytest
 PATH = "/.well-known/oauth-protected-resource"
 
 
+@pytest.fixture(autouse=True)
+def _restore_config():
+    """Put `mantle.config`, `mantle.main` and the browse page back exactly as they were before the
+    test. The tests here reload them under a controlled environment, and `monkeypatch` restores the
+    environment but not the modules built from it.
+
+    `mantle.main` is the one that breaks other tests: a reload builds a NEW `app`, conftest's
+    `client` keeps the original, and a later test that does `from mantle.main import app` sets its
+    dependency overrides on an app its client never calls. Its request then meets the real store and
+    auth. A reload under the restored environment would make a third app, so the namespaces are
+    snapshotted and restored, which keeps every object's identity."""
+    import mantle.config as cfg
+    import mantle.main as main
+    import mantle.ui.browse_page as bp
+    saved = {m: dict(m.__dict__) for m in (cfg, main, bp)}
+    yield
+    for m, ns in saved.items():
+        m.__dict__.clear()
+        m.__dict__.update(ns)
+
+
 def _reload(monkeypatch, **env):
     """Rebuild config with a controlled environment. Returns the config module."""
     for k in ("AGIENCE_TRUSTED_ISSUERS", "ORIGIN_URI", "AUTHORITY_ISSUER",

@@ -15,7 +15,7 @@
 import logging
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException, Depends, Security, Request
 from fastapi.security import (
@@ -157,7 +157,8 @@ class AuthContext:
     #: Did the issuer vouch for that address? Not the same as merely having one.
     #:
     #: `_claim_email` accepts `email` / `upn` / `preferred_username` — none of which is a claim that
-    #: the address was verified. Matching an invite on an unverified address is the classic
+    #: the address was verified, and `email_verified` covers only the first (see
+    #: `_claim_email_verified`). Matching an invite on an unverified address is the classic
     #: "Sign in with X" takeover: any IdP that lets a user type an arbitrary address becomes a way
     #: to claim an invite addressed to someone else. Anything that decides access from the email
     #: must read this too; anything merely displaying it need not.
@@ -250,7 +251,15 @@ def _claim_email_verified(payload: dict) -> bool:
     saying nothing, and collapsing the two is how an unverified address becomes an identity. The
     string form is accepted because claims survive JSON round-trips as strings — and `bool("false")`
     is `True`, so a naive cast would read an explicit denial as approval.
+
+    It vouches for the `email` claim and for nothing else. OIDC defines `email_verified` as a
+    statement about `email`; `_claim_email` falls back to `upn` / `preferred_username` when
+    `email` is absent, and an issuer's `email_verified` says nothing about those. So a token
+    whose address came from a fallback claim is unverified, whatever `email_verified` says.
     """
+    email = payload.get("email")
+    if not (isinstance(email, str) and "@" in email):
+        return False
     v = payload.get("email_verified")
     if isinstance(v, bool):
         return v
@@ -399,6 +408,19 @@ def _enforce_token_scope(auth: "AuthContext", request: Optional[Request]) -> Non
         status_code=403,
         detail=f"token scope {scope!r} does not permit this operation",
     )
+
+
+def enforce_token_bounds(auth: "AuthContext", request: Optional[Request], *,
+                         nonce_source: Any = None) -> None:
+    """Every bound a resolved credential carries beyond its grants: its scope and its key's nonce.
+
+    Called by every path that authenticates a caller — `get_auth` for HTTP, the `/events`
+    handshake for the WebSocket — so a bound holds on every route rather than on the routes that
+    remembered to ask. `nonce_source` is what carries the challenge header when it is not
+    `request`: a WebSocket has headers but no method, and the scope check needs the method.
+    """
+    _enforce_token_scope(auth, request)
+    check_inbound_nonce(nonce_source if nonce_source is not None else request, auth)
 
 
 def _check_grant_permission(grants: List[GrantEntity], action: str, resource_id: str = None) -> bool:
@@ -691,7 +713,7 @@ async def get_auth(
     # the key oracle issue material to this caller — so a token being refused for scope must not
     # first be installed as the identity that may ask for keys. The whole point of the bound is that
     # platform automation does not get to read a credential.
-    _enforce_token_scope(auth, request)
+    enforce_token_bounds(auth, request)
 
     # Each request runs in its own task with its own context copy, so this cannot
     # leak into another request; it is deliberately not reset, because it must stay
@@ -1080,12 +1102,14 @@ def check_access(
     raise HTTPException(status_code=404, detail="Not found")
 
 
-def check_inbound_nonce(request: Request, auth: AuthContext) -> None:
+def check_inbound_nonce(request: Optional[Request], auth: AuthContext) -> None:
     """Enforce nonce validation for keys with ``requires_nonce=True``.
 
-    Must be called explicitly from any endpoint that should be bot-protected.
-    No-ops for principals whose key does not have ``requires_nonce=True``, so
-    the same endpoint can serve both authenticated users and nonce-gated callers.
+    Applied to every authenticated request by :func:`enforce_token_bounds`, so a nonce-gated key
+    reaches no route without a challenge. No-ops for principals whose key does not have
+    ``requires_nonce=True``, so the same endpoint can serve both authenticated users and
+    nonce-gated callers. `request` is anything with ``headers``; with none there is no challenge,
+    which refuses a nonce-gated key.
 
     Raises 403 if the nonce is absent or invalid.
     """
@@ -1098,7 +1122,8 @@ def check_inbound_nonce(request: Request, auth: AuthContext) -> None:
     from mantle.services.auth_service import verify_nonce as _verify_nonce
     from mantle import config
 
-    nonce = request.headers.get("X-Agience-Challenge", "")
+    headers = getattr(request, "headers", None) or {}
+    nonce = headers.get("X-Agience-Challenge", "")
     if not nonce:
         raise HTTPException(status_code=403, detail="Nonce required for inbound access")
 

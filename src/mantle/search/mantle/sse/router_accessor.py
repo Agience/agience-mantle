@@ -73,6 +73,7 @@ from mantle.search.types import (
     ORDER_RECENCY,
     ORDER_SEMANTIC,
 )
+from mantle.db.constants import state_of
 from mantle.services.acting_principal import KeyCustodyDenied
 
 from ..engine import MantleHit, MantleQueryEngine, SystemicKeyFailure
@@ -275,7 +276,7 @@ class MantleSseSearchAccessor:
         embeddings: Optional[Embeddings] = None,
         narrower: Optional[TokenNarrower] = None,
         ranker: Optional[MantleQueryEngine] = None,
-        segment: str = "committed",
+        segment: str = "live",
     ) -> None:
         """``narrower`` narrows, ``ranker`` ranks. There is no third collaborator.
 
@@ -293,7 +294,7 @@ class MantleSseSearchAccessor:
         lineage; turning that back into bytes means asking for this segment's version of it.
         Without the segment, hydration can only take the row sitting at the root id, which is
         the version that was indexed for every artifact where ``id == root_id`` and the wrong
-        one as soon as a committed member is edited into a draft.
+        one for a lineage whose current version has a new id beside the row at its root.
         """
         self._lightcone = lightcone
         self._store_db = store_db
@@ -1678,7 +1679,8 @@ class MantleSseSearchAccessor:
                     # was never in a collection-shaped conversation, so the doc answers for it.
                     collection_id=hit.collection_id or (doc or {}).get("collection_id"),
                     principal_id=hit.principal_id,
-                    state=(doc or {}).get("state"),
+                    # `state_of`, so a legacy `committed` or `draft` row answers `live`.
+                    state=state_of(doc) if doc else None,
                     is_head=None,
                     highlights=None,
                 )
@@ -1686,17 +1688,33 @@ class MantleSseSearchAccessor:
         return out
 
     @staticmethod
-    def _safe_get(store_db, artifact_id: str, segment: str = "committed"):
+    def _safe_get(store_db, artifact_id: str, segment: str = "live"):
         """This segment's version of the lineage ``artifact_id`` names.
 
         ``artifact_id`` on a ranked hit is a ROOT id — both arms index by root — so this is a
-        lineage read, not a document read. `find_version_in_state` resolves within the segment
-        already being searched and falls back to the row at the root, which is the same answer
-        a direct lookup gave for every artifact whose id is its own root.
+        lineage read, not a document read. For the live segment it is the newest non-archived
+        version (`find_newest_by_root`), which is the version an edit wrote and indexed; a
+        legacy `committed` or `draft` row is live. For the archived segment it is the newest
+        archived version, because that segment is what the caller asked to read — the lineage's
+        live head is exactly the version it did not. Either falls back to the row at the root,
+        the answer a direct lookup gives for every artifact whose id is its own root.
+
+        Resolving within the searched segment keeps this from widening anything: the light cone
+        has already authorized the lineage, grants are held on the root, and every version this
+        can return belongs to that lineage.
         """
-        from mantle.db.backend import find_version_in_state
+        from mantle.db.backend import find_newest_by_root
+
+        def _in_segment(db, root_id):
+            if segment == "archived":
+                rows = [v for v in (db.artifacts.versions_of(root_id) or [])
+                        if state_of(v) == "archived"]
+                found = rows[-1] if rows else None      # proper-time order: last = newest
+            else:
+                found = find_newest_by_root(db, root_id)
+            return found if found is not None else _raw_artifact(db, root_id)
         try:
-            return find_version_in_state(store_db, artifact_id, segment)
+            return _in_segment(store_db, artifact_id)
         except Exception:  # noqa: BLE001 — store reads raise broadly
             try:
                 return _raw_artifact(store_db, artifact_id)

@@ -46,11 +46,9 @@ from mantle.db.backend import (
     batch_get_collection_ids_for_roots as db_batch_get_collection_ids_for_roots,
 
     # Artifacts (unified store)
-    create_artifact as db_create_artifact,
     get_artifact as db_get_artifact,
     get_artifacts_by_creator_id as db_get_artifacts_by_creator_id,
-    get_draft_artifact as db_get_draft_artifact,
-    get_latest_committed_artifact as db_get_latest_committed_artifact,
+    get_latest_live_artifact as db_get_latest_live_artifact,
     get_current_in_collection as db_get_current_in_collection,
     get_current_in_collection_many as db_get_current_in_collection_many,
     get_current_in_any_collection_many as db_get_current_in_any_collection_many,
@@ -91,17 +89,14 @@ def db_get_artifact_by_version_id(db, version_id):
 
 
 def db_get_latest_artifact_version_by_root_id(db, root_id):
-    """The newest committed version of a lineage in any collection, or ``None`` if the root
-    has never been committed. Drafts are not considered."""
-    return db_get_latest_committed_artifact(db, root_id)
+    """The newest non-archived version of a lineage in any collection, or ``None`` if the root
+    has none."""
+    return db_get_latest_live_artifact(db, root_id)
 
 
 def db_get_artifact_by_collection_id_and_root_id(db, collection_id, root_id):
-    """The current version of ``root_id`` as seen from ``collection_id`` — the draft in that
-    collection if one exists, else the newest version committed there. ``None`` when the root
-    has no version in this collection."""
-    # `get_current_in_collection` is the same draft-then-committed rule over ONE lineage read;
-    # the draft/committed pair reads the lineage twice to answer the same question.
+    """The current version of ``root_id`` as seen from ``collection_id`` — the newest
+    non-archived version there. ``None`` when the root has no version in this collection."""
     return db_get_current_in_collection(db, collection_id, root_id)
 
 
@@ -220,7 +215,7 @@ def create_new_collection(
         description=description,
         created_by=owner_id,
         content_type=COLLECTION_CONTENT_TYPE,
-        state=CollectionEntity.STATE_COMMITTED,
+        state=CollectionEntity.STATE_LIVE,
         collection_id=container_id or "",
         created_time=now,
         modified_time=now,
@@ -422,107 +417,6 @@ def delete_user_collection(db: Database, user_id: Optional[str], collection_id: 
 
 
 # === Artifact Operations ===
-
-def create_new_artifact(db: Database, user_id: str, context: str, content: str) -> ArtifactEntity:
-    """
-    Create a new artifact version document only. Root and linking are handled separately.
-    Exact 1:1 mapping - no modified_by/modified_time (don't exist in the lattice schema).
-    """
-    now = datetime.now(timezone.utc).isoformat()
-    artifact = ArtifactEntity(
-        id=str(uuid.uuid4()),
-        context=context,
-        content=content,
-        created_by=user_id,
-        created_time=now,
-    )
-    created = db_create_artifact(db, artifact)
-    _attach_committed_collection_ids(db, [created])
-    return created
-
-
-def edit_artifact_in_collection(
-    db: Database,
-    user_id: str,
-    collection_id: str,
-    root_id: str,
-    context: str,
-    content: str,
-    *,
-    archive: bool = False,
-    record: bool = True,
-    prev_version_id: Optional[str] = None,
-    actor_id: Optional[str] = None,
-) -> ArtifactEntity:
-    """
-    Create a new version under an existing root and relink to it.
-    Archive the previously linked version if requested.
-    Provenance: remove by previous version id, add by new version id.
-
-    prev_version_id: Pre-fetched currently linked version (skip lookup)
-    """
-    # Read the currently linked version before unlinking (if not provided)
-    if prev_version_id is None:
-        linked = db_get_artifact_by_collection_id_and_root_id(db, collection_id, root_id)
-        prev_version_id = getattr(linked, "id", None) if linked else None
-
-    # Optionally archive the previously linked version
-    if archive and prev_version_id:
-        try:
-            db_archive_artifact(db, user_id, prev_version_id)
-        except Exception:
-            logger.exception("Failed to archive previous version %s", prev_version_id)
-
-    # Unlink current root from collection (will be replaced)
-    db_delete_collection_artifact_by_collection_and_root(db, collection_id, root_id)
-
-    # Create new version
-    now = datetime.now(timezone.utc).isoformat()
-    new_id = str(uuid.uuid4())
-    new_artifact = ArtifactEntity(
-        id=new_id,
-        root_id=root_id,
-        collection_id=collection_id,
-        context=context,
-        content=content,
-        created_by=actor_id or user_id,
-        created_time=now,
-    )
-    created = db_create_artifact(db, new_artifact)
-
-    # Relink to new version
-    db_add_artifact_to_collection(db, collection_id, root_id, created.id)
-
-    if record:
-        record_collection_commit(
-            db, user_id, collection_id,
-            removes=[prev_version_id] if prev_version_id else [],
-            adds=[created.id],
-            message=f"Replaced version {prev_version_id} with {created.id}",
-            author_id=actor_id or user_id,
-        )
-    
-    # Delete old version from unified search index
-    if prev_version_id:
-        try:
-            delete_artifact_from_index(prev_version_id, root_id, collection_id=collection_id)
-        except Exception as e:
-            logger.warning(f"Failed to delete old collection artifact from search {prev_version_id}: {e}")
-    
-    # Index new version to unified search
-    try:
-        index_artifact(created, collection_id, is_head=True)
-    except Exception as e:
-        logger.warning(f"Failed to index collection artifact {created.id}: {e}")
-
-    _attach_committed_collection_ids(db, [created])
-    _emit(collection_id, "artifact.updated", {
-        "artifact": {**created.to_dict(), "collection_id": collection_id}
-    }, actor_id=user_id)
-    return created
-
-
-
 
 def remove_artifact_from_collection_by_version(
     db: Database,

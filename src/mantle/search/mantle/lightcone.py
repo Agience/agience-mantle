@@ -399,12 +399,11 @@ def _raw_artifacts(store_db, artifact_ids):
 def _resolve_roots(store_db, wanted, out) -> None:
     """Fill in, by ROOT, whatever `wanted` the id lookup could not answer. Mutates `out`.
 
-    The newest COMMITTED version wins, which is the same choice `get_latest_committed_artifact`
+    The newest non-archived version wins, which is the same choice `get_latest_live_artifact`
     makes and for the same reason: `versions_of_many` orders each lineage oldest-first by
-    `(_origin, _seq)` -- the gap-free proper-time identity -- so the last committed doc in the list
-    is the current one. A draft is not substituted for a missing commit: `recall` reads the
-    committed segment, and answering a committed query with a draft would return content that was
-    never published.
+    `(_origin, _seq)` -- the gap-free proper-time identity -- so the last live doc in the list is
+    the current one. A legacy `committed` or `draft` row is live (`state_of`), so a lineage that
+    only ever held a draft resolves too.
 
     Never raises. A store with no `versions_of_many` (a test double, a non-lattice backend) leaves
     `out` exactly as the id lookup left it, which is the behaviour every caller had before this.
@@ -423,7 +422,7 @@ def _resolve_roots(store_db, wanted, out) -> None:
             # `state_of` is the store layer's one answer for what a doc carrying no `state`
             # is in; a second answer here would file a stateless doc differently from the way
             # the index segments already file it.
-            if state_of(doc) != "committed":
+            if state_of(doc) == "archived":
                 continue
             out[str(root_id)] = doc
             break

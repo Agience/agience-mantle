@@ -38,7 +38,7 @@ def _system_principal_id() -> Optional[str]:
 
 
 def load_issuer_configs(db: Any) -> List[Dict[str, Any]]:
-    """Load trusted-issuer configs from committed, system-owned issuer artifacts.
+    """Load trusted-issuer configs from live, system-owned issuer artifacts.
 
     Returns dicts shaped like ``config.TRUSTED_ISSUERS`` entries:
         {"issuer", "audience"?, "jwks"|"jwks_uri", "namespace"?, "role"?}
@@ -54,7 +54,7 @@ def load_issuer_configs(db: Any) -> List[Dict[str, Any]]:
         return []
     try:
         from mantle.db import backend as db_store
-        arts = db_store.list_committed_artifacts_by_context_content_type(
+        arts = db_store.list_live_artifacts_by_context_content_type(
             db, ISSUER_CONTENT_TYPE, created_by=system_id,
         )
     except Exception:
@@ -106,7 +106,7 @@ def create_issuer_artifact(
     namespace: Optional[str] = None,
     role: str = "external",
 ) -> Any:
-    """Create a system-owned, committed trusted-issuer artifact. Raises ValueError
+    """Create a system-owned, live trusted-issuer artifact. Raises ValueError
     on bad input, RuntimeError if the system principal is unavailable."""
     if not issuer:
         raise ValueError("issuer is required")
@@ -148,7 +148,7 @@ def create_issuer_artifact(
     from mantle.db import backend as db_store
     from mantle.entities.artifact import Artifact
     art = Artifact(
-        id=str(uuid.uuid4()), collection_id="", state="committed",
+        id=str(uuid.uuid4()), collection_id="", state="live",
         created_by=system_id, modified_by=system_id, context=json.dumps(ctx),
         content_type=ISSUER_CONTENT_TYPE, name=issuer,
     )
@@ -158,12 +158,12 @@ def create_issuer_artifact(
 
 
 def list_issuer_artifacts(db: Any) -> List[Any]:
-    """Return the committed, system-owned issuer artifacts (for the admin list)."""
+    """Return the live, system-owned issuer artifacts (for the admin list)."""
     system_id = _system_principal_id()
     if db is None or not system_id:
         return []
     from mantle.db import backend as db_store
-    return db_store.list_committed_artifacts_by_context_content_type(
+    return db_store.list_live_artifacts_by_context_content_type(
         db, ISSUER_CONTENT_TYPE, created_by=system_id,
     )
 
@@ -187,7 +187,7 @@ def seed_platform_issuer_artifacts(db: Any) -> int:
         logger.warning("issuer seed: system principal unknown; skipping (manifest fallback)")
         return 0
 
-    # Already-present issuers (committed, system-owned) — skip these.
+    # Already-present issuers (live, system-owned) — skip these.
     existing: set = set()
     for a in list_issuer_artifacts(db):
         ctx = getattr(a, "context", None)
@@ -243,7 +243,7 @@ def seed_platform_issuer_artifacts(db: Any) -> int:
 
 def revoke_issuer_artifact(db: Any, artifact_id: str, *, by: str) -> bool:
     """Revoke trust in an issuer by archiving its artifact (the loader reads only
-    committed). Returns False if not an issuer artifact. Emits artifact.updated ->
+    live). Returns False if not an issuer artifact. Emits artifact.updated ->
     the watcher drops it from the trust set."""
     from mantle.db import backend as db_store
     art = db_store.get_artifact(db, artifact_id)
@@ -275,7 +275,7 @@ def revoke_issuer_artifact(db: Any, artifact_id: str, *, by: str) -> bool:
 # An event signals an issuer change when its name matches AND it carries our
 # content_type (the db chokepoint stamps content_type on artifact.created/updated;
 # the gateway emits issuer.* on typed ops). A full reload on any such event means a
-# delete/rotate is reflected by re-reading the committed set.
+# delete/rotate is reflected by re-reading the live set.
 _ISSUER_EVENT_NAMES = [
     "artifact.created", "artifact.updated", "artifact.deleted", "issuer.*",
 ]

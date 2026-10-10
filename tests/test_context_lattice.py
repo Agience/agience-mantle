@@ -543,7 +543,7 @@ def test_context_root_climbs_the_defining_chain_only(db):
 
 def _seed_grant(db, user_id, resource_id, **flags):
     from mantle.db import lattice_api as api
-    db.artifacts.put_artifact({"id": resource_id, "state": "committed",
+    db.artifacts.put_artifact({"id": resource_id, "state": "live",
                                "content_type": COLLECTION_CONTENT_TYPE,
                                "origin_root": resource_id})
     api.upsert_user_collection_grant(db, user_id=user_id, collection_id=resource_id,

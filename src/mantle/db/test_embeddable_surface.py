@@ -312,9 +312,9 @@ def test_the_store_actually_works_on_the_base_install(tmp_path):
     import mantle.db.lattice_api as api
 
     L = open_lattice(str(tmp_path / "s.db"), origin="external-node")
-    L.artifacts.put_artifact({"id": "coll-1", "state": "committed", "origin_root": "external-root",
+    L.artifacts.put_artifact({"id": "coll-1", "state": "live", "origin_root": "external-root",
                               "content_type": "application/vnd.agience.collection+json"})
-    L.artifacts.put_artifact({"id": "art-1", "content_type": "text/markdown", "state": "committed",
+    L.artifacts.put_artifact({"id": "art-1", "content_type": "text/markdown", "state": "live",
                               "collection_id": "coll-1", "content": "v1"})
     assert L.artifacts.get_artifact("art-1")["content"] == "v1"
 
@@ -324,7 +324,7 @@ def test_the_store_actually_works_on_the_base_install(tmp_path):
     assert len(L.artifacts.versions_of(root)) == 2
 
     db = LatticeDatabase(str(tmp_path / "g.db"), origin="external-node")
-    db.artifacts.put_artifact({"id": "coll-1", "state": "committed", "origin_root": "external-root",
+    db.artifacts.put_artifact({"id": "coll-1", "state": "live", "origin_root": "external-root",
                                "content_type": "application/vnd.agience.collection+json"})
     api.upsert_user_collection_grant(db, user_id="alice", collection_id="coll-1",
                                      can_read=True, granted_by="external-root")

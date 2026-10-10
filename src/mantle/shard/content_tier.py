@@ -324,7 +324,7 @@ def promote_local_content(store, *, max_refs: int = 2000, page: int = 200,
                 _quarantine.append({**f, "at": __import__("time").time()})
     store.artifacts.put_artifact({
         "id": cid, "content_type": "application/vnd.agience.content-cursor+json",
-        "state": "committed",
+        "state": "live",
         "last_id": (last_id if (not errors or _force) else cur.get("last_id", "")),
         # What failed, and why — a bounded sample, so "errors: 5" is diagnosable from the published
         # cursor instead of requiring an ssh session and a hand-written probe.

@@ -264,7 +264,7 @@ def delete_artifact(db: LatticeDatabase, artifact_id: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BRICK 2 — drafts / version history / children (same names + signatures as db.store)
+# BRICK 2 — lineage heads / version history / children (same names + signatures as db.store)
 #
 # Ordering note: db.store sorted versions by `created_time DESC` — a CLAIM stamped by the writer.
 # The lattice orders a lineage by `(_origin, _seq)` (proper time, gap-free, globally unique), which
@@ -283,20 +283,15 @@ def _versions(db: LatticeDatabase, root_id: str):
     return db.artifacts.versions_of(root_id) or []
 
 
-def get_draft_artifact(db: LatticeDatabase, root_id: str,
-                       collection_id: str) -> Optional[ArtifactEntity]:
-    """Return the single draft record for (root_id, collection_id) if any."""
-    for doc in _versions(db, root_id):
-        if state_of(doc) == "draft" and doc.get("collection_id") == collection_id:
-            return from_lattice_doc(doc, ArtifactEntity)
-    return None
+def get_latest_live_artifact(db: LatticeDatabase, root_id: str,
+                             collection_id: Optional[str] = None) -> Optional[ArtifactEntity]:
+    """Newest live version for *root_id* (optionally restricted to a collection).
 
-
-def get_latest_committed_artifact(db: LatticeDatabase, root_id: str,
-                                  collection_id: Optional[str] = None) -> Optional[ArtifactEntity]:
-    """Newest committed version for *root_id* (optionally restricted to a collection)."""
+    Live is every state but `archived` — `state_of` reads a legacy `committed` or `draft` row as
+    live — so a lineage holding an older draft beside a newer committed row, or the reverse,
+    resolves to whichever was written last."""
     for doc in reversed(_versions(db, root_id)):                 # newest first in proper time
-        if state_of(doc) != "committed":
+        if state_of(doc) == "archived":
             continue
         if collection_id and doc.get("collection_id") != collection_id:
             continue
@@ -305,27 +300,21 @@ def get_latest_committed_artifact(db: LatticeDatabase, root_id: str,
 
 
 def _current_in(docs: list, collection_id: str) -> Optional[Dict[str, Any]]:
-    """The current doc for one collection out of an ALREADY-FETCHED lineage: the draft if one
-    exists, else the newest committed version in that collection.
+    """The current doc for one collection out of an ALREADY-FETCHED lineage: the newest
+    non-archived version in that collection.
 
     Split out from `get_current_in_collection` so a caller asking the same question of several
-    collections pays for the lineage once. Same predicates, same proper-time ordering."""
-    for doc in docs:
-        if state_of(doc) == "draft" and doc.get("collection_id") == collection_id:
-            return doc
+    collections pays for the lineage once. Same predicate, same proper-time ordering."""
     for doc in reversed(docs):                                   # newest first in proper time
-        if state_of(doc) == "committed" and doc.get("collection_id") == collection_id:
+        if state_of(doc) != "archived" and doc.get("collection_id") == collection_id:
             return doc
     return None
 
 
 def get_current_in_collection(db: LatticeDatabase, collection_id: str,
                               root_id: str) -> Optional[ArtifactEntity]:
-    """The *current* artifact for (collection, root): the draft if one exists, else the latest
-    committed version in this collection.
-
-    One lineage fetch, not two: `get_draft_artifact` and `get_latest_committed_artifact` each
-    walk `versions_of(root_id)`, so calling them in sequence reads the same lineage twice."""
+    """The *current* artifact for (collection, root): the newest non-archived version in this
+    collection. One lineage fetch."""
     return from_lattice_doc(_current_in(_versions(db, root_id), collection_id), ArtifactEntity)
 
 
@@ -363,10 +352,10 @@ def _versions_many(db: LatticeDatabase, root_ids) -> Dict[str, list]:
 
 def get_current_in_collection_many(db: LatticeDatabase, collection_id: str,
                                    root_ids) -> Dict[str, ArtifactEntity]:
-    """`{root_id: current artifact}` for each named root as seen from ONE collection — the draft
-    if that collection holds one, else the newest version committed there.
+    """`{root_id: current artifact}` for each named root as seen from ONE collection — the newest
+    non-archived version there.
 
-    The plural of `get_current_in_collection`, and the same two predicates in the same
+    The plural of `get_current_in_collection`, and the same predicate in the same
     proper-time order. Every lineage arrives in one chunked read
     (`ArtifactStore.versions_of_many`), so a caller holding a page of roots pays for the read
     once instead of once per root.
@@ -413,15 +402,9 @@ def get_current_in_any_collection_many(db: LatticeDatabase, root_ids,
 
 
 def list_version_history(db: LatticeDatabase, root_id: str) -> list:
-    """All committed versions for a root_id, newest first (proper-time order)."""
+    """All live versions for a root_id, newest first (proper-time order)."""
     return [from_lattice_doc(doc, ArtifactEntity)
-            for doc in reversed(_versions(db, root_id)) if state_of(doc) == "committed"]
-
-
-def list_draft_artifacts(db: LatticeDatabase, collection_id: str) -> list:
-    """Every draft artifact in a collection (used by commit)."""
-    rows = db.artifacts.list_artifacts(collection_id=collection_id, state="draft")
-    return [from_lattice_doc(dict(doc), ArtifactEntity) for doc in rows if doc]
+            for doc in reversed(_versions(db, root_id)) if state_of(doc) != "archived"]
 
 
 def count_children(db: LatticeDatabase, root_id: str) -> int:
@@ -627,26 +610,21 @@ def reorder_collection_artifacts(db: LatticeDatabase, collection_id: str,
 
 
 def list_collection_artifacts(db: LatticeDatabase, collection_id: str, *,
-                              include_archived: bool = False,
-                              draft_workspace_id: Optional[str] = None) -> list:
+                              include_archived: bool = False) -> list:
     """Resolve a collection's contents via the membership edges: for each edge, the CURRENT version
-    of its root — draft-preferred in this collection, else newest in-collection, else the latest
-    committed version anywhere (published cross-collection link), else (gated by the caller) a draft
-    homed in `draft_workspace_id`. Each dict carries `order_key` / `has_committed_version` /
-    `origin` / `propagate` / `relationship` from the edge; sorted by order_key."""
+    of its root — the newest non-archived version in this collection, else the newest non-archived
+    version anywhere (a cross-collection link), else, with `include_archived`, the newest version
+    in this collection. Each dict carries `order_key` / `origin` / `propagate` / `relationship`
+    from the edge; sorted by order_key."""
     out = []
     for e in _membership_edges(db, collection_id):
         root = e.get("dst")
         versions = _versions(db, root)
         in_coll = [v for v in versions if v.get("collection_id") == collection_id]
-        current = (next((v for v in reversed(in_coll) if state_of(v) == "draft"), None)
-                   or (in_coll[-1] if in_coll else None))
-        committed = [v for v in versions if state_of(v) == "committed"]
-        chosen = current or (committed[-1] if committed else None)
-        if chosen is None and draft_workspace_id:
-            chosen = next((v for v in reversed(versions)
-                           if state_of(v) == "draft"
-                           and v.get("collection_id") == draft_workspace_id), None)
+        live = [v for v in versions if state_of(v) != "archived"]
+        chosen = (_current_in(versions, collection_id)
+                  or (live[-1] if live else None)
+                  or (in_coll[-1] if in_coll and include_archived else None))
         if chosen is None:
             continue
         if not include_archived and state_of(chosen) == "archived":
@@ -656,7 +634,6 @@ def list_collection_artifacts(db: LatticeDatabase, collection_id: str, *,
         # its content drops (visibly incomplete), never ciphertext dressed as content.
         _boundary.decrypt_artifact_content(d, strict=False)
         d["order_key"] = _eprop(e, "order_key")
-        d["has_committed_version"] = bool(committed)
         d["origin"] = bool(_eprop(e, "is_origin"))
         d["propagate"] = _prop_mask(e)
         d["relationship"] = None if e.get("label") == _CONTAINS else e.get("label")
@@ -941,31 +918,8 @@ def _feed_doc(raw: Dict[str, Any], **overrides: Any) -> Dict[str, Any]:
     return d
 
 
-def batch_commit_drafts(db: LatticeDatabase, collection_id: str, artifact_ids: list,
-                        committed_by: str, committed_time: str) -> int:
-    """Flip a batch of in-collection drafts to `committed`. Returns docs updated.
-
-    Writes the doc directly rather than through `update_artifact`, so the announcement is made
-    here — one event per document, because a subscriber filters per artifact and a single
-    batch-shaped event would reach nobody watching one of the artifacts in it. Emitted after
-    each write returns, matching how the boundary orders itself around a put."""
-    updated = 0
-    for aid in (artifact_ids or []):
-        raw = db.artifacts.get_artifact(aid)
-        if (raw is None or raw.get("collection_id") != collection_id
-                or raw.get("state") != "draft"):
-            continue
-        raw["state"] = "committed"
-        raw["modified_by"] = committed_by
-        raw["modified_time"] = committed_time
-        db.artifacts.put_artifact(raw)
-        _boundary.emit_artifact_change(_feed_doc(raw), _boundary.UPDATED)
-        updated += 1
-    return updated
-
-
 def delete_artifacts_by_root(db: LatticeDatabase, root_id: str) -> list:
-    """Hard-delete every version (draft + committed + archived) with this root. Returns ids."""
+    """Hard-delete every version (live and archived) with this root. Returns ids."""
     deleted = []
     for v in _versions(db, root_id):
         vid = v.get("id")
@@ -1702,9 +1656,9 @@ def batch_get_collection_ids_for_roots(db: LatticeDatabase, root_ids: list) -> D
     return {r: _collection_ids_for_root(db, r, is_workspace) for r in (root_ids or [])}
 
 
-def list_committed_artifacts_by_context_content_type(db: LatticeDatabase, content_type: str, *,
-                                                     created_by: Optional[str] = None) -> list:
-    """Committed artifacts whose ``context.content_type`` matches (trust-config loads).
+def list_live_artifacts_by_context_content_type(db: LatticeDatabase, content_type: str, *,
+                                                created_by: Optional[str] = None) -> list:
+    """Live artifacts whose ``context.content_type`` matches (trust-config loads).
     `created_by` narrows to one principal — the trust boundary: a label alone never confers
     trust, only provenance does.
 
@@ -1716,7 +1670,7 @@ def list_committed_artifacts_by_context_content_type(db: LatticeDatabase, conten
     `context.content_type` disagree is a writer bug, and is excluded rather than silently
     included."""
     out = []
-    for d in db.artifacts.list_artifacts(state="committed", created_by=created_by,
+    for d in db.artifacts.list_artifacts(state="live", created_by=created_by,
                                          content_type=content_type):
         ctx = d.get("context")
         if isinstance(ctx, str):
@@ -1734,10 +1688,10 @@ __all__ = [
     "after_key", "mid_key",
     "to_lattice_doc", "from_lattice_doc",
     "create_artifact", "get_artifact", "update_artifact", "delete_artifact",
-    "get_draft_artifact", "get_latest_committed_artifact", "get_current_in_collection",
+    "get_latest_live_artifact", "get_current_in_collection",
     "get_current_in_any_collection",
     "get_current_in_collection_many", "get_current_in_any_collection_many",
-    "list_version_history", "list_draft_artifacts",
+    "list_version_history",
     "count_children", "has_children",
     "CollectionEntity",
     "create_collection", "get_collection_by_id", "update_collection", "delete_collection",
@@ -1754,7 +1708,7 @@ __all__ = [
     "get_edge", "add_artifacts_to_collection_batch", "remove_all_edges_for_root",
     "get_origin_parent", "get_origin_root", "list_origin_descendants",
     "get_relationship_target",
-    "batch_commit_drafts", "delete_artifacts_by_root", "archive_artifact",
+    "delete_artifacts_by_root", "archive_artifact",
     "create_commit", "create_commit_items", "get_commit_by_id", "get_commits_for_collection",
     "get_collections_by_owner_and_type", "is_materialized", "mark_materialized",
 ]

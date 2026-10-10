@@ -210,12 +210,12 @@ class TestCellRoundTrip:
             FileCellStore("")
 
     def test_segments_do_not_share_a_tree(self, root):
-        committed = FileCellStore(root, prefix="mantle-cells")
-        draft = FileCellStore(root, prefix="mantle-cells-draft")
-        committed.put("owner-A", "col-1", b"committed", "anchor-0")
-        draft.put("owner-A", "col-1", b"draft", "anchor-0")
-        assert committed.get("owner-A", "col-1", "anchor-0") == b"committed"
-        assert draft.get("owner-A", "col-1", "anchor-0") == b"draft"
+        live = FileCellStore(root, prefix="mantle-cells")
+        archived = FileCellStore(root, prefix="mantle-cells-archived")
+        live.put("owner-A", "col-1", b"live", "anchor-0")
+        archived.put("owner-A", "col-1", b"archived", "anchor-0")
+        assert live.get("owner-A", "col-1", "anchor-0") == b"live"
+        assert archived.get("owner-A", "col-1", "anchor-0") == b"archived"
 
 
 # ---------------------------------------------------------------------------

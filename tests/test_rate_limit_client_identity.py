@@ -47,7 +47,7 @@ def trusted(monkeypatch):
 
 @pytest.fixture()
 def untrusted(monkeypatch):
-    """The default: no proxy is trusted, so no peer's word about the client is taken."""
+    """`AGIENCE_TRUSTED_PROXIES=none`: no proxy is trusted, so no peer's word about the client is taken."""
     monkeypatch.setattr(main, "_RL_TRUSTED_PROXIES", ())
 
 
@@ -119,8 +119,9 @@ def test_an_unparseable_trusted_proxies_entry_is_dropped_not_widened():
     assert str(nets[1]) == "172.16.0.0/12"
 
 
-def test_no_trusted_proxies_configured_is_the_default():
-    """Unset means take nobody's word — the value a node with no edge in front of it needs."""
+def test_an_empty_list_parses_to_no_proxies():
+    """The parser adds nothing of its own; the loopback default is `_trusted_proxies_from_env`'s
+    (see `test_the_same_host_edge_names_the_client.py`)."""
     assert main._parse_trusted_proxies("") == ()
 
 

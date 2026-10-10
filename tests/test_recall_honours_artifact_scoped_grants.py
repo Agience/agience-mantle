@@ -159,10 +159,10 @@ class _FakeStoreDB:
             COLLECTION: {"id": COLLECTION, "root_id": COLLECTION, "context": {}},
             SHARED: {"id": SHARED, "root_id": SHARED, "collection_id": COLLECTION,
                      "context": {"title": _FIELDS[SHARED]["title"]},
-                     "content": _FIELDS[SHARED]["content"], "state": "committed"},
+                     "content": _FIELDS[SHARED]["content"], "state": "live"},
             PRIVATE: {"id": PRIVATE, "root_id": PRIVATE, "collection_id": COLLECTION,
                       "context": {"title": _FIELDS[PRIVATE]["title"]},
-                      "content": _FIELDS[PRIVATE]["content"], "state": "committed"},
+                      "content": _FIELDS[PRIVATE]["content"], "state": "live"},
         })
         self.graph = _FakeGraph()
 

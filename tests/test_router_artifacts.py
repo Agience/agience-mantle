@@ -3,7 +3,7 @@
 Existing coverage in test_router_artifacts_op.py covers the
 POST /artifacts/{id}/op/{op_name} dispatch path. This file covers everything
 else: CRUD, container creation, invoke, add-to-container, batch, search,
-upload, commit/preview, content-url, list-commits, reorder, revert, move,
+upload, commit/preview, content-url, list-commits, reorder, move,
 upload-status, multipart-part-url.
 
 The auth dependency is overridden by the autouse conftest fixture to a user
@@ -80,7 +80,7 @@ def _coll_doc(content_type: str = WORKSPACE_CONTENT_TYPE) -> dict:
     }
 
 
-def _artifact_doc(state: str = "draft") -> dict:
+def _artifact_doc(state: str = "live") -> dict:
     return {
         "_key": "art-1",
         "id": "art-1",
@@ -204,7 +204,7 @@ class TestCreateArtifact:
                 collection_id="container-1",
                 context='{"content_type":"text/plain"}',
                 content="hello",
-                state=ArtifactEntity.STATE_DRAFT,
+                state=ArtifactEntity.STATE_LIVE,
             )
 
         try:
@@ -245,7 +245,7 @@ class TestCreateArtifact:
                 collection_id=kwargs.get("workspace_id", "container-1"),
                 context=kwargs.get("context", "{}"),
                 content=kwargs.get("content", ""),
-                state=ArtifactEntity.STATE_DRAFT,
+                state=ArtifactEntity.STATE_LIVE,
             )
             captured["context"] = kwargs.get("context", "")
             return entity
@@ -284,7 +284,8 @@ class TestReadArtifact:
             "id": "a-1",
             "context": "{}",
             "content": "x",
-            "state": "draft",
+            # A legacy value, as a store that has not been migrated holds it.
+            "state": "committed",
         })
         from mantle.services.dependencies import get_store_db
 
@@ -300,6 +301,8 @@ class TestReadArtifact:
         assert "_rev" not in body
         assert "_key" not in body
         assert body["id"] == "a-1"
+        # A response names only the states that exist.
+        assert body["state"] == "live"
 
     @pytest.mark.asyncio
     async def test_read_404_when_missing(self, client: AsyncClient):
@@ -334,7 +337,7 @@ class TestReadArtifact:
         _patch_db_collection(store, container_doc={
             "id": "container-1",
             "content_type": WORKSPACE_CONTENT_TYPE,
-            "state": "draft",
+            "state": "live",
         })
         from mantle.services.dependencies import get_store_db
 
@@ -442,7 +445,7 @@ class TestUpdateArtifact:
             collection_id="container-1",
             context="{}",
             content="new",
-            state="draft",
+            state="live",
         )
         try:
             with patch(
@@ -476,7 +479,7 @@ class TestUpdateArtifact:
             "context": '{"content_type":"text/markdown"}',
             "content": "# old",
             "content_type": "text/markdown",
-            "state": "draft",
+            "state": "live",
             "created_by": "user-123",
         }
 
@@ -492,7 +495,7 @@ class TestUpdateArtifact:
             collection_id="container-1",
             context='{"content_type":"text/markdown"}',
             content="# new content",
-            state="draft",
+            state="live",
             content_type="text/markdown",
         )
         try:
@@ -605,7 +608,7 @@ class TestDeleteArtifact:
             "collection_id": "",
             "context": "{}",
             "content": "",
-            "state": "draft",
+            "state": "live",
             "created_by": "user-123",
         }
         docs = {"top-1": top_level}
@@ -650,7 +653,7 @@ class TestDeleteArtifact:
         store = MagicMock()
         _patch_db_collection(store, artifact_doc={
             "_key": "top-2", "id": "top-2", "root_id": "top-2",
-            "collection_id": "", "context": "{}", "content": "", "state": "draft",
+            "collection_id": "", "context": "{}", "content": "", "state": "live",
         })
 
         app.dependency_overrides[get_store_db] = lambda: store
@@ -692,7 +695,7 @@ class TestRemoveArtifactFromWorkspace:
             collection_id="ws-1",
             context='{"content_type":"text/plain"}',
             content="hi",
-            state=ArtifactEntity.STATE_DRAFT,
+            state=ArtifactEntity.STATE_LIVE,
             created_by="user-123",
         )
         with patch(
@@ -755,8 +758,8 @@ class TestBatchFetch:
         store = MagicMock()
         # Two distinct artifacts; the second one's check_access raises 403.
         docs = {
-            "a-1": {"id": "a-1", "context": "{}", "state": "draft"},
-            "a-2": {"id": "a-2", "context": "{}", "state": "draft"},
+            "a-1": {"id": "a-1", "context": "{}", "state": "live"},
+            "a-2": {"id": "a-2", "context": "{}", "state": "live"},
         }
         store.artifacts.get_artifact.side_effect = lambda k: docs.get(k)
         store.artifacts.versions_of.side_effect = lambda root: []
@@ -795,7 +798,7 @@ class TestBatchFetch:
             "name": "Inbox",
             "description": "Seed inbox workspace",
             "content_type": WORKSPACE_CONTENT_TYPE,
-            "state": "draft",
+            "state": "live",
         }
         _patch_db_collection(store, container_doc=container_doc)
 
@@ -894,7 +897,7 @@ class TestContentUrl:
             artifact_doc={
                 "_key": "a-1",
                 "context": '{"content_type":"text/plain"}',
-                "state": "draft",
+                "state": "live",
             },
         )
         from mantle.services.dependencies import get_store_db
@@ -917,7 +920,7 @@ class TestContentUrl:
             artifact_doc={
                 "_key": "a-1",
                 "context": '{"content_key":"u-1/a-1.content","filename":"f.pdf","content_type":"application/pdf"}',
-                "state": "draft",
+                "state": "live",
             },
         )
         from mantle.services.dependencies import get_store_db
@@ -950,7 +953,7 @@ class TestUploadInitiate:
             collection_id="container-1",
             context="{}",
             content="",
-            state=ArtifactEntity.STATE_DRAFT,
+            state=ArtifactEntity.STATE_LIVE,
         )
         out = {"upload_id": "a-1", "mode": "single", "url": "https://s3/put", "key": "u/a-1.content"}
         try:
@@ -1042,9 +1045,7 @@ class TestListCommits:
 
 
 class TestRevertArtifact:
-    """Revert is a dedicated `POST /artifacts/{id}/revert` route, the canonical
-    path; the `op/revert` dispatch route also still works.
-    """
+    """There is no revert: nothing is a draft, so there is no draft delta to discard."""
 
     @pytest.mark.asyncio
     async def test_404_when_artifact_missing(self, client: AsyncClient):
@@ -1059,81 +1060,19 @@ class TestRevertArtifact:
             app.dependency_overrides.pop(get_store_db, None)
         assert r.status_code == 404
 
-
     @pytest.mark.asyncio
-    async def test_dedicated_revert_route_returns_committed_version(
-        self, client: AsyncClient
-    ):
-        """`POST /artifacts/{id}/revert` calls workspace_service.revert_artifact and
-        returns the restored committed version — through `_artifact_body`.
-
-        `_artifact_body` guarantees every declared key is present, `null` when unset — a client can
-        program against a fixed shape, unlike a raw `to_dict()`, which omits unset fields and so
-        varies with the data.
-
-        The assertion checks the two values that matter and the guarantee, rather than equality
-        with a literal: an equality test here would fail the next time a field is added to the
-        response, which is the kind of churn the guarantee exists to prevent."""
+    async def test_the_revert_route_is_gone(self, client: AsyncClient):
+        """No route answers `POST /artifacts/{id}/revert` for an artifact that exists."""
         store = MagicMock()
         _patch_db_collection(store, artifact_doc=_artifact_doc())
         from mantle.services.dependencies import get_store_db
 
         app.dependency_overrides[get_store_db] = lambda: store
         try:
-            restored = MagicMock()
-            restored.to_dict.return_value = {"id": "art-1", "state": "committed"}
-            with patch(
-                "mantle.services.workspace_service.revert_artifact",
-                return_value=restored,
-            ):
-                r = await client.post("/artifacts/art-1/revert")
+            r = await client.post("/artifacts/art-1/revert")
         finally:
             app.dependency_overrides.pop(get_store_db, None)
-        assert r.status_code == 200
-        body = r.json()
-        assert body["id"] == "art-1"
-        assert body["state"] == "committed"
-        from mantle.routers.artifacts_router import _ARTIFACT_KEYS
-        missing = [k for k in _ARTIFACT_KEYS if k not in body]
-        assert not missing, (
-            "revert declares `ok=ArtifactResponse`, which promises every key is present "
-            "(`null` when unset), but the body omits %r" % missing)
-
-    @pytest.mark.asyncio
-    async def test_dedicated_revert_route_204_when_no_committed_version(
-        self, client: AsyncClient
-    ):
-        """If there's no committed version to revert to, return 204 No Content."""
-        store = MagicMock()
-        _patch_db_collection(store, artifact_doc=_artifact_doc())
-        from mantle.services.dependencies import get_store_db
-
-        app.dependency_overrides[get_store_db] = lambda: store
-        try:
-            with patch(
-                "mantle.services.workspace_service.revert_artifact",
-                return_value=None,
-            ):
-                r = await client.post("/artifacts/art-1/revert")
-        finally:
-            app.dependency_overrides.pop(get_store_db, None)
-        assert r.status_code == 204
-        assert r.content == b""
-
-    @pytest.mark.asyncio
-    async def test_dedicated_revert_route_404_when_artifact_missing(
-        self, client: AsyncClient
-    ):
-        store = MagicMock()
-        _patch_db_collection(store, artifact_doc=None)
-        from mantle.services.dependencies import get_store_db
-
-        app.dependency_overrides[get_store_db] = lambda: store
-        try:
-            r = await client.post("/artifacts/missing/revert")
-        finally:
-            app.dependency_overrides.pop(get_store_db, None)
-        assert r.status_code == 404
+        assert r.status_code in (404, 405), r.text
 
 
 class TestMoveArtifact:
@@ -1186,7 +1125,7 @@ class TestUploadStatus:
             collection_id="container-1",
             context='{"upload":{"status":"complete"}}',
             content="",
-            state=ArtifactEntity.STATE_DRAFT,
+            state=ArtifactEntity.STATE_LIVE,
         )
         try:
             with patch(

@@ -150,11 +150,16 @@ class SqliteArtifactStore:
     def list_artifacts(self, *, state: Optional[str] = None, content_type: Optional[str] = None,
                        collection_id: Optional[str] = None, created_by: Optional[str] = None,
                        limit: Optional[int] = None, skip: int = 0) -> Iterator[Dict[str, Any]]:
+        from mantle.db.constants import live_states
         where, params = [], []
-        for col, val in (("state", state), ("content_type", content_type),
+        for col, val in (("content_type", content_type),
                          ("collection_id", collection_id), ("created_by", created_by)):
             if val is not None:
                 where.append(f"{col} = ?"); params.append(val)
+        # `live` also matches the legacy `committed` and `draft` — the lattice store's rule.
+        states = live_states(state)
+        if states is not None:
+            where.append("state IN (%s)" % ",".join("?" * len(states))); params.extend(states)
         clause = (" WHERE " + " AND ".join(where)) if where else ""
         q = f"SELECT doc FROM artifacts{clause} LIMIT ? OFFSET ?"
         params += [limit if limit is not None else -1, int(skip)]
@@ -165,7 +170,11 @@ class SqliteArtifactStore:
         if state is None:
             r = self._conn().execute("SELECT count(*) AS n FROM artifacts").fetchone()
         else:
-            r = self._conn().execute("SELECT count(*) AS n FROM artifacts WHERE state = ?", (state,)).fetchone()
+            from mantle.db.constants import live_states
+            states = live_states(state)
+            r = self._conn().execute(
+                "SELECT count(*) AS n FROM artifacts WHERE state IN (%s)" % ",".join("?" * len(states)),
+                states).fetchone()
         return int(r["n"])
 
     def delete_artifact(self, artifact_id: str) -> None:

@@ -488,6 +488,39 @@ def _withhold_unverified_authority(batch, *, stats=None):
     return kept, len(refused)
 
 
+def _normalise_legacy_state(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """``doc`` with a legacy `committed` or `draft` state rewritten to `live` (a copy when it
+    changes; the same dict when it does not)."""
+    from mantle.db.constants import LEGACY_LIVE_STATES, STATE_LIVE
+    if doc.get("state") in LEGACY_LIVE_STATES:
+        doc = dict(doc)
+        doc["state"] = STATE_LIVE
+    return doc
+
+
+def _normalise_context(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """``doc`` with a context that holds client keys under `caller` stored with them at the top
+    level and no `caller` (`mint_context.with_client_keys`), as every local write stores one: a
+    copy when it changes, the same dict when it does not.
+
+    The context is the only field it touches. `_origin`, `_seq`, `_rev` and every authorship
+    field stay the peer's, so the replica is still the peer's row. A leaf digest hashes a row by
+    its id and version (`db/constants.row_hash`), never its context, so it is unchanged, and a
+    consumed row is never published again (`page_by_origin(origin=me)`), so no peer sees the
+    rewritten context as this node's statement."""
+    import json as _json
+
+    from mantle.services.mint_context import client_view, parse_context, with_client_keys
+    ctx = doc.get("context")
+    parsed = parse_context(ctx)
+    if "caller" not in parsed:
+        return doc
+    stored = with_client_keys(parsed, client_view(parsed))
+    doc = dict(doc)
+    doc["context"] = _json.loads(stored) if isinstance(ctx, dict) else stored
+    return doc
+
+
 def _apply_artifacts(store, items: List[Dict[str, Any]], *, stats: Optional[Dict[str, int]] = None) -> int:
     """Upsert consumed artifact docs. `stamp_rev=False` preserves the origin `_rev` so a replicated
     row keeps its origin revision and does not echo around the mesh forever.
@@ -513,6 +546,13 @@ def _apply_artifacts(store, items: List[Dict[str, Any]], *, stats: Optional[Dict
         batch, declined = _split_unordered(store, batch)
         if not batch:
             return declined
+    # A peer that has not migrated sends the legacy `committed` and `draft`. Both are `live`
+    # (`db/constants.state_of`), so the replica is stored as `live` — the value this node's own
+    # rows carry once `system/manage_state_collapse` has run — keeping the incoming
+    # `(_origin, _seq)`. Rewritten here, after the authority check has read the doc as sent, and
+    # on a copy, so nothing upstream sees a changed dict. A context that holds client keys under
+    # `caller` is stored with them at the top level, the same way (`_normalise_context`).
+    batch = [_normalise_context(_normalise_legacy_state(d)) for d in batch]
     written = store.artifacts.put_many(batch, batch=500, stamp_rev=False)
     n = written if isinstance(written, int) else len(batch)
     n += refused_authority
@@ -625,7 +665,7 @@ def _enqueue_consumed(store, batch: List[Dict[str, Any]]) -> None:
     overflow = bool(cur.get("overflow")) or len(merged) > _CONSUMED_CAP
     if overflow:
         merged = merged[:_CONSUMED_CAP]
-    _put_op(store, {"id": _CONSUMED_ID, "content_type": _S3SYNC_CT, "state": "committed",
+    _put_op(store, {"id": _CONSUMED_ID, "content_type": _S3SYNC_CT, "state": "live",
                     "pending": merged, "n": len(merged), "overflow": overflow})
 
 
@@ -648,7 +688,7 @@ def drain_consumed(store, ids) -> int:
     done = {str(x) for x in ids}
     d = store.artifacts.get_artifact(_CONSUMED_ID) or {}
     p = [x for x in (d.get("pending") or []) if str(x) not in done]
-    _put_op(store, {"id": _CONSUMED_ID, "content_type": _S3SYNC_CT, "state": "committed",
+    _put_op(store, {"id": _CONSUMED_ID, "content_type": _S3SYNC_CT, "state": "live",
                     "pending": p, "n": len(p),
                     "overflow": bool(d.get("overflow")) and bool(p)})
     return len(done)
@@ -720,7 +760,7 @@ def _split_unordered(store, batch: List[Dict[str, Any]]):
             # deterministic slice so the artifact stays small, and record that the set is truncated
             # so nobody reads its size as the real number.
             merged = {k: merged[k] for k in sorted(merged)[:_DECLINED_CAP]}
-        _put_op(store, {"id": _DECLINED_ID, "content_type": _DECLINED_CT, "state": "committed",
+        _put_op(store, {"id": _DECLINED_ID, "content_type": _DECLINED_CT, "state": "live",
                         "seen": merged, "n": len(merged), "truncated": overflow,
                         "note": "unordered concurrent authorship; no order was synthesized"})
     return keep, len(newly)
@@ -958,7 +998,7 @@ def _refresh_leaves_lattice(store, leaves_to_refresh, n: int, cur: Dict[str, Any
     # `published` is preserved. This recomputes live digests and uploads nothing, so it must not
     # touch the record of which leaf objects exist in S3 — overwriting that would let a later
     # publish_merkle conclude "nothing changed" while no leaf file had ever been written.
-    _put_op(store, {"id": _S3_MERKLE_CURSOR, "content_type": _S3SYNC_CT, "state": "committed",
+    _put_op(store, {"id": _S3_MERKLE_CURSOR, "content_type": _S3SYNC_CT, "state": "live",
                     _MERKLE_LIVE: digests, _MERKLE_PUBLISHED: cur.get(_MERKLE_PUBLISHED) or [],
                     "root": merkle.root(digests)})
     return {"refreshed": len(want), "root": merkle.root(digests), "excluded_op_rows": excluded,
@@ -1010,7 +1050,7 @@ def refresh_leaves(store, leaves_to_refresh, *, leaves: int = 0) -> Dict[str, An
     # must not touch the record of which leaf objects exist in S3 — overwriting it would let a
     # later publish_merkle conclude "nothing changed" while no leaf file had ever been written.
     _put_op(store, {"id": _S3_MERKLE_CURSOR, "content_type": _S3SYNC_CT,
-                                  "state": "committed", _MERKLE_LIVE: digests,
+                                  "state": "live", _MERKLE_LIVE: digests,
                                   _MERKLE_PUBLISHED: cur.get(_MERKLE_PUBLISHED) or [],
                                   "root": merkle.root(digests)})
     return {"refreshed": done, "root": merkle.root(digests)}
@@ -1122,7 +1162,7 @@ def publish_merkle_incremental(store, *, leaves: int = 0,
         # A summary whose leaves are only partly up is not published. Live (the truth about local
         # state) is recorded and published advances exactly as far as the uploads got; the previous
         # consistent summary stays in place and peers keep converging on the last good root.
-        _put_op(store, {"id": _S3_MERKLE_CURSOR, "content_type": _S3SYNC_CT, "state": "committed",
+        _put_op(store, {"id": _S3_MERKLE_CURSOR, "content_type": _S3SYNC_CT, "state": "live",
                         _MERKLE_LIVE: live, _MERKLE_PUBLISHED: pub, "partial_upload": True})
         return {"published": 0,
                 "reason": "upload-truncated" if truncated else "leaf-enumeration-truncated",
@@ -1130,7 +1170,7 @@ def publish_merkle_incremental(store, *, leaves: int = 0,
     # 4) Summary last (M6); then, and only here, published is equated to live.
     s3.put("%s%s.json" % (_MESH_MERKLE_PREFIX, node),
            json.dumps(merkle.summary(live)).encode("utf-8"), "application/json")
-    _put_op(store, {"id": _S3_MERKLE_CURSOR, "content_type": _S3SYNC_CT, "state": "committed",
+    _put_op(store, {"id": _S3_MERKLE_CURSOR, "content_type": _S3SYNC_CT, "state": "live",
                     _MERKLE_LIVE: live, _MERKLE_PUBLISHED: list(live), "root": merkle.root(live)})
     return {"leaves": n, "changed": len(changed), "uploaded": uploaded,
             "root": merkle.root(live), "secs": round(time.time() - t0, 1),

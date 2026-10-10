@@ -75,8 +75,9 @@ def test_caller_assertions_are_never_merged_into_observed_facets():
     hash stops being evidence about the bytes the store actually holds.
     """
     ctx = mc.mint(artifact_id="a", content="real", caller={"sha256": "deadbeef", "source": "x.md"})
-    assert ctx["caller"]["sha256"] == "deadbeef"
+    assert (ctx["sha256"], ctx["source"]) == ("deadbeef", "x.md")
     assert ctx["addressing"]["sha256"] != "deadbeef"
+    assert "caller" not in ctx
 
 
 def test_no_seam_means_no_enriched_key_at_all(monkeypatch):

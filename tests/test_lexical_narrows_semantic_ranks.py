@@ -148,7 +148,7 @@ def _doc(artifact_id: str) -> dict:
         "created_by": "user-bob",
         "created_time": _MODIFIED[artifact_id],
         "modified_time": _MODIFIED[artifact_id],
-        "state": "committed",
+        "state": "live",
         "context": {"title": artifact_id, "tags": [], "description": "a filed artifact"},
         "content": _TEXT[artifact_id],
     }

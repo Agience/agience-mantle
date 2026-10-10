@@ -46,6 +46,7 @@ from mantle.entities.artifact import Artifact as ArtifactEntity
 from mantle.entities.collection import Collection as CollectionEntity, COLLECTION_CONTENT_TYPE
 from mantle.entities.grant import Grant as GrantEntity
 from mantle.config import AGIENCE_PLATFORM_USER_ID
+from mantle.services import mint_context as _mc
 from mantle.services.bootstrap_types import (
     AUTHORITY_COLLECTION_SLUG,
     INBOX_MATERIALIZATION_SLUGS,
@@ -218,7 +219,7 @@ def _ensure_people_collection(store_db: Database) -> str:
             ),
             created_by=AGIENCE_PLATFORM_USER_ID,
             content_type=COLLECTION_CONTENT_TYPE,
-            state=CollectionEntity.STATE_COMMITTED,
+            state=CollectionEntity.STATE_LIVE,
             created_time=now, modified_time=now,
         ))
         _persist_seed_ids(store_db, {PEOPLE_COLLECTION_SLUG: people_id})
@@ -262,7 +263,7 @@ def ensure_authority_collection(store_db: Database) -> str:
             description="Platform authority root — platform-admin grants live here.",
             created_by=AGIENCE_PLATFORM_USER_ID,
             content_type=COLLECTION_CONTENT_TYPE,
-            state=CollectionEntity.STATE_COMMITTED,
+            state=CollectionEntity.STATE_LIVE,
             created_time=now, modified_time=now,
         ))
         _persist_seed_ids(store_db, {AUTHORITY_COLLECTION_SLUG: authority_id})
@@ -352,7 +353,7 @@ def _ensure_person_artifact(store_db: Database, ctx: UserContext) -> bool:
     now = datetime.now(timezone.utc).isoformat()
     db_create_artifact(store_db, ArtifactEntity(
         id=pid, root_id=pid, collection_id=people_id,
-        state=ArtifactEntity.STATE_COMMITTED,
+        state=ArtifactEntity.STATE_LIVE,
         context=json.dumps(context, separators=(",", ":")),
         content="", content_type=PERSON_CONTENT_TYPE,
         name=display_name, description="Platform member profile.",
@@ -397,7 +398,9 @@ def _convert_leads_for_person(store_db: Database, user_id: str, email: Optional[
         entity = db_get_artifact(store_db, rid)
         if entity is None:
             continue
-        ctxd = _parse_json_obj(getattr(entity, "context", ""))
+        # The lead's own keys, wherever the stored context holds them (`mint_context.client_view`).
+        stored = getattr(entity, "context", "")
+        ctxd = _mc.client_view(stored)
         if ctxd.get("type") != "lead" or ctxd.get("person_id"):
             continue
         content = _parse_json_obj(getattr(entity, "content", ""))
@@ -407,7 +410,7 @@ def _convert_leads_for_person(store_db: Database, user_id: str, email: Optional[
         ctxd["person_id"] = user_id
         ctxd["status"] = "converted"
         ctxd["converted_at"] = datetime.now(timezone.utc).isoformat()
-        entity.context = json.dumps(ctxd, separators=(",", ":"))
+        entity.context = _mc.with_client_keys(stored, ctxd)
         db_update_artifact(store_db, entity)
         converted += 1
 

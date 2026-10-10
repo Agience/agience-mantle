@@ -37,10 +37,11 @@ from __future__ import annotations
 from typing import Any, NamedTuple, Optional
 
 from .constants import (CAS_PREFIX, CRUDEASIO, DEFAULT_LEAVES, EDGE_FORCES,
-                        NEWER, NULL_AUDIT_FIELDS, OLDER, SAME,
+                        LEGACY_LIVE_STATES, LIVE_STATES,
+                        NEWER, NULL_AUDIT_FIELDS, OLDER, SAME, STATE_ARCHIVED, STATE_LIVE,
                         STATE_WHEN_ABSENT, UNORDERED, VERSION_ORDERS,
                         NullAuditField, compare_version, edge_key, is_missing,
-                        leaf_of, row_hash, state_of)
+                        leaf_of, live_states, row_hash, state_of)
 from .edge import LatticeGraphStore
 from .schema import ALL_DDL, ensure_schema
 from .seq import (LatticeConn, SeqAllocator, allocator_for, check_tail,
@@ -51,7 +52,8 @@ __all__ = [
     "CAS_PREFIX", "CRUDEASIO", "DEFAULT_LEAVES", "EDGE_FORCES",
     "NEWER", "OLDER", "SAME", "UNORDERED", "VERSION_ORDERS",
     "NULL_AUDIT_FIELDS", "NullAuditField", "is_missing",
-    "STATE_WHEN_ABSENT", "state_of",
+    "STATE_LIVE", "STATE_ARCHIVED", "LIVE_STATES", "LEGACY_LIVE_STATES",
+    "STATE_WHEN_ABSENT", "state_of", "live_states",
     "compare_version", "edge_key", "leaf_of", "row_hash",
     "LatticeArtifactStore", "LatticeGraphStore", "LatticeConn", "SeqAllocator",
     "ListIndexUnbuilt",

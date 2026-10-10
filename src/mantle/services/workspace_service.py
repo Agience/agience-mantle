@@ -4,8 +4,8 @@
 #
 # In the unified model a "workspace" is just a Collection with
 # `content_type == "application/vnd.agience.workspace+json"`. Artifacts live
-# in a single `artifacts` table and carry a `state` in
-# {draft, committed, archived}. Commit is a state flip; no data copies.
+# in a single `artifacts` table and carry a `state` in {live, archived}. Every write
+# writes `live`; archiving is a state flip, and no data is copied.
 #
 # Consumers still call `workspace_service.*` with `workspace_id` — that id
 # is the collection_id. `db` and `store_db` / `workspace_db` / `collection_db`
@@ -30,6 +30,8 @@ from mantle.entities.collection import (
 
 import mantle.db.backend as store
 from mantle.db.backend import after_key, mid_key
+from mantle.db.constants import state_of
+from mantle.services import mint_context as _mc
 import mantle.events.event_bus as event_bus
 
 logger = logging.getLogger(__name__)
@@ -79,31 +81,29 @@ def _emit_event(collection_id: str, name: str, payload: dict, *, actor_id: Optio
 # Workspace (= collection) CRUD
 # ---------------------------------------------------------------------------
 
-def _mint_container_context(db, container_id, content_type, content, context):
-    """Stamp the db-level mint context onto a container create. See `services/mint_context`.
+def _mint_container_context(db, container_id, content_type, content, context, minted=None):
+    """The db-level mint context for a container create. See `services/mint_context`.
 
-    A description must never fail a write, so every failure path returns the caller's context
-    unchanged — the coverage gate reports the miss, which is honest and distinguishable from a
-    mint that recorded an empty screen.
+    ``minted`` is the router's mint, handed over as a `mint_context.Minted`; it is used as is.
+    Without one — an in-process caller that did not come through the router — this mints, with
+    ``context``'s keys at the top level. ``context`` never decides whether a mint happened: its
+    server-owned keys are a writer's claim and are removed (`mint_context.client_part`).
+
+    A description must never fail a write, so a failed mint stores the writer's own keys, with
+    the server-owned ones still removed, and the coverage gate reports the miss.
     """
     import json as _json
-    from mantle.services import mint_context as _mc
-    caller_ctx = {}
-    if context:
-        try:
-            parsed = _json.loads(context)
-            if isinstance(parsed, dict):
-                caller_ctx = parsed
-        except (ValueError, TypeError):
-            caller_ctx = {"_opaque": context}
+    if isinstance(minted, _mc.Minted):
+        return _json.dumps(minted.context())
     try:
-        minted = _mc.mint(db, artifact_id=container_id, content_type=content_type,
-                          content=content, collection_id=None, caller=caller_ctx or None)
-        return _json.dumps(minted)
+        made = _mc.mint(db, artifact_id=container_id, content_type=content_type,
+                        content=content, collection_id=None,
+                        caller=_mc.client_part(context, allow=_mc.CLAIMABLE_ON_CREATE) or None)
+        return _json.dumps(made)
     except Exception:  # noqa: BLE001
-        logger.warning("mint_context failed on a container create; caller context stands",
+        logger.warning("mint_context failed on a container create; the writer's own keys stand",
                        exc_info=True)
-        return context
+        return _mc.with_client_keys({}, _mc.client_part(context))
 
 def create_container(
     db: Database,
@@ -115,6 +115,7 @@ def create_container(
     description: Optional[str] = None,
     vector=None,
     artifact_id: Optional[str] = None,
+    minted=None,
 ) -> CollectionEntity:
     """Create a TOP-LEVEL container artifact (no parent) and grant the creator
     full CRUDEASIO.
@@ -139,6 +140,16 @@ def create_container(
     """
     container_id = artifact_id or str(uuid.uuid4())
 
+    # The primitive stamps context too, because the router is not the only door.
+    # `routers/artifacts_router` mints context for every external write and hands its mint over as
+    # ``minted``. An in-process caller reaches this function directly and skips the router, which
+    # is how a corpus gets bulk-ingested straight into the lattice and measures 0% context
+    # afterwards, so without a ``minted`` this mints. The mint comes first and the content address
+    # is recorded onto it below, so `content_key` and `content_cas_ref` sit at the top level where
+    # the content routes and `mirror_drain` read them.
+    context = _mint_container_context(db, container_id, content_type, content, context,
+                                      minted=minted)
+
     # A collection is an artifact, so its body is addressed like any other: it goes through
     # `_store_content_in_s3` rather than being handed to the entity directly, which is what keeps
     # a collection from being the one kind of artifact still carrying bytes in its row.
@@ -156,23 +167,13 @@ def create_container(
             collection_id=container_id, creator_id=user_id)
         context = _record_content_address(context or "", _key, cas_ref)
 
-    # The primitive stamps context too, because the router is not the only door.
-    # `routers/artifacts_router` mints context for every external write, which is every writer
-    # reaching mantle as a service — hooks, astra, connectors. An in-process caller reaches this
-    # function directly and skips the router, which is how a corpus gets bulk-ingested straight
-    # into the lattice and measures 0% context afterwards.
-    #
-    # `mint` is idempotent on its own mark, so a write that already came through the router passes
-    # through here untouched rather than being re-stamped with a later timestamp.
-    context = _mint_container_context(db, container_id, content_type, content, context)
-
     entity = CollectionEntity(
         id=container_id,
         name=name,
         description=description,
         created_by=user_id,
         content_type=content_type or COLLECTION_CONTENT_TYPE,
-        state=CollectionEntity.STATE_COMMITTED,
+        state=CollectionEntity.STATE_LIVE,
         context=context or "",
         content=content or "",
         content_ref=cas_ref,
@@ -315,9 +316,15 @@ def update_workspace(
     content: Optional[str] = None,
     content_type: Optional[str] = None,
     state: Optional[str] = None,
+    caller_context: Optional[str] = None,
 ) -> CollectionEntity:
     """Update a top-level artifact's name, description, context, content and/or content_type;
     return the current entity.
+
+    ``caller_context`` is a CLIENT's context, and what a client-facing door passes: it is merged
+    over the stored context by `mint_context.merge_caller_update`, which keeps every server-owned
+    facet (the mint, the rung, the content address) and replaces only the client's keys.
+    ``context`` is the in-process form and is stored as given.
 
     ``None`` fields are left alone, and the store write plus reindex happen only if something
     actually moved — except that supplying ``vector`` is itself a change, since the writer is
@@ -345,29 +352,29 @@ def update_workspace(
     and captured file. Without it a superseded copy can only be deleted, never retired. Pinned by
     ``tests/test_workspace_service.py::test_update_workspace_archives_a_top_level_artifact``.
 
-    **Unarchiving returns a top-level artifact to COMMITTED, not to draft**, which is where it
-    differs from:func:`update_artifact` deliberately. A collection member unarchives to draft
-    because there is a commit path waiting for it — that same function's ``state == committed``
-    branch. A top-level artifact has none::func:`create_container` writes ``committed``
-    directly and no path here ever promotes a draft, so unarchiving one into draft would move it
-    into a segment the default recall does not search and nothing could ever move it out of.
+    Unarchiving returns the artifact to ``live``, whichever non-archived value ``state`` names.
     """
     ws = get_workspace(db, user_id, workspace_id, required="update")
 
     # State transitions settle the artifact's segment and return; they never combine with a
     # content edit in one call, because the two answer different questions ("where does this
-    # live" vs. "what does it say") and the index move has to be the whole of the write.
+    # live" vs. "what does it say") and the index move has to be the whole of the write. A call
+    # that asks for both is refused (`_refuse_a_combined_transition`) rather than half-applied.
+    edits = (name, description, context, vector, content, content_type, caller_context)
     if state == CollectionEntity.STATE_ARCHIVED and ws.state != CollectionEntity.STATE_ARCHIVED:
+        _refuse_a_combined_transition(edits)
         ws.state = CollectionEntity.STATE_ARCHIVED
         ws.modified_by = user_id
         ws.modified_time = _now_iso()
         store.update_collection(db, ws)
-        _reindex_after_state_change(ws, user_id, vacate=["committed", "draft"])
+        _reindex_after_state_change(ws, user_id, vacate=["live"])
         return ws
 
     if ws.state == CollectionEntity.STATE_ARCHIVED:
         if state and state != CollectionEntity.STATE_ARCHIVED:
-            ws.state = CollectionEntity.STATE_COMMITTED
+            _refuse_a_combined_transition(edits)
+            _refuse_restoring_a_superseded_version(db, ws)
+            ws.state = CollectionEntity.STATE_LIVE
             ws.modified_by = user_id
             ws.modified_time = _now_iso()
             store.update_collection(db, ws)
@@ -385,6 +392,16 @@ def update_workspace(
     if description is not None and description != ws.description:
         ws.description = description
         changed = True
+    if content_type is not None:
+        # The context's `content_type` key follows the field (`mint_context.with_content_type`),
+        # before the bytes below are stored and typed by it.
+        synced = _mc.with_content_type(ws.context, content_type)
+        if synced != ws.context:
+            ws.context = synced
+            changed = True
+        if content_type != ws.content_type:
+            ws.content_type = content_type
+            changed = True
     if content is not None and content != ws.content:
         # Addressed on the way in, exactly as a create does — a top-level artifact updated with
         # new content must not become the one row that carries its own bytes.
@@ -393,10 +410,8 @@ def update_workspace(
             collection_id=ws.collection_id or ws.id)
         ws.content = content
         ws.content_ref = cas_ref
-        ws.context = _record_content_address(ws.context or "", _key, cas_ref)
-        changed = True
-    if content_type is not None and content_type != ws.content_type:
-        ws.content_type = content_type
+        ws.context = _mc.readdressed(
+            _record_content_address(ws.context or "", _key, cas_ref), content)
         changed = True
     # A re-supplied vector is itself a change worth reindexing for: the writer is saying
     # the container's meaning moved, even when none of its scalar fields did.
@@ -405,6 +420,12 @@ def update_workspace(
         store.update_collection(db, ws)
         _index_container(db, ws, vector=vector)
 
+    if caller_context is not None:
+        # Merged after the content write above, so a content address it just recorded is one of
+        # the server-owned facets kept.
+        context = _mc.merge_caller_update(ws.context, caller_context)
+    if context is not None and content_type is not None:
+        context = _mc.with_content_type(context, content_type)
     if context is not None:
         parsed = _safe_parse_context(context) if isinstance(context, str) else context
         update_workspace_context(db, user_id, workspace_id, parsed)
@@ -430,7 +451,7 @@ def _may_destroy_member(db: Database, container_id: str, root_id: str, auth: Any
     that same link once the artifact had no other container.** Linking needs only `read` on the
     source.
 
-    Fails closed, including when `auth` is absent: `_may_delete_draft` answers False on any
+    Fails closed, including when `auth` is absent: `_may_delete_artifact` answers False on any
     uncertainty, and what is being decided is whether to destroy someone's artifact.
     """
     try:
@@ -442,7 +463,7 @@ def _may_destroy_member(db: Database, container_id: str, root_id: str, auth: Any
         return False
     if parent and parent[0] == container_id:
         return True
-    return _may_delete_draft(db, auth, root_id)
+    return _may_delete_artifact(db, auth, root_id)
 
 
 def _delete_or_detach_members(
@@ -574,7 +595,11 @@ def get_workspace_context(db: Database, user_id: str, workspace_id: str) -> dict
     ``read``; raises ``HTTPException(404)`` otherwise.
     """
     ws = get_workspace(db, user_id, workspace_id, required="read")
-    parsed = _safe_parse_context(ws.context) if isinstance(ws.context, str) else (ws.context or {})
+    # Every client key at the top level, including one the stored context holds under `caller`
+    # alone (`mint_context.client_view`), so an edit made here and written back with
+    # `update_workspace_context` states the whole of it.
+    raw = _safe_parse_context(ws.context) if isinstance(ws.context, str) else (ws.context or {})
+    parsed = json.loads(_mc.with_client_keys(raw, _mc.client_view(raw)))
     parsed.setdefault("collections", [])
     return parsed
 
@@ -593,10 +618,14 @@ def update_workspace_context(
     if not isinstance(context, dict):
         context = {}
     context.setdefault("collections", [])
-    ws.context = json.dumps(context)
+    # The top level of ``context`` is the client's whole statement — `get_workspace_context`
+    # hands out every client key there — and it is stored there, with no `caller`
+    # (`mint_context.with_client_keys`). The server-owned facets are the ones ``context``
+    # carries, which are the stored ones it was read with.
+    ws.context = _mc.with_client_keys(context, context)
     ws.modified_time = _now_iso()
     store.update_collection(db, ws)
-    return context
+    return json.loads(ws.context)
 
 
 def apply_workspace_card_actions(
@@ -643,7 +672,8 @@ def _extract_bindings(context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Read the ``bindings`` dict from a parsed context, returning ``{}`` if absent or invalid."""
     if not context or not isinstance(context, dict):
         return {}
-    bindings = context.get("bindings")
+    # Read through `client_view`: a stored context can hold its bindings under `caller` alone.
+    bindings = _mc.client_view(context).get("bindings")
     if not isinstance(bindings, dict):
         return {}
     return bindings
@@ -660,6 +690,16 @@ def _user_can_read_collection(
         db, grantee_id=user_id, resource_id=collection_id,
     )
     return any(getattr(g, "can_read", False) for g in grants)
+
+
+def _user_can_add_to_collection(db: Database, user_id: str, collection_id: str) -> bool:
+    """``True`` if *user_id* holds `add` on *collection_id* — the check `add_artifact_to_workspace`
+    makes (`get_workspace(..., required="add")`), answered as a boolean."""
+    try:
+        get_workspace(db, user_id, collection_id, required="add")
+    except HTTPException:
+        return False
+    return True
 
 
 def _resolve_binding_from(
@@ -1009,6 +1049,9 @@ def _record_content_address(context_str: str, content_key: str,
     An absent ref pops the old one. A ref left behind by a write that produced none points the next
     read at bytes that are not this artifact's content — the same rule the upload route states
     where it does this.
+
+    The client keys are stored at the top level with no `caller`
+    (`mint_context.with_client_keys`), as on every write.
     """
     try:
         ctx = json.loads(context_str) if context_str else {}
@@ -1021,7 +1064,7 @@ def _record_content_address(context_str: str, content_key: str,
         ctx["content_cas_ref"] = cas_ref
     else:
         ctx.pop("content_cas_ref", None)
-    return json.dumps(ctx)
+    return _mc.with_client_keys(ctx, _mc.client_view(ctx))
 
 
 def _store_content_in_s3(
@@ -1066,6 +1109,26 @@ def _store_content_in_s3(
     )
     return content_key, content, cas_ref
 
+def _mint_member_context(db, artifact_id, workspace_id, content_type, content, context) -> str:
+    """The context an in-process member create stores: its writer's keys, minted.
+
+    An in-process writer is the store's own code (the upload path records its bookkeeping, the
+    webhook its source), so its keys stay at the top level where the store's readers look, as they
+    always have. What it cannot supply is how the artifact was made: the mint's keys
+    (`mint_context.MINT_KEYS`) always come from the mint, for the acting principal, whatever the
+    writer's context says. A failed mint stores the writer's keys without them."""
+    own = {k: v for k, v in _mc.parse_context(context).items() if k not in _mc.MINT_KEYS}
+    try:
+        made = _mc.mint(db, artifact_id=artifact_id, content_type=content_type,
+                        content=content, collection_id=workspace_id)
+    except Exception:  # noqa: BLE001 — a description must never fail a write
+        logger.warning("mint_context failed on a member create; the writer's keys stand",
+                       exc_info=True)
+        return _mc.normalised(own)
+    # The writer's client keys are stored at the top level (`mint_context.with_client_keys`).
+    return _mc.normalised({**own, **made})
+
+
 def _link_to_target_collections(
     db: Database,
     user_id: str,
@@ -1074,13 +1137,15 @@ def _link_to_target_collections(
 ) -> None:
     """Create ``collection_artifacts`` edges to each target collection bound to the workspace.
 
-    Skips silently (logs at INFO) for any target the caller cannot add to.
+    Skips (logs at INFO) any target the caller cannot add to. Adding a member is the `add` right,
+    the same one `add_artifact_to_workspace` requires: a binding is the caller's own statement in
+    the workspace context, so it confers nothing, and read on a collection is not the right to put
+    things in it.
     """
     target_ids = resolve_binding_multi(db, user_id, workspace_id, "target_collections")
     for target_id in target_ids:
         try:
-            # Check the user has at least read (access proxy for "can_add") on the target.
-            if not _user_can_read_collection(db, user_id, target_id):
+            if not _user_can_add_to_collection(db, user_id, target_id):
                 logger.info(
                     "Skipping target_collection link: user %s lacks access to %s",
                     user_id, target_id,
@@ -1120,8 +1185,15 @@ def create_workspace_artifact(
     index: Optional[str] = None,
     vector=None,
     description: Optional[str] = None,
+    minted=None,
 ) -> ArtifactEntity:
     """Create an artifact inside a container.
+
+    ``minted`` is the router's mint (`mint_context.Minted`); when given it is the stored context,
+    and ``context`` is ignored — the router's mint already holds the writer's keys.
+    Without one — an in-process writer: the upload path, the webhook, a bulk load — this mints
+    for the acting principal (`_mint_member_context`). The content address is recorded onto
+    whichever context is stored.
 
     ``vector`` is a validated:class:`api.vectors.SuppliedVector` when the writer sent one;
     it rides the same index job as the rest of the write. Mantle produces no vector of its
@@ -1132,6 +1204,11 @@ def create_workspace_artifact(
     fields the lexical arm indexes (`pipeline_unified._STATED_OFFER_FIELDS`). The MCP
     `create_artifact` tool description recommends supplying it so the artifact can be found again,
     so a create that dropped it would return 200 and leave the artifact unfindable by its offer.
+
+    The artifact is born ``live``, the segment `recall` reads by default. There is no promotion
+    step between "saved" and "findable": `update_artifact` writes later edits to the same live
+    version in place (pharos `design/architecture.md` §23, "The Commit boundary dissolves into
+    mass").
     """
     get_workspace(db, user_id, workspace_id, required="create")
 
@@ -1161,6 +1238,12 @@ def create_workspace_artifact(
         if existing is None:
             artifact_id = root_id
 
+    if isinstance(minted, _mc.Minted):
+        context = json.dumps(minted.context())
+    else:
+        context = _mint_member_context(db, artifact_id, workspace_id, content_type, content,
+                                       context)
+
     # Store content in the CAS; update context with content_key.
     resolved_content = content
     cas_ref: Optional[str] = None      # an artifact with no content has no bytes to address
@@ -1177,7 +1260,7 @@ def create_workspace_artifact(
         collection_id=workspace_id,
         context=context,
         content=resolved_content,
-        state=ArtifactEntity.STATE_DRAFT,
+        state=ArtifactEntity.STATE_LIVE,
         created_by=user_id,
         modified_by=user_id,
         created_time=now,
@@ -1194,7 +1277,7 @@ def create_workspace_artifact(
     store.add_artifact_to_collection(db, workspace_id, artifact.root_id, order_key)
 
     # Wire target_collections binding: create collection_artifacts edges to
-    # each target collection so the draft artifact is associated immediately.
+    # each target collection so the artifact is associated immediately.
     _link_to_target_collections(db, user_id, workspace_id, artifact)
 
     # Direct owner grant: the creator owns the artifact explicitly (full CRUDEASIO),
@@ -1314,12 +1397,10 @@ def warm_collection(db, collection_id, *, tenant_id=None, limit: int = WARM_SWEE
     seen: set = set()
     try:
         from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
-        # Members regardless of state: committed (dicts, drafts of this workspace
-        # made visible via draft_workspace_id) plus the workspace's own drafts.
+        # Every current (non-archived) member.
         items = []
-        for raw in (store.list_collection_artifacts(db, collection_id, draft_workspace_id=collection_id) or []):
+        for raw in (store.list_collection_artifacts(db, collection_id) or []):
             items.append(ArtifactEntity.from_dict(raw) if isinstance(raw, dict) else raw)
-        items.extend(store.list_draft_artifacts(db, collection_id) or [])
         for art in items:
             aid = getattr(art, "id", None)
             if not aid or aid in seen:
@@ -1394,35 +1475,53 @@ def create_workspace_artifacts_bulk(
     return out
 
 
-def _ensure_draft(
-    db: Database, user_id: str, committed: ArtifactEntity
-) -> ArtifactEntity:
-    """
-    Edit-after-commit: create a new draft record with the same root_id
-    containing a copy of the committed content, leaving the committed
-    version untouched.
-    """
-    existing_draft = store.get_draft_artifact(db, committed.root_id, committed.collection_id)
-    if existing_draft:
-        return existing_draft
+def _refuse_a_combined_transition(edits) -> None:
+    """422 when a state change arrives with field edits.
 
-    now = _now_iso()
-    new_id = str(uuid.uuid4())
+    Refused rather than applied after the transition: the two would be two writes and two index
+    jobs with nothing tying them together, and archiving an artifact while editing it asks for
+    contradictory things (an archived artifact is not edited, `409`). A PATCH that names the
+    state the artifact is already in is not a transition, and its edits apply as usual."""
+    if any(e is not None for e in edits):
+        raise HTTPException(
+            422,
+            "A state change cannot be combined with other fields. Send the state change and "
+            "the edit as two requests.")
 
-    draft = ArtifactEntity(
-        id=new_id,
-        root_id=committed.root_id,
-        collection_id=committed.collection_id,
-        context=committed.context,
-        content=committed.content,
-        state=ArtifactEntity.STATE_DRAFT,
-        created_by=user_id,
-        modified_by=user_id,
-        created_time=now,
-        modified_time=now,
-    )
-    store.create_artifact(db, draft)
-    return draft
+
+def _refuse_restoring_a_superseded_version(db: Database, target: ArtifactEntity) -> None:
+    """409 unless restoring ``target`` brings back a retired lineage, at its newest row.
+
+    A restore applies to a lineage whose every version is archived — an artifact a user retired.
+    It is refused for an archived row that another version superseded (it records
+    ``superseded_by``: a content snapshot, or an older row a migration archived), and for any
+    archived row whose root still has a live version. Either restore would put a second live row
+    under the root, and readers resolve a lineage to its newest live row, so the older content
+    would shadow the head or be shadowed by it depending on which reader asked."""
+    raw = db.artifacts.get_artifact(target.id) or {}
+    if raw.get("superseded_by"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This is a superseded version of %s, not a retired artifact; restore the artifact "
+            "itself." % raw["superseded_by"])
+    root = target.root_id or target.id
+    versions = db.artifacts.versions_of(root) or []
+    live = [v for v in versions
+            if v.get("id") != target.id and state_of(v) != ArtifactEntity.STATE_ARCHIVED]
+    if live:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This lineage already has a live version (%s); an archived version of it cannot be "
+            "restored beside it." % live[-1].get("id"))
+    # Of a retired lineage, only its newest row is restorable — the last in `versions_of`, the
+    # order head resolution reads. An older archived row carries no `superseded_by` when a user
+    # archived it before a newer version existed, and restoring it would make older content the
+    # head.
+    if versions and versions[-1].get("id") != target.id:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "A newer version of this lineage (%s) exists; restore that one."
+            % versions[-1].get("id"))
 
 
 def _reindex_after_state_change(
@@ -1431,10 +1530,10 @@ def _reindex_after_state_change(
     """After a state transition: (re)index the artifact into its new state's
     segment and remove its root from the segment(s) it left (``vacate``).
 
-    The index is per-state (committed/draft/archived live in separate trees);
+    The index is per-state (live and archived are separate trees);
     ``index_artifact`` routes by ``artifact.state`` and the same enqueued job
-    vacates exactly the old segment(s) — never a blanket purge, since a root may
-    legitimately keep a committed version while a draft is also indexed.
+    vacates exactly the old segment — never a blanket purge, since a root may
+    legitimately keep a live version while an archived one is also indexed.
 
     The container id is ``collection_id or id`` because **a top-level artifact is its own
     container** — the same identity ``_index_container`` passes when it indexes one at create
@@ -1469,8 +1568,14 @@ def update_artifact(
     vector=None,
     name: Optional[str] = None,
     description: Optional[str] = None,
+    auth: Any = None,
+    caller_context: Optional[str] = None,
 ) -> ArtifactEntity:
     """Update an artifact in a container.
+
+    ``caller_context`` is a CLIENT's context, merged over the context of the row actually written
+    (`mint_context.merge_caller_update`): the stored server-owned facets stay, the client's keys
+    are replaced. ``context`` is the in-process form and is stored as given.
 
     ``vector`` is a validated:class:`api.vectors.SuppliedVector`. Supplying one is itself a
     change: the writer is restating what this artifact means, so the update proceeds and
@@ -1484,6 +1589,19 @@ def update_artifact(
 
     Both are indexed fields — `title` in the lexical arm is this `name` — so a renamed member is
     findable under its new name.
+
+    **An edit writes the live version in place and never forks a second version** — the rule
+    `upsert_identity_member` applies to a mirror, applied here to every member. A fork would leave
+    the previous row answering `recall` with the content from before the edit. Both search arms
+    key on `root_id`, so reindexing the edited version into the live segment replaces the entry the
+    previous content left there rather than adding a second one.
+
+    The edit lands on the lineage's CURRENT version in this container — its newest non-archived
+    row — whichever id the caller named: recall hydrates a hit as that row
+    (`db/backend.find_newest_by_root`), so writing an older row in place would index the new text
+    against a row recall never returns. A store that has not been migrated can hold an older
+    legacy `draft` beside a newer `committed` row, or the reverse; both read as live, and the
+    newer one takes the edit.
     """
     get_workspace(db, user_id, workspace_id, required="update")
 
@@ -1491,14 +1609,14 @@ def update_artifact(
     if target is not None and target.collection_id != workspace_id:
         target = None
     if target is None:
-        target = store.get_draft_artifact(db, artifact_id, workspace_id)
-    if target is None:
-        target = store.get_latest_committed_artifact(db, artifact_id, workspace_id)
+        target = store.get_latest_live_artifact(db, artifact_id, workspace_id)
     if target is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Artifact not found")
 
-    # Archive toggle.
+    # Archive toggle. A transition is the whole of its write (see `update_workspace`).
+    edits = (context, content, content_type, name, description, vector, caller_context)
     if state == ArtifactEntity.STATE_ARCHIVED and target.state != ArtifactEntity.STATE_ARCHIVED:
+        _refuse_a_combined_transition(edits)
         target.state = ArtifactEntity.STATE_ARCHIVED
         target.modified_by = user_id
         target.modified_time = _now_iso()
@@ -1507,20 +1625,22 @@ def update_artifact(
         #: either — the failure that reaches a client is `put_artifact` raising, which propagates
         #: past a guard regardless.
         store.update_artifact(db, target)
-        # Archive: index into the archived segment and vacate committed + draft
-        # (an archived root has no live committed/draft entry).
+        # Archive: index into the archived segment and vacate the live one.
         if reindex:
-            _reindex_after_state_change(target, user_id, vacate=["committed", "draft"])
+            _reindex_after_state_change(target, user_id, vacate=["live"])
         _emit_event(workspace_id, "artifact.updated", {"artifact": target.to_dict()}, actor_id=user_id)
         return target
 
     if target.state == ArtifactEntity.STATE_ARCHIVED and state and state != ArtifactEntity.STATE_ARCHIVED:
-        target.state = ArtifactEntity.STATE_DRAFT
+        _refuse_a_combined_transition(edits)
+        _refuse_restoring_a_superseded_version(db, target)
+        # Unarchive: every state but `archived` is `live`.
+        target.state = ArtifactEntity.STATE_LIVE
         target.modified_by = user_id
         target.modified_time = _now_iso()
         #: No guard, for the reason given above.
         store.update_artifact(db, target)
-        # Unarchive: index into draft and vacate the archived segment.
+        # Unarchive: index into the live segment and vacate the archived one.
         if reindex:
             _reindex_after_state_change(target, user_id, vacate=["archived"])
         _emit_event(workspace_id, "artifact.updated", {"artifact": target.to_dict()}, actor_id=user_id)
@@ -1529,24 +1649,21 @@ def update_artifact(
     if target.state == ArtifactEntity.STATE_ARCHIVED:
         raise HTTPException(status.HTTP_409_CONFLICT, "Cannot edit an archived artifact")
 
-    # Commit: flip a draft to committed in-place — triggers search indexing.
-    if state == ArtifactEntity.STATE_COMMITTED:
-        if target.state == ArtifactEntity.STATE_DRAFT:
-            target.state = ArtifactEntity.STATE_COMMITTED
-            target.modified_by = user_id
-            target.modified_time = _now_iso()
-            #: No guard, for the reason given above.
-            store.update_artifact(db, target)
-            # Index into the committed segment and vacate the draft segment (the
-            # draft just became the committed version).
-            if reindex:
-                _reindex_after_state_change(target, user_id, vacate=["draft"])
-            _emit_event(workspace_id, "artifact.updated", {"artifact": target.to_dict()}, actor_id=user_id)
-        return target  # already committed — no-op
-
-    # If we're editing a committed version, promote to a new draft with same root_id.
-    if target.state == ArtifactEntity.STATE_COMMITTED:
-        target = _ensure_draft(db, user_id, target)
+    # Edit the lineage's current version in this container, in place (see the docstring). When
+    # that is a different row from the one the caller named, the caller's `update` is checked on
+    # the row actually written as well (`auth`, when the caller supplies one).
+    current = store.get_current_in_collection(db, workspace_id, target.root_id or target.id)
+    if current is not None:
+        if auth is not None and current.id != target.id:
+            from mantle.services.dependencies import check_access
+            check_access(auth, current.id, "update", db)
+        target = current
+    if caller_context is not None:
+        context = _mc.merge_caller_update(target.context, caller_context)
+    elif context is not None:
+        # An in-process writer (the upload path, the content routes) sets keys at the top level,
+        # and they are stored there, with no `caller` (`mint_context.normalised`).
+        context = _mc.normalised(context)
 
     dirty = False
     if name is not None and name != target.name:
@@ -1558,9 +1675,16 @@ def update_artifact(
     if context is not None and context != target.context:
         target.context = context
         dirty = True
-    if content_type is not None and content_type != target.content_type:
-        target.content_type = content_type
-        dirty = True
+    if content_type is not None:
+        # The context's `content_type` key follows the field (`mint_context.with_content_type`),
+        # before the bytes below are stored and typed by it.
+        synced = _mc.with_content_type(target.context, content_type)
+        if synced != target.context:
+            target.context = synced
+            dirty = True
+        if content_type != target.content_type:
+            target.content_type = content_type
+            dirty = True
     if content is not None and content != target.content:
         # Store new content in S3; update target.context with content_key.
         if content:
@@ -1572,6 +1696,8 @@ def update_artifact(
             target.content = stored_content
         else:
             target.content = content
+        # The mint's `addressing` follows the bytes (`mint_context.readdressed`).
+        target.context = _mc.readdressed(target.context, content)
         dirty = True
     if not dirty and vector is None:
         return target
@@ -1590,6 +1716,9 @@ def update_artifact(
             from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
             enqueue_index_artifact(
                 target, target.collection_id, tenant_id=user_id, vector=vector,
+                # An in-place rewrite: the root's previous chunks in this segment are purged
+                # before the new ones go in (`pipeline_unified._mantle_index_artifact`).
+                replace=True,
             )
         except Exception:
             # `warning`, not `debug` — PUBLISHING §4.4. A dropped index job is exactly the kind nobody
@@ -1616,8 +1745,14 @@ def upsert_identity_member(
     description: Optional[str] = None,
     vector=None,
     report: Optional[Dict[str, Any]] = None,
+    minted=None,
 ) -> ArtifactEntity:
-    """Create-or-overwrite the committed member of ``workspace_id`` whose ROOT is ``root_id``.
+    """Create-or-overwrite the live member of ``workspace_id`` whose ROOT is ``root_id``.
+
+    ``context`` is the writer's own context. On a create it is the router's ``minted`` context
+    that is stored (`mint_context.Minted`); on an overwrite the stored server-owned facets are
+    kept and the writer's keys replace the rest (`mint_context.merge_caller_update`), so a writer
+    cannot restate how the artifact was minted.
 
     ``report``, when given, receives ``{"created": True|False}`` — which of the two things this
     upsert actually did. The return value cannot say: both branches return an ``ArtifactEntity``
@@ -1627,19 +1762,15 @@ def upsert_identity_member(
 
     An identity-addressed artifact is a mirror rather than a document. The caller supplied an
     `identity` — "this is the same thing I stored before", a file on disk, a session, a commit — so
-    there is one true version of it and the writer is restating it. The ordinary member lifecycle
-    breaks that in two ways:
+    there is one true version of it and the writer is restating it.
 
-    - A member is born a DRAFT (`create_workspace_artifact`), and `recall` reads the COMMITTED
-      segment. The mirror would be invisible to the search it exists to feed.
-    - Editing a committed member promotes a new draft (`_ensure_draft`) and leaves the committed
-      row alone, so the next recall answers with the PREVIOUS content. For a mirror of a file
-      that just changed, serving the old bytes is precisely the drift this whole mechanism was
-      built to remove.
-
-    So this writes the committed version in place and never forks a draft. Ordinary members are
-    unaffected: they arrive as drafts through `create_workspace_artifact`, and `update_artifact`
-    promotes on edit-after-commit.
+    It writes the live version in place and never forks a second one, which is the rule every
+    member write follows (`create_workspace_artifact` is born live, `update_artifact` edits in
+    place): a mirror of a file that just changed must answer `recall` with the new bytes. The
+    version it overwrites is the newest non-archived one under the root, so a legacy `draft` row
+    in a store that has not been migrated is overwritten like any other. What is particular to this
+    path is the addressing — the caller names the thing, not a version id — and the restatement:
+    every supplied field overwrites, with no comparison against what is stored.
 
     The root is the identity and the id is the version. A top-level artifact derives its `id` from
     the identity because there `id == root_id`; a member derives its root, because that is what
@@ -1648,20 +1779,15 @@ def upsert_identity_member(
     """
     get_workspace(db, user_id, workspace_id, required="create")
 
-    target = store.get_latest_committed_artifact(db, root_id, workspace_id)
-    if target is None:
-        # No committed version. A draft under the same root is the same THING, so adopt it and
-        # commit it rather than creating a second lineage beside it.
-        target = store.get_draft_artifact(db, root_id, workspace_id)
+    target = store.get_latest_live_artifact(db, root_id, workspace_id)
 
     if target is None:
         created = create_workspace_artifact(
             db=db, user_id=user_id, workspace_id=workspace_id,
             context=context or "", content=content or "",
             root_id=root_id, name=name, content_type=content_type,
-            vector=vector, enqueue_index=False,
+            vector=vector, enqueue_index=False, minted=minted,
         )
-        created.state = ArtifactEntity.STATE_COMMITTED
         if description is not None:
             created.description = description
         created.modified_by = user_id
@@ -1675,38 +1801,44 @@ def upsert_identity_member(
             report["created"] = True
         return created
 
+    if context is not None:
+        target.context = _mc.merge_caller_update(target.context, context)
+    if content_type is not None:
+        # The context's `content_type` key follows the field, before the bytes below are stored
+        # and typed by it (`mint_context.with_content_type`).
+        target.context = _mc.with_content_type(target.context, content_type)
     if content is not None and content != target.content:
         if content:
             content_key, stored_content, cas_ref = _store_content_in_s3(
                 target.id, content, target.context, owner_id=target.created_by,
                 collection_id=target.collection_id)
             target.content_ref = cas_ref or target.content_ref
-            context = _record_content_address(context or target.context, content_key, cas_ref)
+            target.context = _record_content_address(target.context, content_key, cas_ref)
             target.content = stored_content
         else:
             target.content = content
-    if context is not None:
-        target.context = context
+        target.context = _mc.readdressed(target.context, content)
     if content_type is not None:
         target.content_type = content_type
     if name is not None:
         target.name = name
     if description is not None:
         target.description = description
-    target.state = ArtifactEntity.STATE_COMMITTED
     target.modified_by = user_id
     target.modified_time = _now_iso()
     #: No guard, same as above.
     store.update_artifact(db, target)
-    _index_identity_member(target, user_id, vector)
+    _index_identity_member(target, user_id, vector, replace=True)
     _emit_event(workspace_id, "artifact.updated", {"artifact": target.to_dict()}, actor_id=user_id)
     if report is not None:
         report["created"] = False
     return target
 
 
-def _index_identity_member(artifact: ArtifactEntity, user_id: str, vector) -> None:
-    """Index a mirror write.
+def _index_identity_member(artifact: ArtifactEntity, user_id: str, vector, *,
+                           replace: bool = False) -> None:
+    """Index a mirror write. ``replace`` marks an overwrite of content already indexed; see
+    `pipeline_unified.enqueue_index_artifact`.
 
     A failure here logs at warning. The sibling reindex calls swallow failures at `debug` because a
     missed reindex is recoverable; on this path the artifact is a mirror whose purpose is to be
@@ -1717,6 +1849,7 @@ def _index_identity_member(artifact: ArtifactEntity, user_id: str, vector) -> No
         from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
         enqueue_index_artifact(
             artifact, artifact.collection_id, tenant_id=user_id, vector=vector,
+            **({"replace": True} if replace else {}),
         )
     except Exception:
         logger.warning(
@@ -1769,15 +1902,14 @@ def delete_artifact(
     except Exception:
         logger.debug("S3 cleanup failed", exc_info=True)
 
-    # If this was the only version for the root, drop all edges too.
+    # If this was the only live version for the root, drop all edges too.
     other_versions = [
         v for v in store.list_version_history(db, artifact.root_id) if v.id != artifact_id
     ]
-    draft = store.get_draft_artifact(db, artifact.root_id, workspace_id)
 
     store.delete_artifact(db, artifact_id)
 
-    if not other_versions and (draft is None or draft.id == artifact_id):
+    if not other_versions:
         store.remove_all_edges_for_root(db, artifact.root_id)
 
     try:
@@ -1792,11 +1924,11 @@ def delete_artifact(
     return counts
 
 
-def _may_delete_draft(db: Database, auth: Any, artifact_id: str) -> bool:
-    """May this caller delete `artifact_id` in its own right?
+def _may_delete_artifact(db: Database, auth: Any, artifact_id: str) -> bool:
+    """May this caller delete `artifact_id` in its own right — an owner grant or a delete grant?
 
     Fails CLOSED on every uncertainty — no `auth`, an unavailable check, an unexpected error.
-    The thing being decided is whether to destroy someone's draft; "could not tell" must never
+    The thing being decided is whether to destroy someone's artifact; "could not tell" must never
     resolve to "yes".
     """
     if auth is None:
@@ -1819,21 +1951,36 @@ def remove_artifact_from_container(
 ) -> ArtifactEntity:
     """Remove an artifact from a container by detaching its edge.
 
-    P2 — works on any container, not just workspaces. Access is gated by the
-    caller's `check_access`, with the `evict` action. If a draft
-    version of the artifact is owned by this container, the draft row is
-    cleaned up as part of the removal so it does not linger.
+    Works on any container, not just workspaces. Access is gated by the caller's `check_access`,
+    with the `evict` action.
 
-    The draft cleanup is a deletion, and it needs its own authorization: `evict` on the container
-    is not enough on its own, or a caller who could evict could destroy a draft version homed
-    there — another user's unfinished work, removed under a container permission, with the
-    artifact's own grants never consulted. Unlinking is fairly a property of the container;
-    deleting a version is not.
+    An artifact HOMED in this container (its current version's `collection_id` is this container)
+    is also taken out of the search index here, in every state. Recall reads an artifact's index
+    entry from its home collection (`lightcone.resolve_authorized_scope` builds its contexts from
+    `doc.collection_id`), so a row that kept its home and its index entry would still answer a
+    recall scoped to the container it was removed from. A member linked in from elsewhere has no
+    index entry here, and only its edge goes.
+
+    What happens to a homed row after that turns on two facts:
+
+    - **No other container holds the root, and the caller may delete it** (an owner or delete
+      grant, `_may_delete_artifact`): the lineage is destroyed — every version row and every edge.
+      Nothing else reaches it, so keeping it would leave a row that nothing lists.
+    - **Otherwise** the row stays where it is, homed here and unindexed: still listed by the
+      containers that link it and still readable by id, and not returned by recall. It is not
+      moved to another container, because the home is also the content-key scope
+      (`db/doc_boundary.content_key_scope`) and a body sealed under one scope cannot be opened
+      under another.
+
+    The destroy needs its own authorization: `evict` on the container is not enough on its own,
+    or a caller who could evict could destroy another user's artifact under a container
+    permission, with the artifact's own grants never consulted. Unlinking is fairly a property of
+    the container; deleting an artifact is not.
 
     `auth` is the caller's context, needed to make that second check. It is optional only so the
-    unlink path stays callable without one; when it is absent the draft is left in place rather
-    than deleted. That is the safe direction: an orphaned draft is recoverable and visible, an
-    unauthorized deletion is neither.
+    unlink path stays callable without one; when it is absent the row is left in place rather
+    than deleted. That is the safe direction: an orphaned row is recoverable, an unauthorized
+    deletion is not.
     """
     # Resolve the root_id: the caller may pass a version id or a root_id.
     root_id = artifact_id
@@ -1859,71 +2006,32 @@ def remove_artifact_from_container(
 
     store.remove_artifact_from_collection(db, container_id, root_id)
 
-    # If a draft version is owned by this container, clean it up — but only for a caller who may
-    # delete THAT ARTIFACT. See the docstring: `evict` on the container authorizes the unlink, not
-    # the destruction of a version.
     local = store.get_current_in_collection(db, container_id, root_id)
-    if local and local.state == ArtifactEntity.STATE_DRAFT and local.collection_id == container_id:
-        if not _may_delete_draft(db, auth, local.id):
-            logger.info(
-                "remove_artifact_from_container(%s): draft %s left in place — the caller holds "
-                "`evict` on the container but not `delete` on the artifact",
-                container_id, local.id)
-            _emit_event(container_id, "artifact.removed", {"artifact_id": artifact_id},
-                        actor_id=user_id)
-            return artifact or store.get_artifact(db, root_id) or ArtifactEntity(
-                id=root_id, root_id=root_id)
-        store.delete_artifact(db, local.id)
+    if local is not None and local.collection_id == container_id:
         try:
             from mantle.search.ingest.pipeline_unified import delete_artifact_from_index
-            delete_artifact_from_index(local.id, local.root_id, collection_id=container_id)
+            # Every segment: `delete_artifact_from_index` purges live, archived and the legacy
+            # draft segment.
+            delete_artifact_from_index(local.id, root_id, collection_id=container_id)
         except Exception:
-            logger.debug("search delete failed", exc_info=True)
+            logger.warning("index removal FAILED for %s — it was removed from %s and a recall "
+                           "scoped there can still return it", root_id, container_id,
+                           exc_info=True)
+
+        held_elsewhere = store.count_other_containers_for_root(db, root_id, container_id) > 0
+        if held_elsewhere:
+            logger.info("remove_artifact_from_container(%s): %s kept — another container still "
+                        "holds it", container_id, root_id)
+        elif not _may_delete_artifact(db, auth, root_id):
+            logger.info("remove_artifact_from_container(%s): %s kept — the caller holds `evict` "
+                        "on the container but not `delete` on the artifact",
+                        container_id, root_id)
+        else:
+            store.delete_artifacts_by_root(db, root_id)
+            store.remove_all_edges_for_root(db, root_id)
 
     _emit_event(container_id, "artifact.deleted", {"artifact_id": artifact_id}, actor_id=user_id)
-    return artifact or store.get_artifact(db, root_id) or ArtifactEntity(id=root_id, root_id=root_id)
-
-
-def revert_artifact(
-    workspace_db: Database,
-    collection_db: Database,
-    user_id: str,
-    workspace_id: str,
-    artifact_id: str,
-) -> Optional[ArtifactEntity]:
-    """
-    Revert: drop the current draft, leaving the committed version in place.
-    Returns the surviving committed version (or None if none exists).
-    """
-    get_workspace(workspace_db, user_id, workspace_id, required="update")
-    target = store.get_artifact(workspace_db, artifact_id)
-    if not target or target.collection_id != workspace_id:
-        return None
-
-    if target.state != ArtifactEntity.STATE_DRAFT:
-        return target
-
-    committed = store.get_latest_committed_artifact(
-        workspace_db, target.root_id, workspace_id
-    )
-    if not committed:
-        return None
-
-    store.delete_artifact(workspace_db, target.id)
-
-    try:
-        from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
-        enqueue_index_artifact(committed, committed.collection_id, tenant_id=user_id)
-    except Exception:
-        # `warning`, not `debug` — PUBLISHING §4.4. A dropped index job is exactly the kind nobody
-        # goes looking for, and `debug` is below the default level: the record existed and was
-        # INVISIBLE. Logs and IS SEEN are different properties. The `mark_materialized` sibling
-        # was promoted for this reason; these four were missed by that pass.
-        logger.warning("reindex after revert FAILED — the draft was discarded but the index"
-                       " still describes it", exc_info=True)
-
-    _emit_event(workspace_id, "artifact.updated", {"artifact": committed.to_dict()}, actor_id=user_id)
-    return committed
+    return artifact or ArtifactEntity(id=root_id, root_id=root_id)
 
 
 def add_artifact_to_workspace(
@@ -1941,14 +2049,14 @@ def add_artifact_to_workspace(
     """
     get_workspace(workspace_db, user_id, workspace_id, required="add")
 
-    # Must resolve to a committed version somewhere.
-    committed = store.get_latest_committed_artifact(workspace_db, artifact_root_id)
-    if not committed:
+    # Must resolve to a live version somewhere.
+    live = store.get_latest_live_artifact(workspace_db, artifact_root_id)
+    if not live:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Artifact not readable")
 
     order_key = after_key(store.get_last_order_key(workspace_db, workspace_id))
     store.add_artifact_to_collection(workspace_db, workspace_id, artifact_root_id, order_key)
-    return committed
+    return live
 
 
 def move_artifact_between_containers(
@@ -2048,7 +2156,7 @@ def initiate_upload_and_create_artifact(
     order_key: Optional[str] = None,
     context: Optional[dict] = None,
 ):
-    """Create a draft artifact to receive a file upload; return ``(descriptor, artifact)``.
+    """Create an artifact to receive a file upload; return ``(descriptor, artifact)``.
 
     The descriptor is ``{"upload_id", "mode", "url", "method", "key"}`` and always describes a
     proxied upload — the client PUTs bytes to Mantle, which envelope-encrypts them before they
@@ -2058,7 +2166,9 @@ def initiate_upload_and_create_artifact(
     ``size`` and ``content_type`` are the client's claim, recorded in context so the UI has
     something to show; the true values are read back from storage on completion. The artifact is
     created unindexed because it has no content yet —:func:`update_upload_status` indexes it
-    once the bytes land.
+    once the bytes land. It is born ``live`` (:func:`create_workspace_artifact`) and every
+    later write goes through `update_artifact` in place, so the completed upload is in the
+    segment `recall` reads by default.
 
     Requires ``create`` on the workspace; raises ``HTTPException(404)`` otherwise.
     """
@@ -2272,12 +2382,19 @@ def update_upload_status(
                 "Upload content not found in this node's CAS or its object store",
             )
 
-        # Only the mirror can restate these; the local path already recorded them on the way in
-        # (`_record_content_ref`), so absent a mirror the values the write set are kept.
+        # Only the mirror can restate these; absent a mirror the values the write set are kept.
         if head:
             ctx["size"] = head.get("ContentLength", ctx.get("size"))
             ctx["content_type"] = head.get("ContentType", ctx.get("content_type"))
         ctx["processing"] = describe_content_processing(ctx.get("content_type") or "", upload_complete=True)
+        # The mint described the empty body the upload was initiated with; describe the bytes
+        # that landed (`mint_context.readdressed`): the digest the content route recorded, and a
+        # length the store measured — the mirror's, or the one the content route recorded
+        # (`content_bytes`). Never `size`: that is a client key, which `context_patch` can set.
+        measured = [n for n in ((head or {}).get("ContentLength"), ctx.get("content_bytes"))
+                    if isinstance(n, int) and not isinstance(n, bool)]
+        ctx = json.loads(_mc.readdressed(
+            ctx, sha256=ctx.get("content_sha256"), nbytes=measured[0] if measured else None))
 
         try:
             if persist_object_to_durable(key):
@@ -2473,14 +2590,14 @@ def receive_card_inbound_message(
     source_artifact, ws, owner_id = resolve_card_key(
         db, artifact_id, token, store_db or db, key_context="inbound"
     )
-    card_ctx: Dict[str, Any] = {
-        "source_artifact_id": artifact_id,
-        "inbound": {"channel": channel or "unknown", "via": "webhook"},
-    }
-    if isinstance(context, dict):
-        card_ctx.update(context)
+    # A webhook body is a client: its server-owned keys are refused like any other door's, and
+    # the provenance this function records — which card, which channel — is applied after the
+    # body's keys, so the body cannot restate it.
+    card_ctx: Dict[str, Any] = _mc.client_part(context) if isinstance(context, dict) else {}
     if isinstance(metadata, dict):
         card_ctx.setdefault("metadata", metadata)
+    card_ctx["source_artifact_id"] = artifact_id
+    card_ctx["inbound"] = {"channel": channel or "unknown", "via": "webhook"}
 
     msg = create_workspace_artifact(
         db=db, user_id=owner_id, workspace_id=ws.id,

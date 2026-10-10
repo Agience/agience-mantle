@@ -1,24 +1,22 @@
-"""The caller's own context keys survive a create one level down, and readers must find them.
+"""`parse_artifact_context` finds a caller's context keys wherever a stored context holds them.
 
-⛔ WHAT WAS WRONG, MEASURED AGAINST PRODUCTION 2026-09-11. `artifacts_router._mint_context` stamps
-a context onto EVERY create and keeps the caller's own "verbatim under `caller`" — its stated
-contract. `parse_artifact_context` read only the top level, so every consumer asking for a
-caller-supplied key by name silently began answering nothing the day minting went live. No error
-and no log line: the key is simply absent.
+Mantle stores a caller's keys at the top level, beside the store's own facets (`minted_by`,
+`minted`, `addressing`, `provenance`, …). A row that no write through `mint_context` has touched
+can also hold them under `caller`, alone or beside some at the top level, and a top-level read of
+such a row finds nothing for a caller-supplied key, with no error and no log line. Measured
+against production, 58 of 67 lead artifacts held their keys under `caller` and 9 at the top level.
 
-Three consequences were already live, and none of them looked like a failure:
+The readers that depend on finding them:
 
-    iris `notify_inbound`   ctx["source"] -> None for 58 of 67 lead artifacts, so the operator's
-                            notification called every one of them "unknown", and company, role,
-                            interest, email_domain and lead_id went with it
-    iris `_resolve_field`   resolves the RECIPIENT of a templated email out of context
-    astra `_find_child`     matches `ctx["title"]` for IDEMPOTENT ingest — a miss does not raise,
+    iris `notify_inbound`   prints `source`, company, role, interest, email_domain and lead_id;
+                            a missed key prints "unknown"
+    iris `_resolve_field`   resolves the recipient of a templated email out of context
+    astra `_find_child`     matches `ctx["title"]` for idempotent ingest; a miss does not raise,
                             it forks the series, "splitting one symbol's history across two
-                            collections" exactly as its own docstring warns
+                            collections" as its own docstring states
 
-⚠ BOTH SHAPES ARE LIVE IN ONE CORPUS. `PATCH` does not mint, so patched and pre-mint artifacts
-keep their keys flat — 9 of those 67 leads do. That is why this merges rather than switching, and
-why the top level has to win: a PATCH is a deliberate statement, the mint is a record of a create.
+Both shapes are live in one corpus, so the reader merges rather than switching: the top level wins,
+and `caller` supplies a key the top level does not hold (`mint_context.client_view`).
 """
 from __future__ import annotations
 
@@ -69,25 +67,24 @@ class TestParseArtifactContextReadsThroughTheMint:
         assert parse_artifact_context({"context": {"caller": []}}) == {"caller": []}
 
     def test_a_non_json_string_context_still_raises(self):
-        """Deliberately NOT swallowed. `_mint_context` keeps an opaque context under
-        `caller._opaque` rather than dropping it, so a reader that quietly returned {} here would
-        turn the caller's own statement about its artifact into silence."""
+        """Not swallowed. A non-JSON context is the caller's own statement about its artifact,
+        which the store keeps under `_opaque`; a reader that returned {} here would turn it into
+        silence."""
         with pytest.raises(json.JSONDecodeError):
             parse_artifact_context({"context": "not json at all"})
 
     def test_content_type_resolves_through_the_mint(self):
-        """`get_artifact_content_type` reads `context.content_type`, which the mint nests too."""
+        """`get_artifact_content_type` reads `context.content_type`, one under `caller` included."""
         assert get_artifact_content_type(
             {"context": json.dumps({"caller": {"content_type": "text/csv; charset=utf-8"}})}
         ) == "text/csv"
 
 
 class TestTheRealProductionShape:
-    """The exact context a live lead carries, so the fix is pinned to real data not a fixture.
+    """A real lead context with its keys under `caller`.
 
-    Taken from `/opt/agience/brain/lattice.db` on 2026-09-11 (person details redacted; only the
-    SHAPE is asserted). Two things here are easy to get wrong and neither shows up in an invented
-    fixture.
+    Taken from `/opt/agience/brain/lattice.db` on 2026-09-11, with person details redacted; only
+    the shape is asserted. Two of its properties do not show up in an invented fixture.
     """
 
     #: A real minted lead context, redacted. `minted.source` is the MINT's own provenance
@@ -108,11 +105,11 @@ class TestTheRealProductionShape:
         assert ctx["source"] == "website-contact"
 
     def test_the_mints_own_source_never_shadows_the_callers(self):
-        """⛔ THE TRAP. `minted.source` is "request" — the mint's provenance, not the lead's.
+        """`minted.source` is "request": the mint's provenance, not the lead's.
 
         A flatten that merged every nested block rather than only `caller` collides on this key,
-        and the collision resolves by DICT ORDER — so the same data answers differently depending
-        on which block the producer happened to write first:
+        and the collision resolves by dict order, so the same data answers differently depending
+        on which block the producer wrote first:
 
             full-flatten, minted first -> 'website-contact'
             full-flatten, caller first -> 'request'        <- same artifact, different answer

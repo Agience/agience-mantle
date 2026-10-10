@@ -61,7 +61,7 @@ def test_a_second_artifact_create_on_the_same_id_replaces_rather_than_raises(db)
     def put(name):
         lattice_api.create_artifact(db, ArtifactEntity(
             id=PINNED, root_id=PINNED, collection_id=container,
-            state=ArtifactEntity.STATE_COMMITTED, created_by="owner", name=name))
+            state=ArtifactEntity.STATE_LIVE, created_by="owner", name=name))
 
     put("first")
     put("second")           # would be an IntegrityError if the PK were the arbiter

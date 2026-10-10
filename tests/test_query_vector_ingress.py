@@ -146,7 +146,7 @@ def _artifact_doc(artifact_id: str) -> dict:
         "root_id": artifact_id,
         "context": json.dumps({"title": "t", "description": "d", "tags": []}),
         "content": "",
-        "state": "committed",
+        "state": "live",
         "created_by": "user-1",
         "principal_id": "user-1",
     }

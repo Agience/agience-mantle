@@ -140,6 +140,7 @@ class TestTheToolsUseTheApisOwnPaths:
         invalidation and the indexing live. Reaching it is what makes an MCP write and an HTTP
         write the same write."""
         entity = MagicMock()
+        # A legacy stored value: the response names only the states that exist.
         entity.to_dict.return_value = {"id": "art-new", "state": "committed"}
         with patch("mantle.services.workspace_service.create_container",
                    return_value=entity) as create:
@@ -161,7 +162,7 @@ class TestTheToolsUseTheApisOwnPaths:
         # carry.
         structured = _tool(r)["structuredContent"]
         assert structured["id"] == "art-new"
-        assert structured["state"] == "committed"
+        assert structured["state"] == "live"
 
         from mantle.routers.artifacts_router import ArtifactResponse
 
@@ -247,7 +248,7 @@ class TestARefusalReachesTheModelIntact:
 
     @patch("mantle.search.mantle.wiring.build_sse_search_accessor")
     async def test_a_refused_field_carries_the_apis_own_words(self, builder, client):
-        rest, tool = await self._both(client, builder, {"query_text": "budget state:draft"})
+        rest, tool = await self._both(client, builder, {"query_text": "budget state:archived"})
         assert rest.status_code == 400
         assert tool["isError"] is True
         text = tool["content"][0]["text"]

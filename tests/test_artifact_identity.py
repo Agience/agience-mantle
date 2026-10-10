@@ -170,12 +170,10 @@ class TestRouterUpsert:
     async def test_identity_inside_a_container_upserts_on_the_ROOT(self):
         """`identity` + `container_id` is supported, and it names the root rather than the version.
 
-        A collection member is born a draft and grows a second live version on edit-after-commit,
-        so "the artifact for this identity" would not be one row. That is a property of the draft
-        lifecycle rather than of identity: an
-        identity names something outside the store (a file, a session, a commit) which has one
-        true version. Naming the root resolves it, and the root is what edges, grants and both
-        search arms are already keyed on.
+        An identity names something outside the store (a file, a session, a commit) which has
+        one true version, and "the artifact for this identity" must be one lineage. Naming the
+        root makes it one, and the root is what edges, grants and both search arms are already
+        keyed on.
 
         It buys more than convenience. Without it every hook artifact is top-level, and a
         top-level artifact is its own origin root, which is the SSE principal: 115 self-rooted
@@ -208,7 +206,7 @@ class TestRouterUpsert:
 
     @pytest.mark.asyncio
     async def test_a_container_member_without_identity_is_untouched(self):
-        """The ordinary draft lifecycle must not have moved. Only identity writes are mirrors."""
+        """A member with no identity takes the ordinary create path. Only identity writes upsert."""
         from mantle.routers import artifacts_router as ar
 
         auth = MagicMock(user_id="user-1")
@@ -260,7 +258,7 @@ class TestALexiconEntrysNamesSurviveTheRoundTrip:
         doc = {
             "id": "wn-oewn-14672278-n",
             "collection_id": "stage.0.lexicon",
-            "state": "committed",
+            "state": "live",
             "title": "O",
             "content": "a nonmetallic bivalent element",
             "content_type": "text/x-wordnet",
@@ -310,7 +308,7 @@ class TestAMergeSaysThatItIsOne:
             "id": "concept-be603d8ac3dd0185fcf653e18a8dc72d",
             "collection_id": "collection:concepts-consolidated",
             "content_type": "application/x-concept",
-            "state": "committed",
+            "state": "live",
             "lemmas": ["decade", "decennary", "decennium"],
             "colimit_of": ["wn-decade.n.01", "wn-oewn-15174893-n"],
         }

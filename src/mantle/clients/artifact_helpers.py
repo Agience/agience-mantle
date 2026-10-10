@@ -96,15 +96,14 @@ def artifact_url(base: str, artifact_id: str, *suffix: str) -> str:
 def parse_artifact_context(artifact: dict) -> dict:
     """Parse artifact context, handling both dict and JSON-string forms, and flatten the mint.
 
-    The caller's own keys are not at the top level on anything this store created.
-    `artifacts_router._mint_context` stamps `{addressing, caller, minted, minted_by, provenance,
-    …}` onto every create and, by its own contract, keeps the caller's context "verbatim under
-    `caller`". Nothing is lost — it moves one level down — but a reader asking for a
-    caller-supplied key by name finds nothing there. No error, no log line: the key is simply
-    absent.
+    A stored context holds a client's keys at the top level, beside the store's own facets
+    (`minted_by`, `minted`, `addressing`, `provenance`, …; `mint_context.with_client_keys`). A
+    context can also hold them under `caller`, alone or beside some at the top level; there, a
+    reader asking for a caller-supplied key at the top level finds nothing, with no error and no
+    log line.
 
     Counted across the whole live lattice — 129 minted artifacts, 417 unminted — because which
-    readers are affected is a question about the data, not about the code:
+    readers such a context affects is a question about the data, not about the code:
 
         source, company, lead_id, role, interest, email_domain, status, type, received_at,
         marketing_opt_in          nested 58, flat 9   <- the lead path, and it is live
@@ -112,12 +111,11 @@ def parse_artifact_context(artifact: dict) -> dict:
         title                     nested  0, flat 1   <- astra `_find_child`: NOT affected today
         bindings, connector_type  nested  0, flat 0   <- not in use at all
 
-    Correction: an earlier version of this note said the operator's lead notification reported 58
-    leads as "unknown". It does not. `notify_inbound` has no production caller — the operator email
-    comes from `www.agience.ai/bff/_email_lead`, which reads the BFF's own flat record and never
-    touches the store.
+    The operator's lead notification is not among them: `notify_inbound` has no production caller,
+    and the operator email comes from `www.agience.ai/bff/_email_lead`, which reads the BFF's own
+    flat record and never touches the store.
 
-    What the reachability actually is:
+    The reachability:
 
         PROVEN BROKEN   `lumen.install_package` — refused a real package whose manifest sat one
                         level down. Hit directly against production.
@@ -131,14 +129,19 @@ def parse_artifact_context(artifact: dict) -> dict:
     These are tools a user can call and they answer wrongly rather than failing; nothing automated
     is silently degraded.
 
-    A merge, never a switch. `PATCH` does not mint, so patched and unminted artifacts keep their
-    keys flat and both shapes are live in the same corpus. The top level wins, so a deliberate
-    PATCH still overrides what the mint recorded, the store's own facets stay reachable, and an
-    artifact with no `caller` block reads exactly as it did before.
+    A merge, never a switch. Both shapes, and the mix of the two, are live in the same corpus and
+    read the same here: the top level wins and `caller` supplies a key the top level does not
+    hold (`mint_context.client_view`), so the store's own facets stay reachable, and an artifact
+    with no `caller` block reads exactly as stored.
+
+    A key the store owns is never lifted out of `caller`: the rung, the mint and the content
+    address are read from the top level only. `caller.provenance` is the claim a create made, and
+    lifting it where a reader expects the rung would present a client's claim as the store's
+    derivation whenever the top-level rung is absent.
 
     `json.loads` is unguarded here deliberately: a context that is a non-JSON string is the
-    caller's statement about its own artifact, and `_mint_context` keeps it under `caller._opaque`
-    rather than dropping it. A reader that swallowed the parse error would turn that into silence.
+    caller's statement about its own artifact, and the store keeps it under `_opaque` rather than
+    dropping it. A reader that swallowed the parse error would turn that into silence.
     """
     raw = artifact.get("context") or {}
     if isinstance(raw, str):
@@ -148,7 +151,8 @@ def parse_artifact_context(artifact: dict) -> dict:
     caller = raw.get("caller")
     if not isinstance(caller, dict) or not caller:
         return raw
-    return {**caller, **raw}
+    from mantle.services.mint_context import SERVER_OWNED_KEYS
+    return {**{k: v for k, v in caller.items() if k not in SERVER_OWNED_KEYS}, **raw}
 
 
 def get_artifact_content_type(artifact: dict) -> str:

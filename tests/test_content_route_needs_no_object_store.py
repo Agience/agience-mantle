@@ -599,6 +599,46 @@ async def test_an_unknown_disposition_is_refused(routed, client):
     assert r.status_code == 422, r.status_code
 
 
+@pytest.mark.parametrize("filename", [
+    'report"; filename="evil.exe',
+    'line\r\nX-Injected: 1.txt',
+    'back\\slash.txt',
+    'café 報告.pdf',
+])
+@pytest.mark.asyncio
+async def test_a_client_written_filename_cannot_shape_the_disposition_header(
+        routed, client, filename):
+    """The filename is client-written context. The header carries one `filename` parameter whose
+    quoted value holds no quote, backslash, semicolon or control character, and the full name travels in
+    `filename*` percent-encoded, so no filename adds a parameter or a header."""
+    import json as _json
+    from urllib.parse import unquote
+
+    from mantle.db import lattice_api
+    from mantle.entities.artifact import Artifact
+
+    db, _store_root = routed
+    lattice_api.create_artifact(db, Artifact(
+        id="a-2", root_id="a-2", collection_id="", name="named", content="",
+        created_by="owner-a", content_type="application/octet-stream",
+        context=_json.dumps({"filename": filename})))
+    put = await client.put("/artifacts/a-2/content", content=b"named bytes")
+    assert put.status_code == 200, put.text
+
+    r = await client.get("/artifacts/a-2/content")
+    assert r.status_code == 200, r.text
+    assert "x-injected" not in r.headers
+    cd = r.headers["content-disposition"]
+    head, quoted_part, star_part = cd.split("; ")
+    assert head == "attachment"
+    assert quoted_part.startswith('filename="') and quoted_part.endswith('"')
+    inner = quoted_part[len('filename="'):-1]
+    assert not any(c in inner for c in '"\\;\r\n'), cd
+    assert all(0x20 <= ord(c) < 0x7F for c in inner), cd
+    assert star_part.startswith("filename*=UTF-8''"), cd
+    assert unquote(star_part[len("filename*=UTF-8''"):]) == filename
+
+
 @pytest.mark.asyncio
 async def test_a_304_never_reads_or_decrypts_the_bytes(routed, client, monkeypatch):
     """The point of checking the ETag BEFORE the tier read, not after.

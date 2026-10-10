@@ -510,7 +510,8 @@ def _content_tier_for_unit_tests(request, monkeypatch):
 
     from mantle.services import workspace_service
 
-    def _addressed(artifact_id, content, context_str, owner_id=None, collection_id=None):
+    def _addressed(artifact_id, content, context_str, owner_id=None, collection_id=None,
+                   creator_id=None):
         key = workspace_service._safe_content_key(
             _loads_or_empty(context_str), artifact_id)
         ref = ("cas/" + hashlib.sha256(content.encode("utf-8")).hexdigest()) if owner_id else None

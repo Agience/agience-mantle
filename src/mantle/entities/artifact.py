@@ -1,10 +1,11 @@
 # entities/artifact.py
-# Unified Artifact entity — one table, one entity, three states.
+# Unified Artifact entity — one table, one entity, two states.
 # See .dev/features/universal-artifact-model.md for design rationale.
 
 from typing import Optional, Dict, Any
 
-from mantle.db.constants import STATE_WHEN_ABSENT as _STATE_WHEN_ABSENT, state_of
+from mantle.db.constants import (STATE_ARCHIVED as _STATE_ARCHIVED, STATE_LIVE as _STATE_LIVE,
+                                 STATE_WHEN_ABSENT as _STATE_WHEN_ABSENT, state_of)
 
 from .base import BaseEntity
 
@@ -16,7 +17,9 @@ COLLECTION_CONTENT_TYPE = "application/vnd.agience.collection+json"
 class Artifact(BaseEntity):
     """
     Unified artifact entity. Every artifact lives in exactly one collection
-    and carries a state in {draft, committed, archived}.
+    and carries a state in {live, archived}. There is no promotion state: every write path writes
+    `live`, and `archived` marks a superseded version or a retired artifact. A stored legacy
+    `committed` or `draft` reads as `live` (`db/constants.state_of`).
 
     Container artifacts (workspaces, collections) are distinguished by
     `content_type`. A container IS an artifact — same table, same entity.
@@ -26,19 +29,14 @@ class Artifact(BaseEntity):
     """
 
     PREFIX = "Artifact"
-    STATE_DRAFT = "draft"
-    STATE_COMMITTED = "committed"
-    STATE_ARCHIVED = "archived"
-    VALID_STATES = {STATE_DRAFT, STATE_COMMITTED, STATE_ARCHIVED}
+    STATE_LIVE = _STATE_LIVE
+    STATE_ARCHIVED = _STATE_ARCHIVED
+    VALID_STATES = {STATE_LIVE, STATE_ARCHIVED}
 
     #: What a STORED doc that carries no `state` is in. Re-exported from the store layer, which
     #: is where the one definition lives (`db/constants.STATE_WHEN_ABSENT`) — the search index is
     #: partitioned by state into separately-keyed encrypted trees, so a second answer here would
     #: relocate an artifact between trees on a read-modify-write that changed nothing.
-    #:
-    #: Distinct from the `state=` default on `__init__` below, which is `draft` and stays `draft`:
-    #: constructing a NEW artifact asserts that an unpublished edit exists, which is exactly the
-    #: claim absence cannot make.
     STATE_WHEN_ABSENT = _STATE_WHEN_ABSENT
 
     def __init__(
@@ -48,7 +46,7 @@ class Artifact(BaseEntity):
         collection_id: str = "",
         context: str = "",
         content: str = "",
-        state: str = STATE_DRAFT,
+        state: str = STATE_LIVE,
         created_by: Optional[str] = None,
         created_time: Optional[str] = None,
         modified_by: Optional[str] = None,

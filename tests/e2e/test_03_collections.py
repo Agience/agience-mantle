@@ -1,7 +1,7 @@
 """Collections & artifacts — the core CRUD surface.
 
-Top-level container (no container_id) → committed collection with an owner grant;
-child artifact (container_id present) → draft. Then read / update / children /
+Top-level container (no container_id) → live collection with an owner grant;
+child artifact (container_id present) → live. Then read / update / children /
 commits / batch / delete.
 """
 from __future__ import annotations
@@ -9,20 +9,20 @@ from __future__ import annotations
 import uuid
 
 
-def test_create_top_level_collection_is_committed(user):
+def test_create_top_level_collection_is_live(user):
     coll = user["api"].create_collection(f"coll-{uuid.uuid4().hex[:6]}")
     assert coll["id"]
-    assert coll.get("state") == "committed", coll
+    assert coll.get("state") == "live", coll
     # The owner can read it back.
     r = user["api"].get_artifact(coll["id"])
     assert r.status_code == 200, r.text
 
 
-def test_create_child_is_draft(user):
+def test_create_child_is_live(user):
     coll = user["api"].create_collection(f"coll-{uuid.uuid4().hex[:6]}")
     child = user["api"].create_child(coll["id"], name="note-1", content="hello world")
     assert child["id"]
-    assert child.get("state") == "draft", child
+    assert child.get("state") == "live", child
 
 
 def test_get_artifact_reports_children(user):
@@ -39,7 +39,7 @@ def test_get_artifact_reports_children(user):
 def test_children_listing(user):
     coll = user["api"].create_collection(f"coll-{uuid.uuid4().hex[:6]}")
     a = user["api"].create_child(coll["id"], name="c1", content="one")
-    r = user["api"].get(f"/artifacts/{coll['id']}/children", params={"workspace_id": coll["id"]})
+    r = user["api"].get(f"/artifacts/{coll['id']}/children")
     assert r.status_code == 200, r.text
     ids = {c.get("id") for c in r.json()["items"]}
     assert a["id"] in ids

@@ -32,9 +32,7 @@ Identity is server-side, so re-promoting is an update. Each artifact is written 
 this script remembering anything. There is no promotion ledger, and losing this machine changes
 nothing.
 
-Membership is a second call, because `identity` and `container_id` are mutually exclusive — "a
-collection member is born a draft and grows a second live version on first edit-after-commit, so
-there is no single row to aim at". Each member is created top-level with its identity and then
+Membership is a second call. Each member is created top-level with its identity and then
 linked into the promoted collection with `source_artifact_id`, which the API documents as "link an
 existing artifact in (edge only), no new artifact". Edges are keyed by `blake2b(src ‖ dst ‖ label)`,
 so re-linking is an upsert and re-running promotes nothing twice.

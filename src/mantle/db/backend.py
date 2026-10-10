@@ -131,39 +131,6 @@ def find_newest_by_roots(db, root_ids):
     return out
 
 
-def find_version_in_state(db, root_id: str, state: str):
-    """Newest version row of ``root_id`` whose state is ``state``, else the row AT ``root_id``.
-
-    The read recall hydrates through, and the reason it is not `get_artifact`.
-
-    Both search arms key the index on ``root_id`` (`search/ingest/pipeline_unified`), so a
-    ranked hit names a LINEAGE, not a version. Hydrating it with a direct lookup on that id is
-    right only while the row at the root is the version that was indexed — true for every
-    artifact where ``id == root_id``, which is every top-level one. It stops being true the
-    moment a committed collection member is edited: `workspace_service._ensure_draft` writes
-    the new content to a NEW id under the same root and leaves the committed row alone, so the
-    draft segment holds the root, the direct lookup returns the committed row, and recall
-    answers with the new version's tokens and the old version's bytes.
-
-    Resolving within the searched STATE rather than to a global head is what keeps this from
-    widening anything: each state is a separately keyed index tree, so the caller has already
-    named which segment they are reading, and this returns that segment's version of a lineage
-    the light cone has already authorized. Grants are held on the root — `add_artifact_to_collection`
-    edges the root, and the light cone narrows on it — so every version this can return belongs
-    to a lineage the caller was already cleared for. A global head resolution would not have
-    that property against the archived segment, where the newest live row is precisely the one
-    the caller did not ask for.
-
-    Falls back to the row at ``root_id`` so a store with no version rows behaves exactly as it
-    did before — the absent-lineage case and the ``id == root_id`` case are the same answer.
-    """
-    rows = [v for v in (db.artifacts.versions_of(root_id) or [])
-            if state_of(v) == state]
-    if rows:
-        return rows[-1]                        # proper-time order: last = newest
-    return db.artifacts.get_artifact(root_id)
-
-
 def check_store_health() -> dict:
     """Health for `/status` — reads the maintained counter (no `count(*)` on any path)."""
     try:

@@ -67,7 +67,7 @@ def test_mid_key_between():
 # ── artifact CRUD round-trip against the standalone store ────────────────────
 def _entity(aid="art-lattice-1", **kw):
     fields = dict(id=aid, collection_id="col-1", content="hello lattice",
-                  content_type="text/markdown", state="committed",
+                  content_type="text/markdown", state="live",
                   name="brick one", created_by="test-mantle")
     fields.update(kw)
     return Artifact(**fields)
@@ -81,7 +81,7 @@ def test_create_and_get_round_trip(db):
     assert got.id == "art-lattice-1"
     assert got.content == "hello lattice"
     assert got.collection_id == "col-1"
-    assert got.state == "committed"
+    assert got.state == "live"
     # origin_root inherits from the collection (the key principal roots at the
     # collection's chain, never self — self-rooting would give every child its own key)
     assert got.origin_root == "col-1"
@@ -112,41 +112,46 @@ def test_no_lattice_internals_leak(db):
         assert k not in d
 
 
-# ── brick 2: drafts / version history / children ─────────────────────────────
-def _version(vid, root, state="committed", collection="col-1", content="v"):
+# ── brick 2: lineage heads / version history / children ──────────────────────
+def _version(vid, root, state="live", collection="col-1", content="v"):
     return _entity(aid=vid, root_id=root, state=state, collection_id=collection, content=content)
 
 
-def test_draft_and_latest_committed(db):
+def _legacy(db, vid, root, state, collection="col-1", content="v"):
+    """A row recording a legacy `committed` or `draft`, as a store that has not been migrated
+    holds it. Written raw: the entity refuses both values."""
+    db.artifacts.put_artifact({"id": vid, "root_id": root, "collection_id": collection,
+                               "state": state, "content": content, "created_by": "test-mantle"})
+
+
+def test_latest_live_is_the_newest_non_archived_version(db):
     api.create_artifact(db, _version("v1", "root-A", content="first"))
-    api.create_artifact(db, _version("v2", "root-A", content="second"))
-    api.create_artifact(db, _version("v3-draft", "root-A", state="draft", content="wip"))
+    _legacy(db, "v2", "root-A", "committed", content="second")
+    api.create_artifact(db, _version("v3-old", "root-A", state="archived", content="retired"))
 
-    draft = api.get_draft_artifact(db, "root-A", "col-1")
-    assert draft is not None and draft.id == "v3-draft" and draft.state == "draft"
-    assert api.get_draft_artifact(db, "root-A", "other-col") is None
-
-    latest = api.get_latest_committed_artifact(db, "root-A")
-    assert latest.id == "v2"                      # newest committed in proper time
-    assert api.get_latest_committed_artifact(db, "root-A", "other-col") is None
+    latest = api.get_latest_live_artifact(db, "root-A")
+    assert latest.id == "v2" and latest.state == "live"   # a legacy value reads as live
+    assert api.get_latest_live_artifact(db, "root-A", "other-col") is None
 
 
-def test_current_in_collection_prefers_draft(db):
-    api.create_artifact(db, _version("c1", "root-B", content="committed"))
+def test_current_in_collection_is_the_newest_live_row(db):
+    api.create_artifact(db, _version("c1", "root-B", content="first"))
     assert api.get_current_in_collection(db, "col-1", "root-B").id == "c1"
-    api.create_artifact(db, _version("c2-draft", "root-B", state="draft"))
-    assert api.get_current_in_collection(db, "col-1", "root-B").id == "c2-draft"
+    _legacy(db, "c2", "root-B", "draft")
+    assert api.get_current_in_collection(db, "col-1", "root-B").id == "c2"
+    api.create_artifact(db, _version("c3", "root-B", state="archived"))
+    assert api.get_current_in_collection(db, "col-1", "root-B").id == "c2"
 
 
 def test_current_in_any_collection_answers_the_same_as_asking_one_at_a_time(db):
     """The batched form must pick the collection the loop would have picked.
 
     Which collection wins is decided by the order the caller supplies, and within a collection
-    the draft still beats the committed version — same two rules, one lineage read instead of
-    one per candidate collection."""
+    the newest live row wins — same two rules, one lineage read instead of one per candidate
+    collection."""
     api.create_artifact(db, _version("m1", "root-M", collection="col-1"))
     api.create_artifact(db, _version("m2", "root-M", collection="col-2"))
-    api.create_artifact(db, _version("m2-draft", "root-M", state="draft", collection="col-2"))
+    _legacy(db, "m2-draft", "root-M", "draft", collection="col-2")
 
     for order in (["col-1", "col-2"], ["col-2", "col-1"]):
         one_at_a_time = next(
@@ -174,10 +179,10 @@ def test_current_in_any_collection_reads_the_lineage_once(db):
 
 
 def test_current_in_collection_many_answers_the_same_as_asking_one_root_at_a_time(db):
-    """The plural must not be a second opinion: same draft-beats-committed rule, same
-    proper-time order, one read for the set."""
+    """The plural must not be a second opinion: same newest-live rule, same proper-time order,
+    one read for the set."""
     api.create_artifact(db, _version("p1", "root-P", collection="col-1"))
-    api.create_artifact(db, _version("p1-draft", "root-P", state="draft", collection="col-1"))
+    _legacy(db, "p1-draft", "root-P", "draft", collection="col-1")
     api.create_artifact(db, _version("q1", "root-Q", collection="col-1"))
     api.create_artifact(db, _version("s1", "root-S", collection="col-2"))
 
@@ -227,20 +232,12 @@ def test_current_in_any_collection_many_honours_the_candidate_order(db):
     assert api.get_current_in_any_collection_many(db, [], ["col-1"]) == {}
 
 
-def test_version_history_newest_first_committed_only(db):
+def test_version_history_newest_first_live_only(db):
     api.create_artifact(db, _version("h1", "root-C"))
-    api.create_artifact(db, _version("h2", "root-C"))
-    api.create_artifact(db, _version("h3-draft", "root-C", state="draft"))
+    _legacy(db, "h2", "root-C", "committed")
+    api.create_artifact(db, _version("h3-old", "root-C", state="archived"))
     hist = api.list_version_history(db, "root-C")
-    assert [a.id for a in hist] == ["h2", "h1"]   # newest first, drafts excluded
-
-
-def test_list_draft_artifacts_by_collection(db):
-    api.create_artifact(db, _version("d1", "root-D", state="draft", collection="col-X"))
-    api.create_artifact(db, _version("d2", "root-E", state="draft", collection="col-X"))
-    api.create_artifact(db, _version("d3", "root-F", state="draft", collection="col-Y"))
-    drafts = api.list_draft_artifacts(db, "col-X")
-    assert sorted(a.id for a in drafts) == ["d1", "d2"]
+    assert [a.id for a in hist] == ["h2", "h1"]   # newest first, archived excluded
 
 
 def test_children_containment_edges(db):
@@ -293,11 +290,11 @@ def test_membership_add_last_key_and_remove(db):
 
 def test_list_collection_artifacts_resolution_and_order(db):
     _mk_collection(db, "col-A")
-    # root-X: committed in-collection, then a draft (draft must win)
-    api.create_artifact(db, _version("x1", "root-X", collection="col-A", content="x committed"))
-    api.create_artifact(db, _version("x2", "root-X", state="draft", collection="col-A", content="x draft"))
-    # root-Y: committed only in ANOTHER collection (published link → committed fallback)
-    api.create_artifact(db, _version("y1", "root-Y", collection="col-B", content="y committed"))
+    # root-X: live in-collection, then a newer legacy draft (the newest live row wins)
+    api.create_artifact(db, _version("x1", "root-X", collection="col-A", content="x first"))
+    _legacy(db, "x2", "root-X", "draft", collection="col-A", content="x newer")
+    # root-Y: live only in ANOTHER collection (a cross-collection link → newest live anywhere)
+    api.create_artifact(db, _version("y1", "root-Y", collection="col-B", content="y live"))
     # root-Z: archived in-collection (hidden unless include_archived)
     api.create_artifact(db, _version("z1", "root-Z", state="archived", collection="col-A"))
     api.add_artifact_to_collection(db, "col-A", "root-X")
@@ -306,10 +303,10 @@ def test_list_collection_artifacts_resolution_and_order(db):
     rows = api.list_collection_artifacts(db, "col-A")
     by_root = {r["root_id"]: r for r in rows}
     assert set(by_root) == {"root-X", "root-Y"}                 # Z archived → hidden
-    assert by_root["root-X"]["id"] == "x2"                      # draft preferred
-    assert by_root["root-X"]["has_committed_version"] is True
+    assert by_root["root-X"]["id"] == "x2"                      # newest live row
+    assert "has_committed_version" not in by_root["root-X"]
     assert by_root["root-X"]["relationship"] is None            # containment
-    assert by_root["root-Y"]["id"] == "y1"                      # committed-anywhere fallback
+    assert by_root["root-Y"]["id"] == "y1"                      # live-anywhere fallback
     assert by_root["root-Y"]["relationship"] == "operator"      # typed relation = the label
     assert [r["root_id"] for r in rows] == ["root-X", "root-Y"] # order_key order (insertion)
     rows_all = api.list_collection_artifacts(db, "col-A", include_archived=True)
@@ -596,19 +593,6 @@ def test_remove_all_edges_and_delete_by_root(db):
     assert api.get_edge(db, "col-A", "root-W") is None
     assert sorted(api.delete_artifacts_by_root(db, "root-W")) == ["w1", "w2"]
     assert api.get_artifact(db, "w1") is None
-
-
-def test_batch_commit_drafts(db):
-    api.create_artifact(db, _version("bc1", "root-P", state="draft"))
-    api.create_artifact(db, _version("bc2", "root-Q", state="draft"))
-    api.create_artifact(db, _version("bc3", "root-R", state="draft", collection="col-OTHER"))
-    api.create_artifact(db, _version("bc4", "root-S"))                    # already committed
-    n = api.batch_commit_drafts(db, "col-1", ["bc1", "bc2", "bc3", "bc4", "ghost"],
-                                "committer-1", "2026-07-22T12:00:00+00:00")
-    assert n == 2                                  # only in-collection drafts flip
-    got = api.get_artifact(db, "bc1")
-    assert got.state == "committed" and got.modified_by == "committer-1"
-    assert api.get_artifact(db, "bc3").state == "draft"
 
 
 def test_archive_artifact_gated_on_delete_grant(db):

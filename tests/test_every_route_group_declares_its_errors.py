@@ -164,9 +164,8 @@ def _measure_success():
                 if not code.startswith("2"):
                     continue
                 #: No `content` key at all means the response has no body, which is a declaration
-                #: rather than an omission: `POST /mcp`’s `202` and `POST /artifacts/{id}/revert`’s
-                #: `204` both say so deliberately, and counting them would demand a schema for a
-                #: body that is empty by construction. An empty `schema: {}` under a content type
+                #: rather than an omission: `POST /mcp`’s `202` says so deliberately, and counting it
+                #: would demand a schema for a body that is empty by construction. An empty `schema: {}` under a content type
                 #: is the defect this looks for: it promises a body and describes nothing.
                 if "content" not in r:
                     continue

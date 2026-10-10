@@ -109,7 +109,7 @@ curl -s http://localhost:8081/mcp \
 ```json
 {"jsonrpc":"2.0","id":1,"result":{
  "structuredContent":{"id":"df65a79f-1a57-4a5b-b10d-62f4032557fc","name":"Kickoff notes",
-   "content_type":"text/markdown","state":"committed","collection_id":"",
+   "content_type":"text/markdown","state":"live","collection_id":"",
    "created_by":"d99d859b-876e-57f6-b196-7b22fa54335c",
    "created_time":"2026-08-12T01:56:01.828633+00:00"}}}
 ```
@@ -141,9 +141,10 @@ lost still succeeds — leaving the next write to create a second root.
 
 The derivation includes the calling principal, so the same name from a different principal is a
 different artifact: two people capturing their own `README.md` cannot collide, and converging on one
-artifact stays a deliberate act — a grant. `identity` is top-level only; combining it with
-`container_id` is a 400 naming the reason, because a member of a collection has a draft/committed
-lifecycle with more than one live version.
+artifact stays a deliberate act — a grant. `identity` also works with `container_id` (the caller
+needs create permission on that collection): the identity then names the member's ROOT, derived
+the same way, and a repeat write overwrites that member's live version in place rather than
+filing a second member. An overwrite does not answer `201 Created`.
 
 ```bash
 curl -s http://localhost:8081/mcp \
@@ -435,7 +436,7 @@ Licensed under Apache-2.0 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
 
 ## Declaration of generative AI use
 
-The author used Anthropic's Claude Opus (versions 4.8 and 5) in the preparation of this work. Its
+The author used Anthropic's Claude Opus (versions 4.8, 5, and 5.5) in the preparation of this work. Its
 contribution was to write code, and to generate and validate content. The ideas, the construction
 and the claims are the author's. No other generative AI tool was used. The author reviewed and
 edited all output and takes full responsibility for the content of this publication.

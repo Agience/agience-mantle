@@ -233,7 +233,7 @@ def _doc(artifact_id: str, collection_id: str, content_type: str) -> dict:
         "created_by": "user-bob",
         "created_time": "2025-01-01T00:00:00Z",
         "modified_time": "2025-01-01T00:00:00Z",
-        "state": "committed",
+        "state": "live",
         "context": {"title": artifact_id, "tags": [], "description": "a filed artifact"},
     }
 

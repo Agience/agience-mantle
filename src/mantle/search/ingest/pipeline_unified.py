@@ -49,6 +49,7 @@ from mantle.search.embeddings import (
     WriterSuppliedEmbeddings,
     model_id as emb_model_id,
 )
+from mantle.db.constants import state_of
 from mantle.entities.artifact import Artifact
 
 from mantle.search.ingest.chunking import (
@@ -73,19 +74,23 @@ _embeddings = Embeddings()
 # Each artifact state indexes into its own physically separate index segment
 # (separate S3 prefixes — see search.mantle.wiring._segment_prefixes). The
 # segment name equals the state name. States are mutually exclusive, so an
-# artifact's entry lives in exactly one segment; a transition (draft→committed,
-# →archived, unarchive) moves it (index into the new segment, purge the others).
-_SEGMENTS = ("committed", "draft", "archived")
+# artifact's entry lives in exactly one segment; a transition (→archived,
+# unarchive) moves it (index into the new segment, purge the one it left).
+_SEGMENTS = ("live", "archived")
+#: Every segment a root may still have entries in. The legacy `draft` segment is written by
+#: nothing now, and is purged on a hard delete and on an explicit vacate, because its cells
+#: carry chunk text (`wiring.LEGACY_DRAFT_SEGMENT`).
+_REMOVABLE_SEGMENTS = _SEGMENTS + ("draft",)
 
 
 def _segment_for_state(state: str) -> str:
-    """Map an artifact state to its index segment (1:1).
+    """Map an artifact state to its index segment.
 
-    An absent or unrecognised state resolves to `Artifact.STATE_WHEN_ABSENT` — the single
-    definition of what a doc with no `state` is in (`db/constants`), which every other reader
-    derives from too. A second answer here would file a stateless doc into one tree and the entity
-    layer would move it to another on the next write."""
-    return state if state in _SEGMENTS else Artifact.STATE_WHEN_ABSENT
+    `db/constants.state_of` is the one reading: an absent state and the legacy `committed` and
+    `draft` all index into `live`. A second answer here would file a doc into one tree and the
+    entity layer would move it to another on the next write."""
+    resolved = state_of({"state": state})
+    return resolved if resolved in _SEGMENTS else Artifact.STATE_WHEN_ABSENT
 
 
 #: Content types that are never indexed. Two criteria admit an entry, and an artifact
@@ -539,8 +544,9 @@ def _mantle_index_artifact(
     collection_id: str,
     fields: dict[str, str],
     *,
-    segment: str = "committed",
+    segment: str = "live",
     vector=None,
+    replace: bool = False,
 ) -> str:
     """Chunk + embed the artifact's content, write to MANTLE cells.
 
@@ -552,19 +558,31 @@ def _mantle_index_artifact(
     Returns :data:`ARM_WRITTEN` / :data:`ARM_SKIPPED` / :data:`ARM_FAILED`; see
     :func:`_sse_index_artifact` for why the status is a return value and not a log line.
 
+    ``replace`` is set by an in-place edit, where this root already has chunks in this
+    collection's segment from the content it had before. Chunks are upserted by
+    ``(root, chunk_id)`` into the cell of each chunk's nearest anchor, so an edit that shortens
+    the content or moves a chunk to another cell would leave the old chunks, and the old text they
+    carry, matchable beside the new ones. With ``replace`` the root's chunks are removed from every
+    cell of the collection first, through the same `_mantle_remove_artifact` a segment vacate
+    uses. Only when there is something to put back, or the content is now empty: an edit that
+    produces no chunks (no supplied vector and no embeddings provider) leaves a writer's earlier
+    vector in place, as `update_artifact`'s MCP tool text states.
+
     On a node with no provisioned AnchorSet this returns :data:`ARM_SKIPPED` for every
     artifact — the write still succeeds and still indexes lexically. That is the fresh-install
     state and it does not clear itself; see the AnchorSet check below and
     :mod:`mantle.search.anchors.store`.
     """
-    content = fields.get("content", "")
-    if not content:
-        return ARM_SKIPPED
-
     if not collection_id:
         return ARM_SKIPPED
 
     artifact_root = artifact.root_id or artifact.id
+
+    content = fields.get("content", "")
+    if not content:
+        if replace:
+            _purge_vector_chunks(artifact_root, collection_id, segment)
+        return ARM_SKIPPED
 
     if vector is not None:
         # One vector, one chunk. The writer embedded this artifact, not a window of it,
@@ -670,6 +688,9 @@ def _mantle_index_artifact(
     if not principal_id:
         return ARM_SKIPPED
 
+    if replace:
+        _mantle_remove_artifact(principal_id, collection_id, artifact_root, segment=segment)
+
     try:
         touched = indexer.index_artifact(
             principal_id, collection_id, mantle_chunks,
@@ -730,9 +751,25 @@ def _read_key_request(principal_id: str):
                       requester_type=actor.principal_type, action="read")
 
 
+def _purge_vector_chunks(artifact_root: str, collection_id: str, segment: str) -> None:
+    """`_mantle_remove_artifact` for a caller holding only the collection: resolves the cell
+    principal the same way the write does."""
+    try:
+        from mantle.services.dependencies import get_store_db
+        from mantle.search.mantle.principal import resolve_cell_principal
+        principal_id = resolve_cell_principal(next(get_store_db()), collection_id)
+    except Exception:
+        logger.warning("MANTLE purge: cell principal unresolved for collection %s — the old "
+                       "chunks of %s stay in its cells", collection_id, artifact_root,
+                       exc_info=True)
+        return
+    if principal_id:
+        _mantle_remove_artifact(principal_id, collection_id, artifact_root, segment=segment)
+
+
 def _mantle_remove_artifact(
     principal_id: str, collection_id: str, artifact_id: str,
-    *, segment: str = "committed",
+    *, segment: str = "live",
 ) -> None:
     """Strip an artifact's chunks from MANTLE cells in one index segment."""
     try:
@@ -763,7 +800,7 @@ def _sse_index_artifact(
     collection_id: str,
     fields: dict[str, str],
     *,
-    segment: str = "committed",
+    segment: str = "live",
     indexer=None,
 ) -> str:
     """Write per-field text into the SSE blind-token posting lists.
@@ -880,7 +917,7 @@ def _sse_index_artifact(
 
 
 def _sse_remove_artifact(
-    principal_id: str, artifact_id: str, *, segment: str = "committed",
+    principal_id: str, artifact_id: str, *, segment: str = "live",
 ) -> None:
     """Strip an artifact's references from the SSE index in one segment."""
     try:
@@ -912,13 +949,15 @@ def move_artifact_segments(
 
     Called at a state transition to vacate the segment(s) the artifact is leaving
     (the new segment is (re)indexed separately). The index is root-keyed, and a
-    root can legitimately occupy two segments at once — a committed version and a
-    WIP draft of the same root coexist — so we never blanket-purge "all others";
+    root can legitimately occupy two segments at once — a live version and an
+    archived one of the same root coexist — so we never blanket-purge "all others";
     the caller names exactly the segment(s) being left:
 
-        commit    (draft→committed):  remove_from=["draft"]
-        archive   (→archived):        remove_from=["committed", "draft"]
-        unarchive (archived→draft):   remove_from=["archived"]
+        archive   (live→archived):    remove_from=["live"]
+        unarchive (archived→live):    remove_from=["archived"]
+
+    ``"draft"`` names the legacy draft segment; `system/manage_state_collapse` vacates it when it
+    relabels a legacy draft.
 
     Best-effort and gated on the index backend being available, so it's a fast
     no-op where search isn't wired (no principal query is run).
@@ -949,7 +988,9 @@ def move_artifact_segments(
         return
     root = artifact.root_id or artifact.id
     for seg in remove_from:
-        if seg not in _SEGMENTS:
+        if seg == "committed":
+            seg = "live"
+        if seg not in _REMOVABLE_SEGMENTS:
             continue
         _mantle_remove_artifact(principal_id, collection_id, root, segment=seg)
         _sse_remove_artifact(principal_id, root, segment=seg)
@@ -1008,14 +1049,15 @@ def index_artifact(
     fields: Optional[dict[str, str]] = None,
     vector=None,
     sse_indexer=None,
+    replace: bool = False,
 ) -> IndexOutcome:
     """Index one artifact into the index segment for its current state.
 
-    ``draft`` / ``committed`` / ``archived`` each have a separate physical index
-    (separate S3 prefixes per arm), so the artifact is written into the segment
-    matching its state. This does not touch the other segments — a root may hold
-    a committed version *and* a WIP draft simultaneously; vacating a segment on a
-    state transition is the caller's job via :func:`move_artifact_segments`.
+    ``live`` and ``archived`` each have a separate physical index (separate S3
+    prefixes per arm), so the artifact is written into the segment matching its
+    state. This does not touch the other segment — a root may hold a live version
+    *and* an archived one simultaneously; vacating a segment on a state transition
+    is the caller's job via :func:`move_artifact_segments`.
 
     ``is_head`` is preserved for caller compatibility and does not drive index
     branching (versioning is artifact-level). ``fields`` may be supplied by the
@@ -1055,6 +1097,9 @@ def index_artifact(
                                     indexer=sse_indexer),
             vector=_mantle_index_artifact(
                 artifact, collection_id, fields, segment=segment, vector=vector,
+                # Passed only when set: without `replace` the vector arm is called with its
+                # default argument list.
+                **({"replace": True} if replace else {}),
             ),
         )
         # Name the per-arm result rather than logging a single unconditional success line,
@@ -1236,8 +1281,9 @@ def delete_artifact_from_index(
                     version_id, collection_id, exc_info=True,
                 )
         # Hard delete: the artifact is gone for good, so purge it from every
-        # segment (we don't track which state it was last indexed under).
-        for seg in _SEGMENTS:
+        # segment (we don't track which state it was last indexed under), the legacy
+        # draft segment included.
+        for seg in _REMOVABLE_SEGMENTS:
             if principal_id and collection_id:
                 _mantle_remove_artifact(principal_id, collection_id, root, segment=seg)
             if principal_id:
@@ -1302,6 +1348,7 @@ def enqueue_index_artifact(
     tenant_id: Optional[str] = None,
     vacate: Optional[list[str]] = None,
     vector=None,
+    replace: bool = False,
 ) -> None:
     """Enqueue an artifact for async indexing; falls back to sync.
 
@@ -1312,9 +1359,14 @@ def enqueue_index_artifact(
 
     ``vector`` rides the job. It is captured by the closure rather than re-read later,
     because the write that carried it has already returned by the time the job runs.
+
+    ``replace`` marks an in-place rewrite of content this root already has indexed here; see
+    :func:`_mantle_index_artifact`. The lexical arm needs no flag: it diffs the root's new token
+    set against the manifest of the old one and drops what is gone.
     """
     def _act() -> bool:
-        outcome = index_artifact(artifact, collection_id, is_head=is_head, vector=vector)
+        outcome = index_artifact(artifact, collection_id, is_head=is_head, vector=vector,
+                                 **({"replace": True} if replace else {}))
         if vacate:
             move_artifact_segments(artifact, collection_id, remove_from=vacate)
         # bool(outcome) is False iff an arm failed — a skip is not a job failure.

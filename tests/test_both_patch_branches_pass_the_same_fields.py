@@ -31,6 +31,17 @@ from mantle.routers import artifacts_router as ar
 #: and naming it here is what keeps "accounted for" different from "forgotten".
 _FOLDED_INTO_VECTOR = {"space_id"}
 
+#: A request field the handler passes under another name. `context` reaches both services as
+#: `caller_context`: a client's context is merged over the stored server-owned facets
+#: (`mint_context.merge_caller_update`), never stored as sent, and `context=` is the in-process
+#: form that IS stored as given.
+_PASSED_AS = {"context": "caller_context"}
+
+#: Keywords that are not request fields. `auth` is the caller's identity: the member branch writes
+#: the lineage's CURRENT row in its container, which can differ from the row named, and re-checks
+#: `update` access on it; a top-level artifact has no such redirect, so its service takes none.
+_NOT_A_FIELD = {"auth"}
+
 
 def _branch_kwargs():
     src = io.open(inspect.getsourcefile(ar), encoding="utf-8").read()
@@ -43,7 +54,7 @@ def _branch_kwargs():
             target = call.args[0]
             if isinstance(target, ast.Attribute) and target.attr in (
                     "update_workspace", "update_artifact"):
-                out[target.attr] = {k.arg for k in call.keywords if k.arg}
+                out[target.attr] = {k.arg for k in call.keywords if k.arg and k.arg not in _NOT_A_FIELD}
     return out
 
 
@@ -64,7 +75,7 @@ def test_the_two_branches_pass_identical_field_sets():
 
 def test_every_model_field_is_passed_or_explicitly_accounted_for():
     got = _branch_kwargs()
-    declared = set(ar.UpdateArtifactRequest.model_fields)
+    declared = {_PASSED_AS.get(f, f) for f in ar.UpdateArtifactRequest.model_fields}
     for branch, passed in got.items():
         unexplained = declared - passed - _FOLDED_INTO_VECTOR
         assert not unexplained, (

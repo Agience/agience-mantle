@@ -9,6 +9,7 @@ on the same peer list.
 
 Peers are configured out-of-band, never hardcoded:
     EMBER_PEERS = "http://<peer-host>:8091,http://…"   # comma-separated peer base URLs
+    EMBER_INVOKE_TOKEN = "<shared secret>"              # sent to peers' /v1/invoke as X-Ember-Token
 """
 from __future__ import annotations
 
@@ -177,9 +178,15 @@ def export_page(store, offset: int = 0, limit: int = 25, *, after: str = "",
 
 
 def _post(base: str, operator: str, arguments: Dict[str, Any], *, timeout: float = 60.0) -> Dict[str, Any]:
+    """Invoke an operator on a peer. A peer's `/v1/invoke` refuses any request whose `X-Ember-Token`
+    does not match its own `EMBER_INVOKE_TOKEN`, so the mesh shares that one secret and each shard
+    presents it under the same name. Unset here, the header is omitted and the peer refuses."""
     body = json.dumps({"operator": operator, "arguments": arguments}).encode()
-    req = urllib.request.Request(base + "/v1/invoke", data=body,
-                                 headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    token = os.getenv("EMBER_INVOKE_TOKEN", "")
+    if token:
+        headers["X-Ember-Token"] = token
+    req = urllib.request.Request(base + "/v1/invoke", data=body, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
@@ -298,7 +305,7 @@ def pull_from_peers(store, *, max_pages: int = 40, page: int = 25, with_content:
         from .sync import _put_op
         _put_op(store, {
             "id": cid, "content_type": "application/vnd.agience.mesh-cursor+json",
-            "state": "committed", "peer": base, "page_offset": offset, "page_after": after,
+            "state": "live", "peer": base, "page_offset": offset, "page_after": after,
             "pulled_total": (cur.get("pulled_total", 0) + pulled),
             "content": f"mesh pull cursor for {base}", "provenance": genesis.P_HUMAN,
             "cited_from": genesis.CITE_GENESIS, "updated": _now()})

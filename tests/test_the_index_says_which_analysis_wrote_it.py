@@ -189,7 +189,7 @@ def _generation_cli(tmp_path, monkeypatch, *, populated: bool, stamp):
     from mantle.search.mantle.wiring import _segment_prefixes, local_sse_path
 
     monkeypatch.setenv("MANTLE_SSE_DIR", str(tmp_path))
-    _, prefix = _segment_prefixes("committed")
+    _, prefix = _segment_prefixes("live")
     store = SqlitePostingStore(local_sse_path(prefix))
     if populated:
         store.add_entry("p1", "deadbeef", "a1", "c1", b"blob")

@@ -274,7 +274,7 @@ class TestSseStoreSelection:
             ),
         ]
 
-    def _build(self, *patches, segment="committed"):
+    def _build(self, *patches, segment="live"):
         with ExitStack() as stack:
             for p in patches:
                 stack.enter_context(p)
@@ -320,14 +320,14 @@ class TestSseStoreSelection:
         assert self._build(*self._s3(configured=True)) is None
 
     def test_segments_get_separate_local_trees(self):
-        """Per-state index segments use separate directories, so a draft's postings cannot
-        answer a committed-only query."""
-        committed = self._build(*self._s3(configured=False), segment="committed")
-        draft = self._build(*self._s3(configured=False), segment="draft")
-        committed.put_posting("owner-A", "a" * 64, b"committed")
-        draft.put_posting("owner-A", "a" * 64, b"draft")
-        assert committed.get_posting("owner-A", "a" * 64) == b"committed"
-        assert draft.get_posting("owner-A", "a" * 64) == b"draft"
+        """Per-state index segments use separate directories, so an archived artifact's
+        postings cannot answer a live query."""
+        live = self._build(*self._s3(configured=False), segment="live")
+        archived = self._build(*self._s3(configured=False), segment="archived")
+        live.put_posting("owner-A", "a" * 64, b"live")
+        archived.put_posting("owner-A", "a" * 64, b"archived")
+        assert live.get_posting("owner-A", "a" * 64) == b"live"
+        assert archived.get_posting("owner-A", "a" * 64) == b"archived"
 
     def test_local_root_follows_MANTLE_SSE_DIR(self, monkeypatch, tmp_path):
         """The local index root follows `MANTLE_SSE_DIR`, so it lands on the mounted volume the
@@ -383,7 +383,7 @@ class TestCellStoreSelection:
             ),
         ]
 
-    def _build(self, *patches, segment="committed"):
+    def _build(self, *patches, segment="live"):
         with ExitStack() as stack:
             for p in patches:
                 stack.enter_context(p)
@@ -417,13 +417,13 @@ class TestCellStoreSelection:
         assert self._build(*self._s3(configured=True)) is None
 
     def test_segments_get_separate_local_trees(self):
-        """A draft's cells cannot answer a committed-only query, on disk as in S3."""
-        committed = self._build(*self._s3(configured=False), segment="committed")
-        draft = self._build(*self._s3(configured=False), segment="draft")
-        committed.put("owner-A", "col-1", b"committed", "anchor-0")
-        draft.put("owner-A", "col-1", b"draft", "anchor-0")
-        assert committed.get("owner-A", "col-1", "anchor-0") == b"committed"
-        assert draft.get("owner-A", "col-1", "anchor-0") == b"draft"
+        """An archived artifact's cells cannot answer a live query, on disk as in S3."""
+        live = self._build(*self._s3(configured=False), segment="live")
+        archived = self._build(*self._s3(configured=False), segment="archived")
+        live.put("owner-A", "col-1", b"live", "anchor-0")
+        archived.put("owner-A", "col-1", b"archived", "anchor-0")
+        assert live.get("owner-A", "col-1", "anchor-0") == b"live"
+        assert archived.get("owner-A", "col-1", "anchor-0") == b"archived"
 
     def test_local_root_follows_MANTLE_CELL_DIR(self, monkeypatch, tmp_path):
         monkeypatch.setenv("MANTLE_CELL_DIR", str(tmp_path / "elsewhere"))

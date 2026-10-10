@@ -40,10 +40,10 @@ the alternative fails an ordinary URL search outright. There is no warning field
 did-you-mean: guessing at intent from a colon is how the parser got into this in the first place.
 
 `state` is not filterable, and that is a statement about the store rather than a gap. It selects
-the index segment: `committed`, `draft` and `archived` are separately-keyed encrypted trees under
-distinct object-storage prefixes (`mantle/wiring._segment_prefixes`), chosen when the accessor is
-built and before any query runs. A `state:draft` filter could not narrow a committed-segment
-recall to drafts, because no draft is in the tree being read. `ArtifactRecallRequest.state` is the
+the index segment: `live` and `archived` are separately-keyed encrypted trees under distinct
+object-storage prefixes (`mantle/wiring._segment_prefixes`), chosen when the accessor is built and
+before any query runs. A `state:archived` filter could not narrow a live-segment recall to
+archived artifacts, because none is in the tree being read. `ArtifactRecallRequest.state` is the
 one way to say it, so a `state:` filter is refused with a message naming that field.
 """
 
@@ -201,7 +201,7 @@ FIELD_ALIASES: Dict[str, str] = {
 #: built here"; a bare "unknown field" would invite a bug report for `content:` forever.
 REFUSED_FIELDS: Dict[str, str] = {
     "state": (
-        "`state` selects the index segment (committed | draft | archived), which is a separately "
+        "`state` selects the index segment (live | archived), which is a separately "
         "keyed encrypted tree chosen before the query runs — a filter cannot narrow one segment "
         "to another. Send the `state` request field instead"
     ),
@@ -241,7 +241,7 @@ def is_filter_field(word: str) -> bool:
     field to `FILTERABLE_FIELDS` and the parser recognizes it in the same commit; there is
     nowhere else to remember.
 
-    `REFUSED_FIELDS` counts as a field, and that is the load-bearing half. `state:draft` is a
+    `REFUSED_FIELDS` counts as a field, and that is the load-bearing half. `state:archived` is a
     filter the caller meant as one, so it must still reach `_validate` and be refused BY NAME.
     Narrowing which words are fields must not soften the error for a word that genuinely is
     one — a refusal that quietly became a search term would answer a different question.

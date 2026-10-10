@@ -54,6 +54,7 @@ from mantle.db.backend import (
 )
 from mantle.entities.artifact import Artifact as ArtifactEntity
 from mantle.services.acting_principal import acting_as
+from mantle.services import mint_context as _mc
 from mantle.services.bootstrap_types import CREDENTIAL_CONTENT_TYPE
 from mantle.services.platform_topology import register_id
 from mantle.services.seed_provisioning.loader import derive_uuid, get_instance_namespace
@@ -86,15 +87,17 @@ def _ensure_artifact(
     db: Database, artifact_id: str, *, content_type: str, name: str,
     description: str, context: dict, content: str, owner: str,
 ) -> bool:
-    """Upsert a committed artifact, CONVERGING its content/context to the current
+    """Upsert a live artifact, CONVERGING its content/context to the current
     values (so config like the authorizer's client_id updates when env changes —
     "agnostic to what exists"). Returns True if it already existed."""
     now = datetime.now(timezone.utc).isoformat()
     ctx_json = json.dumps(context, separators=(",", ":"))
     existing = db_get_artifact(db, artifact_id)
     if existing is not None:
-        # Reconcile content/context/labels to current; preserve identity + provenance.
-        existing.context = ctx_json
+        # Reconcile content/context/labels to current; preserve identity + provenance. The
+        # context's keys replace the stored ones over its server-owned facets
+        # (`mint_context.with_client_keys`).
+        existing.context = _mc.with_client_keys(getattr(existing, "context", None), context)
         existing.content = content
         existing.name = name
         existing.description = description
@@ -104,7 +107,7 @@ def _ensure_artifact(
         return True
     db_create_artifact(db, ArtifactEntity(
         id=artifact_id, root_id=artifact_id,
-        state=ArtifactEntity.STATE_COMMITTED,
+        state=ArtifactEntity.STATE_LIVE,
         context=ctx_json,
         content=content,
         content_type=content_type,

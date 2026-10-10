@@ -18,10 +18,10 @@ It exercises the full matrix the platform is meant to guarantee:
 
 - **Auth** — bootstrap → operator; register + login; external-issuer tokens; bad/expired/wrong-`aud` → 401; grant keys and grant bundles (`agk_…`) usable on Mantle; retired `agc_` API keys rejected.
 - **Users / provisioning** — first `GET /artifacts/visible` seeds baseline grants; same `sub` under two issuers → two distinct users.
-- **Collections / artifacts** — every core API: create (top-level=committed / child=draft), read, update, delete, children, order, commits, batch, visible.
+- **Collections / artifacts** — every core API: create (top-level and child both `live`), read, update, delete, children, order, commits, batch, visible.
 - **Sharing (grants in Mantle's own lattice, CRUDEASIO booleans)** — `can_read` grant + propagation; a read-only grantee's write → **404** (confinement masks 403 as not-found); invite → claim; revoke → 404; deny-effect → 404; **cross-tenant isolation**.
-- **Search** — `POST /artifacts/recall`, ordered + hydrated and `candidates: true` (the same narrowed set, unordered); `state` = committed vs draft.
-- **Commit / first-observation** — draft → `PATCH {state: committed}` → visible in committed search; revert; under `MANTLE_LAZY_INDEX=on`, lazy create → invisible → first `GET` → materialized → visible → `/warm` bulk.
+- **Search** — `POST /artifacts/recall`, ordered + hydrated and `candidates: true` (the same narrowed set, unordered); `state` = live (default) vs archived.
+- **Born findable / first-observation** — a new child is `live` and searchable with no further step, `PATCH {state: draft}` is a 422; under `MANTLE_LAZY_INDEX=on`, lazy create → invisible → first `GET` → materialized → visible → `/warm` bulk.
 - **Events / Issuers** — `WS /events` delivery + ACL; `/system/issuers` admin-only.
 - **Platform admin** — the `/system` namespace behind one predicate: `GET /system/users` is 403 for a non-admin, `POST /system/users/{id}/grant-admin` promotes, `DELETE /system/users/{id}/revoke-admin` demotes, and the operator cannot revoke its own admin.
 

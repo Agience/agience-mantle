@@ -163,7 +163,7 @@ from mantle.services import workspace_service as ws_svc                # noqa: E
 def _member(**kw):
     d = dict(id="a-1", root_id="a-1", collection_id="ws-1", name="before",
              description="before", content="", content_type="text/plain",
-             state=ArtifactEntity.STATE_DRAFT, created_by="user-1", modified_by="user-1")
+             state=ArtifactEntity.STATE_LIVE, created_by="user-1", modified_by="user-1")
     d.update(kw)
     return ArtifactEntity(**d)
 

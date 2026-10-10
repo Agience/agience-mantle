@@ -528,30 +528,41 @@ class TestAPostingKeyedByRootStillResolves:
 
         return _Store()
 
-    def test_a_root_id_resolves_to_its_newest_committed_version(self, monkeypatch):
+    def test_a_root_id_resolves_to_its_newest_live_version(self, monkeypatch):
         from mantle.search.mantle import lightcone
 
         store = self._store({}, {
             "root-1": [
-                {"id": "v1", "root_id": "root-1", "state": "committed", "name": "old"},
+                {"id": "v1", "root_id": "root-1", "state": "live", "name": "old"},
                 {"id": "v2", "root_id": "root-1", "state": "committed", "name": "new"},
+                {"id": "v3", "root_id": "root-1", "state": "archived", "name": "retired"},
             ],
         })
         monkeypatch.setattr(lightcone, "_raw_artifact", lambda *_a, **_k: None)
         docs = lightcone._raw_artifacts(store, ["root-1"])
         assert docs["root-1"]["name"] == "new", (
-            "the lineage is oldest-first, so the LAST committed doc is the current one"
+            "the lineage is oldest-first, so the LAST non-archived doc is the current one"
         )
 
-    def test_a_draft_is_not_substituted_for_a_missing_commit(self, monkeypatch):
-        """`recall` reads the committed segment; answering with a draft publishes what nobody did."""
+    def test_a_draft_only_legacy_lineage_resolves(self, monkeypatch):
+        """A legacy `draft` is live: a lineage that only ever held one is found."""
         from mantle.search.mantle import lightcone
 
         store = self._store({}, {
             "root-2": [{"id": "d1", "root_id": "root-2", "state": "draft", "name": "wip"}],
         })
         monkeypatch.setattr(lightcone, "_raw_artifact", lambda *_a, **_k: None)
-        assert lightcone._raw_artifacts(store, ["root-2"]) == {}
+        assert lightcone._raw_artifacts(store, ["root-2"])["root-2"]["id"] == "d1"
+
+    def test_an_archived_lineage_is_not_substituted(self, monkeypatch):
+        """Recall reads the live segment; answering with a retired version resurrects it."""
+        from mantle.search.mantle import lightcone
+
+        store = self._store({}, {
+            "root-3": [{"id": "a1", "root_id": "root-3", "state": "archived", "name": "gone"}],
+        })
+        monkeypatch.setattr(lightcone, "_raw_artifact", lambda *_a, **_k: None)
+        assert lightcone._raw_artifacts(store, ["root-3"]) == {}
 
     def test_the_second_hop_runs_only_on_the_misses(self, monkeypatch):
         """An ordinary recall, where every id is a real vertex, must not pay a lineage read."""
@@ -560,7 +571,7 @@ class TestAPostingKeyedByRootStillResolves:
         store = self._store({}, {})
         monkeypatch.setattr(
             lightcone, "_raw_artifact",
-            lambda _s, aid: {"id": aid, "state": "committed"},
+            lambda _s, aid: {"id": aid, "state": "live"},
         )
         docs = lightcone._raw_artifacts(store, ["a", "b"])
         assert set(docs) == {"a", "b"}

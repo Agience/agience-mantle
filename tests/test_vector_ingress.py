@@ -171,7 +171,7 @@ def test_the_empty_vector_contract_still_holds(monkeypatch):
 
 def _artifact():
     return SimpleNamespace(
-        id="art-1", root_id="art-1", state="committed", collection_id="ws-1",
+        id="art-1", root_id="art-1", state="live", collection_id="ws-1",
         created_by="user-1", modified_by="user-1", content_type="text/plain",
         context="{}", content="hello world", name="", description="",
         created_time="2026-08-09T00:00:00Z",
@@ -199,7 +199,7 @@ def wired(monkeypatch):
     monkeypatch.setattr("mantle.search.mantle.principal.resolve_cell_principal",
                         lambda db, cid: "principal-1")
     monkeypatch.setattr("mantle.search.mantle.wiring.build_indexer",
-                        lambda db, segment="committed": indexer)
+                        lambda db, segment="live": indexer)
     monkeypatch.setattr(pipeline_unified, "_ingest_key_request", lambda pid: object())
     return indexer
 
@@ -252,7 +252,7 @@ def test_index_artifact_carries_the_vector_to_the_vector_arm_only():
     """The lexical arm reads text and must not be handed a vector it has no use for."""
     seen = {}
 
-    def _vec(artifact, cid, fields, *, segment="committed", vector=None):
+    def _vec(artifact, cid, fields, *, segment="live", vector=None):
         seen["vector"] = vector
         return pipeline_unified.ARM_WRITTEN
 

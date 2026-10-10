@@ -316,7 +316,7 @@ def test_every_workspace_write_path_declares_its_verb():
     WRITE_FNS = {
         "update_workspace", "delete_workspace", "update_workspace_context",
         "create_workspace_artifact", "create_workspace_artifacts_bulk",
-        "update_artifact", "revert_artifact", "add_artifact_to_workspace",
+        "update_artifact", "add_artifact_to_workspace",
         "move_workspace_artifact",
     }
 

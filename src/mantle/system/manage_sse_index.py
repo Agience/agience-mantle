@@ -23,7 +23,7 @@ can go once a recall answers.
 
     python -m mantle.system.manage_sse_index --report
     python -m mantle.system.manage_sse_index
-    python -m mantle.system.manage_sse_index --segment draft
+    python -m mantle.system.manage_sse_index --segment archived
 """
 from __future__ import annotations
 
@@ -122,8 +122,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--report", action="store_true",
                     help="count what would move; write nothing")
-    ap.add_argument("--segment", default="committed",
-                    help="which index segment to migrate (committed / draft / archived)")
+    ap.add_argument("--segment", default="live",
+                    help="which index segment to migrate (live / archived / draft, the legacy segment)")
     ap.add_argument("--generation", action="store_true",
                     help="report which analyzer generation wrote this segment, then exit")
     args = ap.parse_args()

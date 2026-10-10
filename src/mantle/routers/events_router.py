@@ -143,7 +143,9 @@ from mantle.services.dependencies import (
     AuthContext,
     _check_grant_permission,
     check_access,
+    enforce_token_bounds,
     get_auth,
+    offload_sync,
     resolve_auth,
 )
 
@@ -857,11 +859,24 @@ async def _authenticate_ws(ws: WebSocket) -> Optional["_Session"]:
         await ws.close(code=1011, reason="Database unavailable")
         return None
 
+    # In a worker thread, as `get_auth` does: resolution verifies a JWT (and may fetch an
+    # issuer's JWKS) or reads and writes the store for a grant key, and on the event loop that
+    # blocks every other request for the duration of each handshake.
     try:
-        auth = resolve_auth(token, store_db, request=None)
+        auth = await offload_sync(resolve_auth, token, store_db, request=None)
     except Exception as exc:
         logger.info("events WS auth rejected: %s", exc)
         await ws.close(code=4401, reason="Invalid token")
+        return None
+
+    # The same bounds `get_auth` applies after resolution. A platform-scoped token is judged with
+    # no request, which refuses it: no scope names this socket. A key flagged `requires_nonce`
+    # must present its `X-Agience-Challenge` on the handshake.
+    try:
+        enforce_token_bounds(auth, None, nonce_source=ws)
+    except HTTPException as exc:
+        logger.info("events WS refused: %s", exc.detail)
+        await ws.close(code=4403, reason="Forbidden")
         return None
 
     # Publish the acting principal, exactly as `get_auth` does for HTTP routes.
