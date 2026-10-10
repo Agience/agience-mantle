@@ -89,7 +89,8 @@ def _sources():
         if not root.is_dir():
             continue
         for path in root.rglob("*.py"):
-            if any(part in _SKIP for part in path.parts):
+            # Relative to the repo: CI's own checkout sits under `_ci-work`.
+            if any(part in _SKIP for part in path.relative_to(root).parts):
                 continue
             if path.name.startswith("test_") or "tests" in path.parts:
                 continue
