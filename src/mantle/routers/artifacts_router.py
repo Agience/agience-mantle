@@ -2314,14 +2314,10 @@ async def list_children(
     #: number would put it straight back. It is passed inline at the `_page` call below so the
     #: value is visible where the promise is made.
 
-    # Enrich with committed_collection_ids (structural — pure edge traversal)
-    from mantle.entities.artifact import Artifact as ArtifactEntity
-    from mantle.services.collection_service import attach_committed_collection_ids
-    entities = [ArtifactEntity.from_dict(c) for c in children]
-    # A membership query per child on the page — the keyed batch, offloaded whole.
-    await offload_sync(attach_committed_collection_ids, store_db, entities)
-    for raw, entity in zip(children, entities):
-        raw["committed_collection_ids"] = getattr(entity, "committed_collection_ids", [])
+    # Memberships (structural — pure edge traversal): a membership query per child on the page,
+    # the keyed batch, offloaded whole.
+    from mantle.services.collection_service import attach_memberships
+    await offload_sync(attach_memberships, store_db, children)
 
     # Normalize each child
     for child in children:
@@ -3175,6 +3171,10 @@ async def batch_fetch_artifacts(
 
     results = await offload_sync(_fetch_authorized_docs, store_db, auth, body.artifact_ids,
                                  body.include_archived)
+    # The same memberships the children listing carries. Search results are hydrated here, and
+    # without them a card opened from search said it was in no collection (2026-10-17, staging).
+    from mantle.services.collection_service import attach_memberships
+    await offload_sync(attach_memberships, store_db, results)
     #: `artifacts` retired for the one shape. A batch fetch is not paged — it answers exactly
     #: the ids asked for — so `has_more` is False by construction rather than by measurement.
     return _page(results, total=len(results), has_more=False)

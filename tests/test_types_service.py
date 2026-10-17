@@ -179,9 +179,9 @@ _CANONICAL_ROOT = types_root()
 def _content_type_for_folder(type_json_path: Path, root: Path) -> str:
     """Inverse of `_content_type_to_rel_folder`: derive the content type a
     `type.json` is resolved under from its `<top>/<sub>` folder beneath a root
-    (`_wildcard` ↦ `*`)."""
+    (`_wildcard` ↦ `*`, at either level: the root `*/*` is `_wildcard/_wildcard`)."""
     top, sub = type_json_path.parent.relative_to(root).parts
-    return f"{top}/{'*' if sub == '_wildcard' else sub}"
+    return f"{'*' if top == '_wildcard' else top}/{'*' if sub == '_wildcard' else sub}"
 
 
 def _all_type_files() -> list[tuple[Path, Path]]:

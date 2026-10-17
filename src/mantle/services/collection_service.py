@@ -192,6 +192,21 @@ def attach_committed_collection_ids(db: Database, artifacts: Sequence[ArtifactEn
     _attach_committed_collection_ids(db, artifacts)
 
 
+def attach_memberships(db: Database, docs: list) -> None:
+    """Give each artifact document `committed_collection_ids` (its collections, workspaces left
+    out, as the sharing checks read them) and `container_ids` (every container holding it,
+    workspaces included: a workspace is a collection is an artifact)."""
+    from mantle.db.backend import batch_get_container_ids_for_roots
+    from mantle.entities.artifact import Artifact as ArtifactEntity
+    entities = [ArtifactEntity.from_dict(d) for d in docs]
+    _attach_committed_collection_ids(db, entities)
+    roots = [str(d.get("root_id") or d.get("id") or "") for d in docs]
+    containers = batch_get_container_ids_for_roots(db, list(dict.fromkeys(r for r in roots if r)))
+    for doc, entity, root in zip(docs, entities, roots):
+        doc["committed_collection_ids"] = getattr(entity, "committed_collection_ids", [])
+        doc["container_ids"] = sorted(containers.get(root, []))
+
+
 # === Collection CRUD ===
 
 def create_new_collection(

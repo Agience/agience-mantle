@@ -1657,6 +1657,23 @@ def batch_get_collection_ids_for_roots(db: LatticeDatabase, root_ids: list) -> D
     return {r: _collection_ids_for_root(db, r, is_workspace) for r in (root_ids or [])}
 
 
+def batch_get_container_ids_for_roots(db: LatticeDatabase, root_ids: list) -> Dict[str, list]:
+    """`{root_id -> every container holding it}`, workspaces included.
+
+    A workspace is a collection is an artifact, so this is the whole answer to "where is this
+    artifact": `batch_get_collection_ids_for_roots` leaves workspaces out for the sharing checks
+    that read it. Raises `EdgesTruncated` rather than return a clipped list."""
+    out: Dict[str, list] = {}
+    for root in root_ids or []:
+        seen: list = []
+        for e in (db.graph.edges_of(root, direction="in") or []):
+            cid = e.get("src")
+            if cid and cid not in seen:
+                seen.append(cid)
+        out[root] = seen
+    return out
+
+
 def list_live_artifacts_by_context_content_type(db: LatticeDatabase, content_type: str, *,
                                                 created_by: Optional[str] = None) -> list:
     """Live artifacts whose ``context.content_type`` matches (trust-config loads).

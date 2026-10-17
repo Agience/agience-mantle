@@ -142,7 +142,9 @@ def all_values(artifact: Any, paths: Iterable[str]) -> List[str]:
 # ── resolving a type's offer ─────────────────────────────────────────────────────────────────
 
 def _lineage(content_type: str) -> List[str]:
-    """``content_type``, the types it inherits (depth first), then its major wildcard."""
+    """``content_type``, the types it inherits (depth first), its major wildcard, then the root
+    ``*/*`` (Artifact). An Agience or ``+json`` data type skips ``application/*`` (File), as Crystal
+    and the web app resolve it."""
     seen: List[str] = []
 
     def walk(ct: str) -> None:
@@ -154,7 +156,10 @@ def _lineage(content_type: str) -> List[str]:
 
     walk(content_type)
     if "/" in content_type:
-        walk(content_type.split("/", 1)[0] + "/*")
+        data = content_type.startswith("application/vnd.agience.") or content_type.endswith("+json")
+        if not data:
+            walk(content_type.split("/", 1)[0] + "/*")
+    walk("*/*")
     return seen
 
 

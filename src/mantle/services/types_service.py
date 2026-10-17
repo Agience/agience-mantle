@@ -90,8 +90,9 @@ def _content_type_to_rel_folder(content_type: str) -> Optional[Path]:
     if not content_type or "/" not in content_type:
         return None
     top, sub = content_type.split("/", 1)
-    if sub == "*":
-        sub = "_wildcard"
+    # `_wildcard` is `*` at either level, so the root `*/*` is `_wildcard/_wildcard`.
+    top = "_wildcard" if top == "*" else top
+    sub = "_wildcard" if sub == "*" else sub
     return Path(top) / sub
 
 

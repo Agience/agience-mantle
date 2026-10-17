@@ -358,7 +358,7 @@ collect_ignore: list = []
 _IGNORE_UNCOLLECTABLE: set = set()
 
 # The seeds/types package tree is split across repos: seeds live at
-# `agience-observe/package/seeds`; types live at `agience-crystal/src/types`, with
+# `agience-observe/package/seeds`; types live at `agience-crystal/src/crystal/types`, with
 # a vendored copy at `agience-chorus/src/astra/web/vendor/package/types`.
 # `_package_root` is the one place that resolves both locations, so the gate here
 # and the tests below it agree on where the tree lives.
@@ -409,7 +409,7 @@ def pytest_collection_modifyitems(config, items):
         return
     skip = pytest.mark.skip(
         reason="requires a package root holding BOTH seeds/ and types/ — the tree is SPLIT: "
-               "seeds at agience-observe/package/seeds, types at agience-crystal/src/types. "
+               "seeds at agience-observe/package/seeds, types at agience-crystal/src/crystal/types. "
                "NOT in agience-origin. See the note above."
     )
     for item in items:

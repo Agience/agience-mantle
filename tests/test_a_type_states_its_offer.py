@@ -345,3 +345,9 @@ class TestTwoSourcesForOneType:
         result = type_offers.publish(object(), "astra", [])
         assert result["archived"] == 1
         assert type_offers.offer_of("text/markdown")["title"] == ("name",)
+
+
+def test_the_root_declares_for_every_type_that_does_not():
+    type_offers.set_definitions({"*/*": {"offer": {"description": ["context.summary"]}}})
+    assert type_offers.offer_of("application/vnd.agience.lead+json")["description"] == ("context.summary",)
+    assert type_offers.offer_of("text/markdown")["description"] == ("context.summary",)

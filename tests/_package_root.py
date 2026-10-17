@@ -27,7 +27,7 @@ def package_root() -> Path:
 
 # The tree is split across two repos:
 #   · seeds → `agience-observe/package/seeds`
-#   · types → `agience-crystal/src/types`
+#   · types → `agience-crystal/src/crystal/types`
 # Deriving both from a single `package_root()` cannot locate them, since no common parent
 # contains both.
 #
@@ -37,7 +37,7 @@ def package_root() -> Path:
 # the standalone-installable claim requires.
 #
 #     MANTLE_SEEDS_ROOT=<workspace>/agience-observe/package/seeds \
-#     MANTLE_TYPES_ROOT=<workspace>/agience-crystal/src/types \
+#     MANTLE_TYPES_ROOT=<workspace>/agience-crystal/src/crystal/types \
 #     python -m pytest -q tests
 
 #: Sibling locations, used only when a full workspace checkout is present. A standalone
@@ -46,7 +46,7 @@ def package_root() -> Path:
 #: module is the only place that names a sibling repo; every caller asks it rather than guessing.
 _WORKSPACE = _MANTLE_REPO.parent
 _SIBLING_SEEDS = _WORKSPACE / "agience-observe" / "package" / "seeds"
-_SIBLING_TYPES = _WORKSPACE / "agience-crystal" / "src" / "types"
+_SIBLING_TYPES = _WORKSPACE / "agience-crystal" / "src" / "crystal" / "types"
 
 
 def seeds_root() -> Path:
