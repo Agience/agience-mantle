@@ -288,6 +288,15 @@ def override_dependencies():
     app.dependency_overrides.clear()
 
 @pytest.fixture(autouse=True)
+def _no_published_types():
+    """A test starts with no published type definitions, so every type reads the default offer."""
+    from mantle.services import type_offers
+    type_offers.set_definitions({})
+    yield
+    type_offers.set_definitions({})
+
+
+@pytest.fixture(autouse=True)
 def _reset_indexed_geometry():
     """A test starts from a store that has never been indexed under any AnchorSet.
 

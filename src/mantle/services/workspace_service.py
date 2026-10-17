@@ -375,6 +375,8 @@ def update_workspace(
             _refuse_a_combined_transition(edits)
             _refuse_restoring_a_superseded_version(db, ws)
             ws.state = CollectionEntity.STATE_LIVE
+            # A restore takes it out of Trash too (`services/trash.py`).
+            ws.trashed_by = ws.trashed_time = None
             ws.modified_by = user_id
             ws.modified_time = _now_iso()
             store.update_collection(db, ws)
@@ -1636,6 +1638,8 @@ def update_artifact(
         _refuse_restoring_a_superseded_version(db, target)
         # Unarchive: every state but `archived` is `live`.
         target.state = ArtifactEntity.STATE_LIVE
+        # A restore takes it out of Trash too (`services/trash.py`).
+        target.trashed_by = target.trashed_time = None
         target.modified_by = user_id
         target.modified_time = _now_iso()
         #: No guard, for the reason given above.
@@ -1924,6 +1928,19 @@ def delete_artifact(
     return counts
 
 
+def _may_update_artifact(db: Database, auth: Any, artifact_id: str) -> bool:
+    """May this caller change `artifact_id`? Fails closed, as `_may_delete_artifact` does."""
+    if auth is None:
+        return False
+    try:
+        from mantle.services.dependencies import check_access
+
+        check_access(auth, artifact_id, "update", db)
+        return True
+    except Exception:
+        return False
+
+
 def _may_delete_artifact(db: Database, auth: Any, artifact_id: str) -> bool:
     """May this caller delete `artifact_id` in its own right — an owner grant or a delete grant?
 
@@ -1949,38 +1966,24 @@ def remove_artifact_from_container(
     artifact_id: str,
     auth: Any = None,
 ) -> ArtifactEntity:
-    """Remove an artifact from a container by detaching its edge.
+    """Remove an artifact from a container. Removing never destroys.
 
     Works on any container, not just workspaces. Access is gated by the caller's `check_access`,
     with the `evict` action.
 
-    An artifact HOMED in this container (its current version's `collection_id` is this container)
-    is also taken out of the search index here, in every state. Recall reads an artifact's index
-    entry from its home collection (`lightcone.resolve_authorized_scope` builds its contexts from
-    `doc.collection_id`), so a row that kept its home and its index entry would still answer a
-    recall scoped to the container it was removed from. A member linked in from elsewhere has no
-    index entry here, and only its edge goes.
+    - **Another container still holds the root:** its edge here is detached and nothing else
+      changes. An artifact HOMED here (its current version's `collection_id` is this container) is
+      also taken out of the search index, in every state: recall reads an artifact's index entry
+      from its home collection (`lightcone.resolve_authorized_scope`), so a homed row that kept its
+      entry would still answer a recall scoped to the container it was removed from. It stays homed
+      here, because the home is also the content-key scope (`db/doc_boundary.content_key_scope`).
+    - **Nothing else holds it:** it is archived in place and keeps its edge here, so it leaves the
+      container's live listing and recall and stays in the container's archived listing, where it
+      can be restored or deleted. Detaching it would leave an artifact that nothing lists.
+      Archiving changes the artifact, so it needs the caller's `update` on it as well as `evict` on
+      the container; without that the removal is refused rather than orphaning the artifact.
 
-    What happens to a homed row after that turns on two facts:
-
-    - **No other container holds the root, and the caller may delete it** (an owner or delete
-      grant, `_may_delete_artifact`): the lineage is destroyed — every version row and every edge.
-      Nothing else reaches it, so keeping it would leave a row that nothing lists.
-    - **Otherwise** the row stays where it is, homed here and unindexed: still listed by the
-      containers that link it and still readable by id, and not returned by recall. It is not
-      moved to another container, because the home is also the content-key scope
-      (`db/doc_boundary.content_key_scope`) and a body sealed under one scope cannot be opened
-      under another.
-
-    The destroy needs its own authorization: `evict` on the container is not enough on its own,
-    or a caller who could evict could destroy another user's artifact under a container
-    permission, with the artifact's own grants never consulted. Unlinking is fairly a property of
-    the container; deleting an artifact is not.
-
-    `auth` is the caller's context, needed to make that second check. It is optional only so the
-    unlink path stays callable without one; when it is absent the row is left in place rather
-    than deleted. That is the safe direction: an orphaned row is recoverable, an unauthorized
-    deletion is not.
+    Returns the artifact: its `state` is `archived` when the removal archived it.
     """
     # Resolve the root_id: the caller may pass a version id or a root_id.
     root_id = artifact_id
@@ -2004,6 +2007,22 @@ def remove_artifact_from_container(
             "That artifact is not a member of this container — nothing was detached. It may "
             "exist elsewhere, or not exist at all; this route cannot tell you which.")
 
+    held_elsewhere = store.count_other_containers_for_root(db, root_id, container_id) > 0
+    if not held_elsewhere:
+        # 2026-10-14, John: Remove only unlinks. An artifact held nowhere else used to be destroyed.
+        current = (store.get_current_in_collection(db, container_id, root_id)
+                   or store.get_latest_live_artifact(db, root_id))
+        if current is None:
+            # Already archived: removing it again changes nothing.
+            return artifact or ArtifactEntity(id=root_id, root_id=root_id)
+        if not _may_update_artifact(db, auth, current.id):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "This is the only place that artifact is kept, and removing it would archive it; "
+                "you are not permitted to change it. Ask its owner.")
+        return update_artifact(db, user_id, current.collection_id or container_id, current.id,
+                               state=ArtifactEntity.STATE_ARCHIVED, auth=auth)
+
     store.remove_artifact_from_collection(db, container_id, root_id)
 
     local = store.get_current_in_collection(db, container_id, root_id)
@@ -2017,18 +2036,6 @@ def remove_artifact_from_container(
             logger.warning("index removal FAILED for %s — it was removed from %s and a recall "
                            "scoped there can still return it", root_id, container_id,
                            exc_info=True)
-
-        held_elsewhere = store.count_other_containers_for_root(db, root_id, container_id) > 0
-        if held_elsewhere:
-            logger.info("remove_artifact_from_container(%s): %s kept — another container still "
-                        "holds it", container_id, root_id)
-        elif not _may_delete_artifact(db, auth, root_id):
-            logger.info("remove_artifact_from_container(%s): %s kept — the caller holds `evict` "
-                        "on the container but not `delete` on the artifact",
-                        container_id, root_id)
-        else:
-            store.delete_artifacts_by_root(db, root_id)
-            store.remove_all_edges_for_root(db, root_id)
 
     _emit_event(container_id, "artifact.deleted", {"artifact_id": artifact_id}, actor_id=user_id)
     return artifact or ArtifactEntity(id=root_id, root_id=root_id)

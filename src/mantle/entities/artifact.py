@@ -116,6 +116,11 @@ class Artifact(BaseEntity):
         # title split into words. The type cannot tell them apart. `colimit_of` can, because
         # carrying it is what being a merge means.
         colimit_of: Optional[list] = None,
+        # Who moved this artifact to Trash, and when. Set together on an archived artifact by
+        # `services.trash`, cleared together when it is restored; an artifact trashed more than
+        # `trash.RETENTION_DAYS` ago is deleted by policy. Modelled so an entity write keeps them.
+        trashed_by: Optional[str] = None,
+        trashed_time: Optional[str] = None,
     ):
         super().__init__(id=id, created_time=created_time, modified_time=modified_time)
 
@@ -134,6 +139,8 @@ class Artifact(BaseEntity):
         self.origin_root = origin_root or (self.id if not collection_id else None)
         self.lemmas = lemmas
         self.colimit_of = colimit_of
+        self.trashed_by = trashed_by
+        self.trashed_time = trashed_time
         self.context = context
         self.content = content
         self.content_encrypted = content_encrypted
@@ -187,6 +194,9 @@ class Artifact(BaseEntity):
         # nothing to show why.
         if self.colimit_of is not None:
             d["colimit_of"] = list(self.colimit_of)
+        if self.trashed_by is not None:
+            d["trashed_by"] = self.trashed_by
+            d["trashed_time"] = self.trashed_time
         return {k: v for k, v in d.items() if v is not None}
 
     @classmethod
@@ -217,4 +227,6 @@ class Artifact(BaseEntity):
             content_ref=data.get("content_ref"),
             lemmas=data.get("lemmas"),
             colimit_of=data.get("colimit_of"),
+            trashed_by=data.get("trashed_by"),
+            trashed_time=data.get("trashed_time"),
         )

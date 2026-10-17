@@ -312,14 +312,10 @@ def build_claim_url(raw_token: str) -> str:
 
 
 def _send_invite_email(db, user_id, resource_id, target_email, raw_token, message) -> bool:
-    """Best-effort invite email. Mantle has no mail service, so this normally
-    no-ops (ImportError → False). Kept so a future mail seam can light up."""
-    try:
-        from mantle.services import email_service  # type: ignore
-        from mantle.services.person_service import get_user_by_id
-    except Exception:
-        logger.debug("invite email skipped: no mail service in Mantle")
-        return False
+    """Mail the invitation (`services/email_service`). False when mail is not configured or the
+    send failed; the invite stands either way, and its claim link is in the response."""
+    from mantle.services import email_service
+    from mantle.services.person_service import get_user_by_id
     try:
         # No subject token here: this runs several frames below the route, off the
         # invite-creation path, and is handed a `user_id` rather than a request — so the call is
@@ -332,10 +328,24 @@ def _send_invite_email(db, user_id, resource_id, target_email, raw_token, messag
         from_name = "Someone"
     claim_url = build_claim_url(raw_token)
     try:
-        return _run_async(email_service.send_invite(target_email, from_name, "a workspace", claim_url, message))
+        return _run_async(email_service.send_invite(target_email, from_name,
+                                                    _resource_name(db, resource_id), claim_url, message))
     except Exception as exc:
         logger.warning("send_invite email delivery failed: %s", exc)
         return False
+
+
+def _resource_name(db, resource_id: str) -> str:
+    """What the invitation names: the resource's title, else "a workspace"."""
+    try:
+        from mantle.db import lattice_api as store
+        from mantle.search.field_filters import parse_context
+        doc = store.get_artifact(db, resource_id)
+        raw = doc.to_dict() if hasattr(doc, "to_dict") else (doc or {})
+        title = (parse_context(raw).get("title") or raw.get("name") or "").strip()
+        return title or "a workspace"
+    except Exception:
+        return "a workspace"
 
 
 def _run_async(coro):

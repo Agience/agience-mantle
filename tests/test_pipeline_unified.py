@@ -18,6 +18,8 @@ These tests cover the public surface:
 from __future__ import annotations
 
 from types import SimpleNamespace
+
+import pytest
 from unittest.mock import MagicMock, patch
 from mantle.services.acting_principal import acting_as
 from .helpers import self_request
@@ -626,7 +628,19 @@ class TestALexiconEntrysNamesAreIndexed:
     this rule existed, `recall("what is oxygen")` did not narrow to that artifact AT ALL and
     answered `LOX / air / artificial blood` — every hyponym carries `oxygen` inside its own title,
     so the hyponyms were findable and the concept was not.
+
+    The lexicon type says so, in its `offer` (Sage publishes `text/x-wordnet` with
+    `"tags": ["lemmas"]`); these tests publish that declaration, and the last one shows a synset
+    whose type says nothing gets no such tags.
     """
+
+    LEXICON_OFFER = {"title": ["title", "context.title", "name", "lemmas.0"], "tags": ["lemmas"]}
+
+    @pytest.fixture(autouse=True)
+    def _lexicon_type_published(self):
+        from mantle.services import type_offers
+        type_offers.set_definitions({"text/x-wordnet": {
+            "content_type": "text/x-wordnet", "offer": self.LEXICON_OFFER}})
 
     @staticmethod
     def _entry(content_type, lemmas):
@@ -696,6 +710,19 @@ class TestALexiconEntrysNamesAreIndexed:
         assert "oxygen" in tags, tags                       # the entry's own other name
         assert "lexicon" in tags, tags                      # the group it belongs to
         assert "collection" not in tags, tags               # the scheme is not a tag
+
+    def test_the_names_come_from_the_type_not_from_the_field(self):
+        """With no published lexicon offer, a synset's lemmas are not its tags."""
+        from mantle.search.ingest import pipeline_unified
+        from mantle.services import type_offers
+
+        type_offers.set_definitions({})
+        artifact = self._entry("text/x-wordnet", ["o", "atomic number 8", "oxygen"])
+        with patch.object(
+            pipeline_unified, "extract_text_from_artifact", return_value="a gloss",
+        ):
+            fields = pipeline_unified._extract_artifact_fields(artifact)
+        assert "oxygen" not in fields.get("tags", ""), fields
 
 
 class TestAMergedConceptIsIndexable:
@@ -855,8 +882,8 @@ class TestAMergedConceptIsIndexable:
         with patch.object(
             pipeline_unified, "extract_text_from_artifact", return_value="",
         ):
-            assert pipeline_unified._lemmas_are_names(merge) is True
-            assert pipeline_unified._lemmas_are_names(term) is False
+            assert pipeline_unified._colimit_names(merge) == ["decade", "decennary"]
+            assert pipeline_unified._colimit_names(term) == []
 
 
 class TestAnArtifactAnnouncesItselfOnce:

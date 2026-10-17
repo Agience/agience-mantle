@@ -5,6 +5,27 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-10-17
+
+### Added
+- `GET /artifacts/{id}/children?state=archived` lists a container's archived members, homed there or linked in, behind the same per-member authorization as the live listing. `state=live` is the default.
+- `POST /artifacts/batch` takes `include_archived` (default `false`) to return archived artifacts too, for a caller showing them on purpose such as a recall of the `archived` segment.
+- `mantle.services.email_service` sends Mantle's mail: invitations to a workspace or collection, through the Gmail API (`EMAIL_PROVIDER=gmail`, `PLATFORM_EMAIL_ADDRESS`, `GMAIL_OAUTH_*`, display name `PLATFORM_EMAIL_NAME`) or written to `EMAIL_OUTBOX_DIR` (`EMAIL_PROVIDER=outbox`). Invitations used to send nothing: the invite path imported a mail service Mantle did not have. The invitation names the inviter and the resource's title.
+- A content type's `type.json` may declare an `offer`: lists of paths (`title`, `context.headline`, `lemmas.0`, `lemmas.1:`) for `title`, `description` and `tags`. The indexer reads the nearest declaration for each through the type's `inherits` and its major wildcard (`text/*`), then the default it used before (top-level `title`, a structured context's `title`, `name`; `description`, a structured context's `description`; no tags).
+- `PUT /type-definitions/{server}` stores every type definition one server owns as a system-owned `application/vnd.agience.type+json` artifact, replacing what it published before and archiving a type it no longer sends. Only Crystal's service identity may call it. A persona's definition outranks Crystal's builtin for the same type, as in Crystal. The artifacts of a type whose resolved offer changed are indexed again. Definitions a user wrote are never read.
+- Published type definitions are loaded at startup, before the index worker starts.
+- Trash. `POST /artifacts/{id}/trash` (needs `delete`) archives the artifact and marks it `trashed_by` and `trashed_time`; `GET /artifacts/trash` lists the caller's Trash, most recently trashed first, each with `purge_after`. Restoring (`PATCH {"state": "live"}`) clears both marks. Every hour, an artifact trashed more than 30 days ago is deleted through the ordinary delete, as the person who trashed it; if they may no longer delete it, it is kept and the refusal logged. `DELETE /artifacts/{id}` still deletes at once.
+- `trashed_by` is indexed in `listkey`, so a Trash listing reads the index instead of scanning archived versions; a store whose index is not built is scanned instead, with a warning. `LatticeArtifactStore.lookup_with_list_field` pages every artifact carrying an indexed field.
+
+### Changed
+- A container's archived listing (`children?state=archived`) leaves out artifacts in Trash; they are listed in Trash instead.
+- Archiving an artifact that is already archived answers 200 with the artifact instead of 404. Any other change to an archived artifact is still refused until it is restored.
+- `DELETE /artifacts/{id}` deletes an archived artifact; it answered 404.
+- Linking an archived artifact into a container (`POST /artifacts` with `source_artifact_id`) is refused with 409 and a message to restore it first. The link used to succeed into a listing that does not show archived members.
+- With archived members included, `list_collection_artifacts` returns an archived artifact linked in from another container, not only one homed in this container.
+- Removing an artifact from a container never destroys it. Held elsewhere, it loses only its link here. Held nowhere else, it is archived in place and keeps its link, so the container's archived listing finds it; that needs `update` on the artifact, and the removal is refused (403) without it. The response's new `archived` field says which happened. An artifact held nowhere else used to be destroyed.
+- A WordNet synset's lemmas are indexed as its names because its type declares them so (Sage's `text/x-wordnet` type), not by a rule in the indexer naming that type. Until Crystal publishes that declaration, a synset is indexed under the default offer.
+
 ## [0.1.3] - 2026-10-09
 
 ### Breaking

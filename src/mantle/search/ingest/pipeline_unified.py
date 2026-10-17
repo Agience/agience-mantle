@@ -54,9 +54,9 @@ from mantle.entities.artifact import Artifact
 
 from mantle.search.ingest.chunking import (
     chunk_text,
-    extract_text_from_context,
     should_chunk_content,
 )
+from mantle.services import type_offers
 from mantle.search.ingest.tags import (
     normalize_tags,
 )
@@ -195,10 +195,6 @@ except Exception as exc:  # pragma: no cover — queue optional during static an
 #:
 #: `_extract_artifact_fields` still returns `content` beside these. The body is not indexed as
 #: itself; what is indexed is what the body announces — see :func:`_body_offer`.
-#: A lexicon entry, whose `lemmas` are the names it goes by rather than terms taken from a body.
-#: See `_extract_fields` for why the distinction has to be made by type and not by the field.
-LEXICON_CONTENT_TYPE = "text/x-wordnet"
-
 #: Not a discriminator, and the reason this comment is long. `application/x-concept` has two
 #: writers on this store, measured 2026-08-24:
 #:
@@ -215,24 +211,19 @@ LEXICON_CONTENT_TYPE = "text/x-wordnet"
 CONCEPT_CONTENT_TYPE = "application/x-concept"
 
 
-def _lemmas_are_names(artifact) -> bool:
-    """Does this record's ``lemmas`` hold the names it goes BY, rather than words taken from it?
+def _colimit_names(artifact) -> list[str]:
+    """The names a colimit goes by: the union of the names of the synsets it merged.
 
-    Three writers put three different things in one field, so this asks about the record and not
-    about the field being present:
-
-    * a **synset** (`text/x-wordnet`) — its lemmas are the words that mean it, and that IS its
-      offer; the record exists to say these words mean this;
-    * a **colimit** — a merge of synsets, carrying the union of their names. Recognised by
-      ``colimit_of``, which names the members and is what makes it a merge. Not by content type:
-      ConceptNet shares that type and splits its title into the same field;
-    * everything else — on a wiki artifact `lemmas` is key terms `astra/doc_index` pulled out of
-      the body, and indexing those would be indexing the content, which this pipeline is built not
-      to do.
+    A merge is recognised by ``colimit_of``, which names its members and is what makes it a merge,
+    and not by content type: ConceptNet shares that type and splits its own title into the same
+    field. So this is the one offer rule a type cannot state, and it stays here. Every other
+    record's names come from its type's ``offer`` (`services/type_offers.py`) — a lexicon
+    entry's ``lemmas`` are its names because the lexicon type says so, and a wiki page's are
+    terms taken from its body because its type does not.
     """
-    if getattr(artifact, "content_type", None) == LEXICON_CONTENT_TYPE:
-        return True
-    return bool(getattr(artifact, "colimit_of", None))
+    if not getattr(artifact, "colimit_of", None):
+        return []
+    return [str(lemma) for lemma in (getattr(artifact, "lemmas", None) or []) if lemma]
 
 _STATED_OFFER_FIELDS = ("title", "description", "tags")
 
@@ -421,75 +412,44 @@ def _extract_artifact_fields(artifact: Artifact) -> dict[str, str]:
     the full analyzable text (artifact.content + extracted text fields)
     — the same corpus the MANTLE chunker walks for embedding.
     """
-    # ── the offer is TOP-LEVEL; `context` is a compatibility read ────────────────────────────
+    # ── the TYPE says where its offer is ────────────────────────────────────────────────────
     # Five names, four jobs. `title` is the name; `description` is the offer, the one thing a need
     # is matched against; provenance lives in `citation` / `source_path` / `via` and is never
     # reachable by the matcher; and a tag / collection / group / attribute is an edge to another
     # artifact rather than a field.
     #
-    # `context` is read after the explicit fields, so a non-JSON context string cannot be promoted
-    # whole to `description`. Two ingests write exactly such a string — "canon knowledge: <doc>
-    # §<section>" and "the concept <w>: a ConceptNet 5.7 English term node" — and promoting it makes
-    # provenance the stated offer: all 6,480 canon documents then position on `canon.n.01` and
+    # Which fields hold the title, the description and the other names is the content type's to
+    # say, in the `offer` block of its `type.json` (`services/type_offers.py`). A type that says
+    # nothing reads top-level fields first and a STRUCTURED `context` second, so a non-JSON context
+    # string is never promoted whole to `description`: two ingests write exactly such a string —
+    # "canon knowledge: <doc> §<section>" and "the concept <w>: a ConceptNet 5.7 English term
+    # node" — and promoted, all 6,480 canon documents position on `canon.n.01` and
     # `cognition.n.01`, the same two nodes.
     #
-    # Top-level first, context second and only when structured, so rows written before the
-    # alignment keep working and rows written after are not overridden by a stale carrier.
-    text_fields = extract_text_from_context(artifact.context)
+    # `lemmas` is the field that shows why this is the type's call. On a synset they are the words
+    # that mean it, and the OEWN oxygen synset is titled `O` while its gloss never says "oxygen":
+    # before its names reached the index, `recall("what is oxygen")` answered `LOX / air /
+    # artificial blood`. On a wiki page they are key terms `astra/doc_index` pulled from the body,
+    # and indexing those would be indexing the content. One field, two meanings, two writers — so
+    # the lexicon type declares `lemmas` as its tags, and no other type does.
+    offer = type_offers.offer_of(getattr(artifact, "content_type", None))
 
-    # Decided before the title, because the title falls back to the first of these — see the
-    # block below for why this is a decision about the TYPE and not about the field.
-    lemma_names: list[str] = []
-    if _lemmas_are_names(artifact):
-        lemma_names = [str(lemma) for lemma in (getattr(artifact, "lemmas", None) or []) if lemma]
+    # ── a merge titles itself with the first of its names ───────────────────────────────────
+    # Measured 2026-08-24: all 5,484 `application/x-concept` colimits carry `lemmas` and NONE of
+    # `title` / `name` / `description`, with `content` empty — without this they extract to `{}`,
+    # and the merge is unindexable while every member it consolidates stays findable
+    # (COMPACTIFICATION §5 inverted, and silent: the pipeline reports a skip, not a failure).
+    colimit_names = _colimit_names(artifact)
 
     title = (
-        (getattr(artifact, "title", "") or "").strip()
-        or text_fields.get("title", "").strip()
-        or (getattr(artifact, "name", "") or "").strip()
-        # ── a record whose names ARE its lemmas titles itself with the first of them ─────────
-        # This is the synset rule below, applied rather than restated: "only the first of them
-        # becomes the title". A synset gets that title from its source; measured 2026-08-24,
-        # all 5,484 `application/x-concept` colimits carry `lemmas` and NONE of `title` / `name`
-        # / `description`, with `content` empty — so without this they extract to `{}`, "no
-        # analyzable fields", and the merge is unindexable while every member it consolidates
-        # stays findable. That is COMPACTIFICATION §5 inverted, and it is silent: the pipeline
-        # reports a skip, not a failure.
-        #
-        # Derived from `lemmas` rather than read from the `word` field the consolidator also
-        # writes, because `word` is that field's first lemma and a second carrier is a second
-        # thing to keep true. (It does not survive `Artifact.from_dict` either, which is the
-        # form this sees.)
-        or (lemma_names[0].strip() if lemma_names else "")
+        type_offers.first_value(artifact, offer["title"])
+        or (colimit_names[0].strip() if colimit_names else "")
     )
-    description = (
-        (getattr(artifact, "description", "") or "").strip()
-        or text_fields.get("description", "").strip()
-    )
+    description = type_offers.first_value(artifact, offer["description"])
 
-    raw_tags = _group_terms(artifact)
-    # ── a lexicon entry's OTHER NAMES ────────────────────────────────────────────────────────
-    # A synset's `lemmas` are the words that mean it, and for a dictionary entry that IS the
-    # offer: the whole point of the record is to say that these words mean this. Only the first
-    # of them becomes the title, and the two lexicons order them differently, so:
-    #
-    #     wn-oewn-14672278-n   title 'O'        lemmas: o, atomic number 8, oxygen
-    #     wn-oxygen.n.01       title 'oxygen'   lemmas: oxygen, o, atomic number 8
-    #
-    # and the OEWN copy is the one in the SSE index. Its gloss ("a nonmetallic bivalent element
-    # that is normally a colorless odorless tasteless nonflammable diatomic gas") never says the
-    # word either. Measured, `recall("what is oxygen")` did not narrow to that artifact at all and
-    # answered `LOX / air / artificial blood` — every hyponym carries `oxygen` inside its own
-    # title, so the hyponyms were findable and the concept itself was not.
-    #
-    # Restricted to the lexicon content type deliberately. `lemmas` does not mean one thing across
-    # this corpus: on a wiki artifact it is key terms extracted FROM the body by `astra/doc_index`,
-    # and indexing those would be indexing the content, which this pipeline is built not to do
-    # ("we should be indexing (needs/offers) on context, not content"). On a synset they are names.
-    # One field, two meanings, two writers — the same shape as every other defect in this corpus,
-    # which is why this reads the type rather than the field's presence.
-    if lemma_names:
-        raw_tags = list(raw_tags or []) + lemma_names
+    raw_tags = list(_group_terms(artifact) or [])
+    raw_tags += type_offers.all_values(artifact, offer["tags"])
+    raw_tags += colimit_names
     tags_canonical = normalize_tags(raw_tags)
     tags_text = " ".join(t for t in tags_canonical if t)
 

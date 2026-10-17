@@ -426,6 +426,58 @@ def _reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
             pass
 
 
+def reindex_content_types(content_types) -> int:
+    """Queue every live artifact of ``content_types`` to be indexed again. Returns how many.
+
+    Called when a type's published ``offer`` changes (`services/type_offers.py`): the fields an
+    artifact is indexed under moved, and its content did not, so nothing else would reindex it.
+    A wildcard (``text/*``) stands for every type under it. Runs as the platform system
+    principal for the reason `reindex_all_artifacts` states.
+    """
+    with system_acting_context(scope="platform.reindex-types"):
+        return _reindex_content_types(list(content_types or []))
+
+
+def _reindex_content_types(content_types: List[str]) -> int:
+    from mantle.db.backend import COLLECTION_ARTIFACTS, iter_documents
+    from mantle.entities.artifact import Artifact as ArtifactEntity
+    from mantle.search.ingest.pipeline_unified import enqueue_index_artifact, is_indexable
+    from mantle.services.dependencies import get_store_db
+
+    exact = {c.strip().lower() for c in content_types if c and not c.endswith("/*")}
+    prefixes = tuple(c.strip().lower()[:-1] for c in content_types if c and c.endswith("/*"))
+    if not exact and not prefixes:
+        return 0
+    # Equality filters narrow an exact type; a wildcard has no value to filter on, so it scans.
+    scans = [{}] if prefixes else [{"content_type": c} for c in sorted(exact)]
+
+    db_gen = get_store_db()
+    db = next(db_gen)
+    queued = 0
+    try:
+        for filters in scans:
+            for artifact in iter_documents(db, ArtifactEntity, COLLECTION_ARTIFACTS, filters,
+                                           unreadable="skip", denied="omit"):
+                if artifact.state == ArtifactEntity.STATE_ARCHIVED:
+                    continue
+                ct = str(artifact.content_type or "").split(";", 1)[0].strip().lower()
+                if ct not in exact and not (prefixes and ct.startswith(prefixes)):
+                    continue
+                if not is_indexable(artifact):
+                    continue
+                enqueue_index_artifact(artifact, artifact.collection_id or artifact.id,
+                                       replace=True)
+                queued += 1
+    finally:
+        try:
+            next(db_gen)
+        except StopIteration:
+            pass
+    logger.info("Reindex for changed type offers %s: %d artifact(s) queued",
+                sorted(content_types), queued)
+    return queued
+
+
 # Backwards-compatible aliases for legacy call sites.
 init_search_indices = init_search
 

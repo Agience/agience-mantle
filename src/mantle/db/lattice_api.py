@@ -614,7 +614,7 @@ def list_collection_artifacts(db: LatticeDatabase, collection_id: str, *,
     """Resolve a collection's contents via the membership edges: for each edge, the CURRENT version
     of its root — the newest non-archived version in this collection, else the newest non-archived
     version anywhere (a cross-collection link), else, with `include_archived`, the newest version
-    in this collection. Each dict carries `order_key` / `origin` / `propagate` / `relationship`
+    in this collection, else the newest anywhere (an archived artifact linked in from elsewhere). Each dict carries `order_key` / `origin` / `propagate` / `relationship`
     from the edge; sorted by order_key."""
     out = []
     for e in _membership_edges(db, collection_id):
@@ -622,9 +622,10 @@ def list_collection_artifacts(db: LatticeDatabase, collection_id: str, *,
         versions = _versions(db, root)
         in_coll = [v for v in versions if v.get("collection_id") == collection_id]
         live = [v for v in versions if state_of(v) != "archived"]
+        newest = in_coll or versions
         chosen = (_current_in(versions, collection_id)
                   or (live[-1] if live else None)
-                  or (in_coll[-1] if in_coll and include_archived else None))
+                  or (newest[-1] if newest and include_archived else None))
         if chosen is None:
             continue
         if not include_archived and state_of(chosen) == "archived":

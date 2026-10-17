@@ -821,11 +821,10 @@ class TestDelete:
 # ---------------------------------------------------------------------------
 
 class TestRemoveArtifactFromWorkspace:
-    """Unlinking is the container's; destroying the artifact is the artifact's own right.
-
-    An artifact HOMED in the container loses its index entry there whatever else happens, because
-    recall reads the entry from the home collection. The lineage is then destroyed only when no
-    other container holds the root and the caller may delete it; otherwise the row is kept.
+    """Removing never destroys. Held elsewhere, the artifact loses its edge here (and, when homed
+    here, its index entry here). Held nowhere else, it is archived in place and keeps its edge, so
+    the container's archived listing still finds it; that needs `update` on the artifact, and is
+    refused without it rather than orphaning the artifact. 2026-10-14, John: Remove only unlinks.
     """
 
     @pytest.fixture(autouse=True)
@@ -845,73 +844,70 @@ class TestRemoveArtifactFromWorkspace:
                 ws_svc.remove_artifact_from_container(db, "user-1", "ws-1", "missing")
         assert ei.value.status_code == 404
 
-    def test_a_member_linked_in_from_elsewhere_loses_only_its_edge(self):
-        """Homed in another container: nothing of it lives here but the edge."""
+    def _remove(self, *, homed: bool, others: int, may_update, raises=None):
         db = MagicMock()
-        art = _artifact(state=ArtifactEntity.STATE_LIVE, collection_id="other-ws")
-        with (
-            patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
-            patch("mantle.services.workspace_service.store.get_edge",
-                  return_value={"root_id": art.root_id, "origin": False}),
-            patch("mantle.services.workspace_service.store.remove_artifact_from_collection") as rm_edge,
-            patch("mantle.services.workspace_service.store.get_current_in_collection",
-                  return_value=None) as get_current,
-            patch("mantle.services.workspace_service.store.delete_artifacts_by_root") as destroy,
-            patch("mantle.search.ingest.pipeline_unified.delete_artifact_from_index") as deindex,
-        ):
-            result = ws_svc.remove_artifact_from_container(db, "user-1", "ws-1", "a-1")
-
-        rm_edge.assert_called_once_with(db, "ws-1", art.root_id)
-        get_current.assert_called_once_with(db, "ws-1", art.root_id)
-        destroy.assert_not_called()
-        deindex.assert_not_called()
-        assert result.id == art.id
-
-    def _homed(self, *, others: int, may_delete):
-        """Remove an artifact homed in ws-1, with the two facts the destroy turns on."""
-        db = MagicMock()
-        art = _artifact(state=ArtifactEntity.STATE_LIVE, collection_id="ws-1")
+        art = _artifact(state=ArtifactEntity.STATE_LIVE, collection_id="ws-1" if homed else "other-ws")
         access = (patch("mantle.services.dependencies.check_access", return_value=None)
-                  if may_delete else
+                  if may_update else
                   patch("mantle.services.dependencies.check_access",
                         side_effect=HTTPException(status_code=404, detail="Not found")))
         with (
             patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
             patch("mantle.services.workspace_service.store.get_edge", return_value={"_id": "ws-1/a-1"}),
             patch("mantle.services.workspace_service.store.remove_artifact_from_collection") as rm_edge,
-            patch("mantle.services.workspace_service.store.get_current_in_collection", return_value=art),
+            patch("mantle.services.workspace_service.store.get_current_in_collection",
+                  return_value=art if homed else None),
+            patch("mantle.services.workspace_service.store.get_latest_live_artifact", return_value=art),
             patch("mantle.services.workspace_service.store.count_other_containers_for_root",
                   return_value=others),
             patch("mantle.services.workspace_service.store.delete_artifacts_by_root") as destroy,
-            patch("mantle.services.workspace_service.store.remove_all_edges_for_root"),
+            patch("mantle.services.workspace_service.update_artifact",
+                  return_value=_artifact(state=ArtifactEntity.STATE_ARCHIVED)) as archive,
             patch("mantle.search.ingest.pipeline_unified.delete_artifact_from_index") as deindex,
             access,
         ):
-            ws_svc.remove_artifact_from_container(
-                db, "user-1", "ws-1", "a-1", auth=object() if may_delete is not None else None)
+            def call():
+                return ws_svc.remove_artifact_from_container(
+                    db, "user-1", "ws-1", "a-1", auth=object() if may_update is not None else None)
+            if raises:
+                with pytest.raises(HTTPException) as ei:
+                    call()
+                assert ei.value.status_code == raises
+                result = None
+            else:
+                result = call()
+        destroy.assert_not_called()
+        return db, art, rm_edge, deindex, archive, result
+
+    def test_a_member_linked_in_from_elsewhere_loses_only_its_edge(self):
+        db, art, rm_edge, deindex, archive, _ = self._remove(homed=False, others=1, may_update=True)
+        rm_edge.assert_called_once_with(db, "ws-1", art.root_id)
+        deindex.assert_not_called()
+        archive.assert_not_called()
+
+    def test_a_homed_member_another_container_holds_loses_its_edge_and_index_entry_here(self):
+        db, art, rm_edge, deindex, archive, _ = self._remove(homed=True, others=1, may_update=True)
         rm_edge.assert_called_once_with(db, "ws-1", art.root_id)
         deindex.assert_called_once_with(art.id, art.root_id, collection_id="ws-1")
-        return db, art, destroy
+        archive.assert_not_called()
 
-    def test_an_exclusive_member_the_caller_may_delete_is_destroyed(self):
-        db, art, destroy = self._homed(others=0, may_delete=True)
-        destroy.assert_called_once_with(db, art.root_id)
+    def test_an_artifact_held_nowhere_else_is_archived_in_place_not_destroyed(self):
+        db, art, rm_edge, _deindex, archive, result = self._remove(homed=True, others=0, may_update=True)
+        rm_edge.assert_not_called()
+        assert archive.call_args.kwargs["state"] == ArtifactEntity.STATE_ARCHIVED
+        assert result.state == ArtifactEntity.STATE_ARCHIVED
 
-    def test_an_unauthorized_caller_unlinks_but_does_NOT_destroy(self):
-        """`evict` on the container is not enough on its own: a caller who could evict could
-        otherwise destroy another user's artifact under a container permission, with the
-        artifact's own grants never consulted. The edge and the index entry still go."""
-        _db, _art, destroy = self._homed(others=0, may_delete=False)
-        destroy.assert_not_called()
+    def test_without_update_on_the_artifact_the_removal_is_refused(self):
+        """`evict` on the container is not enough to change the artifact itself."""
+        _db, _art, rm_edge, _deindex, archive, _ = self._remove(homed=True, others=0, may_update=False, raises=403)
+        rm_edge.assert_not_called()
+        archive.assert_not_called()
 
-    def test_no_auth_at_all_also_keeps_the_row(self):
-        """Fails CLOSED on the absence of a caller context, not open."""
-        _db, _art, destroy = self._homed(others=0, may_delete=None)
-        destroy.assert_not_called()
-
-    def test_a_member_another_container_holds_is_kept(self):
-        _db, _art, destroy = self._homed(others=1, may_delete=True)
-        destroy.assert_not_called()
+    def test_no_auth_at_all_is_refused(self):
+        """Fails CLOSED on the absence of a caller context."""
+        _db, _art, rm_edge, _deindex, archive, _ = self._remove(homed=True, others=0, may_update=None, raises=403)
+        rm_edge.assert_not_called()
+        archive.assert_not_called()
 
 
 class TestMoveAndOrder:

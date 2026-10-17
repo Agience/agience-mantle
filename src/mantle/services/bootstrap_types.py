@@ -27,10 +27,10 @@ AGENCY_CONTENT_TYPE = "application/vnd.agience.agency+json"
 AGENT_CONTENT_TYPE = "application/vnd.agience.agent+json"
 MCP_SERVER_CONTENT_TYPE = "application/vnd.agience.mcp-server+json"
 PACKAGE_CONTENT_TYPE = "application/vnd.agience.package+json"
-# A content-type definition, itself stored as an artifact. Servers self-register
-# the types they own by writing these into a collection; the platform resolves a
-# type by reading the type-definition artifacts visible in the request's scope
-# (never by scanning a server's filesystem). See `type_registry_store`.
+# A content-type definition, itself stored as an artifact. Crystal publishes each
+# persona's definitions through `PUT /type-definitions/{server}`; they are stored
+# system-owned and read for their `offer` — which fields give an artifact of that
+# type its title, description and tags. See `services/type_offers.py`.
 TYPE_DEFINITION_CONTENT_TYPE = "application/vnd.agience.type+json"
 # MANTLE anchor — a fully-disclosed reference point. The AnchorSet is a
 # collection of these; they are the routing centroids of encrypted search.
@@ -59,16 +59,6 @@ INBOX_SEEDS_COLLECTION_SLUG = "agience-inbox-seeds"
 # grant); the platform/admin reads the directory. Deterministic id —
 # uuid5(instance_namespace, "agience/agience-people").
 PEOPLE_COLLECTION_SLUG = "agience-people"
-
-# Types directory — the platform-managed home for first-party (persona) type
-# definitions. Like People, it is created at RUNTIME (NOT a platform-registry
-# seed) and is intentionally NOT user-readable as a collection: users receive
-# resolved types through Mantle's `/types/all` endpoint, not by reading this
-# collection. So it stays out of ALL_PLATFORM_COLLECTION_SLUGS /
-# USER_READABLE_SEED_SLUGS. Servers push their types here; Mantle loads them at
-# startup, so a restart needs no round trip back to whoever pushed them.
-# Deterministic id — uuid5(instance_namespace, "agience/agience-types").
-TYPES_COLLECTION_SLUG = "agience-types"
 
 # Seed sub-collections — populated at startup, granted READ to new users on first login
 START_HERE_COLLECTION_SLUG = "agience-seeds-start-here"

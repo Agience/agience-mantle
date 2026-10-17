@@ -89,6 +89,7 @@ from mantle.routers.artifacts_router import router as artifacts_router  # noqa: 
 from mantle.routers.events_router import router as events_router  # noqa: E402
 from mantle.routers.grants_router import router as grants_router  # noqa: E402
 from mantle.routers.system_router import router as system_router  # noqa: E402
+from mantle.routers.type_definitions_router import router as type_definitions_router  # noqa: E402
 from mantle.routers.mcp_router import mcp_router  # noqa: E402
 from mantle.routers.oci_router import router as oci_router  # noqa: E402
 from mantle.routers.git_router import router as git_router  # noqa: E402
@@ -370,6 +371,18 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("Trusted-issuer load at startup failed (non-fatal)", exc_info=True)
 
+    # The type definitions Crystal published (`PUT /type-definitions/{server}`): each type's `offer`
+    # says which fields the indexer reads for its title, description and tags. Loaded before the
+    # index worker starts, so nothing is indexed under the default offer of a type that declares
+    # one. Non-fatal: without them every type reads the default.
+    try:
+        from mantle.services import type_offers
+        from mantle.services.system_identity import system_acting_context
+        with system_acting_context(scope="platform.types-load"):
+            type_offers.load_definitions(store_db)
+    except Exception:
+        logger.warning("Type definition load at startup failed (non-fatal)", exc_info=True)
+
     # Start the index worker before seeding so that enqueue_index_artifact()
     # dispatches to the async queue rather than falling back to synchronous
     # per-artifact blocking. init_search() is a no-op here (no index to create); the
@@ -452,6 +465,15 @@ async def lifespan(app: FastAPI):
         logger.warning("Issuer watcher not started (non-fatal)", exc_info=True)
         issuer_watch_task = None
 
+    # Trash: delete what has been in Trash longer than its retention, hourly. Each deletion runs
+    # as the person who trashed the artifact (`services/trash.py`).
+    try:
+        from mantle.services.trash import run_purge_loop
+        trash_purge_task = asyncio.create_task(run_purge_loop())
+    except Exception:
+        logger.warning("Trash purge not started (non-fatal)", exc_info=True)
+        trash_purge_task = None
+
     # Mantle stores content_type as an opaque label and emits change events; no
     # type/operation runtime (resolution, dispatch, warming) runs here. Type
     # definitions remain ordinary artifacts in the store.
@@ -488,6 +510,12 @@ async def lifespan(app: FastAPI):
         issuer_watch_task.cancel()
         try:
             await issuer_watch_task
+        except (asyncio.CancelledError, Exception):
+            pass
+    if trash_purge_task is not None:
+        trash_purge_task.cancel()
+        try:
+            await trash_purge_task
         except (asyncio.CancelledError, Exception):
             pass
     search_init_task.cancel()
@@ -973,13 +1001,15 @@ app.add_middleware(_WebSocketRateLimit)
 # Database-layer surface. App/platform routers (beacon, internal_personas, stream) are
 # not mounted here. events_router is the outbound data-change stream (WS /events).
 # system_router is the whole admin namespace — issuers, users, seed, erasure — behind
-# one predicate. A server is an ordinary artifact, so it needs no router of its own;
+# one predicate. type_definitions_router is where Crystal publishes type definitions (service
+# only). A server is an ordinary artifact, so it needs no router of its own;
 # so is a secret — its value is artifact content, encrypted at rest by the envelope and
 # authorized by the light cone, so there is no `/secrets` surface either.
 app.include_router(artifacts_router)
 app.include_router(events_router)
 app.include_router(grants_router)
 app.include_router(system_router)
+app.include_router(type_definitions_router)
 app.include_router(mcp_router)
 # `/v2` — the OCI distribution surface, read-only and by digest. The registry IS the lattice: an
 # image is a collection, a blob is content, and the address is the same number. This is what closes

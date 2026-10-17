@@ -136,8 +136,12 @@ def test_a_removed_note_is_not_recalled_from_its_workspace(db):
 
     assert note not in _recall(db, "periwinkle", scope=[inbox])
     assert note not in _recall(db, "periwinkle")
-    # Nothing else holds it and its owner removed it, so the lineage is gone rather than orphaned.
-    assert store.get_artifact(db, note) is None
+    # Nothing else holds it, so removing archived it in place rather than destroying it: it stays
+    # in the workspace's archived listing, restorable (2026-10-14, John: Remove only unlinks).
+    assert store.get_artifact(db, note).state == "archived"
+    archived = {row.get("root_id") or row.get("id")
+                for row in store.list_collection_artifacts(db, inbox, include_archived=True)}
+    assert note in archived
 
 
 def test_a_removed_note_another_collection_holds_stays_there(db):
@@ -156,15 +160,19 @@ def test_a_removed_note_another_collection_holds_stays_there(db):
     assert store.get_artifact(db, note) is not None
 
 
-def test_a_removal_by_someone_who_may_not_delete_keeps_the_row_but_not_the_entry(db):
-    """`evict` on the container unlinks; it does not authorize destroying the artifact."""
+def test_removing_the_only_copy_without_the_right_to_change_it_is_refused(db):
+    """`evict` on the container does not authorize archiving the artifact, and detaching the only
+    copy would orphan it, so nothing changes."""
+    from fastapi import HTTPException
     inbox = _container(db, "Inbox")
     note = _note(db, inbox, "periwinkle harbour schedule")
     with acting_as(USER, principal_type="user"):
-        ws.remove_artifact_from_container(db, USER, inbox, note, auth=None)
+        with pytest.raises(HTTPException) as refused:
+            ws.remove_artifact_from_container(db, USER, inbox, note, auth=None)
 
-    assert store.get_artifact(db, note) is not None
-    assert note not in _recall(db, "periwinkle", scope=[inbox])
+    assert refused.value.status_code == 403
+    assert store.get_artifact(db, note).state == "live"
+    assert note in _recall(db, "periwinkle", scope=[inbox])
 
 
 @pytest.mark.anyio

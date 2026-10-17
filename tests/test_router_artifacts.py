@@ -706,7 +706,7 @@ class TestRemoveArtifactFromWorkspace:
 
         assert r.status_code == 200
         body = r.json()
-        assert body == {"id": "art-1", "removed": True, "container_id": "ws-1"}
+        assert body == {"id": "art-1", "removed": True, "container_id": "ws-1", "archived": False}
         svc.assert_called_once()
 
     @pytest.mark.asyncio

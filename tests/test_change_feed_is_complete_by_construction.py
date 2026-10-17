@@ -109,8 +109,6 @@ WRITE_SITES: dict[tuple[str, str], tuple[str, str]] = {
                  "artifact.deleted for the root rather than one per version."),
     ("services/workspace_service.py", "delete_artifact"): (
         SERVICE, "emits artifact.deleted with the container the db layer no longer has."),
-    ("services/workspace_service.py", "remove_artifact_from_container"): (
-        SERVICE, "detach; emits artifact.deleted against the container it was removed from."),
     ("services/workspace_service.py", "delete_workspace"): (
         SERVICE, "emits one artifact.deleted per root and then one for the workspace itself. Per "
                  "root and not just for the container, because a subscriber told only that the "

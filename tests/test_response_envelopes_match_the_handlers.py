@@ -144,13 +144,13 @@ def _returned_keys(fn_name: str):
 def test_the_scan_finds_the_documented_routes():
     """A guard that reaches nothing reports green for ever."""
     doc = _documented()
-    #: Fifteen: every route that declares an `ok=` envelope and returns something this scan can
+    #: Seventeen: every route that declares an `ok=` envelope and returns something this scan can
     #: read. The list routes return through `_page`; the artifact routes through
     #: `_artifact_body(…)` / `_artifact_detail_body(…)`, whose guaranteed key sets are derived from
     #: the models. `ArtifactResponse` is `extra="allow"`, so the spec says
     #: `additionalProperties: true` — twelve keys guaranteed, more may arrive — which declares the
     #: document without closing it.
-    assert len(doc) == 15, "expected 15 documented envelopes, found %d: %r" % (len(doc), doc)
+    assert len(doc) == 17, "expected 17 documented envelopes, found %d: %r" % (len(doc), doc)
 
 
 @pytest.mark.parametrize("handler,model_name", sorted(_documented().items()))

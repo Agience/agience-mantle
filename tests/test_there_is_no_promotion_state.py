@@ -145,6 +145,10 @@ class _EveryRequesterHoldsEveryKey:
 
 @pytest.fixture
 def db(tmp_path, monkeypatch):
+    return real_node(tmp_path, monkeypatch)
+
+
+def real_node(tmp_path, monkeypatch):
     """A standalone node: one store file, local index directories, no object storage."""
     database = store.LatticeDatabase(str(tmp_path / "live.db"), origin="live-test")
 
@@ -316,6 +320,26 @@ async def test_patch_committed_restores_an_archived_artifact(db, monkeypatch):
     assert restored["state"] == "live"
     assert db.artifacts.get_artifact(root)["state"] == "live"
     assert root in _recall(db, "quillwort")
+
+
+async def test_archiving_twice_answers_the_archived_artifact_and_editing_it_is_refused(db, monkeypatch):
+    """2026-10-13, a tester: archiving answered 404 when two copies of one card on screen archived
+    the same artifact; the second request found it already archived."""
+    from fastapi import HTTPException
+    monkeypatch.setattr(artifacts, "check_access", lambda *a, **k: None)
+    inbox = _container(db, "Inbox")
+    with acting_as(USER, principal_type="user"):
+        root = _write_workspace_create(db, inbox, "sallowmere archive twice", monkeypatch)
+        for _ in range(2):
+            again = await artifacts.update_artifact(
+                artifact_id=root, body=artifacts.UpdateArtifactRequest(state="archived"),
+                auth=_auth(), store_db=db)
+            assert again["state"] == "archived"
+        with pytest.raises(HTTPException) as refused:
+            await artifacts.update_artifact(
+                artifact_id=root, body=artifacts.UpdateArtifactRequest(state="archived", content="x"),
+                auth=_auth(), store_db=db)
+    assert refused.value.status_code == 404, "an archived artifact is edited only after a restore"
 
 
 # ── recall aliases ────────────────────────────────────────────────────────────────────────────
@@ -531,3 +555,75 @@ def test_an_archived_head_restores_and_its_snapshot_does_not(db, monkeypatch):
         out = ws.update_artifact(db, USER, inbox, "m", state="live", reindex=False)
     assert (out.id, out.state) == ("m", "live")
     assert db.artifacts.get_artifact(snap)["state"] == "archived"
+
+
+
+async def test_an_archived_artifact_is_listed_by_every_container_holding_it_when_asked_for(db, monkeypatch):
+    """2026-10-13, a tester: after a refresh an archived artifact was gone from its workspace and
+    its collection, with no way in the app to find it again. Default listings read past it; the
+    `archived` listing finds it wherever it is held, homed there or linked in."""
+    monkeypatch.setattr(artifacts, "check_access", lambda *a, **k: None)
+    monkeypatch.setattr(artifacts, "_readable_members", lambda chunk, auth, db: list(chunk))
+    inbox = _container(db, "Inbox")
+    coll = _container(db, "Collection B")
+    with acting_as(USER, principal_type="user"):
+        root = _write_workspace_create(db, inbox, "tamarisk archived listing", monkeypatch)
+        store.add_artifact_to_collection(db, coll, root, origin=False, propagate=[])
+        await artifacts.update_artifact(artifact_id=root, body=artifacts.UpdateArtifactRequest(state="archived"),
+                                        auth=_auth(), store_db=db)
+
+        async def ids(container, state):
+            page = await artifacts.list_children(artifact_id=container, request=None, content_type=None,
+                                                 workspace_id=None, state=state, limit=100, offset=0,
+                                                 store_db=db, auth=_auth())
+            return [(c.get("root_id") or c.get("id"), c.get("state")) for c in page["items"]]
+
+        for container in (inbox, coll):
+            assert await ids(container, "live") == []
+            assert await ids(container, "archived") == [(root, "archived")], container
+
+
+async def test_an_archived_artifact_is_not_linked_into_another_container(db, monkeypatch):
+    """2026-10-13, a tester: dragging an archived artifact into a container linked it where no
+    default listing shows it; it vanished from both with no error. The link is refused, naming why."""
+    from fastapi import HTTPException
+    monkeypatch.setattr(artifacts, "check_access", lambda *a, **k: None)
+    inbox = _container(db, "Inbox")
+    coll = _container(db, "Collection B")
+    with acting_as(USER, principal_type="user"):
+        root = _write_workspace_create(db, inbox, "tamarisk archived link", monkeypatch)
+        await artifacts.update_artifact(artifact_id=root, body=artifacts.UpdateArtifactRequest(state="archived"),
+                                        auth=_auth(), store_db=db)
+        with pytest.raises(HTTPException) as refused:
+            artifacts._link_source_artifact(
+                db, artifacts.CreateArtifactRequest(container_id=coll, source_artifact_id=root), _auth())
+    assert refused.value.status_code == 409 and "Restore it" in refused.value.detail
+    assert store.get_edge(db, coll, root) is None
+
+
+async def test_a_batch_fetch_returns_an_archived_artifact_only_when_asked(db, monkeypatch):
+    """An archived recall hit is hydrated through `/artifacts/batch`; without the option the batch
+    skipped it, so an archived search found hits and showed none."""
+    monkeypatch.setattr(artifacts, "check_access", lambda *a, **k: None)
+    inbox = _container(db, "Inbox")
+    with acting_as(USER, principal_type="user"):
+        root = _write_workspace_create(db, inbox, "tamarisk batch archived", monkeypatch)
+        await artifacts.update_artifact(artifact_id=root, body=artifacts.UpdateArtifactRequest(state="archived"),
+                                        auth=_auth(), store_db=db)
+    assert artifacts._fetch_authorized_docs(db, _auth(), [root]) == []
+    got = artifacts._fetch_authorized_docs(db, _auth(), [root], include_archived=True)
+    assert [(d.get("root_id") or d.get("id"), d.get("state")) for d in got] == [(root, "archived")]
+
+
+async def test_an_archived_artifact_can_be_deleted(db, monkeypatch):
+    """2026-10-13, a tester: deleting an archived artifact answered 404 from every control."""
+    monkeypatch.setattr(artifacts, "check_access", lambda *a, **k: None)
+    inbox = _container(db, "Inbox")
+    with acting_as(USER, principal_type="user"):
+        root = _write_workspace_create(db, inbox, "tamarisk delete archived", monkeypatch)
+        await artifacts.update_artifact(artifact_id=root, body=artifacts.UpdateArtifactRequest(state="archived"),
+                                        auth=_auth(), store_db=db)
+        out = await artifacts.delete_artifact(artifact_id=root, cascade=False, auth=_auth(), store_db=db)
+    assert out["deleted"] is True
+    assert not db.artifacts.versions_of(root), "the archived lineage is still stored"
+    assert store.list_collection_artifacts(db, inbox, include_archived=True) == []

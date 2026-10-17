@@ -206,7 +206,11 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
     # `lookup_by_list_field` refuses a field outside it rather than seeking an index that was
     # never populated for it and reporting the resulting `[]` as "no matches" — the same
     # wrong-answer-not-empty-answer trap the build marker exists to close, one level down.
-    LIST_INDEX_FIELDS: Tuple[str, ...] = ("lemmas", "calls")
+    LIST_INDEX_FIELDS: Tuple[str, ...] = ("lemmas", "calls", "trashed_by")
+    #: The indexed fields that hold one value rather than a list. `trashed_by` is how a person's
+    #: Trash is listed without a scan (`services/trash.py`). No row carried it before it was
+    #: indexed, so a store whose index is built covers it with no backfill.
+    SCALAR_INDEX_FIELDS: Tuple[str, ...] = ("trashed_by",)
 
     def _index_lists(self, cur: sqlite3.Cursor, aid: str, doc: Optional[Dict[str, Any]],
                      ct: Any, *, had_prev: bool = True) -> int:
@@ -224,6 +228,8 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
         ct_s = None if ct is None else str(ct)
         for field in self.LIST_INDEX_FIELDS:
             vals = doc.get(field)
+            if field in self.SCALAR_INDEX_FIELDS and isinstance(vals, str):
+                vals = [vals]
             if not isinstance(vals, (list, tuple, set)):
                 continue            # a scalar in a list field is malformed; index nothing
             for v in vals:
@@ -1323,6 +1329,20 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
             " ORDER BY l.aid LIMIT ?", params).fetchall()
         truncated = len(rows) > n
         return Page([json.loads(r["doc"]) for r in rows[:n]], truncated=truncated, limit=n)
+
+    def lookup_with_list_field(self, field: str, *, after: str = "",
+                               limit: int = 500) -> List[Dict[str, Any]]:
+        """Artifacts carrying any value in indexed `field`, ordered by id, after id `after`.
+
+        A keyset page: pass the last id back as `after` for the next. An artifact with several
+        values appears once."""
+        self._require_list_index(field)
+        n = int(limit)
+        rows = self.db.read().execute(
+            "SELECT DISTINCT l.aid, v.doc FROM listkey l JOIN vertex v ON v.id = l.aid "
+            "WHERE l.field = ? AND l.aid > ? ORDER BY l.aid LIMIT ?",
+            (field, str(after or ""), n + 1)).fetchall()
+        return Page([json.loads(r["doc"]) for r in rows[:n]], truncated=len(rows) > n, limit=n)
 
     def backfill_root_id(self, *, dry_run: bool = False) -> Dict[str, Any]:
         """Give every row without one its version-lineage handle. Idempotent.

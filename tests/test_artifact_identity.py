@@ -295,7 +295,7 @@ class TestAMergeSaysThatItIsOne:
     """`colimit_of` names the synsets a merge absorbed, and it must survive the round trip.
 
     Same contract as `lemmas` above and the same failure if it is dropped, one layer along:
-    `pipeline_unified._lemmas_are_names` reads this field to decide whether a record's `lemmas`
+    `pipeline_unified._colimit_names` reads this field to decide whether a record's `lemmas`
     are names it goes by or words taken out of it. Measured 2026-08-24, that decision cannot be
     made from `content_type` — `application/x-concept` carries 5,484 colimits AND 1,165,110
     ConceptNet terms, and the two put opposite things in `lemmas`. A save that dropped

@@ -1079,6 +1079,9 @@ class RemoveItemResponse(BaseModel):
     id: str
     removed: bool
     container_id: Optional[str] = None
+    #: True when nothing else held the artifact, so the removal archived it in place: it is in the
+    #: container's archived listing (`?state=archived`) rather than gone.
+    archived: bool = False
 
 
 class PageResponse(BaseModel):
@@ -1354,6 +1357,33 @@ def _ids_of_content_type(store_db, content_type: str) -> set:
         if aid:
             ids.add(aid)
     return ids
+
+
+@router.get(
+    "/trash",
+    summary="List the caller's Trash",
+    description=(
+        "Every artifact the caller moved to Trash, most recently trashed first, each with "
+        "`purge_after`: when it is deleted for good. Restore one with `PATCH {\"state\": "
+        "\"live\"}`; delete one now with `DELETE`."
+    ),
+    responses=_errors(401, ok=PageResponse),
+)
+async def list_trash(
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    if not auth.user_id:
+        raise HTTPException(status_code=401, detail="User identification required")
+    from mantle.services import trash
+    docs = await offload_sync(trash.list_for, store_db, auth.user_id)
+    items = []
+    for doc in docs:
+        body = _artifact_body(_normalize_artifact_doc(doc))
+        body["trashed_time"] = doc.get("trashed_time")
+        body["purge_after"] = trash.purge_after(doc.get("trashed_time"))
+        items.append(body)
+    return _page(items, total=len(items), has_more=len(docs) >= trash.LIST_LIMIT)
 
 
 @router.get(
@@ -1911,6 +1941,14 @@ def _link_source_artifact(
     source = _get_artifact(store_db, parsed.source_artifact_id)
     if not source:
         source = get_latest_live_artifact(store_db, parsed.source_artifact_id)
+    # An archived artifact is linked nowhere new: default listings read past it, so the link would
+    # succeed and show nothing in the destination. 2026-10-13, a tester dragged one into a
+    # container and it vanished from both with no error.
+    if (source and source.state == _ArtifactStates.STATE_ARCHIVED) or (
+            not source and _find_archived_artifact(store_db, parsed.source_artifact_id)):
+        raise HTTPException(status_code=409,
+                            detail="That artifact is archived. Restore it before adding it to "
+                                   "another workspace or collection.")
     if not source:
         raise HTTPException(status_code=404, detail="Source artifact not found")
     root_id = source.root_id or source.id
@@ -2180,6 +2218,12 @@ async def list_children(
                     "so a client that still sends it gets the same listing.",
         deprecated=True,
     ),
+    state: Literal["live", "archived"] = Query(
+        "live",
+        description="`live` (the default) lists the members a reader works with. `archived` lists "
+                    "only the archived ones, homed here or linked in, so they can be found and "
+                    "restored: default views and recall read past them.",
+    ),
     limit: int = Query(100, ge=1, le=1000, description="Page size."),
     offset: int = Query(0, ge=0, description="How many children to skip."),
     store_db: Database = Depends(get_store_db),
@@ -2204,7 +2248,14 @@ async def list_children(
 
     # An edge scan plus a lineage resolution per member — unbounded in the container's size,
     # and it runs before the page is taken.
-    children = await offload_sync(store.list_collection_artifacts, store_db, artifact_id)
+    if state == "archived":
+        listed = await offload_sync(store.list_collection_artifacts, store_db, artifact_id,
+                                    include_archived=True)
+        # Archived, not trashed: an artifact in Trash is listed in its owner's Trash instead.
+        children = [c for c in listed
+                    if c.get("state") == "archived" and not c.get("trashed_by")]
+    else:
+        children = await offload_sync(store.list_collection_artifacts, store_db, artifact_id)
 
     # Filter out operator edges (relationship != null means non-containment)
     children = [c for c in children if not c.get("relationship")]
@@ -2310,6 +2361,14 @@ async def update_artifact(
         # A restore (`live`, or its deprecated alias `committed`) names an archived artifact,
         # which `_find_artifact` does not return. The update below takes the un-archive branch.
         doc = await offload_sync(_find_archived_artifact, store_db, artifact_id)
+    if not doc and body.state == _ArtifactStates.STATE_ARCHIVED and body.model_fields_set <= {"state"}:
+        # Archiving is idempotent: a second archive of the same artifact (two copies of one card on
+        # a screen, a double click) answers with the archived artifact rather than 404, which read
+        # as a failure while the first request had already done the work. Any other change to an
+        # archived artifact is still refused below; it must be restored first.
+        archived = await offload_sync(_find_archived_artifact, store_db, artifact_id)
+        if archived:
+            return _artifact_body(_normalize_artifact_doc(archived))
     if not doc:
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -2383,6 +2442,51 @@ async def update_artifact(
     return _artifact_body(updated.to_dict())
 
 
+# ---------- POST /artifacts/{artifact_id}/trash ----------
+
+@router.post("/{artifact_id}/trash", status_code=status.HTTP_200_OK,
+    summary="Move an artifact to Trash",
+    description=(
+        "Archive the artifact and put it in the caller's Trash, where it stays for "
+        "`RETENTION_DAYS` (30) and is then deleted. Needs `delete`. An artifact that is already "
+        "archived goes to Trash as it is. Restore it with `PATCH {\"state\": \"live\"}`."
+    ),
+    responses=_errors(401, 404, 409, 500, ok=ArtifactResponse),
+)
+async def trash_artifact(
+    artifact_id: Annotated[str, Path(description=_ARTIFACT_PARAM)],
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    if not auth.user_id:
+        raise HTTPException(status_code=401, detail="User identification required")
+    await offload_sync(check_access, auth, artifact_id, "delete", store_db)
+
+    from mantle.services import trash, workspace_service
+    doc = await offload_sync(_find_artifact, store_db, artifact_id)
+    if doc:
+        # Archived through the same path `PATCH {"state": "archived"}` takes, so the index and
+        # the change feed move exactly as an archive does.
+        container_id = doc.get("collection_id")
+        if container_id:
+            await offload_sync(workspace_service.update_artifact, store_db, auth.user_id,
+                               container_id, artifact_id, state="archived", auth=auth)
+        else:
+            await offload_sync(workspace_service.update_workspace, store_db, auth.user_id,
+                               artifact_id, name=None, description=None, state="archived")
+    elif not await offload_sync(_find_archived_artifact, store_db, artifact_id):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    marked = await offload_sync(trash.mark, store_db, auth.user_id, artifact_id)
+    if marked is None:
+        # The lineage has a newer live version than the one named: it was not archived.
+        raise HTTPException(status_code=409, detail="A newer version of this artifact is live")
+    body = _artifact_body(_normalize_artifact_doc(marked))
+    body["trashed_time"] = marked.get("trashed_time")
+    body["purge_after"] = trash.purge_after(marked.get("trashed_time"))
+    return body
+
+
 # ---------- DELETE /artifacts/{artifact_id} ----------
 
 @router.delete("/{artifact_id}", status_code=status.HTTP_200_OK,
@@ -2419,7 +2523,11 @@ async def delete_artifact(
 
     await offload_sync(check_access, auth, artifact_id, "delete", store_db)
 
-    doc = await offload_sync(_find_artifact, store_db, artifact_id)
+    # An archived artifact can be deleted: deleting is how a user discards what they archived.
+    # 2026-10-13, a tester: deleting an archived artifact answered 404 from every control, because
+    # the lookup reads past archived rows the way the default listings do.
+    doc = (await offload_sync(_find_artifact, store_db, artifact_id)
+           or await offload_sync(_find_archived_artifact, store_db, artifact_id))
     if not doc:
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -2498,7 +2606,8 @@ async def remove_child_from_container(
     )
     #: The RESPONSE still says `container_id`, because there the name describes the value rather
     #: than a path position, and a caller reading the body should not have to know the URL shape.
-    return {"id": artifact.id, "removed": True, "container_id": artifact_id}
+    return {"id": artifact.id, "removed": True, "container_id": artifact_id,
+            "archived": getattr(artifact, "state", None) == _ArtifactStates.STATE_ARCHIVED}
 
 
 # ---------- POST /artifacts/recall — Recall ----------
@@ -2968,6 +3077,12 @@ class BatchFetchRequest(CountsUnknownFields):
                     "reporting them separately would make this endpoint an existence oracle for "
                     "artifacts you cannot see. Match the response back by `id`.",
     )
+    include_archived: bool = Field(
+        False,
+        description="Also return archived artifacts, for a caller showing them on purpose (an "
+                    "archived view, or a recall of the `archived` segment). Off, an archived id is "
+                    "skipped like any other the caller cannot get.",
+    )
 
 
 # =============================================================================
@@ -3013,7 +3128,8 @@ def _readable_members(children: list, auth: AuthContext, store_db: Database) -> 
     return keep
 
 
-def _fetch_authorized_docs(store_db: Database, auth: AuthContext, artifact_ids: List[str]) -> list:
+def _fetch_authorized_docs(store_db: Database, auth: AuthContext, artifact_ids: List[str],
+                           include_archived: bool = False) -> list:
     """Resolve each id and keep only what the caller may read.
 
     One sync pass so the handler pays a single thread hop for the whole request: the body is two
@@ -3030,6 +3146,8 @@ def _fetch_authorized_docs(store_db: Database, auth: AuthContext, artifact_ids: 
     results: list = []
     for aid in dict.fromkeys(artifact_ids):
         doc = _find_artifact(store_db, aid)
+        if not doc and include_archived:
+            doc = _find_archived_artifact(store_db, aid)
         if not doc:
             continue
 
@@ -3055,7 +3173,8 @@ async def batch_fetch_artifacts(
     if not auth.user_id and not auth.bearer_grant:
         raise HTTPException(status_code=401, detail="Missing authorization")
 
-    results = await offload_sync(_fetch_authorized_docs, store_db, auth, body.artifact_ids)
+    results = await offload_sync(_fetch_authorized_docs, store_db, auth, body.artifact_ids,
+                                 body.include_archived)
     #: `artifacts` retired for the one shape. A batch fetch is not paged — it answers exactly
     #: the ids asked for — so `has_more` is False by construction rather than by measurement.
     return _page(results, total=len(results), has_more=False)
