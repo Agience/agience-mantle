@@ -132,7 +132,7 @@ class TestCreateArtifactNonce:
             headers={"X-Agience-Challenge": token},
         )
         # 401 "User identification required": past the nonce gate, refused by the NEXT guard —
-        # a grant key alone does not identify a user.
+        # this key records no issuer, so nobody could own what it created.
         assert resp.status_code == 401, resp.json()
         assert "nonce" not in resp.json()["detail"].lower(), resp.json()
 

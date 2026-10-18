@@ -1624,7 +1624,7 @@ async def create_artifact(
     # present a valid X-Agience-Challenge. No-op for users / non-nonce keys.
     check_inbound_nonce(request, auth)
 
-    if not auth.user_id:
+    if not auth.user_id and _key_issuer(auth, body.container_id) is None:
         raise HTTPException(status_code=401, detail="User identification required")
 
     # Mantle is the database layer — `create` is a plain insert; no operation
@@ -1679,6 +1679,8 @@ async def _default_create_artifact(
     # results and both ignore unknown keys (`model_config` is empty and pydantic v2 defaults to
     # `extra="ignore"`). Neither this function nor `create_artifact` reads a raw key off the dict.
     parsed = body
+    #: Who owns what this call creates: the caller, or for a grant key the person who issued it.
+    owner_id = auth.user_id or _key_issuer(auth, parsed.container_id)
 
     #: Checked before anything is minted, hashed or encrypted, all of which scale with size.
     _refuse_oversize_inline(parsed.content, "POST /artifacts")
@@ -1715,7 +1717,7 @@ async def _default_create_artifact(
     context_str, minted = _mint_context(
         context_str,
         db=store_db,
-        artifact_id=_derived_identity_id(auth.user_id, parsed.identity),
+        artifact_id=_derived_identity_id(owner_id, parsed.identity),
         content_type=parsed.content_type,
         content=parsed.content,
         container_id=parsed.container_id,
@@ -1736,7 +1738,7 @@ async def _default_create_artifact(
 
     # Top-level: no parent to authorize against; the creator owns it.
     if not parsed.container_id:
-        derived_id = _derived_identity_id(auth.user_id, parsed.identity)
+        derived_id = _derived_identity_id(owner_id, parsed.identity)
 
         # An `identity` that already names an artifact makes this write an UPDATE. That is the
         # whole point of supplying one — the caller is saying "this is the same thing I stored
@@ -1748,7 +1750,7 @@ async def _default_create_artifact(
             updated = await offload_sync(
                 workspace_service.update_workspace,
                 store_db,
-                auth.user_id,
+                owner_id,
                 derived_id,
                 name=parsed.name,
                 description=parsed.description,
@@ -1775,7 +1777,7 @@ async def _default_create_artifact(
         entity = await offload_sync(
             workspace_service.create_container,
             db=store_db,
-            user_id=auth.user_id,
+            user_id=owner_id,
             content_type=parsed.content_type,
             name=parsed.name,
             context=context_str or "",
@@ -1811,7 +1813,7 @@ async def _default_create_artifact(
         # separately keyed owners, and a recall must read every one of them. Containment collapses
         # that to one, so this parameter combination is the difference between recall
         # cost tracking the corpus and not.
-        derived_root = _derived_identity_id(auth.user_id, parsed.identity)
+        derived_root = _derived_identity_id(owner_id, parsed.identity)
         #: The upsert cannot say which half it did through its return value — both branches hand
         #: back an indistinguishable `ArtifactEntity` — so it reports into this dict instead. A
         #: member upsert that overwrites must not answer `201 Created`.
@@ -1819,7 +1821,7 @@ async def _default_create_artifact(
         entity = await offload_sync(
             workspace_service.upsert_identity_member,
             store_db,
-            auth.user_id,
+            owner_id,
             parsed.container_id,
             derived_root,
             # ``None`` when the request sent no context: a re-capture that restates only the
@@ -1853,7 +1855,7 @@ async def _default_create_artifact(
     entity = await offload_sync(
         workspace_service.create_workspace_artifact,
         db=store_db,
-        user_id=auth.user_id,
+        user_id=owner_id,
         workspace_id=parsed.container_id,
         context=context_str or "",
         content=parsed.content or "",
@@ -1865,6 +1867,24 @@ async def _default_create_artifact(
         minted=minted,
     )
     return entity.to_dict()
+
+
+
+def _key_issuer(auth: AuthContext, container_id: Optional[str]) -> Optional[str]:
+    """The person a grant key acts for when it creates inside a container, else ``None``.
+
+    A key is not a person and carries no ``user_id``, so it never receives its issuer's own reach:
+    whether it may add to ``container_id`` is still decided by ``check_access`` on the key's own
+    grants. What it creates there has to belong to someone, and it belongs to the person who issued
+    the key, who could already administer what the key was granted (minting requires it). The mint
+    context records the key as the principal that made the call. A key creates nothing top-level.
+    2026-10-18: every create by a key answered 401 whatever its bits said, so an agent holding
+    `can_create` on a collection could not record anything in it.
+    """
+    if auth.principal_type != "grant_key" or not container_id or auth.bearer_grant is None:
+        return None
+    # A key with no recorded issuer stays refused: nobody could own what it made.
+    return getattr(auth.bearer_grant, "granted_by", None) or None
 
 
 def _derived_identity_id(user_id: str, identity: Optional[str]) -> Optional[str]:
