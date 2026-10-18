@@ -1871,7 +1871,8 @@ async def _default_create_artifact(
 
 
 def _key_issuer(auth: AuthContext, container_id: Optional[str]) -> Optional[str]:
-    """The person a grant key acts for when it creates inside a container, else ``None``.
+    """The person a grant key acts for when it creates inside a container (or updates the artifact
+    named), else ``None``.
 
     A key is not a person and carries no ``user_id``, so it never receives its issuer's own reach:
     whether it may add to ``container_id`` is still decided by ``check_access`` on the key's own
@@ -2367,7 +2368,10 @@ async def update_artifact(
     store_db: Database = Depends(get_store_db),
 ):
     """Partially update an artifact or container."""
-    if not auth.user_id:
+    #: Whose the new version is: the caller, or for a grant key the person who issued it. The key's
+    #: own grants still decide whether it may update this artifact (`check_access` below).
+    owner_id = auth.user_id or _key_issuer(auth, artifact_id)
+    if not owner_id:
         raise HTTPException(status_code=401, detail="User identification required")
 
     await offload_sync(check_access, auth, artifact_id, "update", store_db)
@@ -2413,7 +2417,7 @@ async def update_artifact(
         updated = await offload_sync(
             workspace_service.update_workspace,
             store_db,
-            auth.user_id,
+            owner_id,
             artifact_id,
             name=body.name,
             description=body.description,
@@ -2440,7 +2444,7 @@ async def update_artifact(
     updated = await offload_sync(
         workspace_service.update_artifact,
         store_db,
-        auth.user_id,
+        owner_id,
         container_id,
         artifact_id,
         name=body.name,

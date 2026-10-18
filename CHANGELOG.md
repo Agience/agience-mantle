@@ -20,6 +20,7 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 - `trashed_by` is indexed in `listkey`, so a Trash listing reads the index instead of scanning archived versions; a store whose index is not built is scanned instead, with a warning. `LatticeArtifactStore.lookup_with_list_field` pages every artifact carrying an indexed field.
 
 ### Changed
+- A grant key also updates what its grants let it update, and the version is its issuer's. A timer records each run on its own card with its key.
 - A grant key creates inside a container its grants let it add to; what it creates belongs to the person who issued the key, and the mint context names the key. A key still creates nothing top-level and reaches nothing its grants do not. Every create by a key answered 401 whatever its permissions, so an agent holding `can_create` on a collection could not record anything in it.
 - A container's archived listing (`children?state=archived`) leaves out artifacts in Trash; they are listed in Trash instead.
 - Archiving an artifact that is already archived answers 200 with the artifact instead of 404. Any other change to an archived artifact is still refused until it is restored.

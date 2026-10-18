@@ -94,3 +94,29 @@ async def test_a_read_only_key_cannot_create(db):
     with pytest.raises(HTTPException) as e:
         await _create(db, key, container_id=log, context=json.dumps({"title": "x"}), content="x")
     assert e.value.status_code in (403, 404)
+
+
+async def _update(db, auth, artifact_id, **body):
+    with acting_as(auth.principal_id, principal_type=auth.principal_type):
+        return await artifacts.update_artifact(
+            artifact_id=artifact_id, body=artifacts.UpdateArtifactRequest(**body), auth=auth, store_db=db)
+
+
+async def test_a_key_updates_what_its_grants_let_it_and_the_version_is_its_issuers(db):
+    """A timer records each run on its own card with its key (2026-10-18: every update by a key
+    answered 401, whatever its bits said)."""
+    log = _collection(db, "Operations log")
+    key = _key(db, log, "editor")
+    doc = await _create(db, key, container_id=log, context=json.dumps({"title": "run 1"}), content="x")
+    updated = await _update(db, key, doc["root_id"], context=json.dumps({"title": "run 1, done"}))
+    assert json.loads(updated["context"])["title"] == "run 1, done"
+    assert updated["modified_by"] == USER, "the version is the issuer's"
+
+
+async def test_a_read_only_key_cannot_update(db):
+    log = _collection(db, "Operations log")
+    writer, reader = _key(db, log, "editor"), _key(db, log, "viewer")
+    doc = await _create(db, writer, container_id=log, context=json.dumps({"title": "x"}), content="x")
+    with pytest.raises(HTTPException) as e:
+        await _update(db, reader, doc["root_id"], context=json.dumps({"title": "changed"}))
+    assert e.value.status_code in (403, 404)
