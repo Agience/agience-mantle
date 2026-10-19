@@ -116,7 +116,7 @@ lexical = []
 # The semantic arm names prism here rather than relying on a dev workspace's editable install to
 # satisfy it. The base install is unaffected: `db/test_embeddable_surface.py` holds by AST scan that
 # the store subtree has no sibling-package imports.
-semantic = ["numpy>=1.24", "agience-prism>=0.1.1"]
+semantic = ["numpy>=1.24", "agience-prism>=0.1.5"]
 
 # Both arms together. `[lexical]` alone is the lighter option for a consumer that needs encrypted
 # term search without the vector arm's weight.
@@ -147,7 +147,7 @@ search = ["agience-mantle[lexical,semantic]"]
 service = [
     "agience-mantle[s3,search]",
     # Distribution `agience-prism`; import name `prism`; GitHub repo `agience-prism-py`.
-    "agience-prism>=0.1.1",
+    "agience-prism>=0.1.5",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.30",
     "starlette>=0.37",
@@ -191,7 +191,7 @@ service = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=1.0",
-    "agience-prism>=0.1.1",
+    "agience-prism>=0.1.5",
     "threadpoolctl>=3.0",
 ]
 

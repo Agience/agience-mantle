@@ -1053,9 +1053,11 @@ def _delete_counts(counts: Any) -> "tuple[int, int, int]":
 
 
 class CredentialUseResponse(BaseModel):
-    """A credential's secret, for the persona making the one call it is used in."""
+    """A credential's secret, sealed to the persona making the one call it is used in."""
     id: str
-    content: str = Field(description="The secret, decrypted. Never returned to the caller the persona acts for.")
+    sealed: Dict[str, str] = Field(description=(
+        "The secret sealed to the persona's enrolled key (RSA-OAEP-256 + A256GCM), bound to this "
+        "secret and the card it was released for. Only that persona can open it."))
 
 
 class DeleteArtifactResponse(BaseModel):
@@ -2064,11 +2066,58 @@ def _mint_context(
 
 # ---------- GET /artifacts/{artifact_id} — Read ----------
 
-def _credential_for_use(db: Database, artifact_id: str) -> Optional[dict]:
-    """The credential's document with its content decrypted under an `invoke` key demand."""
+def _decrypted_for_use(db: Database, artifact_id: str) -> Optional[dict]:
+    """A document with its content decrypted under an `invoke` key demand."""
     from mantle.services.content_crypto import content_key_action
     with content_key_action("invoke"):
         return _find_artifact(db, artifact_id)
+
+
+def _context_of(doc: dict) -> dict:
+    raw = doc.get("context")
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _llm_connection_secrets(card: dict) -> Set[str]:
+    ref = _context_of(card).get("credentials_ref") or {}
+    return {str(ref["secret_id"])} if isinstance(ref, dict) and ref.get("secret_id") else set()
+
+
+def _authorizer_secrets(card: dict) -> Set[str]:
+    raw = card.get("content") or "{}"
+    try:
+        cfg = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return set()
+    if not isinstance(cfg, dict):
+        return set()
+    return {str(cfg[k]) for k in ("client_secret_artifact_id", "refresh_token_artifact_id") if cfg.get(k)}
+
+
+def _mcp_server_secrets(card: dict) -> Set[str]:
+    t = _context_of(card).get("transport") or {}
+    return {str(t["secret_id"])} if isinstance(t, dict) and t.get("secret_id") else set()
+
+
+#: What a secret may be released FOR: the card type that points at it, the one persona that serves
+#: that type and may receive it, and where the card names its secrets. A secret is released only to
+#: that persona, only for a card that names it.
+_SECRET_USES: Dict[str, Tuple[str, Any]] = {
+    "application/vnd.agience.llm-connection+json": ("lumen", _llm_connection_secrets),
+    "application/vnd.agience.authorizer+json": ("iris", _authorizer_secrets),
+    "application/vnd.agience.mcp-server+json": ("iris", _mcp_server_secrets),
+}
+
+
+class CredentialUseRequest(CountsUnknownFields):
+    for_: str = Field(alias="for", description="The card the secret is used for (an LLM connection, an authorizer).")
+    model_config = ConfigDict(populate_by_name=True)
 
 
 @router.post("/{artifact_id}/use",
@@ -2076,31 +2125,60 @@ def _credential_for_use(db: Database, artifact_id: str) -> Optional[dict]:
 )
 async def use_credential(
     artifact_id: Annotated[str, Path(description=_ARTIFACT_PARAM)],
+    body: CredentialUseRequest,
     auth: AuthContext = Depends(get_auth),
     store_db: Database = Depends(get_store_db),
 ):
-    """A credential's secret, released for USE to a platform persona acting for someone who holds
-    `invoke` on it.
+    """A credential's secret, released for one use, sealed to the persona that will use it.
 
     A key and an authorizer's secret are one thing: a credential artifact whose content is the
     secret. Shared — a platform model connection granted to everyone, a person's connection granted
-    to their team — it must be usable by those it is granted to without being readable by them, or
-    sharing it would hand it over. So this route answers only a delegation (a persona, `act.sub`
-    `agience-server-*`, acting for a subject), never a person's own token, a grant key or an MCP
-    client: the secret goes into the persona's process for the one call and never back to the
-    caller. The subject needs `invoke`, not `read`, and the content key is demanded under `invoke`.
-    Each use is witnessed in the credential's access log as an `invoke` by that persona.
+    to a team — it must be usable by those it is granted to without being readable by them, and in
+    clear only at the point of use. So:
+
+    - **Only a proven persona.** The caller is a delegation whose actor is a persona that signed for
+      it with its own enrolled key (`act.iss` names it). A person's own token, a grant key, an MCP
+      client, or a delegation the shared `chorus` identity asked for is refused.
+    - **Only for a card that names it, served by that persona.** `for` is the card (an LLM connection
+      for Lumen, an authorizer for Iris). The subject needs `invoke` on the card and on the secret,
+      not `read`; the card must name this secret; the persona must be the one that serves the card.
+    - **Sealed to the persona's key** from the authority manifest, bound to this secret and card
+      (`prism.trust.sealing`). The answer, the edge and any log carry ciphertext; the plaintext
+      exists only inside the persona.
+
+    Each release is witnessed in the access log of the card and of the secret as an `invoke` by
+    that persona.
     """
-    actor = auth.actor or ""
-    if auth.principal_type != "user" or not actor.startswith("agience-server-"):
+    actor, signer = auth.actor or "", auth.actor_signer or ""
+    if auth.principal_type != "user" or not signer or actor != f"agience-server-{signer}":
         raise HTTPException(status_code=403,
-                            detail="a credential is released for use only to a platform persona acting for its caller")
+                            detail="a secret is released only to a persona that proved who it is")
+    card_id = body.for_
+    await offload_sync(check_access, auth, card_id, "invoke", store_db)
     await offload_sync(check_access, auth, artifact_id, "invoke", store_db)
-    doc = await offload_sync(_credential_for_use, store_db, artifact_id)
-    from mantle.services.bootstrap_types import CREDENTIAL_CONTENT_TYPE
-    if not doc or doc.get("content_type") != CREDENTIAL_CONTENT_TYPE:
+    card = await offload_sync(_decrypted_for_use, store_db, card_id)
+    use = _SECRET_USES.get((card or {}).get("content_type") or "")
+    if not card or use is None:
         raise HTTPException(status_code=404, detail="Not found")
-    return {"id": doc.get("id") or artifact_id, "content": doc.get("content") or ""}
+    persona, names = use
+    if persona != signer:
+        raise HTTPException(status_code=403, detail=f"this card's secrets are used by {persona} only")
+    doc = await offload_sync(_decrypted_for_use, store_db, artifact_id)
+    from mantle.services.bootstrap_types import CREDENTIAL_CONTENT_TYPE
+    if (not doc or doc.get("content_type") != CREDENTIAL_CONTENT_TYPE
+            or {str(doc.get("id")), str(doc.get("root_id") or ""), artifact_id}.isdisjoint(names(card))):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    from prism.trust import sealing
+    from prism.trust.authority_trust import get_authority_manifest
+    try:
+        jwk = (get_authority_manifest().get_jwks(signer).get("keys") or [])[0]
+    except (KeyError, IndexError):
+        raise HTTPException(status_code=403, detail=f"no enrolled key for {signer}; nothing to seal to") from None
+    kid = str(jwk.get("kid") or f"{signer}-1")
+    sealed = sealing.seal(str(doc.get("content") or "").encode("utf-8"), sealing.public_key_from_jwk(jwk),
+                          kid=kid, context=f"{artifact_id}|{card_id}")
+    return {"id": doc.get("id") or artifact_id, "sealed": sealed}
 
 
 @router.get("/{artifact_id}",

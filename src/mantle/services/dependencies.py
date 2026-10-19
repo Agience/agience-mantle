@@ -151,6 +151,11 @@ class AuthContext:
     #: Provenance only — never an authorization input, which is why both principal types
     #: can name their actor here without either of them gaining reach by doing so.
     actor: Optional[str] = None
+    #: Which service's signature asked Origin for this delegation (`act.iss`): the persona itself
+    #: when it signed with its own enrolled key, `chorus` when the shared identity asked. The actor
+    #: is PROVEN only when this names it (`agience-server-<signer>` == `actor`); the release of a
+    #: secret (`POST /artifacts/{id}/use`) demands that, and nothing else reads it.
+    actor_signer: Optional[str] = None
     authority: Optional[str] = None                     # issuer / authority identity (external IdP = tenant)
     host_id: Optional[str] = None                       # host identity (platform instance)
     email: Optional[str] = None                         # profile email from token claims (external IdP login)
@@ -629,6 +634,7 @@ def resolve_auth(
                 principal_type="user",
                 user_id=str(d_sub),
                 actor=str(d_act_sub),
+                actor_signer=(str((payload.get("act") or {}).get("iss") or "") or None),
                 authority=str(payload.get("iss", "")) or None,
                 host_id=str(d_host),
                 # Carried through so `_enforce_token_scope` can honour it. Origin stamps this from
