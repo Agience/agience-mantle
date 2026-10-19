@@ -112,11 +112,9 @@ def test_happy_path_provisions_graph(gmail_env, wired):
     wired.add_edge.assert_called_once()
     assert wired.add_edge.call_args.kwargs["relationship"] == "authorizer"
 
-    # Grants: operator gets invoke on the operator artifact, read on all four.
+    # Grants: the operator (a person, the graph's administrator) reads and invokes all four.
     assert wired.upsert_grant.call_count == 4
-    invoke_grants = [c for c in wired.upsert_grant.call_args_list if c.kwargs.get("can_invoke")]
-    assert len(invoke_grants) == 1
-    assert invoke_grants[0].kwargs["collection_id"] == "id-platform-email-sender"
+    assert all(c.kwargs["can_read"] and c.kwargs["can_invoke"] for c in wired.upsert_grant.call_args_list)
 
 
 def test_the_credential_value_is_the_artifact_content(gmail_env, wired):
@@ -203,11 +201,14 @@ def test_grants_system_principal_when_available(gmail_env, wired, monkeypatch):
     # Every grant is issued BY the operator — that's the rooting to a person.
     for c in wired.upsert_grant.call_args_list:
         assert c.kwargs["granted_by"] == _OPERATOR
-    # The system principal also gets invoke on the operator artifact.
-    sys_invoke = [c for c in wired.upsert_grant.call_args_list
-                  if c.kwargs["user_id"] == "sys-principal-1" and c.kwargs.get("can_invoke")]
-    assert len(sys_invoke) == 1
-    assert sys_invoke[0].kwargs["collection_id"] == "id-platform-email-sender"
+    # The system principal USES the credentials and never reads them (2026-10-19): invoke on all
+    # four, read only on the operator and the authorizer, whose settings are not secret.
+    sys_grants = {c.kwargs["collection_id"]: (c.kwargs["can_read"], c.kwargs["can_invoke"])
+                  for c in wired.upsert_grant.call_args_list if c.kwargs["user_id"] == "sys-principal-1"}
+    assert sys_grants == {"id-platform-email-sender": (True, True),
+                          "id-platform-email-authorizer": (True, True),
+                          "id-platform-email-client-secret": (False, True),
+                          "id-platform-email-refresh-token": (False, True)}
 
 
 # ---------------------------------------------------------------------------

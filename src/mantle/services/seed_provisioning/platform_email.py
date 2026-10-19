@@ -269,11 +269,22 @@ def _provision(
         grantees.append(system_principal)
         register_id("platform-system-principal", system_principal)
 
+    # The system principal USES the credentials and never reads them: `invoke` on the authorizer
+    # and its two credentials, `read` only on the authorizer (its settings are not secret). The
+    # secrets reach Iris sealed to Iris's own key (`POST /artifacts/{id}/use`), in clear only at
+    # the send. 2026-10-19: it held `read` on both credentials, which handed the secrets to anyone
+    # acting as it.
+    def flags(grantee: str, resource: str) -> tuple[bool, bool]:
+        if grantee == operator:
+            return True, True
+        return resource in (op_id, authz_id), True
+
     for grantee in grantees:
-        for resource, invoke in ((op_id, True), (authz_id, False), (cs_id, False), (rt_id, False)):
+        for resource in (op_id, authz_id, cs_id, rt_id):
+            read, invoke = flags(grantee, resource)
             db_upsert_user_collection_grant(
                 db, user_id=grantee, collection_id=resource, granted_by=operator,
-                can_read=True, can_invoke=invoke,
+                can_read=read, can_invoke=invoke,
                 # ⛔ THE OPERATOR NEEDS `can_admin` OR THIS GRAPH CAN NEVER BE CHANGED.
                 #
                 # `grant_service.can_admin` is "A GRANT with can_admin — no creator fast-path",
@@ -294,3 +305,14 @@ def _provision(
                 can_admin=(grantee == operator),
                 name="Platform email sender",
             )
+
+
+def platform_mail_ids() -> dict:
+    """The platform mail authorizer and its two credentials, by their derived ids; {} when the
+    instance namespace is unavailable. What a `platform.email.send` token may reach."""
+    ns = get_instance_namespace()
+    if not ns:
+        return {}
+    return {"authorizer": derive_uuid(ns, _NS, _AUTHORIZER_SLUG),
+            "client_secret": derive_uuid(ns, _NS, _CLIENT_SECRET_SLUG),
+            "refresh_token": derive_uuid(ns, _NS, _REFRESH_TOKEN_SLUG)}

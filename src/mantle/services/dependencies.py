@@ -368,12 +368,18 @@ def _scope_allows(scope: str, method: str, path: str) -> bool:
     problem from a scope that may reach everything.
     """
     if scope == "platform.email.send":
-        # The operator id is deliberately NOT pinned here. Ophan derives it as
-        # `uuid5(instance_namespace,...)` and Mantle's own provisioner derives the same value
-        # (`seed_provisioning/platform_email._operator_id`), so binding it would mean resolving the
-        # namespace on every request to gain a check the invoke path's own grants already make.
-        # The bound this enforces is "this token may only invoke, not read the whole store".
-        return method == "POST" and path.startswith("/artifacts/") and path.endswith("/op/invoke")
+        # Iris's platform mail (2026-10-19): read the platform authorizer's settings, and have its
+        # two credentials released for use, sealed to Iris. Pinned to those three ids, so the token
+        # reaches nothing else in the store. It allowed only `POST .../op/invoke`, a route Mantle
+        # does not serve (operations are Crystal's), so it reached nothing at all.
+        from mantle.services.seed_provisioning.platform_email import platform_mail_ids
+        ids = platform_mail_ids()
+        if not ids:
+            return False
+        if method == "GET" and path.rstrip("/") == f"/artifacts/{ids['authorizer']}":
+            return True
+        return method == "POST" and path in (f"/artifacts/{ids['client_secret']}/use",
+                                             f"/artifacts/{ids['refresh_token']}/use")
     if scope == "platform.stripe.resolve":
         return method == "POST" and path.rstrip("/") == "/secrets/reveal"
     return False

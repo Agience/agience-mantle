@@ -54,10 +54,26 @@ def _auth(scope):
 
 # ── the destinations each scope legitimately needs ───────────────────────────────────────────────
 
-def test_the_mail_scope_may_invoke_an_operator():
-    """`ophan/server.py:269` — POST {MANTLE}/artifacts/{op_id}/op/invoke."""
-    _enforce_token_scope(_auth("platform.email.send"),
-                         _req("POST", "/artifacts/8f1c-op-email/op/invoke"))
+_MAIL = {"authorizer": "authz-1", "client_secret": "cs-1", "refresh_token": "rt-1"}
+
+
+@pytest.fixture
+def mail_ids(monkeypatch):
+    from mantle.services.seed_provisioning import platform_email
+    monkeypatch.setattr(platform_email, "platform_mail_ids", lambda: dict(_MAIL))
+
+
+def test_the_mail_scope_reaches_the_platform_authorizer_and_its_two_secrets_only(mail_ids):
+    """2026-10-19: Iris sends platform mail as itself. Its token reads the platform authorizer's
+    settings and has its two credentials released for use; it allowed only `.../op/invoke`, a
+    route Mantle does not serve, so it reached nothing."""
+    _enforce_token_scope(_auth("platform.email.send"), _req("GET", "/artifacts/authz-1"))
+    _enforce_token_scope(_auth("platform.email.send"), _req("POST", "/artifacts/cs-1/use"))
+    _enforce_token_scope(_auth("platform.email.send"), _req("POST", "/artifacts/rt-1/use"))
+    for method, path in (("GET", "/artifacts/cs-1"), ("POST", "/artifacts/other/use"),
+                         ("GET", "/artifacts/other"), ("POST", "/artifacts/x/op/invoke")):
+        with pytest.raises(HTTPException):
+            _enforce_token_scope(_auth("platform.email.send"), _req(method, path))
 
 
 def test_the_stripe_scope_may_reach_the_secret_route():
@@ -162,10 +178,10 @@ def test_enforcement_precedes_the_acting_principal():
         "already been granted key-custody standing")
 
 
-def test_the_allowlist_is_a_function_of_scope_and_not_a_wildcard():
+def test_the_allowlist_is_a_function_of_scope_and_not_a_wildcard(mail_ids):
     """A guard against the check being softened into a no-op: at least one real path must be
     refused for each known scope, or `_scope_allows` has become `return True`."""
-    assert _scope_allows("platform.email.send", "POST", "/artifacts/x/op/invoke")
+    assert _scope_allows("platform.email.send", "POST", "/artifacts/cs-1/use")
     assert not _scope_allows("platform.email.send", "POST", "/secrets/reveal")
     assert _scope_allows("platform.stripe.resolve", "POST", "/secrets/reveal")
     assert not _scope_allows("platform.stripe.resolve", "GET", "/secrets/reveal")

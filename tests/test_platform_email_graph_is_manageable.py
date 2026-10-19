@@ -72,9 +72,11 @@ def test_can_admin_is_conditional_on_being_the_operator():
     assert "operator" in rendered, f"can_admin does not key off the operator: {rendered}"
 
 
-def test_the_system_principal_still_gets_read_and_invoke():
-    """Background sends act as the system principal, so removing its read would break sending
-    while looking like a tightening."""
+def test_the_grant_flags_come_from_the_one_rule_per_grantee():
+    """Background sends act as the system principal. Since 2026-10-19 it USES the mail secrets
+    (`invoke`, released sealed to Iris) and reads only the operator and authorizer: the flags are
+    computed per grantee and resource by one rule, whose values
+    `test_platform_email_provisioner.test_grants_system_principal_when_available` pins."""
     kw = _kwargs(_grant_call())
-    assert ast.unparse(kw["can_read"]) == "True"
-    assert "invoke" in ast.unparse(kw["can_invoke"])
+    assert ast.unparse(kw["can_read"]) == "read"
+    assert ast.unparse(kw["can_invoke"]) == "invoke"
