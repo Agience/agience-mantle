@@ -162,7 +162,29 @@ def redacted_artifact(doc: Mapping[str, Any]) -> Dict[str, Any]:
     out = {k: v for k, v in dict(doc).items() if k not in FEED_BODY_FIELDS}
     if out.get("state") in LEGACY_LIVE_STATES:
         out["state"] = STATE_LIVE
+    # The context's content fields (the title, from the root type) are body too: the feed carries
+    # neither them nor their sealed form, and a subscriber reads them back through the authorized
+    # path. 2026-10-19: every title was in the event log in plain text.
+    _strip_content_fields(out)
     return out
+
+
+def _strip_content_fields(doc: Dict[str, Any]) -> None:
+    from mantle.db.doc_boundary import CONTENT_FIELDS, SEALED
+    ctx = doc.get("context")
+    as_string = isinstance(ctx, str)
+    if as_string:
+        try:
+            ctx = json.loads(ctx) if ctx else {}
+        except (TypeError, ValueError):
+            doc["context"] = "{}"           # unreadable: carry nothing rather than guess
+            return
+    if not isinstance(ctx, dict):
+        return
+    if not any(k in ctx for k in (*CONTENT_FIELDS, SEALED)):
+        return
+    ctx = {k: v for k, v in ctx.items() if k not in (*CONTENT_FIELDS, SEALED)}
+    doc["context"] = json.dumps(ctx) if as_string else ctx
 
 
 def _carries_legacy_state(doc: Any) -> bool:
@@ -187,12 +209,14 @@ def redact_content(payload: Any) -> Any:
 
     artifact = payload.get("artifact")
     artifacts = payload.get("artifacts")
+    # An artifact carrying a context may carry its content fields in it, so it is redacted too.
     carries_body = any(field in payload for field in FEED_BODY_FIELDS)
     if isinstance(artifact, Mapping):
-        carries_body = carries_body or any(f in artifact for f in FEED_BODY_FIELDS)
+        carries_body = carries_body or any(f in artifact for f in (*FEED_BODY_FIELDS, "context"))
     if isinstance(artifacts, (list, tuple)):
         carries_body = carries_body or any(
-            isinstance(a, Mapping) and any(f in a for f in FEED_BODY_FIELDS) for a in artifacts)
+            isinstance(a, Mapping) and any(f in a for f in (*FEED_BODY_FIELDS, "context"))
+            for a in artifacts)
     legacy = _carries_legacy_state(artifact) or (
         isinstance(artifacts, (list, tuple)) and any(_carries_legacy_state(a) for a in artifacts))
     if not carries_body and not legacy:

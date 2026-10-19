@@ -87,8 +87,18 @@ async def _patch(db, user, ptype, artifact_id, **body):
             auth=_auth(user, ptype), store_db=db)
 
 
+def _stored(db, artifact_id) -> dict:
+    """The stored row as an authorized reader sees it: its content fields (the title) are sealed
+    at rest and restored for a reader the key oracle serves (`doc_boundary.unseal_content_fields`)."""
+    from mantle.db.doc_boundary import unseal_content_fields
+    raw = dict(db.artifacts.get_artifact(artifact_id))
+    with acting_as(VICTIM, principal_type="user"):
+        unseal_content_fields(raw)
+    return raw
+
+
 def _ctx(db, artifact_id) -> dict:
-    return json.loads(db.artifacts.get_artifact(artifact_id)["context"])
+    return json.loads(_stored(db, artifact_id)["context"])
 
 
 #: The facets a forged update would target, named here rather than read from
@@ -329,7 +339,7 @@ def test_the_rung_is_what_the_principal_earned(principal_type, claim, actor, ear
 
 def _flat(db, artifact_id) -> dict:
     from mantle.clients.artifact_helpers import parse_artifact_context
-    return parse_artifact_context({"context": db.artifacts.get_artifact(artifact_id)["context"]})
+    return parse_artifact_context({"context": _stored(db, artifact_id)["context"]})
 
 
 async def test_after_an_identity_upsert_the_caller_is_the_update(db):

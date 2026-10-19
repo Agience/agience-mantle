@@ -41,6 +41,88 @@ class ContentDecryptionError(RuntimeError):
 #: attacker's choice.
 CONTENT_KEY_PRINCIPAL = "content_key_principal"
 
+#: The context fields that are part of an artifact's CONTENT, not its structure: declared by the root
+#: type (`*/*`, `context_schema` with `"part": "content"`) and so inherited by every type. They are
+#: sealed on the way into the store under the same key as the body (`context.sealed`) and restored on
+#: every authorized read, so the store, its files and the change feed carry them only as ciphertext.
+#: 2026-10-19 (John): "Title is really just part of content, and the content type definition should
+#: provide for that. It's a field inherited from the root artifact type." Titles were plaintext in the
+#: artifact row and in the event log.
+CONTENT_FIELDS = ("title",)
+SEALED = "sealed"
+
+
+def _context_dict(doc: dict):
+    """(context as a dict, whether it was stored as a JSON string)."""
+    raw = doc.get("context")
+    if isinstance(raw, dict):
+        return dict(raw), False
+    if not raw:
+        return {}, isinstance(raw, str)
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None, True
+    return (parsed, True) if isinstance(parsed, dict) else (None, True)
+
+
+def _put_context(doc: dict, ctx: dict, as_string: bool) -> None:
+    doc["context"] = json.dumps(ctx) if as_string else ctx
+
+
+def seal_content_fields(doc: dict) -> None:
+    """Move the context's content fields into `context.sealed`, encrypted under the body's key."""
+    ctx, as_string = _context_dict(doc)
+    if not ctx:
+        return
+    fields = {k: ctx.pop(k) for k in CONTENT_FIELDS if k in ctx}
+    if not fields:
+        return
+    import base64
+
+    from mantle.services import content_crypto
+    principal = content_key_principal(doc)
+    try:
+        blob = content_crypto.encrypt_content(
+            principal, json.dumps(fields).encode("utf-8"),
+            collection_id=content_key_scope(doc), creator_id=doc.get("created_by"))
+    except KeyCustodyDenied:
+        raise
+    except Exception as exc:
+        logger.error("context field encryption failed (id=%s) — refusing to store plaintext",
+                     doc.get("_key") or doc.get("id"), exc_info=True)
+        raise ContentEncryptionError("context field encryption unavailable; refusing to persist plaintext") from exc
+    ctx[SEALED] = {"p": principal, "blob": base64.b64encode(blob).decode("ascii")}
+    _put_context(doc, ctx, as_string)
+
+
+def unseal_content_fields(raw: dict) -> None:
+    """Restore the sealed content fields into the context for an authorized reader.
+
+    Fails soft: a reader the key oracle will not serve (a background path with no acting
+    principal, a row keyed elsewhere) gets the context WITHOUT the fields, never the ciphertext,
+    and never an error — a missing title is visible, a failed read of a workspace is an outage."""
+    ctx, as_string = _context_dict(raw)
+    if not ctx or SEALED not in ctx:
+        return
+    sealed = ctx.pop(SEALED)
+    try:
+        import base64
+
+        from mantle.services import content_crypto
+        plain = content_crypto.decrypt_content(
+            (sealed or {}).get("p") or content_key_principal(raw),
+            base64.b64decode((sealed or {}).get("blob") or ""),
+            collection_id=content_key_scope(raw), require_encrypted=True)
+        fields = json.loads(plain.decode("utf-8"))
+        for k in CONTENT_FIELDS:
+            if k in fields and k not in ctx:
+                ctx[k] = fields[k]
+    except Exception:  # noqa: BLE001 — see the docstring
+        logger.debug("context fields of %s stay sealed for this reader",
+                     raw.get("_key") or raw.get("id"), exc_info=True)
+    _put_context(raw, ctx, as_string)
+
 
 #: Document field carrying the collection's immutable origin root.
 #:
@@ -131,6 +213,7 @@ def encrypt_artifact_content(doc: dict) -> None:
     control, and skipping it when it is unavailable would be a fail-open shape
     this codebase does not accept.
     """
+    seal_content_fields(doc)
     content = doc.get("content")
 
     # Addressed content never enters the document. The bytes are already in the CAS at
@@ -183,6 +266,11 @@ def encrypt_artifact_content(doc: dict) -> None:
         ) from exc
 
 def decrypt_artifact_content(raw: dict, *, strict: bool = True) -> None:
+    unseal_content_fields(raw)
+    _decrypt_body(raw, strict=strict)
+
+
+def _decrypt_body(raw: dict, *, strict: bool = True) -> None:
     """Decrypt an artifact doc's inline ``content`` in place if flagged.
 
     A failed decrypt must never leave ``content`` holding ciphertext with the
