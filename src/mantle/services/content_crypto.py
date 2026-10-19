@@ -56,7 +56,9 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Callable, Optional
+import contextlib
+import contextvars
+from typing import Callable, Iterator, Optional
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
@@ -84,6 +86,23 @@ legacy_aad_reads: int = 0
 # principal_id -> 32-byte master key. Injectable so the crypto is unit-testable
 # without the oracle/DB, and so the content layer can pass a cached-oracle provider.
 MasterKeyProvider = Callable[[str], bytes]
+
+
+#: The right a content key is demanded under. `read` everywhere but one place: a credential released
+#: for USE (`POST /artifacts/{id}/use`) is decrypted for a persona acting for someone who holds
+#: `invoke` on it and not `read`, so a shared key can be used without being readable. The oracle
+#: checks whichever right is named here against the light cone, as it checks `read`.
+_KEY_ACTION: contextvars.ContextVar[str] = contextvars.ContextVar("mantle_content_key_action", default="read")
+
+
+@contextlib.contextmanager
+def content_key_action(action: str) -> Iterator[None]:
+    """Demand content keys under `action` for the duration. Only the use route widens this."""
+    token = _KEY_ACTION.set(action)
+    try:
+        yield
+    finally:
+        _KEY_ACTION.reset(token)
 
 
 def _default_master_key(principal_id: str, collection_id: Optional[str] = None,
@@ -123,7 +142,7 @@ def _default_master_key(principal_id: str, collection_id: Optional[str] = None,
         principal_id,
         KeyRequest(
             requester_id=actor.principal_id, purpose=KeyPurpose.GRANT,
-            requester_type=actor.principal_type, action="read",
+            requester_type=actor.principal_type, action=_KEY_ACTION.get(),
             # Encrypt mints, decrypt does not: `action` stays "read" for the reason above; this
             # carries the other half. Minting on decrypt would hand back a fresh key that
             # decrypts nothing and reports "no results" instead of surfacing a missing key.

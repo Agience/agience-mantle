@@ -1052,6 +1052,12 @@ def _delete_counts(counts: Any) -> "tuple[int, int, int]":
     return _n("detached"), _n("destroyed"), _n("refused")
 
 
+class CredentialUseResponse(BaseModel):
+    """A credential's secret, for the persona making the one call it is used in."""
+    id: str
+    content: str = Field(description="The secret, decrypted. Never returned to the caller the persona acts for.")
+
+
 class DeleteArtifactResponse(BaseModel):
     """What the delete did, not merely that it happened.
 
@@ -2057,6 +2063,45 @@ def _mint_context(
 
 
 # ---------- GET /artifacts/{artifact_id} — Read ----------
+
+def _credential_for_use(db: Database, artifact_id: str) -> Optional[dict]:
+    """The credential's document with its content decrypted under an `invoke` key demand."""
+    from mantle.services.content_crypto import content_key_action
+    with content_key_action("invoke"):
+        return _find_artifact(db, artifact_id)
+
+
+@router.post("/{artifact_id}/use",
+    responses=_errors(401, 403, 404, 500, ok=CredentialUseResponse),
+)
+async def use_credential(
+    artifact_id: Annotated[str, Path(description=_ARTIFACT_PARAM)],
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    """A credential's secret, released for USE to a platform persona acting for someone who holds
+    `invoke` on it.
+
+    A key and an authorizer's secret are one thing: a credential artifact whose content is the
+    secret. Shared — a platform model connection granted to everyone, a person's connection granted
+    to their team — it must be usable by those it is granted to without being readable by them, or
+    sharing it would hand it over. So this route answers only a delegation (a persona, `act.sub`
+    `agience-server-*`, acting for a subject), never a person's own token, a grant key or an MCP
+    client: the secret goes into the persona's process for the one call and never back to the
+    caller. The subject needs `invoke`, not `read`, and the content key is demanded under `invoke`.
+    Each use is witnessed in the credential's access log as an `invoke` by that persona.
+    """
+    actor = auth.actor or ""
+    if auth.principal_type != "user" or not actor.startswith("agience-server-"):
+        raise HTTPException(status_code=403,
+                            detail="a credential is released for use only to a platform persona acting for its caller")
+    await offload_sync(check_access, auth, artifact_id, "invoke", store_db)
+    doc = await offload_sync(_credential_for_use, store_db, artifact_id)
+    from mantle.services.bootstrap_types import CREDENTIAL_CONTENT_TYPE
+    if not doc or doc.get("content_type") != CREDENTIAL_CONTENT_TYPE:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"id": doc.get("id") or artifact_id, "content": doc.get("content") or ""}
+
 
 @router.get("/{artifact_id}",
     responses=_errors(401, 404, 500,
