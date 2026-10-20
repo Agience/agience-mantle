@@ -129,3 +129,37 @@ async def test_a_title_stored_before_sealing_is_sealed_by_the_pass(db):
         read = await artifacts.read_artifact(artifact_id=doc["id"], auth=_auth(), store_db=db)
     assert json.loads(read["context"])["title"] == f"Old {WORD}"
     assert seal_stored_titles(db, dry_run=True)["plain"] == 0
+
+
+async def test_the_reverse_puts_the_titles_back_in_plain_text_for_a_rollback(db):
+    """Before Mantle is rolled back to a version that does not read sealed titles, the release
+    unseals them; the forward pass seals them again. 2026-10-20."""
+    from mantle.system.seal_titles import seal_stored_titles, unseal_stored_titles
+    _, doc = await _note(db, title=f"Kept {WORD}")
+    assert WORD not in json.dumps(_raw(db, doc["id"]))
+
+    counts = unseal_stored_titles(db)
+    assert counts["unsealed"] >= 1 and counts["denied"] == 0
+    ctx = json.loads(_raw(db, doc["id"])["context"])
+    assert ctx["title"] == f"Kept {WORD}" and doc_boundary.SEALED not in ctx, "as an older Mantle reads it"
+    assert unseal_stored_titles(db, dry_run=True)["sealed"] == 0
+
+    assert seal_stored_titles(db)["sealed"] >= 1
+    assert WORD not in json.dumps(_raw(db, doc["id"])), "and forward again"
+    with acting_as(USER, principal_type="user"):
+        read = await artifacts.read_artifact(artifact_id=doc["id"], auth=_auth(), store_db=db)
+    assert json.loads(read["context"])["title"] == f"Kept {WORD}"
+
+
+async def test_a_title_the_oracle_will_not_open_stays_sealed_rather_than_emptied(db, monkeypatch):
+    from mantle.services import content_crypto
+    from mantle.services.acting_principal import KeyCustodyDenied
+    from mantle.system.seal_titles import unseal_stored_titles
+    _, doc = await _note(db)
+    before = _raw(db, doc["id"])["context"]
+
+    def refuse(*a, **k):
+        raise KeyCustodyDenied("no key")
+    monkeypatch.setattr(content_crypto, "decrypt_content", refuse)
+    counts = unseal_stored_titles(db)
+    assert counts["denied"] >= 1 and _raw(db, doc["id"])["context"] == before
