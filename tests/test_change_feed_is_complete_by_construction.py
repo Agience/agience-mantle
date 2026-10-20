@@ -202,6 +202,11 @@ WRITE_SITES: dict[tuple[str, str], tuple[str, str]] = {
                   "are superseded versions of that root, as `vertex._snapshot_prior` writes them, "
                   "and the bulk relabel of `committed` to `live` changes no value any reader "
                   "returns."),
+    ("system/seal_titles.py", "unseal_stored_titles"): (
+        OFF_FEED, "the reverse of title sealing, run before a rollback: it rewrites only the stored "
+                  "form of a title (sealed to plain) on rows as they are. No reader sees a different "
+                  "artifact, and the feed carries no title in either form, so there is nothing to "
+                  "announce."),
     ("shard/erasure.py", "erase"): (
         BOUNDARY, "the erasure path. Emits artifact.deleted per erased id, carrying an id and a "
                   "verb and nothing off the erased doc — a subscriber holding derived state is "
