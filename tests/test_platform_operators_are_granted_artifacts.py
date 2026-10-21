@@ -125,3 +125,15 @@ async def test_a_key_cannot_carry_what_its_owner_does_not_hold(db):
                     resource_id=P.ids()["op-raise-inbox-item"], role="collaborator"),
                 auth=_auth(USER), store_db=db)
     assert e.value.status_code == 403
+
+
+def test_the_platform_operator_holds_what_it_provisions_and_can_open_its_titles(db):
+    """2026-10-21, the RC's reverse migration: it could not unseal the six titles the operators were
+    made with, because their owner held no grant on them; `created_by` confers nothing."""
+    P.ensure_platform_operators(db)
+    for slug, rid in P.ids().items():
+        with acting_as(PLATFORM, principal_type="user"):
+            check_access(_auth(PLATFORM), rid, "admin", db)
+    from mantle.system.seal_titles import unseal_stored_titles
+    counts = unseal_stored_titles(db, dry_run=True)
+    assert counts["denied"] == 0, counts

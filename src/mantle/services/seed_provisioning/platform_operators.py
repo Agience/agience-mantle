@@ -99,9 +99,19 @@ def _context(op: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _own(upsert, db: Database, operator: str, artifact_id: str, title: str) -> None:
+    """The platform operator's own grant on what it provisions. `created_by` is provenance and
+    confers nothing, so without it the operator could not read, change or share its own operators,
+    nor open their titles, which are sealed with their content."""
+    upsert(db, user_id=operator, collection_id=artifact_id, granted_by=operator,
+           can_create=True, can_read=True, can_update=True, can_delete=True, can_evict=True,
+           can_invoke=True, can_add=True, can_share=True, can_admin=True, name=f"Owner: {title}")
+
+
 def ensure_platform_operators(db: Database) -> bool:
     """Create or converge the collection and its operators. False when not yet possible."""
     from mantle.db.backend import add_artifact_to_collection as db_add_edge
+    from mantle.db.backend import upsert_user_collection_grant
     from mantle.services.acting_principal import acting_as
     from mantle.services.platform_topology import register_id
     from mantle.services.seed_provisioning.platform_email import _ensure_artifact, _operator_id
@@ -118,12 +128,14 @@ def ensure_platform_operators(db: Database) -> bool:
                          context={"content_type": COLLECTION_CT, "title": "Platform operators"},
                          content="", owner=operator)
         register_id(_COLLECTION_SLUG, coll)
+        _own(upsert_user_collection_grant, db, operator, coll, "Platform operators")
         for op in OPERATORS:
             op_id = known[op["slug"]]
             existed = _ensure_artifact(db, op_id, content_type=OPERATOR_CT, name=op["title"],
                                        description=op["description"], context=_context(op),
                                        content="", owner=operator)
             register_id(op["slug"], op_id)
+            _own(upsert_user_collection_grant, db, operator, op_id, op["title"])
             if not existed:
                 db_add_edge(db, coll, op_id, origin=True)
     logger.info("platform_operators: %d operators in %s", len(OPERATORS), known[_COLLECTION_SLUG])
