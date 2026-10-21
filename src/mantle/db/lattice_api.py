@@ -578,6 +578,22 @@ def remove_artifact_from_collection(db: LatticeDatabase, collection_id: str, roo
         return False
 
 
+def remove_links(db: LatticeDatabase, artifact_id: str, relationship: str) -> int:
+    """Delete `artifact_id`'s typed links named `relationship` or one of its `relationship.`
+    sub-names. Only links: a containment edge is never touched, and nothing linked is archived —
+    a link is not a home. Returns how many were removed."""
+    if not relationship or relationship == _CONTAINS:
+        return 0
+    removed = 0
+    for e in _membership_edges(db, artifact_id):
+        label = e.get("label") or ""
+        if label == _CONTAINS or not (label == relationship or label.startswith(relationship + ".")):
+            continue
+        db.graph.delete_edge(artifact_id, e.get("dst"), label)
+        removed += 1
+    return removed
+
+
 def set_edge_order_key(db: LatticeDatabase, collection_id: str, root_id: str,
                        new_order_key: str) -> bool:
     """Update the order_key on a single membership edge (upsert by (src,dst,label) preserves the

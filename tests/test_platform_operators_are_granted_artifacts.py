@@ -77,15 +77,19 @@ def test_the_migration_grants_every_account_the_store_knows(db):
         check_access(_auth(OTHER), P.ids()["op-reconcile-accounts"], "invoke", db)
 
 
-async def test_the_platform_names_its_own_operators_to_an_account_it_granted(db):
+async def test_the_platform_names_its_operators_and_which_the_caller_may_invoke(db):
     from mantle.routers import artifacts_router as artifacts
     P.ensure_platform_operators(db)
     with acting_as(OTHER, principal_type="user"):
-        assert (await artifacts.list_platform_operators(auth=_auth(OTHER), store_db=db))["items"] == []
+        before = (await artifacts.list_platform_operators(auth=_auth(OTHER), store_db=db))["items"]
+    assert sorted(i["slug"] for i in before) == sorted(o["slug"] for o in P.OPERATORS)
+    assert not any(i["may_invoke"] for i in before)
     P.grant_to_account(db, OTHER)
     with acting_as(OTHER, principal_type="user"):
         got = (await artifacts.list_platform_operators(auth=_auth(OTHER), store_db=db))["items"]
     assert sorted((i["slug"], i["id"]) for i in got) == sorted((o["slug"], P.ids()[o["slug"]]) for o in P.OPERATORS)
+    assert all(i["may_invoke"] for i in got)
+    assert {(i["server"], i["tool"]) for i in got} >= {("lumen", "reconcile"), ("sage", "browse_collections")}
 
 
 async def test_a_key_carries_what_its_owner_holds_now(db):
@@ -137,3 +141,20 @@ def test_the_platform_operator_holds_what_it_provisions_and_can_open_its_titles(
     from mantle.system.seal_titles import unseal_stored_titles
     counts = unseal_stored_titles(db, dry_run=True)
     assert counts["denied"] == 0, counts
+
+
+async def test_a_timers_key_is_told_which_operators_it_may_invoke(db):
+    """A timer fires on a grant key, which has no user id; Crystal's gate asks this route on its
+    behalf for every persona tool a firing reaches, so the key must get an answer, not a 401."""
+    from mantle.routers import artifacts_router as artifacts
+    from mantle.services import grant_key_service as keys
+
+    P.ensure_platform_operators(db)
+    P.grant_to_account(db, USER)
+    op = P.ids()["op-raise-inbox-item"]
+    root, _token = keys.mint(db, user_id=USER, name="Timer", resource_id=op, role="collaborator")
+    key = AuthContext(principal_id=root.id, principal_type="grant_key", user_id=None,
+                      grants=keys.resolve(db, root), grant_key_id=root.id, bearer_grant=root)
+    got = {i["slug"]: i["may_invoke"] for i in
+           (await artifacts.list_platform_operators(auth=key, store_db=db))["items"]}
+    assert got["op-raise-inbox-item"] is True and got["op-reconcile-accounts"] is False

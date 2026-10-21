@@ -1598,10 +1598,13 @@ async def list_visible(
 class PlatformOperator(BaseModel):
     id: str
     slug: str
+    server: str = Field(..., description="The persona whose tool it runs.")
+    tool: str
+    may_invoke: bool = Field(..., description="Whether the caller holds `invoke` on it.")
 
 
 class PlatformOperatorsResponse(BaseModel):
-    """The platform's own operators the caller may read."""
+    """Every operator the platform provides, and which of them the caller may invoke."""
     items: List[PlatformOperator]
 
 
@@ -1609,9 +1612,11 @@ class PlatformOperatorsResponse(BaseModel):
     "/platform-operators",
     summary="Which operators the platform provides",
     description=(
-        "The platform's own operators the caller may read, by id and slug. They are derived on this "
-        "node, not read from any card, so an operator someone shares cannot pass for the "
-        "platform's by what it says about itself."
+        "Every operator the platform provides, by id and slug, with the persona tool it runs and "
+        "whether the caller may invoke it. They are derived on this node, not read from any card, "
+        "so an operator someone shares cannot pass for the platform's by what it says about "
+        "itself; and a persona tool one of them runs is reached directly only by a caller who may "
+        "invoke it (Crystal reads this to decide)."
     ),
     responses=_errors(401, ok=PlatformOperatorsResponse),
 )
@@ -1619,8 +1624,10 @@ async def list_platform_operators(
     auth: AuthContext = Depends(get_auth),
     store_db: Database = Depends(get_store_db),
 ):
-    if not auth.user_id:
-        raise HTTPException(status_code=401, detail="User identification required")
+    # Any principal: a timer fires on a grant key, which carries no user id, and the gate in Crystal
+    # asks this for every persona tool it reaches. `check_access` decides each one as it does anywhere.
+    if not auth.user_id and auth.principal_type != "grant_key":
+        raise HTTPException(status_code=401, detail="Authentication required")
     from mantle.services.seed_provisioning import platform_operators as platform_ops
     known = platform_ops.ids()
     items = []
@@ -1629,10 +1636,12 @@ async def list_platform_operators(
         if not op_id:
             continue
         try:
-            await offload_sync(check_access, auth, op_id, "read", store_db)
+            await offload_sync(check_access, auth, op_id, "invoke", store_db)
+            may = True
         except HTTPException:
-            continue
-        items.append({"id": op_id, "slug": op["slug"]})
+            may = False
+        items.append({"id": op_id, "slug": op["slug"], "server": op["server"], "tool": op["tool"],
+                      "may_invoke": may})
     return {"items": items}
 
 
@@ -2810,6 +2819,36 @@ async def remove_child_from_container(
     #: than a path position, and a caller reading the body should not have to know the URL shape.
     return {"id": artifact.id, "removed": True, "container_id": artifact_id,
             "archived": getattr(artifact, "state", None) == _ArtifactStates.STATE_ARCHIVED}
+
+
+class LinksRemovedResponse(BaseModel):
+    """How many of the artifact's links were removed."""
+    id: str
+    relationship: str
+    removed: int
+
+
+@router.delete("/{artifact_id}/links/{relationship}", status_code=status.HTTP_200_OK,
+    summary="Remove an artifact's typed links",
+    description=(
+        "Removes the artifact's links named `relationship`, and those under it (`step1` removes "
+        "`step1.collection_id`). Only links: no member is detached and nothing linked is archived, "
+        "since a link is not a home. Needs `evict` on the artifact, as detaching a member does."
+    ),
+    responses=_errors(401, 404, ok=LinksRemovedResponse),
+)
+async def remove_links(
+    artifact_id: Annotated[str, Path(description="The artifact the links hang from.")],
+    relationship: Annotated[str, Path(pattern=r"^[A-Za-z0-9_.:-]{1,64}$",
+                                      description="The links' relationship, or a prefix of their names.")],
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    if not auth.user_id:
+        raise HTTPException(status_code=401, detail="User identification required")
+    await offload_sync(check_access, auth, artifact_id, "evict", store_db)
+    removed = await offload_sync(store.remove_links, store_db, artifact_id, relationship)
+    return {"id": artifact_id, "relationship": relationship, "removed": removed}
 
 
 # ---------- POST /artifacts/recall — Recall ----------

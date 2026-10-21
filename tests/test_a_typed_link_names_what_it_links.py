@@ -94,3 +94,27 @@ async def test_a_relationship_without_a_link_is_refused(db):
     with pytest.raises(HTTPException) as e:
         await _create(db, container_id=space, relationship="input", context=json.dumps({"title": "x"}))
     assert e.value.status_code == 400
+
+
+async def test_removing_a_steps_links_leaves_members_and_the_linked_artifact_alone(db):
+    space, accounts, flow, note = await _setup(db)
+    await _create(db, container_id=flow["id"], source_artifact_id=accounts, relationship="s1.collection_id")
+    await _create(db, container_id=flow["id"], source_artifact_id=note["id"], relationship="s2.source_id")
+    await _create(db, container_id=flow["id"], source_artifact_id=note["id"])          # a member too
+    with acting_as(USER, principal_type="user"):
+        out = await artifacts.remove_links(artifact_id=flow["id"], relationship="s1", auth=_auth(), store_db=db)
+    assert out["removed"] == 1
+    assert _ids(await _list(db, flow["id"], links="*")) == {(note["id"], "s2.source_id")}
+    assert _ids(await _list(db, flow["id"])) == {(note["id"], None)}, "the member stays"
+    from mantle.db import backend as store
+    assert store.get_artifact(db, accounts).state == "live", "the linked artifact is not archived"
+
+
+async def test_removing_links_needs_evict_on_the_artifact(db):
+    _, accounts, flow, _ = await _setup(db)
+    await _create(db, container_id=flow["id"], source_artifact_id=accounts, relationship="s1.collection_id")
+    with acting_as(OTHER, principal_type="user"):
+        with pytest.raises(HTTPException) as e:
+            await artifacts.remove_links(artifact_id=flow["id"], relationship="s1", auth=_auth(OTHER), store_db=db)
+    assert e.value.status_code == 404
+    assert _ids(await _list(db, flow["id"], links="*")) == {(accounts, "s1.collection_id")}

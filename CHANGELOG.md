@@ -24,6 +24,7 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 - The platform provides its core operators as granted artifacts: reconcile accounts, answer from my notes, raise an Inbox item, list my collections and ask a model, in a "Platform operators" collection owned by the platform operator, which holds an owner's grant on each. Each is granted to every account one by one (read and invoke) at first sign-in, so each can be withheld or metered on its own; the release migration `mantle.services.seed_provisioning.platform_operators` grants every existing account. Each declares its inputs, and an input naming an artifact says so (`"format": "artifact-id"`, with the content types it accepts).
 - `GET /artifacts/platform-operators` names the platform's own operators the caller may read, by id and slug, derived on the node, so an operator someone shares cannot pass for the platform's by what it says about itself.
 - A typed link: `POST /artifacts` with `source_artifact_id` takes a `relationship`, which says what the linked artifact is to the one it hangs from and confers nothing. `GET /artifacts/{id}/children?links=*` (or a relationship's name, matching its `name.` sub-names) lists an artifact's links, each shown only to a reader who may read it; without `links`, links are not listed as members.
+- `DELETE /artifacts/{id}/links/{relationship}` removes an artifact's typed links of that name and the names under it, and nothing else: no member is detached and nothing linked is archived, since a link is not a home. It needs `evict` on the artifact. Removing a link through the member route could archive what it named.
 
 ### Changed
 - A grant key also updates what its grants let it update, and the version is its issuer's. A timer records each run on its own card with its key.
@@ -37,6 +38,7 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 - A WordNet synset's lemmas are indexed as its names because its type declares them so (Sage's `text/x-wordnet` type), not by a rule in the indexer naming that type. Until Crystal publishes that declaration, a synset is indexed under the default offer.
 - A grant key carries what its owner holds now: each grant it carries is narrowed, at every use, to what its issuer holds on that resource, so a right the issuer loses leaves every key they issued too. It was clamped once, when minted.
 - A key's owner may put on it any resource they hold something on, clamped to what they hold; it needed admin there. A timer's key reaches the operators its workflow runs, which an account holds as read and invoke.
+- `GET /artifacts/platform-operators` names every operator the platform provides, with the persona tool it runs and whether the caller may invoke it, and answers a grant key too, so Crystal can refuse a withheld operator's tool however it is reached.
 
 ## [0.1.3] - 2026-10-09
 

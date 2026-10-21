@@ -158,6 +158,10 @@ WRITE_SITES: dict[tuple[str, str], tuple[str, str]] = {
                   "an add, a move or a reorder."),
     ("db/lattice_api.py", "remove_artifact_from_collection"): (
         OFF_FEED, "a membership edge — see add_artifact_to_collection."),
+    ("db/lattice_api.py", "remove_links"): (
+        OFF_FEED, "typed links: edges that confer nothing, made as add_artifact_to_collection makes "
+                  "them. No artifact version changes, and a link is read where it is used (a "
+                  "workflow's catalogue and runner), never from the feed."),
     ("db/lattice_api.py", "set_edge_order_key"): (
         OFF_FEED, "reordering. No artifact version changes."),
     ("db/lattice_api.py", "remove_all_edges_for_root"): (
