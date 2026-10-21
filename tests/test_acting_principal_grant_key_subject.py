@@ -92,6 +92,7 @@ def test_the_light_cone_resolves_a_key_through_its_bundle():
         patch("mantle.db.backend.get_grant_by_id", return_value=root),
         patch("mantle.db.backend.get_active_grants_for_grantee", side_effect=_members),
         patch("mantle.db.backend.list_origin_descendants", return_value=set()),
+        patch("mantle.services.grant_service.effective_flags", side_effect=_issuer_holds_all),
     ):
         reached = LightConeResolver(db=MagicMock()).resolve(
             KEY_GRANT_ID, "read", principal_type="grant_key")
@@ -143,3 +144,10 @@ def test_every_other_principal_kind_is_untouched():
         AuthContext(principal_id=USER_ID, principal_type="user", user_id=USER_ID,
                     actor="agience-server-astra"))
     assert dele.actor == "agience-server-astra"
+
+
+def _issuer_holds_all(_db, _user, _resource):
+    """The issuer holds what it granted: these tests are about walking the bundle, and narrowing to
+    what an issuer holds now has its own (`test_a_key_carries_what_its_owner_holds_now`)."""
+    from mantle.entities.grant import Grant
+    return {f: True for f in Grant.PERMISSION_FLAGS}

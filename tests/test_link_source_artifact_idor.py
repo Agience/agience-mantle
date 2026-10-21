@@ -35,6 +35,7 @@ def parsed():
     return SimpleNamespace(
         container_id="container-owned-by-attacker",
         source_artifact_id="artifact-owned-by-victim",
+        relationship=None,
     )
 
 

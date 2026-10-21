@@ -255,18 +255,38 @@ def authenticate(db, raw_token: str) -> Optional[GrantEntity]:
     return matches[0] if matches else None
 
 
+def _as_held_now(db, grant: GrantEntity) -> GrantEntity:
+    """*grant* narrowed to what its issuer holds on its resource now.
+
+    Minting clamps a key to its issuer (`clamp_to_issuer`), but only once: an issuer who later
+    loses a right kept it on every key they had minted. A key acts for its issuer, so what the
+    issuer no longer holds the key no longer carries — withholding an operator from an account
+    reaches the keys that account issued too. A deny passes as it is: it only narrows.
+    """
+    from mantle.entities.grant import grant_is_allow
+    if not grant.resource_id or not grant.granted_by or not grant_is_allow(grant):
+        return grant
+    from mantle.services.grant_service import effective_flags
+    # What the issuer holds, as a ceiling, met by the one operator (`Grant.masked_by`).
+    ceiling = GrantEntity(resource_id=grant.resource_id, grantee_type="user", grantee_id=grant.granted_by,
+                          granted_by=grant.granted_by,
+                          **effective_flags(db, grant.granted_by, grant.resource_id))
+    return grant.masked_by(ceiling)
+
+
 def resolve(db, root: GrantEntity) -> List[GrantEntity]:
     """Every grant the bearer of *root* effectively holds.
 
     The root itself when it names a resource, plus each member of the bundle narrowed
     by the root's bits, recursively for nested bundles. Members are masked at every
-    level, so a nested bundle can only ever narrow further.
+    level, so a nested bundle can only ever narrow further; each is also narrowed to what
+    its issuer holds now (`_as_held_now`).
 
     Returns detached copies; nothing here writes.
     """
     effective: List[GrantEntity] = []
     if root.resource_id:
-        effective.append(root)
+        effective.append(_as_held_now(db, root))
 
     seen = {root.id}
     # (bundle grant whose members to expand, ceiling those members are masked by)
@@ -283,7 +303,7 @@ def resolve(db, root: GrantEntity) -> List[GrantEntity]:
                 seen.add(member.id)
                 masked = member.masked_by(ceiling)
                 if masked.resource_id:
-                    effective.append(masked)
+                    effective.append(_as_held_now(db, masked))
                 # A member may itself carry members (a nested bundle). It becomes the
                 # next ceiling in its own MASKED form, so narrowing compounds down the
                 # chain rather than resetting at each level.

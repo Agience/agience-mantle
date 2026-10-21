@@ -354,6 +354,16 @@ def _require_admin(auth: AuthContext, resource_id: str, store_db: Database) -> N
         )
 
 
+def _require_some_hold(auth: AuthContext, resource_id: str, store_db: Database) -> None:
+    """Raise 403 unless the caller holds some allowed action on the resource — what a key of
+    theirs may carry there, clamped to exactly that."""
+    from mantle.services import grant_service
+    if not auth.user_id:
+        raise HTTPException(status_code=401, detail="User identification required")
+    if not any(grant_service.effective_flags(store_db, auth.user_id, resource_id).values()):
+        raise HTTPException(status_code=403, detail="You hold nothing on this resource for a key to carry")
+
+
 def _require_share_or_admin(auth: AuthContext, resource_id: str, store_db: Database) -> None:
     """Raise 403 unless the caller can create invites (creator OR can_share/can_admin)."""
     from mantle.services import grant_service
@@ -828,8 +838,11 @@ async def add_bundle_member_endpoint(
 ):
     """Attach a resource to the bundle with its own permissions.
 
-    Requires can_admin on the resource being added — the bundle's own bits never widen
-    anything, they only cap what its members already carry.
+    The key's owner may put on it anything they hold there: the member is clamped to what they
+    hold (`clamp_to_issuer`), and narrowed again at every use to what they hold then
+    (`grant_key_service.resolve`), so a key carries its owner's authority and never more. A
+    timer's key reaches the operators its workflow runs, which an account holds as read and
+    invoke, not admin. With nothing held there, it is refused.
     """
     if not auth.user_id:
         raise HTTPException(status_code=401, detail="User identification required")
@@ -837,7 +850,7 @@ async def add_bundle_member_endpoint(
     if not bundle:
         raise HTTPException(status_code=404, detail="Grant key not found")
     _require_key_owner(bundle, auth)
-    await offload_sync(_require_admin, auth, body.resource_id, store_db)
+    await offload_sync(_require_some_hold, auth, body.resource_id, store_db)
 
     from mantle.services import grant_key_service
     try:

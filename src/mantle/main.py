@@ -359,6 +359,16 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("Platform email provisioning failed (non-fatal)", exc_info=True)
 
+    # The platform's own operators: granted artifacts, one grant per operator per account
+    # (`seed_provisioning/platform_operators`). Idempotent, non-fatal, every startup.
+    try:
+        from mantle.services.seed_provisioning.platform_operators import ensure_platform_operators
+        from mantle.services.system_identity import system_acting_context
+        with system_acting_context(scope="platform.operators-seed"):
+            ensure_platform_operators(store_db)
+    except Exception:
+        logger.warning("Platform operator provisioning failed (non-fatal)", exc_info=True)
+
     # Load trusted-issuer artifacts into the token verifier. The authority manifest
     # + AGIENCE_TRUSTED_ISSUERS env are the bootstrap seed; governable issuer
     # artifacts in the store are the source of truth going forward (the verifier

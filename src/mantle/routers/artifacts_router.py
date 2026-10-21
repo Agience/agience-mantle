@@ -234,6 +234,10 @@ class CreateArtifactRequest(BaseModel):
 
     container_id: Optional[str] = None   # optional: also add a membership edge into this collection
     source_artifact_id: Optional[str] = None  # link an existing artifact instead of creating one
+    #: With `source_artifact_id`: the link's relationship — what the linked artifact IS to the
+    #: container (`step1.collection_id`, `authorizer`), rather than plain membership. A typed link
+    #: confers nothing: no grant travels along it, like every link this call makes.
+    relationship: Optional[str] = Field(default=None, pattern=r"^[A-Za-z0-9_.:-]{1,64}$")
 
     identity: Optional[str] = Field(
         None,
@@ -1591,6 +1595,47 @@ async def list_visible(
     return _page(results, total=total, has_more=more)
 
 
+class PlatformOperator(BaseModel):
+    id: str
+    slug: str
+
+
+class PlatformOperatorsResponse(BaseModel):
+    """The platform's own operators the caller may read."""
+    items: List[PlatformOperator]
+
+
+@router.get(
+    "/platform-operators",
+    summary="Which operators the platform provides",
+    description=(
+        "The platform's own operators the caller may read, by id and slug. They are derived on this "
+        "node, not read from any card, so an operator someone shares cannot pass for the "
+        "platform's by what it says about itself."
+    ),
+    responses=_errors(401, ok=PlatformOperatorsResponse),
+)
+async def list_platform_operators(
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    if not auth.user_id:
+        raise HTTPException(status_code=401, detail="User identification required")
+    from mantle.services.seed_provisioning import platform_operators as platform_ops
+    known = platform_ops.ids()
+    items = []
+    for op in platform_ops.OPERATORS:
+        op_id = known.get(op["slug"])
+        if not op_id:
+            continue
+        try:
+            await offload_sync(check_access, auth, op_id, "read", store_db)
+        except HTTPException:
+            continue
+        items.append({"id": op_id, "slug": op["slug"]})
+    return {"items": items}
+
+
 # ---------- POST /artifacts — Create ----------
 
 @router.post(
@@ -1717,6 +1762,9 @@ async def _default_create_artifact(
                 detail="identity and source_artifact_id are mutually exclusive: identity derives "
                        "the id of an artifact this call writes, source_artifact_id links one that "
                        "already exists. Supply one.")
+    if parsed.relationship and not parsed.source_artifact_id:
+        raise HTTPException(status_code=400,
+                            detail="relationship names a link; supply source_artifact_id, the artifact linked")
 
     sent_context = _context_as_stored(parsed.context)
     context_str = _merge_content_type_into_context(sent_context, parsed.content_type)
@@ -1987,6 +2035,7 @@ def _link_source_artifact(
         root_id,
         origin=False,
         propagate=[],
+        relationship=parsed.relationship or None,
     )
     return source.to_dict()
 
@@ -2370,6 +2419,12 @@ async def list_children(
     ),
     limit: int = Query(100, ge=1, le=1000, description="Page size."),
     offset: int = Query(0, ge=0, description="How many children to skip."),
+    links: Optional[str] = Query(
+        None, pattern=r"^(\*|[A-Za-z0-9_.:-]{1,64})$",
+        description="List the artifact's typed links instead of its members: `*` for every link, "
+                    "or a relationship's name (a name followed by `.` matches its sub-names, so "
+                    "`step1` lists `step1.collection_id`). Each item carries its `relationship`. "
+                    "Each linked artifact is shown only to a reader who may read it."),
     store_db: Database = Depends(get_store_db),
     auth: AuthContext = Depends(get_auth),
 ):
@@ -2401,8 +2456,12 @@ async def list_children(
     else:
         children = await offload_sync(store.list_collection_artifacts, store_db, artifact_id)
 
-    # Filter out operator edges (relationship != null means non-containment)
-    children = [c for c in children if not c.get("relationship")]
+    # Members, or with `links` the typed links (relationship != null means non-containment).
+    if isinstance(links, str) and links:   # called directly, an unset Query is its default object
+        children = [c for c in children if c.get("relationship") and (
+            links == "*" or c["relationship"] == links or str(c["relationship"]).startswith(links + "."))]
+    else:
+        children = [c for c in children if not c.get("relationship")]
 
     # Optional content_type filter
     if content_type:

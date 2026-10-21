@@ -94,7 +94,8 @@ def test_resolve_auth_accepts_grant_key_with_bundle_expanded():
 
     with patch("mantle.services.dependencies.verify_token", return_value=None), \
          patch("mantle.db.backend.get_active_grants_for_grantee", side_effect=_by_grantee), \
-         patch("mantle.db.backend.update_grant", return_value=None):
+         patch("mantle.db.backend.update_grant", return_value=None), \
+         patch("mantle.services.grant_service.effective_flags", side_effect=_issuer_holds_all):
         ctx = resolve_auth(token="agk_test_key", store_db=MagicMock())
 
     assert ctx.principal_type == "grant_key"
@@ -469,3 +470,10 @@ def test_get_store_db_stays_a_sync_generator():
     assert inspect.isgeneratorfunction(get_store_db)
     assert not inspect.isasyncgenfunction(get_store_db)
     assert not inspect.iscoroutinefunction(get_store_db)
+
+
+def _issuer_holds_all(_db, _user, _resource):
+    """The issuer holds what it granted: these tests are about walking the bundle, and narrowing to
+    what an issuer holds now has its own (`test_a_key_carries_what_its_owner_holds_now`)."""
+    from mantle.entities.grant import Grant
+    return {f: True for f in Grant.PERMISSION_FLAGS}

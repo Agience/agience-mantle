@@ -21,6 +21,9 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 - Published type definitions are loaded at startup, before the index worker starts.
 - Trash. `POST /artifacts/{id}/trash` (needs `delete`) archives the artifact and marks it `trashed_by` and `trashed_time`; `GET /artifacts/trash` lists the caller's Trash, most recently trashed first, each with `purge_after`. Restoring (`PATCH {"state": "live"}`) clears both marks. Every hour, an artifact trashed more than 30 days ago is deleted through the ordinary delete, as the person who trashed it; if they may no longer delete it, it is kept and the refusal logged. `DELETE /artifacts/{id}` still deletes at once.
 - `trashed_by` is indexed in `listkey`, so a Trash listing reads the index instead of scanning archived versions; a store whose index is not built is scanned instead, with a warning. `LatticeArtifactStore.lookup_with_list_field` pages every artifact carrying an indexed field.
+- The platform provides its core operators as granted artifacts: reconcile accounts, answer from my notes, raise an Inbox item, list my collections and ask a model, in a "Platform operators" collection owned by the platform operator. Each is granted to every account one by one (read and invoke) at first sign-in, so each can be withheld or metered on its own; the release migration `mantle.services.seed_provisioning.platform_operators` grants every existing account. Each declares its inputs, and an input naming an artifact says so (`"format": "artifact-id"`, with the content types it accepts).
+- `GET /artifacts/platform-operators` names the platform's own operators the caller may read, by id and slug, derived on the node, so an operator someone shares cannot pass for the platform's by what it says about itself.
+- A typed link: `POST /artifacts` with `source_artifact_id` takes a `relationship`, which says what the linked artifact is to the one it hangs from and confers nothing. `GET /artifacts/{id}/children?links=*` (or a relationship's name, matching its `name.` sub-names) lists an artifact's links, each shown only to a reader who may read it; without `links`, links are not listed as members.
 
 ### Changed
 - A grant key also updates what its grants let it update, and the version is its issuer's. A timer records each run on its own card with its key.
@@ -32,6 +35,8 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 - With archived members included, `list_collection_artifacts` returns an archived artifact linked in from another container, not only one homed in this container.
 - Removing an artifact from a container never destroys it. Held elsewhere, it loses only its link here. Held nowhere else, it is archived in place and keeps its link, so the container's archived listing finds it; that needs `update` on the artifact, and the removal is refused (403) without it. The response's new `archived` field says which happened. An artifact held nowhere else used to be destroyed.
 - A WordNet synset's lemmas are indexed as its names because its type declares them so (Sage's `text/x-wordnet` type), not by a rule in the indexer naming that type. Until Crystal publishes that declaration, a synset is indexed under the default offer.
+- A grant key carries what its owner holds now: each grant it carries is narrowed, at every use, to what its issuer holds on that resource, so a right the issuer loses leaves every key they issued too. It was clamped once, when minted.
+- A key's owner may put on it any resource they hold something on, clamped to what they hold; it needed admin there. A timer's key reaches the operators its workflow runs, which an account holds as read and invoke.
 
 ## [0.1.3] - 2026-10-09
 

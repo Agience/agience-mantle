@@ -178,6 +178,14 @@ def provision_user(
     if inbox_id:
         _materialize_inbox(store_db, user_id, inbox_id)
 
+    # The platform's own operators, one grant each (`platform_operators`). Non-fatal: an account
+    # without them still signs in, and the release migration grants every account again.
+    try:
+        from mantle.services.seed_provisioning.platform_operators import grant_to_account
+        grant_to_account(store_db, user_id)
+    except Exception:
+        logger.warning("provision_user (%s): platform operators not granted", user_id, exc_info=True)
+
     # Identity linkage: give the user a Person artifact and attach any pre-signup
     # leads (contact form, newsletter) that share their email — so the lead's
     # history rolls up to the user. Both idempotent + non-fatal.
