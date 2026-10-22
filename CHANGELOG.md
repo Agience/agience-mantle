@@ -25,6 +25,7 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 - `GET /artifacts/platform-operators` names the platform's own operators the caller may read, by id and slug, derived on the node, so an operator someone shares cannot pass for the platform's by what it says about itself.
 - A typed link: `POST /artifacts` with `source_artifact_id` takes a `relationship`, which says what the linked artifact is to the one it hangs from and confers nothing. `GET /artifacts/{id}/children?links=*` (or a relationship's name, matching its `name.` sub-names) lists an artifact's links, each shown only to a reader who may read it; without `links`, links are not listed as members.
 - `DELETE /artifacts/{id}/links/{relationship}` removes an artifact's typed links of that name and the names under it, and nothing else: no member is detached and nothing linked is archived, since a link is not a home. It needs `evict` on the artifact. Removing a link through the member route could archive what it named.
+- A `contributor` role: read and add, and change nothing anyone else made. The only role that could add, `editor`, also rewrote and deleted another member's card, so a shared collection could not keep each contribution's author.
 
 ### Changed
 - A grant key also updates what its grants let it update, and the version is its issuer's. A timer records each run on its own card with its key.

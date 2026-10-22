@@ -63,6 +63,13 @@ class Grant(BaseEntity):
         "viewer": {
             "can_read": True,
         },
+        #: Reads everything there and adds their own, and changes nothing anyone else made: a shared
+        #: collection where each contribution keeps its author (use case 08). An editor can rewrite
+        #: or delete another member's card.
+        "contributor": {
+            "can_create": True,
+            "can_read": True,
+        },
         "editor": {
             "can_create": True,
             "can_read": True,
