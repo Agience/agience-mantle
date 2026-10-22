@@ -95,6 +95,21 @@ MasterKeyProvider = Callable[[str], bytes]
 _KEY_ACTION: contextvars.ContextVar[str] = contextvars.ContextVar("mantle_content_key_action", default="read")
 
 
+#: The artifact whose content is being opened, while it is (`KeyRequest.artifact_id`): a grant on
+#: that artifact alone is enough for its key. Set by `doc_boundary.decrypt_artifact_content`.
+_KEY_ARTIFACT: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("mantle_content_key_artifact", default=None)
+
+
+@contextlib.contextmanager
+def content_key_artifact(artifact_id: Optional[str]) -> Iterator[None]:
+    """Name the artifact being decrypted for the duration."""
+    token = _KEY_ARTIFACT.set(artifact_id or None)
+    try:
+        yield
+    finally:
+        _KEY_ARTIFACT.reset(token)
+
+
 @contextlib.contextmanager
 def content_key_action(action: str) -> Iterator[None]:
     """Demand content keys under `action` for the duration. Only the use route widens this."""
@@ -149,6 +164,8 @@ def _default_master_key(principal_id: str, collection_id: Optional[str] = None,
             may_create=may_create,
             # Only ever non-None on the encrypt path — see `KeyRequest.creator_id`.
             creator_id=creator_id,
+            # Only on a decrypt: never widens what may be minted.
+            artifact_id=None if may_create else _KEY_ARTIFACT.get(),
         ),
         collection_id=collection_id,
     )

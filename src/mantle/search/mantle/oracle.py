@@ -336,6 +336,12 @@ class KeyRequest:
     #: Defaults to False so the read protection below is what a caller gets by not thinking about
     #: it — the same allow-list reasoning `_WRITE_ACTIONS` states.
     may_create: bool = False
+    #: The artifact whose content this key opens, on a read. Keys are derived per owner and checked
+    #: per collection, so a grant on one card, short of its collection, passed `check_access` and
+    #: was refused the key: the card answered 404 to the person it was shared with. Named, a grant
+    #: reaching the artifact is enough for the key that opens it, by the same upward walk
+    #: `check_access` makes. The key stays in Mantle, which decrypts this artifact for this request.
+    artifact_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.requester_id:
@@ -496,6 +502,7 @@ class LightConeGrantVerifier:
         principal_id: str,
         collection_id: Optional[str],
         action: str,
+        artifact_id: Optional[str] = None,
     ) -> bool:
         # BASE CASE: a principal has custody of its own key. The light cone below resolves pairs
         # whose principal is a collection's origin root — and a user's first collections are
@@ -546,7 +553,11 @@ class LightConeGrantVerifier:
         # holds a grant on it or on an ancestor that still conducts the action, which is exactly
         # what descending from those grants would have reached.
         if collection_id:
-            return self._reaches(requester_id, requester_type, collection_id, action)
+            if self._reaches(requester_id, requester_type, collection_id, action):
+                return True
+            # A grant on the artifact alone (`KeyRequest.artifact_id`): its chain runs through the
+            # collection, so this reaches no further than `check_access` on the artifact does.
+            return bool(artifact_id) and self._reaches(requester_id, requester_type, artifact_id, action)
 
         # Principal-scoped key (e.g. the SSE key, which spans a principal's whole corpus):
         # authorized iff the requester reaches at least one collection under that principal.
@@ -855,12 +866,16 @@ class OracleService:
         ):
             return
 
+        # `artifact_id` only when named, so a verifier that has no artifact-scoped answer is asked
+        # exactly the question it was always asked.
+        scoped = {"artifact_id": request.artifact_id} if request.artifact_id else {}
         if not self._verifier.authorized(
             requester_id=request.requester_id,
             requester_type=request.requester_type,
             principal_id=principal_id,
             collection_id=collection_id,
             action=request.action,
+            **scoped,
         ):
             raise GrantDenied(
                 f"{request.requester_id!r} holds no {request.action!r} grant reaching "

@@ -266,8 +266,11 @@ def encrypt_artifact_content(doc: dict) -> None:
         ) from exc
 
 def decrypt_artifact_content(raw: dict, *, strict: bool = True) -> None:
-    unseal_content_fields(raw)
-    _decrypt_body(raw, strict=strict)
+    # The artifact is named to the key oracle, so a grant on it alone opens it (`KeyRequest`).
+    from mantle.services.content_crypto import content_key_artifact
+    with content_key_artifact(raw.get("root_id") or raw.get("id")):
+        unseal_content_fields(raw)
+        _decrypt_body(raw, strict=strict)
 
 
 def _decrypt_body(raw: dict, *, strict: bool = True) -> None:
