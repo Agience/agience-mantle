@@ -1604,8 +1604,15 @@ def update_artifact(
     against a row recall never returns. A store that has not been migrated can hold an older
     legacy `draft` beside a newer `committed` row, or the reverse; both read as live, and the
     newer one takes the edit.
+
+    Authorization is the caller's, on the ARTIFACT: the routes run `check_access(artifact,
+    "update" | "delete")` first, which walks the artifact's own grants and then its container's.
+    2026-10-22: this asked for `update` on the CONTAINER instead, by direct grant only, so the maker
+    of a card in someone else's collection — who holds an owner's grant on it — could not edit it,
+    and an editor of the collection could rewrite any card in it, whoever made it.
     """
-    get_workspace(db, user_id, workspace_id, required="update")
+    if get_workspace_unsafe(db, workspace_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Workspace not found")
 
     target = store.get_artifact(db, artifact_id)
     if target is not None and target.collection_id != workspace_id:

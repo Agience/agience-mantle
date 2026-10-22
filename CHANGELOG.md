@@ -43,6 +43,7 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ### Fixed
 - A card shared on its own, short of its collection, opens for the person it was shared with. Content keys are checked per collection, so the key oracle refused a reader who reached the card but not its collection: `/grants/my-access` said allowed and `GET /artifacts/{id}` answered 404. A key request now names the artifact being decrypted, and a grant reaching that artifact is enough for its key, by the same walk `check_access` makes; the key stays in Mantle, and the card's siblings stay closed.
+- The maker of a card in someone else's collection edits and deletes it, as the owner's grant minted at its creation says. The update path asked for `update` on the container instead, by direct grant only: a contributor could not fix a typo in their own idea, and an editor of the collection could rewrite anyone's card. Authorization is now the routes' `check_access` on the artifact alone.
 
 ## [0.1.3] - 2026-10-09
 
