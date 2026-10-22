@@ -184,6 +184,14 @@ def main() -> int:
     from mantle.services.system_identity import system_acting_context
 
     db = next(get_store_db())
+    # The node's settings, loaded as Mantle's startup loads them, so the operator resolves from the
+    # store itself (`platform.operator_id`) rather than only by asking Origin, which a release
+    # candidate that redeploys Mantle alone does not run. 2026-10-22: the migration failed there.
+    from mantle import config
+    from mantle.services.platform_settings_service import settings as platform_settings
+    platform_settings.load_all(db)
+    config.set_settings_provider(platform_settings.get)
+    config.load_settings_from_db()
     with system_acting_context(scope="platform.operators-seed"):
         if not ensure_platform_operators(db):
             logger.error("platform operators could not be provisioned")

@@ -9,6 +9,7 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ### Fixed
 - The test that Trash is declared before `/artifacts/{artifact_id}` reads the order from the artifacts router itself: newer FastAPI keeps an included router as one entry in `app.routes`, and the test failed on GitHub's runners.
+- The platform-operators migration loads the node's settings as Mantle's startup does, so it resolves the platform operator from the store rather than only from Origin; a release that redeployed Mantle alone could not run it.
 
 ## [0.1.4] - 2026-10-17
 
