@@ -5,6 +5,11 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-10-22
+
+### Fixed
+- The test that Trash is declared before `/artifacts/{artifact_id}` reads the order from the artifacts router itself: newer FastAPI keeps an included router as one entry in `app.routes`, and the test failed on GitHub's runners.
+
 ## [0.1.4] - 2026-10-17
 
 ### Added

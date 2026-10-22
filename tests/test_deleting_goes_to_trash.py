@@ -198,9 +198,10 @@ async def test_a_restored_artifact_is_never_purged(db, monkeypatch):
 
 def test_the_trash_listing_is_not_taken_for_an_artifact_id():
     """`GET /artifacts/trash` is declared before `GET /artifacts/{artifact_id}`, which would
-    otherwise answer it as the artifact named `trash`."""
-    from mantle.main import app
-    paths = [(r.path, sorted(getattr(r, "methods", []) or [])) for r in app.routes]
+    otherwise answer it as the artifact named `trash`. Read from the router that declares both:
+    newer FastAPI keeps an included router as one entry in `app.routes` rather than its routes."""
+    from mantle.routers.artifacts_router import router
+    paths = [(r.path, sorted(getattr(r, "methods", []) or [])) for r in router.routes]
     trash_at = paths.index(("/artifacts/trash", ["GET"]))
     one_at = next(i for i, (p, m) in enumerate(paths) if p == "/artifacts/{artifact_id}" and "GET" in m)
     assert trash_at < one_at
