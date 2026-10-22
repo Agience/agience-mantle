@@ -133,11 +133,12 @@ def test_a_new_note_is_written_into_the_default_recall_segment(db, workspace, in
 
 
 def test_the_second_edit_is_what_a_default_recall_answers_with(db, workspace, index_writes):
-    """A save after the first one is what recall answers with: one row, the newest content.
+    """A save after the first one is what recall answers with: one live row, the newest content.
 
-    A create that lands in the default segment is not enough on its own. If an edit wrote the new
-    content to a second row, the first row and its index entry would keep answering with the
-    content from before the edit, so the first save would be findable and every later one not.
+    A create that lands in the default segment is not enough on its own. If an edit left the first
+    row live, it and its index entry would keep answering with the content from before the edit,
+    so the first save would be findable and every later one not. Each body change keeps the
+    version it replaced as an archived snapshot, which recall does not answer with.
     """
     with acting_as(USER, principal_type="user"):
         note = ws.create_workspace_artifact(
@@ -149,8 +150,9 @@ def test_the_second_edit_is_what_a_default_recall_answers_with(db, workspace, in
 
     root = note.root_id
     lineage = _lineage(db, root)
-    assert len(lineage) == 1, f"an edit forked the lineage into {len(lineage)} rows"
-    assert [v.get("state") for v in lineage] == [DEFAULT_RECALL_SEGMENT]
+    live = [v for v in lineage if store.state_of(v) != "archived"]
+    assert [v["id"] for v in live] == [note.id], f"the lineage has {len(live)} live rows"
+    assert len(lineage) == 3, "each body change keeps the version it replaced"
 
     # The row recall hydrates a live-segment hit through, and what it holds.
     hydrated = backend.find_newest_by_root(db, root)
@@ -258,7 +260,9 @@ def test_with_content_addressed_bodies_recall_answers_with_the_newest_edit(
     snapshots = [v for v in lineage if store.state_of(v) == "archived"]
     assert [v["id"] for v in heads] == [note.id], f"the lineage has {len(heads)} heads"
     assert len(snapshots) == 2, "each content change keeps the prior version as a snapshot"
-    assert {v.get("superseded_by") for v in snapshots} == {note.id}
+    # The live version names the snapshot it was made from; the lineage is a DAG, not a pile.
+    assert store.get_artifact(db, note.id).parent_id in {v["id"] for v in snapshots}
+    assert not any(v.get("superseded_by") for v in lineage), "no row points forward to its successor"
 
     hydrated = backend.find_newest_by_root(db, root)
     assert hydrated["id"] == note.id

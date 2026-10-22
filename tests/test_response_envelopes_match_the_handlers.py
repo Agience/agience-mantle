@@ -150,7 +150,7 @@ def test_the_scan_finds_the_documented_routes():
     #: the models. `ArtifactResponse` is `extra="allow"`, so the spec says
     #: `additionalProperties: true` — twelve keys guaranteed, more may arrive — which declares the
     #: document without closing it.
-    assert len(doc) == 20, "expected 20 documented envelopes, found %d: %r" % (len(doc), doc)
+    assert len(doc) == 19, "expected 19 documented envelopes, found %d: %r" % (len(doc), doc)
 
 
 @pytest.mark.parametrize("handler,model_name", sorted(_documented().items()))

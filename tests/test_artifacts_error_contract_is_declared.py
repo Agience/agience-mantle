@@ -39,8 +39,8 @@ def artifact_ops():
            for method, op in item.items()
            if isinstance(op, dict) and "Artifacts" in (op.get("tags") or [])}
     # Pinned, so a new operation cannot arrive without being covered by the checks below.
-    assert len(ops) == 23, (
-        "expected 23 artifact operations, found %d — this suite's subject moved" % len(ops))
+    assert len(ops) == 22, (
+        "expected 22 artifact operations, found %d — this suite's subject moved" % len(ops))
     return ops
 
 
@@ -137,7 +137,7 @@ def test_every_path_parameter_is_described(artifact_ops):
     `{artifact_id}` and never `{container_id}`, because a container is an artifact and two
     templates make a code generator emit two unrelated resources. The name therefore carries no
     hint about which role the id plays, and the roles differ: on `warm`, `children`,
-    `children/order` and `commits` the id names the container and the operation acts on what it
+    and `children/order` the id names the container and the operation acts on what it
     holds rather than on the artifact named in the path.
     """
     undescribed = []
@@ -157,7 +157,7 @@ def test_the_container_routes_say_the_id_is_a_container(artifact_ops):
     Every two-id operation reads container-first, so there is no exception to carve out here:
     detaching a member is `DELETE /artifacts/{artifact_id}/children/{child_id}`, where the first
     segment is the container and the second is the member."""
-    want = ("/warm", "/children", "/commits")
+    want = ("/warm", "/children")
     seen = 0
     for (path, _m), op in artifact_ops.items():
         if not path.endswith(want):
@@ -168,7 +168,7 @@ def test_the_container_routes_say_the_id_is_a_container(artifact_ops):
             seen += 1
             assert "CONTAINER" in prm.get("description", ""), (
                 "%s does not say its path id names a container" % path)
-    assert seen >= 3, "only %d container-route path params found — the scan missed some" % seen
+    assert seen >= 2, "only %d container-route path params found — the scan missed some" % seen
 
 
 def test_remove_names_both_of_its_ids_for_what_they_are(artifact_ops):

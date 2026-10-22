@@ -1,6 +1,6 @@
 """Tests for `db.lattice_api` — the function-compatible `db` surface over the lattice,
 covering brick 1 through 7: artifact CRUD, collections and membership, grants, origin lineage and
-the propagation light-cone, commits/keys/credentials, and the shared persistence boundary.
+the propagation light-cone, keys/credentials, and the shared persistence boundary.
 
 These prove the standalone-Mantle contract at its root: an `ArtifactEntity` round-trips through the
 same function names/signatures the routers already call, against Mantle's own store (a temp SQLite
@@ -605,33 +605,8 @@ def test_archive_artifact_gated_on_delete_grant(db):
                for d in db.artifacts.list_artifacts(content_type="text/markdown"))
 
 
-# ── brick 6: commits + api keys + server credentials + JWKs ──────────────────
-def test_commits_round_trip_and_collection_lookup(db):
-    try:
-        from mantle.entities.commit import Commit
-        from mantle.entities.commit_item import CommitItem
-    except ImportError:
-        from mantle.entities.commit import Commit
-        from mantle.entities.commit_item import CommitItem
-    items = [CommitItem(id="ci-1", item_type="add", collection_id="col-1",
-                        artifact_version_ids=["v1"]),
-             CommitItem(id="ci-2", item_type="add", collection_id="col-OTHER",
-                        artifact_version_ids=["v2"])]
-    assert api.create_commit_items(db, items) == ["ci-1", "ci-2"]
-    api.create_commit(db, Commit(id="cm-1", message="first", timestamp="2026-07-22T10:00:00Z",
-                                 author_id="user-1", item_ids=["ci-1"]))
-    api.create_commit(db, Commit(id="cm-2", message="second", timestamp="2026-07-22T11:00:00Z",
-                                 author_id="user-1", item_ids=["ci-2"]))
-    raw = api.get_commit_by_id(db, "cm-1")
-    assert raw is not None and raw["id"] == "cm-1" and raw["message"] == "first"
-    assert api.get_commit_by_id(db, "nope") is None
-    got = api.get_commits_for_collection(db, "col-1")
-    assert [c["id"] for c in got] == ["cm-1"]
-    both = api.get_commits_for_collection(db, "col-OTHER")
-    assert [c["id"] for c in both] == ["cm-2"]
+# ── brick 6: api keys + server credentials + JWKs ──────────────────
 
-
-# ── brick 7: the shared persistence boundary (crypto + events) ───────────────
 def test_content_is_ciphertext_at_rest_plaintext_on_read(db):
     import base64
     api.create_artifact(db, _entity())

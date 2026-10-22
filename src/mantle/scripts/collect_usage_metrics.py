@@ -32,7 +32,7 @@ def _load_backend_dependencies() -> None:
 
 
 def _count_ct(db, content_type: str) -> int:
-    """Stream-count one typed plane. Small planes only (grants/commits/containers)."""
+    """Stream-count one typed plane. Small planes only (grants/containers)."""
     return sum(1 for _ in db.artifacts.list_artifacts(content_type=content_type))
 
 
@@ -40,7 +40,7 @@ def collect_usage_metrics() -> dict[str, int]:
     _load_backend_dependencies()
     db = get_store_handle()
 
-    from mantle.db.lattice_api import _GRANT_CT, _COMMIT_CT               # the typed planes
+    from mantle.db.lattice_api import _GRANT_CT                           # the typed plane
     from mantle.db.lattice_identity import _PEOPLE
     from mantle.entities.collection import WORKSPACE_CONTENT_TYPE, COLLECTION_CONTENT_TYPE
 
@@ -51,7 +51,6 @@ def collect_usage_metrics() -> dict[str, int]:
         "collections_total": _count_ct(db, COLLECTION_CONTENT_TYPE),
         "live_artifact_versions_total": int(db.artifacts.count(state="live")),
         "grants_total": _count_ct(db, _GRANT_CT),
-        "commits_total": _count_ct(db, _COMMIT_CT),
     }
 
 

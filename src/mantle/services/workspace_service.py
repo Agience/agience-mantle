@@ -1495,17 +1495,10 @@ def _refuse_restoring_a_superseded_version(db: Database, target: ArtifactEntity)
     """409 unless restoring ``target`` brings back a retired lineage, at its newest row.
 
     A restore applies to a lineage whose every version is archived — an artifact a user retired.
-    It is refused for an archived row that another version superseded (it records
-    ``superseded_by``: a content snapshot, or an older row a migration archived), and for any
-    archived row whose root still has a live version. Either restore would put a second live row
-    under the root, and readers resolve a lineage to its newest live row, so the older content
-    would shadow the head or be shadowed by it depending on which reader asked."""
-    raw = db.artifacts.get_artifact(target.id) or {}
-    if raw.get("superseded_by"):
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            "This is a superseded version of %s, not a retired artifact; restore the artifact "
-            "itself." % raw["superseded_by"])
+    It is refused for any archived row whose root still has a live version (a content snapshot, or
+    an older row a migration archived), and for any but the newest row of a retired lineage.
+    Either restore would put a second live row under the root, or make older content the head,
+    and readers resolve a lineage to its newest live row."""
     root = target.root_id or target.id
     versions = db.artifacts.versions_of(root) or []
     live = [v for v in versions
@@ -1516,9 +1509,7 @@ def _refuse_restoring_a_superseded_version(db: Database, target: ArtifactEntity)
             "This lineage already has a live version (%s); an archived version of it cannot be "
             "restored beside it." % live[-1].get("id"))
     # Of a retired lineage, only its newest row is restorable — the last in `versions_of`, the
-    # order head resolution reads. An older archived row carries no `superseded_by` when a user
-    # archived it before a newer version existed, and restoring it would make older content the
-    # head.
+    # order head resolution reads. Restoring an older one would make older content the head.
     if versions and versions[-1].get("id") != target.id:
         raise HTTPException(
             status.HTTP_409_CONFLICT,

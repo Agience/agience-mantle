@@ -10,7 +10,6 @@ def test_collect_usage_metrics_returns_stable_metric_set(tmp_path, monkeypatch):
     from mantle.db import lattice_api as api
     from mantle.entities.artifact import Artifact
     from mantle.entities.grant import Grant
-    from mantle.entities.commit import Commit
     from mantle.entities.collection import WORKSPACE_CONTENT_TYPE
 
     db = api.open_database(str(tmp_path / "usage.db"), origin="usage-test")
@@ -30,8 +29,6 @@ def test_collect_usage_metrics_returns_stable_metric_set(tmp_path, monkeypatch):
     api.add_artifact_to_collection(db, "ws-1", "a-1")
     api.create_grant(db, Grant(id="g-1", resource_id="ws-1", grantee_type="user",
                                grantee_id="u1", granted_by="u1"))
-    api.create_commit(db, Commit(id="c-1", message="m", timestamp="2026-01-01T00:00:00Z",
-                                 item_ids=[]))
     from mantle.db import lattice_identity as idl
     idl.create_person(db, {"id": "u1", "email": "u1@x"})
 
@@ -40,13 +37,12 @@ def test_collect_usage_metrics_returns_stable_metric_set(tmp_path, monkeypatch):
     assert set(metrics) == {
         "users_total", "workspaces_total", "workspace_artifacts_total",
         "collections_total", "live_artifact_versions_total",
-        "grants_total", "commits_total",
+        "grants_total",
     }
     assert metrics["users_total"] == 1
     assert metrics["workspaces_total"] == 1
     assert metrics["workspace_artifacts_total"] == 1     # the membership edge
     assert metrics["grants_total"] == 1
-    assert metrics["commits_total"] == 1
     assert metrics["live_artifact_versions_total"] >= 2   # ws + artifact; typed docs carry no state
 
 

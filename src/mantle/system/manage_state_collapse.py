@@ -23,8 +23,7 @@ What it does, in order:
      The newest row of the group — last in ``(_origin, _seq)`` order, the rule every reader
      applies — is the one that stays live. When this node authored it, it is written ``live``
      and announced on the change feed as ``artifact.updated``. Each older row this node
-     authored is archived with ``superseded_by`` naming the newest; an older row another node
-     authored is left to step 2, and the readers' newest-row rule already resolves past it.
+     authored is archived; an older row another node authored is left to step 2, and the readers' newest-row rule already resolves past it.
      These are ordinary authored writes (a fresh ``_seq``), so peers receive them. The newest row
      is then reindexed into the live segment with ``replace=True`` and its root is vacated from
      the legacy draft segment.
@@ -278,7 +277,7 @@ def apply(db, groups: List[Dict[str, Any]], *, batch: int = DEFAULT_BATCH,
             for loser in members[:-1]:
                 if loser.get("id") in g["losers"]:
                     db.artifacts.put_artifact(
-                        _changed(loser, state="archived", superseded_by=g["winner"]))
+                        _changed(loser, state="archived"))
                     archived += 1
             # A newest row another node authored is not written here; step 2 relabels it in
             # place.

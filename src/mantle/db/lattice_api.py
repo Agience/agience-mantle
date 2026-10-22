@@ -248,8 +248,42 @@ def get_artifact(db: LatticeDatabase, artifact_id: str) -> Optional[ArtifactEnti
 #: And it did not even cover the real failure: if `put_artifact` ever returned without
 #: persisting, `is None` would not have caught it either. The only failure that reaches a client
 #: is `put_artifact` RAISING, which propagates past every one of those guards.
+def _content_changed(db: LatticeDatabase, entity: ArtifactEntity) -> bool:
+    """Does writing `entity` change its artifact's CONTENT — the body, or a field the types declare
+    part of the content (the title, declared on the root type `*/*` and inherited by every type;
+    `doc_boundary.CONTENT_FIELDS` is the same list the seal uses)? Compared in plaintext, as this
+    reader opens the stored version: a sealed field cannot be compared sealed. A prior version this
+    reader cannot open is left to the store's own `content_ref` rule."""
+    prior = db.artifacts.get_artifact(entity.id)
+    if not prior:
+        return False
+    before = dict(prior)
+    try:
+        _boundary.decrypt_artifact_content(before, strict=True)
+    except Exception:
+        return False
+    after = entity.to_dict()
+    if (before.get("content_ref") or None) != (after.get("content_ref") or None):
+        return True
+    if not after.get("content_ref") and (before.get("content") or "") != (after.get("content") or ""):
+        return True
+
+    def fields(ctx):
+        if isinstance(ctx, str):
+            try:
+                ctx = json.loads(ctx) if ctx else {}
+            except ValueError:
+                ctx = {}
+        return {k: (ctx or {}).get(k) for k in _boundary.CONTENT_FIELDS}
+
+    return fields(before.get("context")) != fields(after.get("context"))
+
+
 def update_artifact(db: LatticeDatabase, entity: ArtifactEntity) -> ArtifactEntity:
-    db.artifacts.put_artifact(to_lattice_doc(entity))
+    """Write `entity` over its live version. When its content changes — the body or the title — the
+    version it replaces is kept, archived, and the live one names it as its `parent_id`; every other
+    change (lifecycle, placement, description, bindings) is written in place."""
+    db.artifacts.put_artifact(to_lattice_doc(entity), new_version=_content_changed(db, entity))
     _boundary.emit_artifact_change(entity, "artifact.updated")
     return entity
 
@@ -463,8 +497,9 @@ def update_collection(db: LatticeDatabase, entity: Any) -> Any:
     """A container update is an artifact update — same chokepoint as `create_collection`.
 
     A rename or a description edit is the change a live tree is most likely to be showing
-    stale, so it announces itself exactly like any other artifact write."""
-    db.artifacts.put_artifact(to_lattice_doc(entity))
+    stale, so it announces itself exactly like any other artifact write. A change of its title is
+    a change of its content, and keeps the version it replaces (`update_artifact`)."""
+    db.artifacts.put_artifact(to_lattice_doc(entity), new_version=_content_changed(db, entity))
     _boundary.emit_artifact_change(entity, _boundary.UPDATED)
     return entity
 
@@ -1268,18 +1303,6 @@ def get_containers_for_user(db: LatticeDatabase, user_id: str,
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BRICK 6 — commits (Group 5)
-#
-# Same move as grants: each store side-collection becomes a stamped `content_type` plane in the
-# one store. Commit provenance (`get_commit_by_id` / `get_commits_for_collection`) keeps store's
-# RAW-dict return shape — the routers render those directly.
-# ─────────────────────────────────────────────────────────────────────────────
-
-_COMMIT_CT = "application/vnd.agience.commit+json"
-_COMMIT_ITEM_CT = "application/vnd.agience.commit-item+json"
-
-
 def _put_typed(db: LatticeDatabase, entity: Any, ct: str) -> Any:
     d = to_lattice_doc(entity)
     d["content_type"] = ct
@@ -1296,58 +1319,6 @@ def _get_typed(db: LatticeDatabase, id: str, ct: str, cls: Type[T]) -> Optional[
     if raw is None or raw.get("content_type") != ct:
         return None
     return from_lattice_doc(raw, cls)
-
-
-# ── commits ──────────────────────────────────────────────────────────────────
-def create_commit(db: LatticeDatabase, commit: Any) -> Any:
-    return _put_typed(db, commit, _COMMIT_CT)
-
-
-def create_commit_items(db: LatticeDatabase, items: list) -> list:
-    return [_put_typed(db, item, _COMMIT_ITEM_CT).id for item in (items or [])]
-
-
-def get_commit_by_id(db: LatticeDatabase, commit_id: str) -> Optional[Dict[str, Any]]:
-    """Raw commit dict (store returned the raw doc with `id` set — preserved)."""
-    raw = db.artifacts.get_artifact(commit_id)
-    if raw is None or raw.get("content_type") != _COMMIT_CT:
-        return None
-    return {k: v for k, v in raw.items() if k not in _LATTICE_INTERNAL}
-
-
-def get_commits_for_collection(db: LatticeDatabase, collection_id: str) -> list:
-    """Commits whose item set touches this collection, newest first (raw dicts).
-
-    Each dict carries its resolved `adds` / `removes`, derived from `CommitItem` — the only
-    place the changed version-ids live. Without this, the commits API would publish `adds: []`
-    and `removes: []` for every commit: a changeset history in which nothing ever changed, and
-    silent because the route would default the missing attributes to `[]`.
-
-    It costs nothing extra to resolve here: this function already scans every `CommitItem` doc to
-    decide which commits touch the collection, so resolving from that same scan avoids the
-    per-commit lookup a router-level fix would add.
-
-    Scoped to `collection_id`: a commit spanning two collections reports only the ids that moved
-    in this one, which is what a caller asking for this container's history means."""
-    items_here = {}
-    for d in _typed_docs(db, _COMMIT_ITEM_CT):
-        if d.get("collection_id") == collection_id and d.get("id"):
-            items_here[d["id"]] = d
-    out = []
-    for c in _typed_docs(db, _COMMIT_CT):
-        mine = [items_here[i] for i in (c.get("item_ids") or []) if i in items_here]
-        if not mine:
-            continue
-        row = {k: v for k, v in c.items() if k not in _LATTICE_INTERNAL}
-        adds, removes = [], []
-        for it in mine:
-            target = removes if it.get("item_type") == "remove" else adds
-            target.extend(it.get("artifact_version_ids") or [])
-        row["adds"] = adds
-        row["removes"] = removes
-        out.append(row)
-    out.sort(key=lambda c: c.get("timestamp") or "", reverse=True)
-    return out
 
 
 # ── WHERE-index materialization bookkeeping ──────────────────────────────────
@@ -1399,10 +1370,13 @@ _COLLECTION_TO_CT = {COLLECTION_GRANTS: _GRANT_CT}
 #: The typed side-planes that share the vertex table. An "artifacts" query must NOT see them —
 #: in store they were separate collections, and that scoping is part of the contract.
 _SIDE_PLANE_CTS = frozenset({
-    _GRANT_CT, _COMMIT_CT, _COMMIT_ITEM_CT, _MATERIALIZED_CT,
+    _GRANT_CT, _MATERIALIZED_CT,
     # Retired planes. Nothing writes these, but a lattice provisioned by an older version may
     # still hold their rows, and scoping is about what a query may SEE — dropping the name here
-    # would surface those rows in `artifacts` results.
+    # would surface those rows in `artifacts` results. Commits are among them: an artifact's
+    # changes are its versions.
+    "application/vnd.agience.commit+json",
+    "application/vnd.agience.commit-item+json",
     "application/vnd.agience.api-key+json",
     "application/vnd.agience.server-credential+json",
     "application/vnd.agience.server-jwk+json",
@@ -1743,7 +1717,6 @@ __all__ = [
     "get_origin_parent", "get_origin_root", "list_origin_descendants",
     "get_relationship_target",
     "delete_artifacts_by_root", "archive_artifact",
-    "create_commit", "create_commit_items", "get_commit_by_id", "get_commits_for_collection",
     "get_collections_by_owner_and_type", "is_materialized", "mark_materialized",
 ]
 

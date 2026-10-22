@@ -119,12 +119,12 @@ def test_apply_settles_every_class_and_leaves_the_counters_exact(db):
     assert out["relabelled"] == 9
     assert sorted(reindexed) == ["a", "b~2", "c~2", "e", "f", "h-peer"]
 
-    # A, E: live. B, C: the newest row is live and each older one points at it.
+    # A, E: live. B, C: the newest row is live and each older one is archived.
     for doc_id in ("a", "e", "b~2", "f", "c~2", "h-peer"):
         assert _state(db, doc_id) == "live", doc_id
     for loser, winner in (("b", "b~2"), ("f~1", "f"), ("c~1", "c~2"), ("h", "h-peer")):
         doc = db.artifacts.get_artifact(loser)
-        assert (doc["state"], doc.get("superseded_by")) == ("archived", winner), loser
+        assert doc["state"] == "archived" and "superseded_by" not in doc, (loser, winner)
     # Another node's rows are relabelled in place: same author, same proper time.
     for doc_id, seq in (("d", 7), ("h-peer", 8)):
         doc = db.artifacts.get_artifact(doc_id)

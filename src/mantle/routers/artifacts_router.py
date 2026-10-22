@@ -28,7 +28,6 @@
 #   PUT    /artifacts/{id}/content              → Proxied upload (encrypts on the byte path)
 #   PATCH  /artifacts/{id}/children/order       → Reorder a container's children
 #   POST   /artifacts/{id}/warm                 → Materialize a collection's latent artifacts
-#   GET    /artifacts/{artifact_id}/commits     → List commits for collection (id must be one)
 #   GET    /artifacts/{id}/access-log           → The artifact's own access history
 #
 # There is no move verb: an artifact's home is its membership edges, so moving one is
@@ -998,9 +997,8 @@ router = APIRouter(prefix="/artifacts", tags=["Artifacts"])
 # — is caught by `tests/test_response_envelopes_match_the_handlers.py`, which compares each model's
 # fields against the literal keys of its route's `return` and fails on either kind of mismatch.
 #
-# Nested payloads are `Any` on purpose. `artifacts`, `commits` and `events` carry artifact and
-# commit documents, and an artifact document is open — a content type may add fields, measured on a
-# real lattice. Typing them would be the same drop-what-you-did-not-anticipate bug one level down.
+# Nested payloads are `Any` on purpose. `artifacts` and `events` carry artifact documents, and an
+# artifact document is open — a content type may add fields, measured on a real lattice. Typing them would be the same drop-what-you-did-not-anticipate bug one level down.
 #
 # `upload-initiate` is declared here too, as `UploadInitiateResponse`. Its key set is knowable
 # because `initiate_upload_and_create_artifact` has exactly one return and it is a literal,
@@ -4227,81 +4225,8 @@ async def reorder_children(
 
 
 # =============================================================================
-# Container Metadata
+# Access record
 # =============================================================================
-
-# ---------- GET /artifacts/{artifact_id}/commits ----------
-
-@router.get("/{artifact_id}/commits",
-    # No 400: nothing on this path refuses a request it has authorized.
-    responses=_errors(401, 404, 500, ok=PageResponse),
-)
-async def list_commits(
-    artifact_id: Annotated[str, Path(description=_CONTAINER_PARAM)],
-    limit: int = Query(100, ge=1, le=1000, description="Page size."),
-    offset: int = Query(0, ge=0, description="How many commits to skip, newest first."),
-    auth: AuthContext = Depends(get_auth),
-    store_db: Database = Depends(get_store_db),
-):
-    """List commits for a collection container."""
-    #: Authenticate before touching the store. Ordered after `check_access` instead, an
-    #: unauthenticated caller gets a different status for an id that exists than for one that
-    #: does not — an existence oracle built out of the difference between two error codes.
-    if not auth.user_id:
-        raise HTTPException(status_code=401, detail="User identification required")
-
-    await offload_sync(check_access, auth, artifact_id, "read", store_db)
-
-    # Any artifact may be asked for its commits, and one that has none gets an empty page. Nothing
-    # on this path tests whether the artifact is a collection, and a read returning nothing is a
-    # correct answer rather than an error.
-
-    from mantle.services.collection_service import get_commits_for_collection
-
-    try:
-        # A commit row plus its item rows for each commit in the collection's history.
-        commits = await offload_sync(
-            get_commits_for_collection, store_db, auth.user_id, artifact_id
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error("Failed to list commits: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to list commits")
-
-    # The response uses the one page shape, so `total` is the full history length and `has_more`
-    # is derived from the window returned.
-    #
-    # Direct attribute access, never `getattr(c,..., default)`. `adds` and `removes` are not
-    # fields of `Commit` — they live in the `CommitItem`s that `item_ids` points at, and
-    # `collection_service` sets both attributes from the store's own resolution. Reading them
-    # with an empty-list default would publish a changeset in which nothing ever changed; a
-    # direct read raises `AttributeError` on a rename instead of quietly emptying the response.
-    #
-    # `collection_id` is the route's own `artifact_id` rather than a lookup, because `Commit`
-    # carries no collection.
-    rows = [
-        {
-            "id": c.id,
-            "collection_id": artifact_id,
-            "message": c.message,
-            "author_id": c.author_id,
-            "created_time": c.created_time,
-            "adds": c.adds,
-            "removes": c.removes,
-        }
-        for c in commits
-    ]
-    # Paged, like every other list on this surface.
-    #
-    # This bounds the response, not the work. `get_commits_for_collection` scans every
-    # `CommitItem` and every `Commit` doc in the store to decide which touch this container, and
-    # paging cannot narrow a filter that is not indexed by container. Narrowing the scan is a
-    # store-layer change.
-    total = len(rows)
-    window = rows[offset:offset + limit]
-    return _page(window, total=total, has_more=(offset + len(window)) < total)
-
 
 @router.get("/{artifact_id}/access-log",
     responses=_errors(401, 404, 500, ok=AccessLogResponse),

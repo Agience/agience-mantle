@@ -82,7 +82,7 @@ def spec():
     return app.openapi()
 
 
-@pytest.mark.parametrize("suffix", ["warm", "commits"])
+@pytest.mark.parametrize("suffix", ["warm"])
 def test_the_url_did_not_move(spec, suffix):
     """A path-parameter rename must be invisible on the wire. If this fails, callers broke."""
     paths = [p for p in spec["paths"] if p.endswith("/" + suffix)]

@@ -1,10 +1,10 @@
 """P-8: a handler must answer 401 before it touches the store.
 
 Measured 2026-08-25 across `artifacts_router.py`: eleven handlers raise an explicit 401 and also
-read the store, and **one of them did it in the wrong order**. `list_commits` ran
+read the store, and **one of them did it in the wrong order**: a listing route ran
 `check_access` → `_artifact_exists` → `401`, so an unauthenticated caller received:
 
-    an id that does not exist  ->  400 "Commits only available for collections"
+    an id that does not exist  ->  400, naming what the id was not
     an id that does exist      ->  401 "User identification required"
 
 The status code answered *"does this artifact exist?"* for someone who had not identified

@@ -1,9 +1,8 @@
 import json
 import logging
-import time
 import uuid
 from datetime import datetime, timezone
-from typing import List, Optional, Set, TYPE_CHECKING, Any, Dict, Mapping, Sequence, cast
+from typing import List, Optional, Set, TYPE_CHECKING, Any, Dict, Mapping, Sequence
 
 import mantle.events.event_bus as event_bus
 
@@ -31,8 +30,6 @@ else:
 
 from mantle.entities.artifact import Artifact as ArtifactEntity
 from mantle.entities.collection import Collection as CollectionEntity
-from mantle.entities.commit import Commit as CommitEntity
-from mantle.entities.commit_item import CommitItem as CommitItemEntity
 from mantle.entities.grant import Grant as GrantEntity
 
 from mantle.db.backend import (
@@ -54,19 +51,8 @@ from mantle.db.backend import (
     get_current_in_any_collection_many as db_get_current_in_any_collection_many,
     list_collection_artifacts as db_list_collection_artifacts,
     archive_artifact as db_archive_artifact,
-    after_key as _db_after_key,
-    get_last_order_key as _db_get_last_order_key,
-
-    # Edges
-    add_artifact_to_collection as db_add_artifact_to_collection,
-    add_artifacts_to_collection_batch as _db_add_edges_batch,
     remove_artifact_from_collection as _db_remove_edge,
 
-    # Commits
-    create_commit as db_create_commit,
-    create_commit_items as db_create_commit_items,
-    get_commit_by_id as db_get_commit_by_id,
-    get_commits_for_collection as db_get_commits_for_collection,
 
     # Grants - unified authorization records
     get_active_collection_ids_for_user as db_get_active_collection_ids_for_user,
@@ -433,70 +419,6 @@ def delete_user_collection(db: Database, user_id: Optional[str], collection_id: 
 
 # === Artifact Operations ===
 
-def remove_artifact_from_collection_by_version(
-    db: Database,
-    user_id: str,
-    collection_id: str,
-    *,
-    version_id: str,
-    archive: bool = False,
-    record: bool = True,
-    root_id: Optional[str] = None,
-    linked_version_id: Optional[str] = None,
-) -> None:
-    """
-    Unlink by version id. If the currently linked version equals version_id, unlink.
-    If it differs, unlink by root to honor user intent and consider that a drift case.
-    If archive=True and you are unlinking the currently linked version, set is_archived=true.
-    Provenance: record remove using version id.
-
-    root_id: Pre-fetched root_id (skip version lookup)
-    linked_version_id: Pre-fetched currently linked version (skip link lookup)
-    """
-    # Get root_id if not provided
-    if not root_id:
-        v = db_get_artifact_by_version_id(db, version_id)
-        if not v:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Artifact version not found")
-        root_id = getattr(v, "root_id", None)
-        if not root_id:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Version has no root_id")
-
-    # Get linked version if not provided
-    if linked_version_id is None:
-        linked = db_get_artifact_by_collection_id_and_root_id(db, collection_id, root_id)
-        linked_version_id = getattr(linked, "id", None) if linked else None
-
-    # Unlink
-    db_delete_collection_artifact_by_collection_and_root(db, collection_id, root_id)
-
-    # Archive only if we were unlinking the currently linked version
-    if archive and linked_version_id and linked_version_id == version_id:
-        try:
-            db_archive_artifact(db, user_id, version_id)
-        except Exception:
-            logger.exception("Failed to archive version %s on remove", version_id)
-
-    if record:
-        record_collection_commit(
-            db, user_id, collection_id,
-            removes=[version_id],
-            message=f"Removed version {version_id} from collection {collection_id}",
-        )
-    
-    # Delete from unified search index if this was the linked version
-    if linked_version_id and linked_version_id == version_id:
-        try:
-            delete_artifact_from_index(version_id, root_id, collection_id=collection_id)
-        except Exception as e:
-            logger.warning(f"Failed to delete collection artifact from search {version_id}: {e}")
-
-    _emit(collection_id, "artifact.deleted", {
-        "artifact_id": root_id, "collection_id": collection_id
-    }, actor_id=user_id)
-    _note_membership_change(user_id, collection_id)
-
-
 def get_unattached_artifacts(db: Database, user_id: str) -> List[ArtifactEntity]:
     """
     Return artifacts created by `user_id` that have no CollectionArtifact link.
@@ -732,53 +654,6 @@ def _note_membership_change(user_id: str, collection_id: str) -> None:
     note_membership_change(user_id, collection_id)
 
 
-def add_artifact_to_collection_with_access_check(
-    db: Database,
-    user_id: str,
-    collection_id: str,
-    version_id: str,
-    root_id: Optional[str] = None,
-) -> ArtifactEntity:
-    """
-    Service-level wrapper: Link an existing version into a collection.
-    Resolve root from the version.
-
-    root_id: Pre-fetched root_id (skip version lookup)
-    """
-
-    # Validate version exists and fetch its root (if not provided)
-    artifact = None
-    if not root_id:
-        artifact = db_get_artifact_by_version_id(db, version_id)
-        if not artifact:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Artifact version not found")
-        root_id = getattr(artifact, "root_id", None)
-        if not root_id:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Version has no root_id")
-    
-    # Fetch artifact if we didn't already (for return value)
-    if not artifact:
-        artifact = db_get_artifact_by_version_id(db, version_id)
-        if not artifact:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Artifact version not found")
-
-    # Create/replace link
-    db_delete_collection_artifact_by_collection_and_root(db, collection_id, root_id)
-    db_add_artifact_to_collection(db, collection_id, root_id, version_id)
-
-    record_collection_commit(
-        db, user_id, collection_id,
-        adds=[version_id],
-        message=f"Linked existing artifact version {version_id}",
-    )
-    _attach_committed_collection_ids(db, [artifact])
-    _emit(collection_id, "artifact.created", {
-        "artifact": {**artifact.to_dict(), "collection_id": collection_id}
-    }, actor_id=user_id)
-    _note_membership_change(user_id, collection_id)
-    return artifact
-
-
 def archive_artifact_by_version_id(db: Database, user_id: str, version_id: str) -> bool:
     """
     Archives an artifact by its version ID.
@@ -792,141 +667,7 @@ def archive_artifact_by_version_id(db: Database, user_id: str, version_id: str) 
 
 # === Commit ===
 
-def create_commit(db: Database, user_id: str, commit: CommitEntity) -> CommitEntity:
-    """
-    Handles explicit commit creation from the API.
-    """
-    # This loop performs no per-item validation: `record_collection_commit` is the path
-    # that validates write access per referenced collection_id, and normal flows use it.
-    for item_id in getattr(commit, "item_ids", []) or []:
-        pass
-
-    # Minimal envelope write: fill id, timestamp, author then create
-    now = datetime.now(timezone.utc).isoformat()
-    commit.id = commit.id or str(uuid.uuid4())
-    commit.timestamp = now
-    commit.author_id = user_id
-    db_create_commit(db, commit)
-    return commit
-
-
-def get_commit(db: Database, user_id: str, commit_id: str) -> CommitEntity:
-    """Fetch a commit by id and convert it to a domain entity."""
-    raw = db_get_commit_by_id(db, commit_id)
-    if not raw:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
-
-    if isinstance(raw, Mapping):
-        data: Dict[str, Any] = dict(cast(Mapping[str, Any], raw))
-    else:
-        data = cast(Dict[str, Any], raw)
-
-    data.setdefault("id", commit_id)
-    data.setdefault("created_time", data.get("timestamp"))
-    data.setdefault("modified_time", data.get("timestamp"))
-    return CommitEntity.from_dict(data)
-
-
-def get_commits_for_collection(db: Database, user_id: str, collection_id: str) -> List[CommitEntity]:
-    """Return commits associated with a collection."""
-    records = db_get_commits_for_collection(db, collection_id) or []
-    entities: List[CommitEntity] = []
-    for raw in records:
-        if isinstance(raw, Mapping):
-            data = dict(cast(Mapping[str, Any], raw))
-        else:
-            data = cast(Dict[str, Any], raw)
-        commit_id = data.get("id") or data.get("_key") or str(uuid.uuid4())
-        data.setdefault("id", commit_id)
-        data.setdefault("created_time", data.get("timestamp"))
-        data.setdefault("modified_time", data.get("timestamp"))
-        entity = CommitEntity.from_dict(data)
-        # . `Commit.from_dict` takes only the fields the entity declares, and `adds` /
-        # `removes` are not among them — they live in the `CommitItem`s that `item_ids` points at.
-        # The store layer resolves them from the scan it already performs, and they are carried
-        # here so the API can report a changeset that is not permanently empty.
-        #
-        # Set on the instance rather than added to `Commit.__init__`: they are DERIVED for one
-        # collection's view of this commit, not state the entity owns. A commit spanning two
-        # collections has different `adds` in each, so storing them on the entity would make the
-        # answer depend on which query built it.
-        entity.adds = list(data.get("adds") or [])
-        entity.removes = list(data.get("removes") or [])
-        entities.append(entity)
-    return entities
-
 # === Provenance helper ===
-
-def record_collection_commit(
-    db: Database,
-    user_id: str,
-    collection_id: str,
-    *,
-    adds: Optional[List[str]] = None,
-    removes: Optional[List[str]] = None,
-    message: Optional[str] = None,
-    author_id: Optional[str] = None,
-    subject_user_id: Optional[str] = None,
-    presenter_type: Optional[str] = None,
-    presenter_id: Optional[str] = None,
-    client_id: Optional[str] = None,
-    host_id: Optional[str] = None,
-    server_id: Optional[str] = None,
-    agent_id: Optional[str] = None,
-    grant_key_id: Optional[str] = None,
-    confirmation: Optional[str] = None,
-    changeset_type: Optional[str] = None,
-) -> str:
-    """
-    Create up to two CommitItems (add/remove) for a single collection and one Commit that references them.
-    Returns the commit id.
-    """
-    adds = list({a for a in (adds or []) if a})
-    removes = list({r for r in (removes or []) if r})
-
-    # Build items
-    item_ids: List[str] = []
-    items: List[CommitItemEntity] = []
-
-    if adds:
-        items.append(CommitItemEntity(
-            id=str(uuid.uuid4()),
-            item_type="add",
-            collection_id=collection_id,
-            artifact_version_ids=adds,
-        ))
-    if removes:
-        items.append(CommitItemEntity(
-            id=str(uuid.uuid4()),
-            item_type="remove",
-            collection_id=collection_id,
-            artifact_version_ids=removes,
-        ))
-
-    if items:
-        created_item_ids = db_create_commit_items(db, items) or []
-        item_ids.extend(created_item_ids)
-
-    commit = CommitEntity(
-        id=str(uuid.uuid4()),
-        message=message or "",
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        author_id=author_id or user_id,
-        subject_user_id=subject_user_id or user_id,
-        presenter_type=presenter_type,
-        presenter_id=presenter_id,
-        client_id=client_id,
-        host_id=host_id,
-        server_id=server_id,
-        agent_id=agent_id,
-        grant_key_id=grant_key_id,
-        confirmation=confirmation or "human_affirmed",
-        changeset_type=changeset_type or "manual",
-        item_ids=item_ids,
-    )
-    db_create_commit(db, commit)
-    return commit.id
-
 
 # ---------------------------------------------------------------------------
 # Native dispatch handler — called by operation_dispatcher for type.json

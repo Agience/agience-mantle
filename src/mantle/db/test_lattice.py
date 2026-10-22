@@ -1695,7 +1695,8 @@ def test_revise_creates_a_new_version_and_never_destroys_the_old():
     assert len(L.artifacts.versions_of("a1")) == 2
     old = L.artifacts.get_artifact("a1")
     assert old["content"] == "VERSION ONE", "the prior version was destroyed"
-    assert old["state"] == "archived" and old["superseded_by"] == v2["id"]
+    assert old["state"] == "archived" and "superseded_by" not in old
+    assert v2["parent_id"] == "a1", "the new version names the version it was made from"
     # the head is the new version.
     assert L.artifacts.head_of("a1")["content"] == "VERSION TWO"
 
@@ -1861,12 +1862,13 @@ def test_changed_content_ref_snapshots_the_prior_and_handle_stays_latest():
 
     # the handle holds the latest
     assert L.artifacts.get_artifact("a1")["content"] == "VERSION TWO"
-    # the prior version is preserved (snapshot), archived, and points at the handle
+    # the prior version is preserved (snapshot), archived, and the handle names it as its parent
     snaps = [json.loads(r[0]) for r in L.db.read().execute(
         "SELECT doc FROM vertex WHERE id LIKE 'a1@%'").fetchall()]
     assert len(snaps) == 1
     assert snaps[0]["content"] == "VERSION ONE"
-    assert snaps[0]["state"] == "archived" and snaps[0]["superseded_by"] == "a1"
+    assert snaps[0]["state"] == "archived" and "superseded_by" not in snaps[0]
+    assert L.artifacts.get_artifact("a1")["parent_id"] == snaps[0]["id"]
     assert snaps[0]["root_id"] == "a1"          # shares the lineage
     # "VERSION ONE" is still reachable — not silently lost.
     assert any(s["content"] == "VERSION ONE" for s in snaps)

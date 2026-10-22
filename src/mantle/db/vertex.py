@@ -417,7 +417,8 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
              new.get("claimed_at"), new.get("next_retry_at"), new.get("completed_at")))
 
     # ── ArtifactStore: single put ────────────────────────────────────────────
-    def put_artifact(self, doc: Dict[str, Any], *, stamp_rev: bool = True) -> Dict[str, Any]:
+    def put_artifact(self, doc: Dict[str, Any], *, stamp_rev: bool = True,
+                     new_version: bool = False) -> Dict[str, Any]:
         """Idempotent upsert keyed on `id`. Returns the stored doc.
 
             stamp_rev=True   Local authorship. Allocates a fresh `_seq` from this
@@ -447,46 +448,56 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
             #     path decides, driven by the data, not by which method was called.
             # Local authorship only (stamp_rev): a mesh-consumed row is already version-distinct
             # by its peer (_origin,_seq), so snapshotting it here would double-count a peer's history.
-            if stamp_rev and doc.get("content_ref"):
+            #   · `new_version` — the caller saw the content change where only it can: the title
+            #     is part of the content (the root type declares it so) and is stored sealed, so
+            #     two seals of one title differ and the bytes here cannot tell a change from none.
+            #     `lattice_api.update_artifact` compares the plaintext and says so.
+            if stamp_rev and (doc.get("content_ref") or new_version):
                 prev = cur.execute(
                     "SELECT content_ref, root_id, doc FROM vertex WHERE id = ?",
                     (doc["id"],)).fetchone()
-                if prev is not None and prev["content_ref"] \
-                        and prev["content_ref"] != doc["content_ref"]:
-                    self._snapshot_prior(cur, doc["id"], prev)
+                if prev is not None and (new_version or (
+                        prev["content_ref"] and prev["content_ref"] != doc["content_ref"])):
+                    # The live version names the snapshot it was made from.
+                    doc["parent_id"] = self._snapshot_prior(cur, doc["id"], prev) or doc.get("parent_id")
             origin, seq_val = self._version_for(cur, doc, stamp_rev)
             if not stamp_rev:
                 _seq.observe_seq(cur, origin, seq_val)
             return self._write_row(cur, doc, origin, seq_val)
 
-    def _snapshot_prior(self, cur: sqlite3.Cursor, aid: str, prev: sqlite3.Row) -> None:
+    def _snapshot_prior(self, cur: sqlite3.Cursor, aid: str, prev: sqlite3.Row) -> Optional[str]:
         """Preserve the prior version of `aid` under a derived, archived id before its content is
-        replaced in place. The snapshot shares the handle's `root_id`; the handle stays the head.
+        replaced in place, and return that id: the version the new content was made from, which
+        the live version names as its `parent_id`. The snapshot shares the handle's `root_id`; the
+        handle stays the head.
 
         The snapshot is written through `_write_row`, so it picks up the merkle XOR, `_seq`
         allocation and counter accounting without duplicating any of them. Idempotent: the derived
-        id is a function of the prior `content_ref`, so a repeated call finds the row and returns."""
+        id is a function of the prior row, so a repeated call finds the row and returns it."""
         try:
             pdoc = json.loads(prev["doc"]) if prev["doc"] else {}
         except Exception:
-            return
+            return None
         if not pdoc:
-            return
+            return None
         root = prev["root_id"] or aid
-        old_ref = prev["content_ref"] or ""
-        snap_id = "%s@%s" % (aid, hashlib.blake2b(old_ref.encode("utf-8"),
+        # Derived from the whole prior row, not only its `content_ref`: two title edits over one
+        # body share a `content_ref`, and keying on it would take the second for a repeat of the
+        # first and keep no copy of the title it replaced. A retried write sees the same prior row
+        # and finds its own snapshot.
+        snap_id = "%s@%s" % (aid, hashlib.blake2b((prev["doc"] or "").encode("utf-8"),
                                                   digest_size=8).hexdigest())
-        # degenerate, or already snapshotted (idempotent)
-        if snap_id == aid or cur.execute(
-                "SELECT 1 FROM vertex WHERE id = ?", (snap_id,)).fetchone():
-            return
+        if snap_id == aid:                           # degenerate
+            return None
+        if cur.execute("SELECT 1 FROM vertex WHERE id = ?", (snap_id,)).fetchone():
+            return snap_id                           # already snapshotted (idempotent)
         snap = dict(pdoc)
         snap["id"] = snap_id
         snap["root_id"] = root
         snap["state"] = "archived"
-        snap["superseded_by"] = aid
         origin, seq_val = self._version_for(cur, snap, True)
         self._write_row(cur, snap, origin, seq_val)
+        return snap_id
 
     def _version_for(self, cur: sqlite3.Cursor, doc: Dict[str, Any],
                      stamp_rev: bool) -> Tuple[str, int]:
@@ -1380,7 +1391,8 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
         """Author a new version under the same lineage. A convenience, not a required route.
 
         The shape matches `entities/artifact.py` and Ember's `LocalCache.revise`:
-          · the new version is a new row with its own `id`, sharing `root_id`;
+          · the new version is a new row with its own `id`, sharing `root_id`, naming the version
+            it was made from (`parent_id`);
           · the prior head is archived, never deleted — it stays queryable forever;
           · `version_id` is the live head ("version_id is latest").
 
@@ -1404,21 +1416,24 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
         if prev.get("state") == "archived":
             root_hint = prev.get("root_id") or artifact_id
             raise ValueError(
-                "cannot revise %r: it is ARCHIVED (superseded by %r). Revising a superseded "
-                "version forks the lineage into two live heads on one root_id, and nothing "
-                "downstream can tell which is current. Resolve the head first: "
-                "head_of(%r)." % (artifact_id, prev.get("superseded_by"), root_hint))
+                "cannot revise %r: it is ARCHIVED. Revising an archived version forks the "
+                "lineage into two live heads on one root_id, and nothing downstream can tell "
+                "which is current. Resolve the head first: head_of(%r)." % (artifact_id, root_hint))
         root = prev.get("root_id") or self.db.read().execute(
             "SELECT root_id FROM vertex WHERE id = ?", (artifact_id,)).fetchone()[0] or artifact_id
 
         doc = dict(prev)
         doc.update(changes)
         doc["root_id"] = root
+        doc["parent_id"] = artifact_id
         doc["state"] = K.STATE_LIVE
         if author:
             doc["created_by"] = author
+        # What the version holds, not where it sits in the lineage: `parent_id` stays out, so the
+        # same content revised again is the version that already holds it.
         canon = {k: v for k, v in doc.items()
-                 if k != "id" and not (k.startswith("_") and k in ("_origin", "_seq", "_leaf", "_rev"))}
+                 if k not in ("id", "parent_id")
+                 and not (k.startswith("_") and k in ("_origin", "_seq", "_leaf", "_rev"))}
         body = json.dumps(canon, sort_keys=True, separators=(",", ":")).encode("utf-8")
         vid = "%s~%s" % (root, hashlib.blake2b(body, digest_size=8).hexdigest())
         doc.pop("id", None)
@@ -1432,7 +1447,6 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
         self.put_artifact(doc)
         old = dict(prev)
         old["state"] = "archived"
-        old["superseded_by"] = vid
         self.put_artifact(old)
         return doc
 

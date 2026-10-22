@@ -121,6 +121,10 @@ class Artifact(BaseEntity):
         # `trash.RETENTION_DAYS` ago is deleted by policy. Modelled so an entity write keeps them.
         trashed_by: Optional[str] = None,
         trashed_time: Optional[str] = None,
+        # The version this one was made from: the snapshot a content change archived, or the
+        # version `revise()` was made from. It makes a lineage a DAG rather than a flat grouping
+        # under `root_id`, so a reconciliation can find where two lines of an artifact parted.
+        parent_id: Optional[str] = None,
     ):
         super().__init__(id=id, created_time=created_time, modified_time=modified_time)
 
@@ -141,6 +145,7 @@ class Artifact(BaseEntity):
         self.colimit_of = colimit_of
         self.trashed_by = trashed_by
         self.trashed_time = trashed_time
+        self.parent_id = parent_id
         self.context = context
         self.content = content
         self.content_encrypted = content_encrypted
@@ -197,6 +202,8 @@ class Artifact(BaseEntity):
         if self.trashed_by is not None:
             d["trashed_by"] = self.trashed_by
             d["trashed_time"] = self.trashed_time
+        if self.parent_id is not None:
+            d["parent_id"] = self.parent_id
         return {k: v for k, v in d.items() if v is not None}
 
     @classmethod
@@ -229,4 +236,5 @@ class Artifact(BaseEntity):
             colimit_of=data.get("colimit_of"),
             trashed_by=data.get("trashed_by"),
             trashed_time=data.get("trashed_time"),
+            parent_id=data.get("parent_id"),
         )

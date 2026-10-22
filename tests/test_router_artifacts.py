@@ -3,7 +3,7 @@
 Existing coverage in test_router_artifacts_op.py covers the
 POST /artifacts/{id}/op/{op_name} dispatch path. This file covers everything
 else: CRUD, container creation, invoke, add-to-container, batch, search,
-upload, commit/preview, content-url, list-commits, reorder, move,
+upload, commit/preview, content-url, reorder, move,
 upload-status, multipart-part-url.
 
 The auth dependency is overridden by the autouse conftest fixture to a user
@@ -973,66 +973,6 @@ class TestUploadInitiate:
         assert body["mode"] == "single"
         initiate.assert_called_once()
 
-
-# ---------------------------------------------------------------------------
-# List commits
-# ---------------------------------------------------------------------------
-
-class TestListCommits:
-    @pytest.mark.asyncio
-    async def test_a_missing_artifact_yields_an_empty_page_not_a_type_error(self, client: AsyncClient):
-        """With authorization stubbed by this module's autouse fixture, there is nothing left to
-        refuse a missing id: `artifacts_router.check_access` is patched to a granting stub, so
-        `_artifact_exists` is the only remaining gate. In production `check_access` runs first,
-        calls the same `get_raw_artifact`, and answers 404 for missing-or-denied, so a branch that
-        reports a type restriction on a missing artifact is unreachable there.
-
-        The honest answer under a granting stub is the one the endpoint has always given for an
-        artifact with no commits: an empty page. That is what this asserts.
-        """
-        store = MagicMock()
-        _patch_db_collection(store, container_doc=None)
-        from mantle.services.dependencies import get_store_db
-
-        app.dependency_overrides[get_store_db] = lambda: store
-        try:
-            r = await client.get("/artifacts/missing/commits")
-        finally:
-            app.dependency_overrides.pop(get_store_db, None)
-        assert r.status_code == 200, r.json()
-        assert r.json() == {"items": [], "total": 0, "has_more": False}
-
-    @pytest.mark.asyncio
-    async def test_returns_commit_list(self, client: AsyncClient):
-        store = MagicMock()
-        _patch_db_collection(store, container_doc=_coll_doc())
-        from mantle.services.dependencies import get_store_db
-
-        app.dependency_overrides[get_store_db] = lambda: store
-        commits = [
-            SimpleNamespace(
-                id="c-1",
-                collection_id="container-1",
-                message="initial",
-                author_id="user-123",
-                created_time="t0",
-                adds=["a-1"],
-                removes=[],
-            ),
-        ]
-        try:
-            with patch(
-                "mantle.services.collection_service.get_commits_for_collection",
-                return_value=commits,
-            ):
-                r = await client.get("/artifacts/container-1/commits")
-        finally:
-            app.dependency_overrides.pop(get_store_db, None)
-        assert r.status_code == 200
-        body = r.json()
-        assert len(body["items"]) == 1
-        assert body["items"][0]["id"] == "c-1"
-        assert body["items"][0]["message"] == "initial"
 
 
 # ---------------------------------------------------------------------------
