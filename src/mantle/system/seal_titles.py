@@ -7,8 +7,10 @@ pass reads each such row through the ordinary path and writes it back, so the wr
 it. New writes need nothing; `tests/test_a_title_is_content_and_sealed_at_rest.py` keeps them
 sealed.
 
-Each row is handled as its creator, the principal whose grant reaches its key; a row whose key the
-oracle will not hand over is reported and left alone, never forced. Only the title is sealed: the
+Each row is handled as its creator, else as the owner of its root: a title is sealed under its
+root's key, and a creator whose grant was revoked (a contributor removed from a shared workspace,
+whose note stays) no longer reaches it, while the root's owner does. A row whose key the oracle
+hands to neither is reported and left alone, never forced. Only the title is sealed: the
 body is left as it is stored.
 
 `--unseal` is the reverse, which the release runs before rolling Mantle back to a version that
@@ -38,6 +40,17 @@ def _plain_title(doc: dict) -> bool:
     return isinstance(ctx, dict) and any(k in ctx for k in CONTENT_FIELDS)
 
 
+def _holders(db, doc: dict, roots: dict) -> list[str]:
+    """Who may hold the row's key: its creator, then the owner of its root. 2026-10-29, on the
+    release candidate: a note whose contributor had been revoked could not be unsealed as them."""
+    root = doc.get("origin_root")
+    if root and root not in roots:
+        r = db.artifacts.get_artifact(root)
+        roots[root] = r.get("created_by") if isinstance(r, dict) else None
+    found = [doc.get("created_by"), roots.get(root) if root else None]
+    return [str(h) for i, h in enumerate(found) if h and h not in found[:i]]
+
+
 def seal_stored_titles(db, *, dry_run: bool = False) -> dict:
     """Seal every stored plain-text title. Returns the counts.
 
@@ -51,20 +64,27 @@ def seal_stored_titles(db, *, dry_run: bool = False) -> dict:
     counts = {"plain": len(todo), "sealed": 0, "denied": 0, "ownerless": 0}
     if dry_run:
         return counts
+    roots: dict = {}
     for doc in todo:
-        owner = doc.get("created_by")
-        if not owner:
+        holders = _holders(db, doc, roots)
+        if not holders:
             counts["ownerless"] += 1
             continue
-        raw = dict(doc)
-        try:
-            with acting_as(str(owner), principal_type="user"):
-                seal_content_fields(raw)
+        why = ""
+        for holder in holders:
+            raw = dict(doc)
+            try:
+                with acting_as(holder, principal_type="user"):
+                    seal_content_fields(raw)
+            except Exception as exc:  # noqa: BLE001 — per row; the next holder, then the next row
+                why = type(exc).__name__
+                continue
             db.artifacts.put_artifact(raw)
             counts["sealed"] += 1
-        except Exception as exc:  # noqa: BLE001 — per row; the rest of the corpus still seals
+            break
+        else:
             counts["denied"] += 1
-            logger.info("  cannot seal %s (%s) — leaving it alone", str(doc.get("id"))[:8], type(exc).__name__)
+            logger.info("  cannot seal %s (%s) — leaving it alone", str(doc.get("id"))[:8], why)
     return counts
 
 
@@ -87,20 +107,23 @@ def unseal_stored_titles(db, *, dry_run: bool = False) -> dict:
     counts = {"sealed": len(todo), "unsealed": 0, "denied": 0, "ownerless": 0}
     if dry_run:
         return counts
+    roots: dict = {}
     for doc in todo:
-        owner = doc.get("created_by")
-        if not owner:
+        holders = _holders(db, doc, roots)
+        if not holders:
             counts["ownerless"] += 1
             continue
-        raw = dict(doc)
-        with acting_as(str(owner), principal_type="user"):
-            unseal_content_fields(raw)
-        if not _plain_title(raw):
-            counts["denied"] += 1      # the oracle would not open it; left sealed rather than emptied
+        for holder in holders:
+            raw = dict(doc)
+            with acting_as(holder, principal_type="user"):
+                unseal_content_fields(raw)
+            if _plain_title(raw):
+                db.artifacts.put_artifact(raw)
+                counts["unsealed"] += 1
+                break
+        else:
+            counts["denied"] += 1      # the oracle would open it for neither; left sealed, not emptied
             logger.info("  cannot unseal %s — leaving it sealed", str(doc.get("id"))[:8])
-            continue
-        db.artifacts.put_artifact(raw)
-        counts["unsealed"] += 1
     return counts
 
 

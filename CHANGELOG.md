@@ -19,6 +19,10 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 - The README states what is encrypted and what is stored readable. Artifact content and `context.title` are encrypted per principal. Every other field is governed by grants, including `name`, `description`, other `context` keys, relationship names, grant details, ids, graph edges, the access log and the change feed. Recall logs its query text at `INFO`.
 - The README states that the search index holds no plaintext terms: every artifact is indexed by blind token, with no plaintext lexical index to fall back to.
 
+### Fixed
+
+- `mantle.system.seal_titles` (and `--unseal`) handles each row as its creator, else as the owner of its root. A note left in a shared workspace by a contributor whose access was revoked could not be unsealed as them, and stopped the release's rollback check.
+
 ## [0.1.6] - 2026-10-28
 
 ### Added
