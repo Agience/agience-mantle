@@ -376,7 +376,7 @@ def update_workspace(
             _refuse_restoring_a_superseded_version(db, ws)
             ws.state = CollectionEntity.STATE_LIVE
             # A restore takes it out of Trash too (`services/trash.py`).
-            ws.trashed_by = ws.trashed_time = None
+            ws.trashed_by = ws.trashed_time = ws.trashed_from = None
             ws.modified_by = user_id
             ws.modified_time = _now_iso()
             store.update_collection(db, ws)
@@ -1637,7 +1637,7 @@ def update_artifact(
         # Unarchive: every state but `archived` is `live`.
         target.state = ArtifactEntity.STATE_LIVE
         # A restore takes it out of Trash too (`services/trash.py`).
-        target.trashed_by = target.trashed_time = None
+        target.trashed_by = target.trashed_time = target.trashed_from = None
         target.modified_by = user_id
         target.modified_time = _now_iso()
         #: No guard, for the reason given above.
@@ -2195,6 +2195,9 @@ def initiate_upload_and_create_artifact(
     if context:
         base_ctx.update(context)
 
+    # Typed as the file it receives, not left untyped: the type is what a reader renders it as and
+    # what a `type:` filter matches. 2026-10-23, a tester: an uploaded Markdown file showed as a
+    # generic card and `type:text/markdown` did not find it.
     artifact = create_workspace_artifact(
         db,
         user_id,
@@ -2203,6 +2206,7 @@ def initiate_upload_and_create_artifact(
         content="",
         order_key=order_key,
         enqueue_index=False,
+        content_type=content_type or None,
     )
 
     key = f"{tenant}/{artifact.id}.content"
@@ -2413,9 +2417,11 @@ def update_upload_status(
 
         ctx.pop("upload", None)
 
+        # The artifact takes the type the bytes were stored under, which the mirror restates.
         result = update_artifact(
             db, user_id, workspace_id, upload_id,
             context=_ensure_json_str(ctx),
+            content_type=ctx.get("content_type") or None,
         )
         _emit_event(workspace_id, "upload.complete", {"artifact": result.to_dict()}, actor_id=user_id)
         return result

@@ -5,6 +5,23 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-10-28
+
+### Added
+- `POST /artifacts/{id}/untrash` restores an artifact from Trash to the state it had before it was deleted, live or archived. It needs `update` and answers 409 when the artifact is not in Trash. Trashed artifacts now carry `trashed_from`.
+- `GET /artifacts/{id}/versions` lists an artifact's versions, newest first. `GET /artifacts/{id}/versions/{version_id}` reads one earlier version, with its content and title.
+- `POST /artifacts/{id}/versions/{version_id}/restore` writes an earlier version back as the artifact's current content. The replaced version is kept. The route needs `update` on the artifact and `read` on the version. It answers 409 when the restore would show the version to someone it is denied to.
+- Each version is shown only to principals who can read that version's own id. A grant on the artifact reaches every version, and a grant or deny on one version reaches that version alone.
+- `POST /grants/{grant_id}/resend` sends a pending invite again with a new claim link, and the earlier link stops working. The invite's granter or an admin of its resource may resend it, and the response carries the new `claim_token`, `claim_url` and `email_sent`.
+- The response to creating an invite grant in `grants_router` includes `email_sent`, which says whether the invitation was mailed.
+- `python -m mantle.system.type_uploads` gives stored uploads the content type recorded in their context, in place and without keeping a version. It supports `--dry-run` and is safe to run more than once.
+
+### Changed
+- An invite grant created with an email address is now mailed to that address, with the optional message included. `email_sent` is false when the invite has no address, mail is not configured or the send did not go through. The invite still stands in those cases, and `claim_url` can be passed on.
+- A member who claims an invite appears in the access list under the invite's name, or under the address it was sent to when it has no name.
+- Uploaded files are typed as their file from creation, for example `text/markdown`. They render as that type and match `type:` filters. The type is kept when the upload completes.
+- Deleting an already-archived artifact and restoring it from Trash returns it archived. `PATCH {"state": "live"}` still restores an artifact to live and takes it out of Trash.
+
 ## [0.1.5] - 2026-10-22
 
 ### Fixed

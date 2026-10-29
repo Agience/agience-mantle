@@ -119,8 +119,11 @@ class Artifact(BaseEntity):
         # Who moved this artifact to Trash, and when. Set together on an archived artifact by
         # `services.trash`, cleared together when it is restored; an artifact trashed more than
         # `trash.RETENTION_DAYS` ago is deleted by policy. Modelled so an entity write keeps them.
+        # `trashed_from` is the state it had before it went to Trash, `archived` or unset for
+        # live, so a restore from Trash undoes the delete and nothing more.
         trashed_by: Optional[str] = None,
         trashed_time: Optional[str] = None,
+        trashed_from: Optional[str] = None,
         # The version this one was made from: the snapshot a content change archived, or the
         # version `revise()` was made from. It makes a lineage a DAG rather than a flat grouping
         # under `root_id`, so a reconciliation can find where two lines of an artifact parted.
@@ -145,6 +148,7 @@ class Artifact(BaseEntity):
         self.colimit_of = colimit_of
         self.trashed_by = trashed_by
         self.trashed_time = trashed_time
+        self.trashed_from = trashed_from
         self.parent_id = parent_id
         self.context = context
         self.content = content
@@ -202,6 +206,7 @@ class Artifact(BaseEntity):
         if self.trashed_by is not None:
             d["trashed_by"] = self.trashed_by
             d["trashed_time"] = self.trashed_time
+            d["trashed_from"] = self.trashed_from
         if self.parent_id is not None:
             d["parent_id"] = self.parent_id
         return {k: v for k, v in d.items() if v is not None}
@@ -236,5 +241,6 @@ class Artifact(BaseEntity):
             colimit_of=data.get("colimit_of"),
             trashed_by=data.get("trashed_by"),
             trashed_time=data.get("trashed_time"),
+            trashed_from=data.get("trashed_from"),
             parent_id=data.get("parent_id"),
         )

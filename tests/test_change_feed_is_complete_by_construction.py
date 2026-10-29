@@ -211,6 +211,11 @@ WRITE_SITES: dict[tuple[str, str], tuple[str, str]] = {
                   "form of a title (sealed to plain) on rows as they are. No reader sees a different "
                   "artifact, and the feed carries no title in either form, so there is nothing to "
                   "announce."),
+    ("system/type_uploads.py", "type_stored_uploads"): (
+        OFF_FEED, "the release migration that types stored uploads from their context. It runs "
+                  "before Mantle starts (`platform_release` migrates a service, then starts it), so "
+                  "no subscriber is connected to be told, and every client reads the typed rows "
+                  "when it next loads."),
     ("shard/erasure.py", "erase"): (
         BOUNDARY, "the erasure path. Emits artifact.deleted per erased id, carrying an id and a "
                   "verb and nothing off the erased doc — a subscriber holding derived state is "

@@ -230,6 +230,9 @@ class GrantWithClaimResponse(GrantResponse):
 
     claim_token: Optional[str] = Field(None, description="The invite secret. Shown once.")
     claim_url: Optional[str] = Field(None, description="The link a person follows to claim it.")
+    email_sent: Optional[bool] = Field(None, description=(
+        "Whether the invitation was mailed to its address. False when it has no address, mail is "
+        "not configured, or the send failed: the invite stands, and `claim_url` is to be passed on."))
 
 
 class GrantKeyResponse(GrantResponse):
@@ -572,14 +575,17 @@ async def create_grant_endpoint(
                 name=body.name,
                 notes=body.notes,
                 expires_at=body.expires_at,
-                message=body.message,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
+        email_sent = bool(target_email) and await offload_sync(
+            grant_service.send_invite_email, store_db, auth.user_id, body.resource_id,
+            target_email, raw_token, body.message)
         response = _grant_response(created)
         response["claim_token"] = raw_token
         response["claim_url"] = grant_service.build_claim_url(raw_token)
+        response["email_sent"] = email_sent
         return response
 
     # Direct user->user grant: requires can_admin on the resource.
@@ -963,6 +969,47 @@ async def revoke_grant(
     await offload_sync(_invalidate_cache_for, store_db, grant)
 
     return {"id": grant_id, "state": "revoked"}
+
+
+@router.post("/{grant_id}/resend",
+    responses=_errors(401, 404, 410, ok=GrantWithClaimResponse),
+)
+async def resend_invite(
+    grant_id: Annotated[str, Path(description=_GRANT_PARAM)],
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    """Send a pending invite again, with a new claim link; the link sent before stops working.
+
+    Who may revoke an invite may resend it: its granter, or an admin of its resource. Only the
+    store's hash of a link is kept, so a resend is a new link, returned once here like a new
+    invite's, with `email_sent` saying whether it was mailed.
+    """
+    if not auth.user_id:
+        raise HTTPException(status_code=401, detail="User identification required")
+    from mantle.services import grant_service
+    from mantle.services.grant_service import InviteExhausted
+    grant = get_grant_by_id(store_db, grant_id)
+    if not grant or grant.grantee_type != GrantEntity.GRANTEE_INVITE:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    if grant.granted_by != auth.user_id:
+        try:
+            await offload_sync(_require_admin, auth, grant.resource_id, store_db)
+        except HTTPException:
+            raise HTTPException(status_code=404, detail="Invite not found")
+    try:
+        raw_token = await offload_sync(grant_service.reissue_invite, store_db, grant)
+    except InviteExhausted as exc:
+        raise HTTPException(status_code=410, detail=str(exc))
+    target = grant.target_entity if (grant.target_entity_type or "").lower() == "email" else None
+    email_sent = bool(target) and await offload_sync(
+        grant_service.send_invite_email, store_db, auth.user_id, grant.resource_id,
+        target, raw_token, None)
+    response = _grant_response(grant)
+    response["claim_token"] = raw_token
+    response["claim_url"] = grant_service.build_claim_url(raw_token)
+    response["email_sent"] = email_sent
+    return response
 
 
 @router.post("/{grant_id}/accept",

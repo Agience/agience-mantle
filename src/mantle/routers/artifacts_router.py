@@ -1374,8 +1374,8 @@ def _ids_of_content_type(store_db, content_type: str) -> set:
     summary="List the caller's Trash",
     description=(
         "Every artifact the caller moved to Trash, most recently trashed first, each with "
-        "`purge_after`: when it is deleted for good. Restore one with `PATCH {\"state\": "
-        "\"live\"}`; delete one now with `DELETE`."
+        "`purge_after`: when it is deleted for good. Restore one with `POST /{id}/untrash`; "
+        "delete one now with `DELETE`."
     ),
     responses=_errors(401, ok=PageResponse),
 )
@@ -2658,7 +2658,8 @@ async def update_artifact(
     description=(
         "Archive the artifact and put it in the caller's Trash, where it stays for "
         "`RETENTION_DAYS` (30) and is then deleted. Needs `delete`. An artifact that is already "
-        "archived goes to Trash as it is. Restore it with `PATCH {\"state\": \"live\"}`."
+        "archived goes to Trash as it is, and its restore returns it archived. Restore it with "
+        "`POST /{id}/untrash`."
     ),
     responses=_errors(401, 404, 409, 500, ok=ArtifactResponse),
 )
@@ -2686,7 +2687,8 @@ async def trash_artifact(
     elif not await offload_sync(_find_archived_artifact, store_db, artifact_id):
         raise HTTPException(status_code=404, detail="Not found")
 
-    marked = await offload_sync(trash.mark, store_db, auth.user_id, artifact_id)
+    marked = await offload_sync(trash.mark, store_db, auth.user_id, artifact_id,
+                                was_archived=not doc)
     if marked is None:
         # The lineage has a newer live version than the one named: it was not archived.
         raise HTTPException(status_code=409, detail="A newer version of this artifact is live")
@@ -2694,6 +2696,43 @@ async def trash_artifact(
     body["trashed_time"] = marked.get("trashed_time")
     body["purge_after"] = trash.purge_after(marked.get("trashed_time"))
     return body
+
+
+@router.post("/{artifact_id}/untrash", status_code=status.HTTP_200_OK,
+    summary="Restore an artifact from Trash",
+    description=(
+        "Undo a move to Trash: the artifact returns to the state it had before, live or "
+        "archived, and leaves the Trash. Needs `update`. 409 when it is not in Trash."
+    ),
+    responses=_errors(401, 404, 409, 500, ok=ArtifactResponse),
+)
+async def untrash_artifact(
+    artifact_id: Annotated[str, Path(description=_ARTIFACT_PARAM)],
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    if not auth.user_id:
+        raise HTTPException(status_code=401, detail="User identification required")
+    await offload_sync(check_access, auth, artifact_id, "update", store_db)
+
+    from mantle.services import trash, workspace_service
+    head = await offload_sync(trash.head_of, store_db, artifact_id)
+    if not head:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not trash.is_trashed(head):
+        raise HTTPException(status_code=409, detail="This artifact is not in Trash")
+    if head.get("trashed_from") == "archived":
+        restored = await offload_sync(trash.unmark, store_db, auth.user_id, artifact_id)
+        return _artifact_body(_normalize_artifact_doc(restored))
+    # It was live: the ordinary restore, which takes it out of Trash as it moves the index.
+    container_id = head.get("collection_id")
+    if container_id:
+        await offload_sync(workspace_service.update_artifact, store_db, auth.user_id,
+                           container_id, artifact_id, state="live", auth=auth)
+    else:
+        await offload_sync(workspace_service.update_workspace, store_db, auth.user_id,
+                           artifact_id, name=None, description=None, state="live")
+    return _artifact_body(_normalize_artifact_doc(await offload_sync(trash.head_of, store_db, artifact_id)))
 
 
 # ---------- DELETE /artifacts/{artifact_id} ----------
@@ -4278,3 +4317,202 @@ async def get_artifact_access_log(
     return {"artifact_id": artifact_id,
             **_page(events, total=None, has_more=has_more)}
 
+
+
+# =============================================================================
+# Versions
+# =============================================================================
+#
+# A content edit keeps the version it replaces as an archived snapshot `id@hash`, and the live
+# version names it as its `parent_id` (Pharos: information-model §5.3). A version is an artifact,
+# so whether a principal sees it is the light cone's answer for that version's own id
+# (`check_access`): a grant on the artifact reaches every version through its root, and a grant or
+# deny on one version's id reaches that version alone. Nothing here is a second access rule.
+
+#: The most versions one listing walks back through. A longer line answers `has_more`.
+_VERSION_WALK_LIMIT = 500
+
+
+class VersionSummary(BaseModel):
+    """One version on an artifact's line: enough to choose it, not its content."""
+    id: str = Field(..., description="This version's id: the artifact's own id for the current "
+                                     "version, `id@hash` for an earlier one.")
+    parent_id: Optional[str] = Field(None, description="The version this one was made from.")
+    current: bool = Field(..., description="Whether this is the version reads return now.")
+    title: Optional[str] = None
+    modified_time: Optional[str] = None
+    modified_by: Optional[str] = None
+
+
+class VersionsResponse(PageResponse):
+    """The versions this principal can see on the artifact's line, newest first."""
+    artifact_id: str
+
+
+def _version_line(db: Database, head: Dict[str, Any]):
+    """The line back from `head` through `parent_id`, newest first, each doc as stored. Stops at
+    a version with no parent, one this store does not hold, a cycle, or the walk limit; the second
+    value says whether the limit cut it short."""
+    from mantle.db.backend import get_raw_artifact
+    line, seen, doc = [], set(), head
+    while doc and len(line) < _VERSION_WALK_LIMIT:
+        vid = str(doc.get("id") or "")
+        if not vid or vid in seen:
+            break
+        seen.add(vid)
+        line.append(doc)
+        parent = doc.get("parent_id")
+        doc = get_raw_artifact(db, parent) if parent else None
+    return line, bool(doc) and len(line) >= _VERSION_WALK_LIMIT
+
+
+def _visible(auth: AuthContext, version_id: str, db: Database, memo: dict) -> bool:
+    try:
+        check_access(auth, version_id, "read", db, grant_memo=memo)
+        return True
+    except HTTPException:
+        return False
+
+
+def _opened(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """A stored version read for its reader: title unsealed, body decrypted."""
+    from mantle.db.backend import _decrypt_artifact_content as _decrypt_doc
+    out = dict(doc)
+    _decrypt_doc(out)
+    return out
+
+
+def _title_of(doc: Dict[str, Any]) -> Optional[str]:
+    from mantle.services.mint_context import parse_context
+    title = parse_context(doc.get("context")).get("title")
+    return str(title) if title is not None else None
+
+
+def _visible_versions(db: Database, auth: AuthContext, head: Dict[str, Any]):
+    """The line back from `head` as the versions `auth` can read, each summarised, and whether the
+    walk limit cut it short. The head is listed unchecked: the caller has already read it."""
+    line, cut = _version_line(db, head)
+    memo: dict = {}
+    items = []
+    for i, doc in enumerate(line):
+        vid = str(doc.get("id"))
+        if i and not _visible(auth, vid, db, memo):
+            continue
+        opened = _opened(doc)
+        items.append(VersionSummary(
+            id=vid, parent_id=doc.get("parent_id"), current=(i == 0),
+            title=_title_of(opened), modified_time=doc.get("modified_time"),
+            modified_by=doc.get("modified_by")).model_dump())
+    return items, cut
+
+
+def _version_of(db: Database, artifact_id: str, version_id: str):
+    """`(head, version)` when `version_id` is on `artifact_id`'s line, else 404."""
+    head = _find_artifact(db, artifact_id)
+    if not head:
+        raise HTTPException(status_code=404, detail="Not found")
+    line, _ = _version_line(db, head)
+    version = next((d for d in line if str(d.get("id")) == version_id), None)
+    if version is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    return head, version
+
+
+@router.get("/{artifact_id}/versions",
+    summary="List an artifact's versions",
+    description=(
+        "The versions on this artifact's line, newest first: the current one, then each version "
+        "it was made from, by `parent_id`. Only the versions the caller can read are listed (a "
+        "version is an artifact, and the access check answers for its own id), and the walk "
+        "continues past one it leaves out."
+    ),
+    responses=_errors(401, 404, 500, ok=VersionsResponse),
+)
+async def list_versions(
+    artifact_id: Annotated[str, Path(description=_ARTIFACT_PARAM)],
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    await offload_sync(check_access, auth, artifact_id, "read", store_db)
+    head = await offload_sync(_find_artifact, store_db, artifact_id)
+    if not head:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    items, cut = await offload_sync(_visible_versions, store_db, auth, head)
+    return {"artifact_id": artifact_id,
+            **_page(items, total=None if cut else len(items), has_more=cut)}
+
+
+@router.get("/{artifact_id}/versions/{version_id}",
+    summary="Read one version of an artifact",
+    description="An earlier version as it was: its content and title. It must be on this "
+                "artifact's line, and the caller must be able to read that version; a grant on "
+                "that one version is enough.",
+    responses=_errors(401, 404, 500, ok=ArtifactResponse),
+)
+async def read_version(
+    artifact_id: Annotated[str, Path(description=_ARTIFACT_PARAM)],
+    version_id: Annotated[str, Path(description="The version's id, from the versions list.")],
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    await offload_sync(check_access, auth, version_id, "read", store_db)
+    _, version = await offload_sync(_version_of, store_db, artifact_id, version_id)
+    return _artifact_body(_normalize_artifact_doc(await offload_sync(_opened, version)))
+
+
+def _restore_would_widen(db: Database, version_id: str, artifact_id: str) -> bool:
+    """Whether restoring would show the version's content to someone it is denied to: a deny on
+    the version's own id, held by a principal who can read the artifact now."""
+    from mantle.db import lattice_api
+    from mantle.entities.grant import grant_is_deny
+    for grant in lattice_api.get_grants_for_collection(db, version_id):
+        if getattr(grant, "state", "active") != "active" or not grant_is_deny(grant):
+            continue
+        if not getattr(grant, "can_read", False) or grant.grantee_type != "user":
+            continue
+        reader = AuthContext(principal_id=grant.grantee_id, principal_type="user",
+                             user_id=grant.grantee_id)
+        if _visible(reader, artifact_id, db, {}):
+            return True
+    return False
+
+
+@router.post("/{artifact_id}/versions/{version_id}/restore",
+    summary="Restore an earlier version",
+    description=(
+        "Writes the version's content and title as the artifact's current content. It is an "
+        "ordinary edit, so the version it replaces is kept and the restored one names it as its "
+        "parent: nothing is lost. Needs `update` on the artifact and `read` on the version, and is "
+        "refused (409) when it would show the version to someone that version is denied to."
+    ),
+    responses=_errors(401, 404, 409, 500, ok=ArtifactResponse),
+)
+async def restore_version(
+    artifact_id: Annotated[str, Path(description=_ARTIFACT_PARAM)],
+    version_id: Annotated[str, Path(description="The version's id, from the versions list.")],
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    await offload_sync(check_access, auth, artifact_id, "update", store_db)
+    head, version = await offload_sync(_version_of, store_db, artifact_id, version_id)
+    await offload_sync(check_access, auth, version_id, "read", store_db)
+    if str(version.get("id")) == str(head.get("id")):
+        return _artifact_body(_normalize_artifact_doc(head))
+    if await offload_sync(_restore_would_widen, store_db, version_id, artifact_id):
+        raise HTTPException(status_code=409, detail=(
+            "Restoring this version would show it to someone it is not shared with. "
+            "Change who can see the artifact first."))
+
+    from mantle.services.mint_context import client_view
+    old = await offload_sync(_opened, version)
+    now = await offload_sync(_opened, head)
+    context = client_view(now.get("context"))
+    title = _title_of(old)
+    if title is None:
+        context.pop("title", None)
+    else:
+        context["title"] = title
+    return await update_artifact(
+        artifact_id=artifact_id, auth=auth, store_db=store_db,
+        body=UpdateArtifactRequest(content=old.get("content") or "", context=context))

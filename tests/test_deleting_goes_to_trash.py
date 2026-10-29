@@ -107,6 +107,45 @@ async def test_an_archived_artifact_goes_to_trash_as_it_is(db, monkeypatch):
     assert body["state"] == "archived" and body["trashed_by"] == USER
 
 
+async def _untrash(db, root):
+    with acting_as(USER, principal_type="user"):
+        return await artifacts.untrash_artifact(artifact_id=root, auth=_auth(), store_db=db)
+
+
+# 2026-10-23, a tester: an archived artifact deleted and then restored from Trash came back live.
+# A restore from Trash undoes the delete and nothing else (John, 2026-10-27).
+async def test_a_restore_from_trash_returns_an_archived_artifact_archived(db, monkeypatch):
+    inbox, root = _note(db, monkeypatch)
+    with acting_as(USER, principal_type="user"):
+        await artifacts.update_artifact(artifact_id=root,
+                                        body=artifacts.UpdateArtifactRequest(state="archived"),
+                                        auth=_auth(), store_db=db)
+    await _trash(db, root)
+    restored = await _untrash(db, root)
+    assert restored["state"] == "archived"
+    assert "trashed_by" not in restored and "trashed_from" not in restored
+    assert await _list_trash(db) == []
+    assert root in await _children(db, inbox, "archived")
+    assert root not in await _children(db, inbox, "live")
+
+
+async def test_a_restore_from_trash_returns_a_live_artifact_live(db, monkeypatch):
+    inbox, root = _note(db, monkeypatch)
+    await _trash(db, root)
+    restored = await _untrash(db, root)
+    assert restored["state"] == "live" and "trashed_by" not in restored
+    assert await _list_trash(db) == []
+    assert root in await _children(db, inbox, "live")
+    assert root in _recall(db, "marram")
+
+
+async def test_restoring_what_is_not_in_trash_is_refused(db, monkeypatch):
+    _inbox, root = _note(db, monkeypatch)
+    with pytest.raises(HTTPException) as refused:
+        await _untrash(db, root)
+    assert refused.value.status_code == 409
+
+
 async def test_trash_is_per_person(db, monkeypatch):
     _inbox, root = _note(db, monkeypatch)
     await _trash(db, root)

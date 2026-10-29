@@ -56,7 +56,7 @@ def test_the_invite_path_mails_the_claim_link_to_the_hosted_app(outbox, monkeypa
     monkeypatch.setattr(grant_service, "_resource_name", lambda db, rid: "Shared Plans")
     monkeypatch.setattr("mantle.config.FACET_URI", "https://my.agience.ai")
 
-    sent = grant_service._send_invite_email(None, "u-1", "ws-9", "invitee@example.invalid", "tok123", None)
+    sent = grant_service.send_invite_email(None, "u-1", "ws-9", "invitee@example.invalid", "tok123", None)
 
     assert sent is True
     (mail,) = _mails(outbox)

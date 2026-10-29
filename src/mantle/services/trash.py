@@ -2,8 +2,10 @@
 
 An artifact in Trash is an archived artifact that carries ``trashed_by`` and ``trashed_time`` on
 the newest version of its lineage. Archived, so every default read passes it by (`spine.md` §2);
-marked, so a person's Trash lists it and a container's Archived view does not. Restoring it is
-the ordinary restore (`state: live`), which clears both marks.
+marked, so a person's Trash lists it and a container's Archived view does not. Restoring it from
+Trash undoes the delete and nothing more: it returns to the state it had, recorded as
+``trashed_from`` when it was marked, so an artifact archived before it was deleted comes back
+archived. The ordinary restore (`state: live`) also takes an artifact out of Trash, as live.
 
 Old versions "are deleted only by policy, and the policy itself is the audit trail"
 (`architecture.md`). This is that policy for Trash: :func:`purge_expired` deletes what has been
@@ -55,7 +57,7 @@ def is_trashed(doc: Optional[Dict[str, Any]]) -> bool:
     return bool(doc and doc.get("trashed_by") and state_of(doc) == _ARCHIVED)
 
 
-def _head(db: Any, artifact_id: str) -> Optional[Dict[str, Any]]:
+def head_of(db: Any, artifact_id: str) -> Optional[Dict[str, Any]]:
     """The newest version of ``artifact_id``'s lineage, raw."""
     raw = db.artifacts.get_artifact(artifact_id)
     root = (raw or {}).get("root_id") or artifact_id
@@ -63,8 +65,9 @@ def _head(db: Any, artifact_id: str) -> Optional[Dict[str, Any]]:
     return dict(versions[-1]) if versions else (dict(raw) if raw else None)
 
 
-def mark(db: Any, user_id: str, artifact_id: str) -> Optional[Dict[str, Any]]:
-    """Mark the archived head of ``artifact_id`` as trashed by ``user_id``, now.
+def mark(db: Any, user_id: str, artifact_id: str, *, was_archived: bool = False) -> Optional[Dict[str, Any]]:
+    """Mark the archived head of ``artifact_id`` as trashed by ``user_id``, now, recording whether
+    it was already archived before it was deleted (``was_archived``).
 
     Returns the marked document, or ``None`` when the head is not archived (archive it first).
     Written through the store's artifact update, which announces it on the change feed."""
@@ -72,12 +75,31 @@ def mark(db: Any, user_id: str, artifact_id: str) -> Optional[Dict[str, Any]]:
     from mantle.db.lattice_api import from_lattice_doc
     from mantle.entities.artifact import Artifact
 
-    head = _head(db, artifact_id)
+    head = head_of(db, artifact_id)
     if not head or state_of(head) != _ARCHIVED:
         return None
     entity = from_lattice_doc(head, Artifact)
     entity.trashed_by = user_id
     entity.trashed_time = _now().isoformat()
+    entity.trashed_from = _ARCHIVED if was_archived else None
+    entity.modified_by = user_id
+    db_store.update_artifact(db, entity)
+    return entity.to_dict()
+
+
+def unmark(db: Any, user_id: str, artifact_id: str) -> Optional[Dict[str, Any]]:
+    """Take the trashed head of ``artifact_id`` out of Trash and leave it archived.
+
+    Returns the document, or ``None`` when the head is not in Trash."""
+    from mantle.db import backend as db_store
+    from mantle.db.lattice_api import from_lattice_doc
+    from mantle.entities.artifact import Artifact
+
+    head = head_of(db, artifact_id)
+    if not is_trashed(head):
+        return None
+    entity = from_lattice_doc(head, Artifact)
+    entity.trashed_by = entity.trashed_time = entity.trashed_from = None
     entity.modified_by = user_id
     db_store.update_artifact(db, entity)
     return entity.to_dict()

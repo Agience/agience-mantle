@@ -233,14 +233,12 @@ def create_invite(
     name: Optional[str] = None,
     notes: Optional[str] = None,
     expires_at: Optional[str] = None,
-    message: Optional[str] = None,
-    send_email: bool = False,
 ) -> Tuple[GrantEntity, str]:
     """Create an invite grant using a named role preset.
 
     Returns ``(grant, raw_claim_token)``. The raw token is returned exactly once;
     the grant stores only a SHA-256 hash. Raises :class:`ValueError` for an
-    unknown role. ``send_email`` is best-effort and no-ops without a mail service.
+    unknown role. Mailing it is :func:`send_invite_email`'s, so the caller learns whether it went.
     """
     preset = GrantEntity.permissions_for_role(role)
 
@@ -287,16 +285,28 @@ def create_invite(
 
     created = create_grant(db, grant)
 
-    email_sent = False
-    if send_email and target_email:
-        email_sent = _send_invite_email(db, user_id, resource_id, target_email, raw_token, message)
     _emit_invite_event(
         resource_id, "grant.invite.created",
-        {"grant_id": created.id, "role": role, "target_email": target_email, "email_sent": email_sent},
+        {"grant_id": created.id, "role": role, "target_email": target_email},
         actor_id=user_id,
     )
 
     return created, raw_token
+
+
+def reissue_invite(db: Database, invite: GrantEntity) -> str:
+    """Give a pending invite a new claim token and return it; the old link stops working.
+
+    The store keeps only a token's hash, so an invite cannot be sent again with the link it was
+    first sent with. Raises :class:`InviteExhausted` for an invite that is no longer pending.
+    """
+    if invite.grantee_type != GrantEntity.GRANTEE_INVITE or invite.state != GrantEntity.STATE_ACTIVE:
+        raise InviteExhausted("Invite is no longer active")
+    raw_token = _generate_claim_token()
+    invite.grantee_id = hash_token(raw_token)
+    invite.modified_time = _now_iso()
+    update_grant(db, invite)
+    return raw_token
 
 
 def build_claim_url(raw_token: str) -> str:
@@ -311,9 +321,10 @@ def build_claim_url(raw_token: str) -> str:
     return f"{str(_BASE).rstrip('/')}/invite/{raw_token}"
 
 
-def _send_invite_email(db, user_id, resource_id, target_email, raw_token, message) -> bool:
-    """Mail the invitation (`services/email_service`). False when mail is not configured or the
-    send failed; the invite stands either way, and its claim link is in the response."""
+def send_invite_email(db, user_id, resource_id, target_email, raw_token, message) -> bool:
+    """Mail the invitation (`services/email_service`), from *user_id*. False when mail is not
+    configured or the send failed; the invite stands either way, and its claim link is in the
+    response."""
     from mantle.services import email_service
     from mantle.services.person_service import get_user_by_id
     try:
@@ -420,7 +431,8 @@ def claim_invite(db: Database, user_id: str, raw_token: str,
         can_admin=invite.can_admin,
         requires_identity=True,
         state=GrantEntity.STATE_ACTIVE,
-        name=invite.name,
+        # The address the inviter typed names the member they see in the access list.
+        name=invite.name or invite.target_entity,
         notes=f"Claimed from invite {invite.id}",
         granted_at=now,
         expires_at=invite.expires_at,
