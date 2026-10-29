@@ -151,6 +151,20 @@ def _parse_components(raw: str) -> dict:
     return out
 
 
+def _installed_version() -> str:
+    """The version pip recorded for this distribution, or "" when it is not installed.
+
+    A release installs Mantle from its wheel into a slot, with no `build_info.json` beside it, so
+    this is what `/version` names there, as Origin's does. 2026-10-29: production Mantle answered
+    `{"version": ""}` after 2026.10.14, and the platform check could not tell which build it ran."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("agience-mantle")
+    except PackageNotFoundError:
+        return ""
+
+
 def _load_build_info():
     for candidate in [BUILD_INFO_PATH, str(Path(__file__).resolve().parent.parent / "build_info.json")]:
         try:
@@ -159,7 +173,7 @@ def _load_build_info():
             continue
         info["components"] = _parse_components(info.get("components") or "")
         return info
-    return {"version": "", "build_time": "", "components": {}}
+    return {"version": _installed_version(), "build_time": "", "components": {}}
 
 BUILD_INFO = _load_build_info()
 

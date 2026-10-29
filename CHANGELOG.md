@@ -22,6 +22,7 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 ### Fixed
 
 - `mantle.system.seal_titles` (and `--unseal`) handles each row as its creator, else as the owner of its root. A note left in a shared workspace by a contributor whose access was revoked could not be unsealed as them, and stopped the release's rollback check.
+- `/version` names the installed version when no `build_info.json` was stamped, as Origin's does. A release installs Mantle from its wheel, with no `build_info.json`, and production Mantle answered with an empty version after 2026.10.14.
 
 ## [0.1.6] - 2026-10-28
 
