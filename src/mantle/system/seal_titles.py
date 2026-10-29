@@ -8,7 +8,8 @@ it. New writes need nothing; `tests/test_a_title_is_content_and_sealed_at_rest.p
 sealed.
 
 Each row is handled as its creator, the principal whose grant reaches its key; a row whose key the
-oracle will not hand over is reported and left alone, never forced.
+oracle will not hand over is reported and left alone, never forced. Only the title is sealed: the
+body is left as it is stored.
 
 `--unseal` is the reverse, which the release runs before rolling Mantle back to a version that
 does not read sealed titles; then the forward pass seals them again on the next promote.
@@ -38,8 +39,12 @@ def _plain_title(doc: dict) -> bool:
 
 
 def seal_stored_titles(db, *, dry_run: bool = False) -> dict:
-    """Seal every stored plain-text title. Returns the counts."""
-    from mantle.db import backend as store
+    """Seal every stored plain-text title. Returns the counts.
+
+    Each title is sealed under the row's key, as the write boundary seals it, and the row is written
+    as it is: the body is neither read nor rewritten, so a body held only in the object store needs
+    no object store here."""
+    from mantle.db.doc_boundary import seal_content_fields
     from mantle.services.acting_principal import acting_as
 
     todo = [d for d in db.artifacts.list_artifacts() if isinstance(d, dict) and _plain_title(d)]
@@ -51,13 +56,11 @@ def seal_stored_titles(db, *, dry_run: bool = False) -> dict:
         if not owner:
             counts["ownerless"] += 1
             continue
+        raw = dict(doc)
         try:
             with acting_as(str(owner), principal_type="user"):
-                artifact = store.get_artifact(db, str(doc.get("id")))
-                if artifact is None:
-                    counts["denied"] += 1
-                    continue
-                store.update_artifact(db, artifact)
+                seal_content_fields(raw)
+            db.artifacts.put_artifact(raw)
             counts["sealed"] += 1
         except Exception as exc:  # noqa: BLE001 — per row; the rest of the corpus still seals
             counts["denied"] += 1

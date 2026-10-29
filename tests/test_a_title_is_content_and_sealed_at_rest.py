@@ -163,3 +163,27 @@ async def test_a_title_the_oracle_will_not_open_stays_sealed_rather_than_emptied
     monkeypatch.setattr(content_crypto, "decrypt_content", refuse)
     counts = unseal_stored_titles(db)
     assert counts["denied"] >= 1 and _raw(db, doc["id"])["context"] == before
+
+
+async def test_a_title_is_sealed_without_reading_the_body(db, monkeypatch):
+    """2026-10-29, release 2026.10.14: the RC has no object store, and the pass read and rewrote
+    each whole artifact, so 11 titles whose body lives only in the bucket could not be sealed again
+    after the rollback check unsealed them. Sealing a title needs the row's key, not its body."""
+    from mantle.services.content_service import ContentStoreUnavailable
+    from mantle.system.seal_titles import seal_stored_titles, unseal_stored_titles
+    _, doc = await _note(db, title=f"Far {WORD}")
+    assert unseal_stored_titles(db)["unsealed"] >= 1
+    body = _raw(db, doc["id"])["content"]
+
+    def unreachable(*a, **k):
+        raise ContentStoreUnavailable("not in this node's local content tier")
+    reachable = doc_boundary._decrypt_body
+    monkeypatch.setattr(doc_boundary, "_decrypt_body", unreachable)
+    counts = seal_stored_titles(db)
+    assert counts["denied"] == 0 and counts["sealed"] >= 1
+    raw = _raw(db, doc["id"])
+    assert WORD not in json.dumps(raw) and raw["content"] == body, "the title sealed, the body as stored"
+    monkeypatch.setattr(doc_boundary, "_decrypt_body", reachable)
+    with acting_as(USER, principal_type="user"):
+        read = await artifacts.read_artifact(artifact_id=doc["id"], auth=_auth(), store_db=db)
+    assert json.loads(read["context"])["title"] == f"Far {WORD}"
