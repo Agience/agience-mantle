@@ -50,7 +50,7 @@ def shutdown_search() -> None:
     pass
 
 
-def reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
+def reindex_all_artifacts(*, max_workers: Optional[int] = None, force: bool = False) -> dict:
     """Bulk-reindex every non-archived artifact into MANTLE + MANTLE-SSE.
 
     One-shot admin operation. Use cases:
@@ -83,6 +83,10 @@ def reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
     third outcome — nothing to write, or an arm whose prerequisites (an AnchorSet, a
     wired indexer) are absent — and it keeps ``failed`` meaning failed.
 
+    ``force`` rebuilds even when a full pass has completed before (the completion marker below
+    makes later boots skip): a change to what an index holds is rebuilt by calling with it
+    (`mantle.system.reindex`).
+
     Runs as the platform system principal: it has no request context, and it both
     reads every artifact (decrypting content) and writes every index cell, so it
     needs an identity the grant ledger can check. The wrapper is here rather than at
@@ -90,10 +94,10 @@ def reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
     and the CLI — one wrapper covers all three and none can forget it.
     """
     with system_acting_context(scope="platform.reindex"):
-        return _reindex_all_artifacts(max_workers=max_workers)
+        return _reindex_all_artifacts(max_workers=max_workers, force=force)
 
 
-def _reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
+def _reindex_all_artifacts(*, max_workers: Optional[int] = None, force: bool = False) -> dict:
     """Body of :func:`reindex_all_artifacts`; assumes an acting principal is set."""
     from mantle import config
     from mantle.db.backend import COLLECTION_ARTIFACTS, iter_documents
@@ -147,10 +151,10 @@ def _reindex_all_artifacts(*, max_workers: Optional[int] = None) -> dict:
             _done = _ps.get(_marker) if hasattr(_ps, "get") else None
         finally:
             _g.close()
-        if _done:
+        if _done and not force:
             logger.info(
                 "Reindex SKIPPED: a full pass already completed (%s = %s). Call "
-                "reindex_all_artifacts() explicitly to rebuild.", _marker, _done)
+                "reindex_all_artifacts(force=True) to rebuild.", _marker, _done)
             return {"indexed": 0, "skipped": 0, "failed": 0, "total": 0}
     except Exception:
         pass                       # cannot read the marker → do the work rather than skip blindly

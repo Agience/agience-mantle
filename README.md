@@ -21,11 +21,17 @@ touch and what key is issued. Revocation is a single grant edit — no re-encryp
 
 *Grants are keys, not metadata.*
 
-**What is encrypted, and what is not.** Content is encrypted per principal and bound
-cryptographically to the collection it was written for. What the store keeps in the clear is what it
-must read to *find* things: the offer text the lexical index reads, and the identifiers in the
-posting store. The blind-token index closes exactly that, and covers **5.9%** of our reference
-corpus today, with the remainder served by a plaintext lexical index.
+**What is encrypted, and what is not.** An artifact's content and its `context.title` are
+encrypted per principal and bound cryptographically to the collection they were written for. The
+search index holds no plaintext terms: every artifact is indexed by blind token, and there is no
+plaintext lexical index to fall back to.
+
+The rest of the record is stored readable and governed by grants rather than by encryption, both in
+the artifact row and in the durable change feed: an artifact's `name` and `description`, every
+`context` key other than `title` (tags, filename, custom keys), relationship names on typed links,
+and a grant's name, notes and invite address. Identifiers and structure are readable too — ids,
+content type, creator and timestamps, graph edges, the access log, the ids beside each blind token,
+and each body's SHA-256 and byte length. Recall logs its query text at `INFO`.
 
 Durability is an operator responsibility — [Backing a node up](#backing-a-node-up) is the procedure.
 
