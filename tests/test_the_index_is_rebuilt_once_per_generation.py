@@ -77,3 +77,57 @@ def test_a_forced_rebuild_gets_past_the_completion_marker(monkeypatch):
     assert init_search._reindex_all_artifacts()["total"] == 0, "unforced: skipped at the marker"
     with pytest.raises(_Reached):
         init_search._reindex_all_artifacts(force=True)
+
+
+# 2026-10-29, on the release candidate: the full pass runs as the platform, whose principal holds no
+# grant to a person's content, and was refused for every artifact. The migration indexes each
+# artifact as its creator.
+@pytest.fixture
+def node(tmp_path, monkeypatch):
+    from .test_there_is_no_promotion_state import real_node
+    return real_node(tmp_path, monkeypatch)
+
+
+async def test_the_migration_indexes_a_persons_artifacts_as_their_creator(node):
+    from .test_a_title_is_content_and_sealed_at_rest import _note
+    await _note(node, title="quasar-lantern-731")
+    s = Settings()
+    out = reindex.reindex_once(node, s)
+    assert out["failed"] == 0 and out["denied"] == 0 and out["unreadable"] == 0, out
+    assert out["indexed"] >= 2, out   # the collection and the note
+    assert out["rebuilt"] and s.values[reindex.SETTING] == str(reindex.GENERATION)
+
+
+# The indexer turns any exception in its search arm into a failed outcome and logs the exception. A
+# write the key service refuses (on the release candidate: 69 of the platform's own artifacts) is
+# counted as denied and does not stop the release; any other fault is still a failure.
+@pytest.mark.parametrize("raised, counted", [("refused", "denied"), ("fault", "failed")])
+def test_a_refused_index_write_is_denied_and_any_other_fault_fails(monkeypatch, raised, counted):
+    import logging
+    from mantle.db import lattice_api
+    from mantle.search.ingest import pipeline_unified as pu
+    from mantle.search.mantle.oracle import GrantDenied
+
+    class Db:
+        class artifacts:
+            @staticmethod
+            def list_artifacts():
+                return iter([{"id": "a1", "created_by": "u1", "origin_root": None}])
+
+            @staticmethod
+            def get_artifact(_id):
+                return None
+
+    def index_artifact(artifact, collection_id, is_head=True):
+        exc = GrantDenied("refused") if raised == "refused" else RuntimeError("disk")
+        try:
+            raise exc
+        except Exception:
+            logging.getLogger("mantle.search.ingest.pipeline_unified").warning("SSE indexing failed", exc_info=True)
+        return pu.IndexOutcome(sse=pu.ARM_FAILED, vector="skipped")
+
+    monkeypatch.setattr(lattice_api, "from_lattice_doc", lambda raw, cls: type("A", (), {"collection_id": "c", "id": "a1"})())
+    monkeypatch.setattr(pu, "is_indexable", lambda a: True)
+    monkeypatch.setattr(pu, "index_artifact", index_artifact)
+    counts = reindex.reindex_as_owners(Db)
+    assert counts[counted] == 1 and counts["indexed"] == 0, counts

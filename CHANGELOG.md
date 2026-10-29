@@ -9,8 +9,8 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ### Added
 
-- `mantle.system.reindex` is a migration, run with `python -m mantle.system.reindex`, that rebuilds the search index once for each index generation recorded in the `search.reindex.generation` platform setting. Artifacts saved before a change to indexing, such as hyphenated names being found by their parts, are re-indexed on the next release. `--check` reports whether a rebuild is due and changes nothing.
-- A pass that reports failures records no generation and exits non-zero, so the next release runs it again. Artifacts that cannot be read on the node are counted as unreadable, not as failures.
+- `mantle.system.reindex` is a migration, run with `python -m mantle.system.reindex`, that rebuilds the search index once for each index generation recorded in the `search.reindex.generation` platform setting. Artifacts saved before a change to indexing, such as hyphenated names being found by their parts, are re-indexed on the next release. Each artifact is indexed as a principal whose grants reach it (its creator, the owner of its root, or the platform for its own artifacts), because the platform's principal holds no grant to a person's content. `--check` reports whether a rebuild is due and changes nothing.
+- A pass that reports failures records no generation and exits non-zero, so the next release runs it again. Artifacts that cannot be read on the node are counted as unreadable, and index writes the key service refuses as denied; neither is a failure.
 - `reindex_all_artifacts` in `mantle.search.init_search` accepts `force=True`, which rebuilds even when an earlier full pass has set the completion marker that makes later boots skip.
 - The release workflow (`.github/workflows/publish.yml`) also runs on pushes to `release/**` branches. It builds and checks the package and keeps the files as the `dist` artifact for the platform release to deploy.
 
