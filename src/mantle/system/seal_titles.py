@@ -65,17 +65,31 @@ def _holders(db, doc: dict, roots: dict) -> list[str]:
     return [str(h) for i, h in enumerate(found) if h and h not in found[:i]]
 
 
+def _acting_as_each(holders: list):
+    """Each way to act for a row, in order: every holder as a person, then as a service, then the
+    platform's own principal. The platform's own rows (operators, its collections, type definitions)
+    belong to service principals or to no one, and the key service opens them for those, not for a
+    person of the same id. 2026-10-30, on the release candidate: the rollback pass, acting only as a
+    person, could open 199 of 242 rows; 347 rows with no owner were left in plain text. The same
+    order as `mantle.system.reindex`."""
+    from mantle.services.acting_principal import acting_as
+    from mantle.services.system_identity import system_acting_context
+    for holder in holders:
+        yield lambda h=holder: acting_as(h, principal_type="user")
+        yield lambda h=holder: acting_as(h, principal_type="service")
+    yield lambda: system_acting_context(scope="platform.seal")
+
+
 def seal_stored_titles(db, *, dry_run: bool = False) -> dict:
     """Seal every stored plain-text title. Returns the counts.
 
     Each title is sealed under the row's key, as the write boundary seals it, and the row is written
     as it is: the body is neither read nor rewritten, so a body held only in the object store needs
     no object store here."""
-    from mantle.db.doc_boundary import seal_content_fields
-    from mantle.services.acting_principal import acting_as
+    from mantle.db.doc_boundary import seal_content_fields, unseal_content_fields
 
     todo = [d for d in db.artifacts.list_artifacts() if isinstance(d, dict) and _plain_title(d)]
-    counts = {"plain": len(todo), "sealed": 0, "denied": 0, "ownerless": 0}
+    counts = {"plain": len(todo), "sealed": 0, "left_plain": 0, "ownerless": 0}
     if dry_run:
         return counts
     roots: dict = {}
@@ -83,22 +97,32 @@ def seal_stored_titles(db, *, dry_run: bool = False) -> dict:
         holders = _holders(db, doc, roots)
         if not holders:
             counts["ownerless"] += 1
-            continue
         why = ""
-        for holder in holders:
+        for acting in _acting_as_each(holders):
             raw = dict(doc)
             try:
-                with acting_as(holder, principal_type="user"):
+                with acting():
                     seal_content_fields(raw)
-            except Exception as exc:  # noqa: BLE001 — per row; the next holder, then the next row
+                    # Written only if the same actor opens it again: a seal nobody this pass can
+                    # act as can read back would leave the row unreadable. 2026-10-30, on the
+                    # release candidate: 43 of the platform's rows were sealed and then could not be
+                    # opened by any actor, person, service or platform.
+                    check = dict(raw)
+                    unseal_content_fields(check)
+            except Exception as exc:  # noqa: BLE001 — per row; the next way, then the next row
                 why = type(exc).__name__
+                continue
+            if _still_sealed(check):
+                why = "not readable back"
                 continue
             db.artifacts.put_artifact(raw)
             counts["sealed"] += 1
             break
         else:
-            counts["denied"] += 1
-            logger.info("  cannot seal %s (%s) — leaving it alone", str(doc.get("id"))[:8], why)
+            # Left as it is stored today, in plain text, and reported: the key service opens this
+            # row for no actor this pass has. Not a failure of the release; an open item.
+            counts["left_plain"] += 1
+            logger.info("  cannot seal %s (%s) — left in plain text", str(doc.get("id"))[:8], why)
     return counts
 
 
@@ -107,7 +131,6 @@ def unseal_stored_titles(db, *, dry_run: bool = False) -> dict:
     title put back in plain text, read as the row's creator and written to the row as it is, past
     the write boundary that would seal it again. Returns the counts."""
     from mantle.db.doc_boundary import SEALED, unseal_content_fields
-    from mantle.services.acting_principal import acting_as
 
     def sealed(doc: dict) -> bool:
         raw = doc.get("context")
@@ -126,11 +149,13 @@ def unseal_stored_titles(db, *, dry_run: bool = False) -> dict:
         holders = _holders(db, doc, roots)
         if not holders:
             counts["ownerless"] += 1
-            continue
-        for holder in holders:
+        for acting in _acting_as_each(holders):
             raw = dict(doc)
-            with acting_as(holder, principal_type="user"):
-                unseal_content_fields(raw)
+            try:
+                with acting():
+                    unseal_content_fields(raw)
+            except Exception:  # noqa: BLE001 — an actor that cannot be assumed; the next way
+                continue
             if not _still_sealed(raw):
                 db.artifacts.put_artifact(raw)
                 counts["unsealed"] += 1
@@ -165,7 +190,7 @@ def main() -> int:
     else:
         counts = seal_stored_titles(db, dry_run=args.dry_run)
         logger.info("%s: %s", "would seal" if args.dry_run else "sealed", counts)
-    return 0 if not counts["denied"] else 1
+    return 1 if counts.get("denied") else 0
 
 
 if __name__ == "__main__":

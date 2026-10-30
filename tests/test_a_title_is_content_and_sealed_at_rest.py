@@ -130,7 +130,7 @@ async def test_a_title_stored_before_sealing_is_sealed_by_the_pass(db):
 
     assert seal_stored_titles(db, dry_run=True)["plain"] >= 1
     counts = seal_stored_titles(db)
-    assert counts["sealed"] >= 1 and counts["denied"] == 0
+    assert counts["sealed"] >= 1 and counts["left_plain"] == 0
     assert WORD not in json.dumps(_raw(db, doc["id"]))
     with acting_as(USER, principal_type="user"):
         read = await artifacts.read_artifact(artifact_id=doc["id"], auth=_auth(), store_db=db)
@@ -187,10 +187,32 @@ async def test_a_title_is_sealed_without_reading_the_body(db, monkeypatch):
     reachable = doc_boundary._decrypt_body
     monkeypatch.setattr(doc_boundary, "_decrypt_body", unreachable)
     counts = seal_stored_titles(db)
-    assert counts["denied"] == 0 and counts["sealed"] >= 1
+    assert counts["left_plain"] == 0 and counts["sealed"] >= 1
     raw = _raw(db, doc["id"])
     assert WORD not in json.dumps(raw) and raw["content"] == body, "the title sealed, the body as stored"
     monkeypatch.setattr(doc_boundary, "_decrypt_body", reachable)
     with acting_as(USER, principal_type="user"):
         read = await artifacts.read_artifact(artifact_id=doc["id"], auth=_auth(), store_db=db)
     assert json.loads(read["context"])["title"] == f"Far {WORD}"
+
+
+async def test_a_row_no_actor_can_read_back_is_left_plain_not_sealed_blind(db, monkeypatch):
+    """2026-10-30, on the release candidate: the pass sealed 43 of the platform's rows that then no
+    actor could open. A seal is written only if the actor that made it opens it again."""
+    from mantle.services import content_crypto
+    from mantle.services.acting_principal import KeyCustodyDenied
+    from mantle.system.seal_titles import seal_stored_titles
+    _, doc = await _note(db, title="Settled")
+    raw = dict(_raw(db, doc["id"]))
+    ctx = json.loads(raw["context"])
+    ctx.pop(doc_boundary.SEALED)
+    ctx["title"] = f"Old {WORD}"
+    raw["context"] = json.dumps(ctx)
+    db.artifacts.put_artifact(raw)
+
+    def refuse(*a, **k):
+        raise KeyCustodyDenied("no read grant")
+    monkeypatch.setattr(content_crypto, "decrypt_content", refuse)    # sealing works; reading back does not
+    counts = seal_stored_titles(db)
+    assert counts["left_plain"] >= 1
+    assert WORD in json.dumps(_raw(db, doc["id"])), "a seal nobody could open was written"

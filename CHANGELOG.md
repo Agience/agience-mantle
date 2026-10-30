@@ -16,6 +16,7 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 - `provision_user` acts as the user it provisions, so an admin script that provisions writes under that user's key.
 
 ### Fixed
+- `mantle.system.seal_titles` acts for each row as its creator or the owner of its root, as a person and then as a service, and then as the platform, as `mantle.system.reindex` does; a row with no owner goes to the platform. It writes a seal only if the same actor opens it again, and leaves a row it cannot verify in plain text, reported as `left_plain`. On the release candidate the pass had sealed 43 of the platform's rows that no actor could open.
 - A reader the key service would not serve, which then saved what it read, erased the sealed fields for good: the blob was dropped before the decrypt. It is kept unless the decrypt succeeds, and a response never carries it.
 - `title:`, `description:` and `tags:` filters read the stored row, where the fields are sealed, and matched nothing. They read the row opened for the searcher.
 - `mantle.system.type_uploads` opens a sealed row before deciding whether it is an untyped upload.
