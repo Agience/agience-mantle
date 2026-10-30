@@ -36,6 +36,9 @@ from mantle.entities.grant import Grant                            # noqa: E402
 from mantle.routers import events_router as ev                     # noqa: E402
 from mantle.services.dependencies import AuthContext               # noqa: E402
 
+# Fixtures here write sealed fields with no acting principal (`conftest.content_keys`).
+pytestmark = pytest.mark.usefixtures("content_keys")
+
 ARTIFACT = "a-1"
 CONTAINER = "col-1"
 OWNER = "u-1"

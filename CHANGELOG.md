@@ -5,6 +5,22 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-10-30
+
+### Changed
+- Every context key an artifact carries, and its top-level `name` and `description`, are sealed under the body's key, as the title was. Structure is the named exception (`doc_boundary.STRUCTURAL_CONTEXT_KEYS`): `content_type`, `content_key`, `content_cas_ref`, the card-key bindings `stream` and `inbound`, and the upload bookkeeping `upload`, `processing` and `storage`. Issuers, type definitions, anchors, crosswalks and subscriptions keep their context readable, because it is read before anyone signs in, but their title is still sealed. A sealed blob written before this (title only) still opens.
+- The change feed carries the structure alone: no sealed field, in either form, and no `name` or `description`. A subscriber reads them back through the authorized path.
+- Recall logs its counts, never the query text.
+- A new description or tag set makes a version, as a new title does. What the server records about the bytes (digest, size, `addressing`, the mint) is sealed too, but a completed upload does not fork its artifact.
+- `mantle.system.seal_titles` seals every sealable field of a row stored in plaintext, and `--unseal` restores every field for a rollback.
+- `provision_user` acts as the user it provisions, so an admin script that provisions writes under that user's key.
+
+### Fixed
+- A reader the key service would not serve, which then saved what it read, erased the sealed fields for good: the blob was dropped before the decrypt. It is kept unless the decrypt succeeds, and a response never carries it.
+- `title:`, `description:` and `tags:` filters read the stored row, where the fields are sealed, and matched nothing. They read the row opened for the searcher.
+- `mantle.system.type_uploads` opens a sealed row before deciding whether it is an untyped upload.
+
+
 ## [0.1.7] - 2026-10-29
 
 ### Added

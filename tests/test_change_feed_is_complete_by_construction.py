@@ -39,6 +39,9 @@ SRC = BACKEND / "src" / "mantle"
 from mantle.events import event_bus                        # noqa: E402
 from mantle.db import doc_boundary                  # noqa: E402
 
+# Fixtures here write sealed fields with no acting principal (`conftest.content_keys`).
+pytestmark = pytest.mark.usefixtures("content_keys")
+
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════
 # 1 · The detectors and the table
@@ -625,8 +628,10 @@ async def test_a_container_rename_reaches_a_subscriber(store, bus):
     (event,) = await _drain(queue, expect=1)
     assert event.name == "artifact.updated"
     assert event.artifact_id == "ws-1"
-    assert _artifact_of(event).get("name") == "after", \
-        "the event carried the container but not the new name, so a subscriber still shows the old"
+    # The new name is content and sealed (2026-10-29), so the feed announces the change and carries
+    # neither name; a subscriber reads it back through the authorized path (Facet's
+    # `completeFromFeed`), which is what makes the rename visible.
+    assert "name" not in _artifact_of(event), "the feed carried a sealed field: the container's name"
     assert event.actor_id == "u-2"
     assert queue.empty()
 

@@ -24,6 +24,9 @@ from mantle.entities.artifact import Artifact as ArtifactEntity, WORKSPACE_CONTE
 from mantle.services import workspace_service as ws
 from mantle.services.acting_principal import acting_as
 
+# Fixtures here write sealed fields with no acting principal (`conftest.content_keys`).
+pytestmark = pytest.mark.usefixtures("content_keys")
+
 
 # `acting_as` is not decoration. `update_artifact` issues key material and refuses without an
 # acting principal — on a request path the auth dependency installs one, and a test that calls the

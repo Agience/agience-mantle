@@ -44,6 +44,9 @@ from mantle.search.mantle.oracle import (
 )
 from mantle.services import grant_key_service as gks
 
+# Fixtures here write sealed fields with no acting principal (`conftest.content_keys`).
+pytestmark = pytest.mark.usefixtures("content_keys")
+
 OWNER = "user-owner"
 ALICE = "user-alice"
 COLLECTION = "col-1"

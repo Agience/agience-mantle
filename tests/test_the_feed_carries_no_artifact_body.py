@@ -252,7 +252,8 @@ async def test_a_logged_event_still_identifies_what_changed(store, bus, content_
     assert event.actor_id == "u-1"
     assert artifact["id"] == "a-desc"
     assert artifact["collection_id"] == "col-1"
-    assert artifact["name"] == "q3"
+    # The name is content and sealed (2026-10-29): the feed carries it in neither form.
+    assert "name" not in artifact
     assert artifact["state"] == "live"
     assert artifact["content_type"] == "text/markdown", \
         "the content TYPE is a descriptor, not a body — a subscriber filters on it"
@@ -262,12 +263,11 @@ async def test_a_logged_event_still_identifies_what_changed(store, bus, content_
 # 4 · The rule itself
 # ═════════════════════════════════════════════════════════════════════════════════════════════
 
-def test_redaction_removes_the_body_and_keeps_everything_else():
-    doc = {"id": "a-1", "collection_id": "c-1", "name": "q3", "content": SECRET,
+def test_redaction_removes_the_body_and_the_sealed_fields_and_keeps_the_structure():
+    doc = {"id": "a-1", "collection_id": "c-1", "name": "q3", "description": "d", "content": SECRET,
            "content_encrypted": True, "content_type": "text/markdown"}
     out = event_bus.redacted_artifact(doc)
-    assert out == {"id": "a-1", "collection_id": "c-1", "name": "q3",
-                   "content_type": "text/markdown"}
+    assert out == {"id": "a-1", "collection_id": "c-1", "content_type": "text/markdown"}
     assert doc["content"] == SECRET, "redaction edited the caller's doc in place"
 
 

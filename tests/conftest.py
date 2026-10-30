@@ -535,3 +535,26 @@ def _content_tier_for_unit_tests(request, monkeypatch):
             return {}
 
     monkeypatch.setattr(workspace_service, "_store_content_in_s3", _addressed)
+
+
+@pytest.fixture
+def content_keys(monkeypatch):
+    """A deterministic content master key per principal, so a test can write sealed fields without
+    standing up the key oracle and its grant ledger (`real_node` does the same for a whole node).
+
+    Opt-in, never autouse: a production path that writes with no acting principal must still fail
+    closed in every test that does not ask for this. 2026-10-29, sealing everything: a fixture that
+    creates a named collection needs a key, which a title-only seal never asked it for.
+    """
+    import hashlib
+
+    from mantle.services import content_crypto
+    real_encrypt, real_decrypt = content_crypto.encrypt_content, content_crypto.decrypt_content
+
+    def _provider(principal_id: str) -> bytes:
+        return hashlib.sha256(("master:" + principal_id).encode("utf-8")).digest()
+
+    monkeypatch.setattr(content_crypto, "encrypt_content",
+                        lambda pid, pt, **kw: real_encrypt(pid, pt, master_key_provider=_provider, **kw))
+    monkeypatch.setattr(content_crypto, "decrypt_content",
+                        lambda pid, blob, **kw: real_decrypt(pid, blob, master_key_provider=_provider, **kw))

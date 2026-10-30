@@ -539,7 +539,10 @@ def test_an_archived_head_restores_and_its_snapshot_does_not(db, monkeypatch):
 
     # The rows name CAS addresses this node holds no bytes for; what is decided here is the
     # state, not the body.
-    monkeypatch.setattr(doc_boundary, "decrypt_artifact_content", lambda d, **k: d)
+    # The context is still unsealed: everything but the structure is sealed, and a read that
+    # skipped the unseal would see none of it (2026-10-29, sealing everything).
+    _unseal = doc_boundary.unseal_content_fields
+    monkeypatch.setattr(doc_boundary, "decrypt_artifact_content", lambda d, **k: (_unseal(d), d)[1])
 
     inbox = _container(db, "Inbox")
     base = {"id": "m", "root_id": "m", "collection_id": inbox, "state": "live",

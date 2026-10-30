@@ -40,9 +40,43 @@ def _file_type(doc: dict) -> str:
     return ct.strip() if isinstance(ct, str) else ""
 
 
+def _opened(db, doc: dict, roots: dict) -> dict:
+    """`doc` with its sealed context opened, as a holder of its key, when it is an untyped row whose
+    context is sealed; else `doc`. The filename that marks an upload is content, and sealed
+    (2026-10-29): read raw, every sealed upload looked typed."""
+    from mantle.db.doc_boundary import SEALED, unseal_content_fields
+    from mantle.services.acting_principal import acting_as
+    from mantle.system.seal_titles import _holders
+    if doc.get("content_type"):
+        return doc
+    raw = doc.get("context")
+    try:
+        ctx = raw if isinstance(raw, dict) else json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return doc
+    if not isinstance(ctx, dict) or SEALED not in ctx:
+        return doc
+    for holder in _holders(db, doc, roots):
+        copy = dict(doc)
+        with acting_as(holder, principal_type="user"):
+            unseal_content_fields(copy)
+        opened = copy.get("context")
+        try:
+            opened = opened if isinstance(opened, dict) else json.loads(opened or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(opened, dict) and SEALED not in opened:
+            return copy
+    return doc
+
+
 def type_stored_uploads(db, *, dry_run: bool = False) -> dict:
-    """Type every untyped upload from its context. Returns the counts."""
-    todo = [(d, _file_type(d)) for d in db.artifacts.list_artifacts() if isinstance(d, dict)]
+    """Type every untyped upload from its context. Returns the counts.
+
+    The decision reads the opened context (`_opened`); the write sets the artifact's type on the
+    stored row and nothing else, so its content and its seal are left as they are."""
+    roots: dict = {}
+    todo = [(d, _file_type(_opened(db, d, roots))) for d in db.artifacts.list_artifacts() if isinstance(d, dict)]
     todo = [(d, ct) for d, ct in todo if ct]
     counts = {"untyped": len(todo), "typed": 0}
     if dry_run:

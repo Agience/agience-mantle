@@ -71,6 +71,9 @@ from mantle.entities.artifact import Artifact                        # noqa: E40
 from mantle.entities.grant import Grant                              # noqa: E402
 from mantle.services.dependencies import AuthContext                 # noqa: E402
 
+# Fixtures here write sealed fields with no acting principal (`conftest.content_keys`).
+pytestmark = pytest.mark.usefixtures("content_keys")
+
 WORKSPACE, ARTIFACT, USER = "ws-1", "a-1", "u-1"
 
 

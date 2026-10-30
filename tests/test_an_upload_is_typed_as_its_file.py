@@ -17,6 +17,9 @@ from mantle.entities.artifact import WORKSPACE_CONTENT_TYPE
 from mantle.services import workspace_service as ws
 from mantle.services.acting_principal import acting_as
 
+# This store has no grant ledger behind its key oracle (`conftest.content_keys`).
+pytestmark = pytest.mark.usefixtures("content_keys")
+
 CAS_REF = "cas/" + "a" * 64
 
 

@@ -31,13 +31,27 @@ logger = logging.getLogger("seal_titles")
 
 
 def _plain_title(doc: dict) -> bool:
-    from mantle.db.doc_boundary import CONTENT_FIELDS
+    """Whether the row holds anything the store seals in plaintext: a sealable context key or a
+    writer-supplied top-level field (`doc_boundary.sealable_keys`, `SEALED_DOC_FIELDS`)."""
+    from mantle.db.doc_boundary import sealable_doc_fields, sealable_keys
     raw = doc.get("context")
     try:
         ctx = raw if isinstance(raw, dict) else json.loads(raw or "{}")
     except (TypeError, ValueError):
         return False
-    return isinstance(ctx, dict) and any(k in ctx for k in CONTENT_FIELDS)
+    if not isinstance(ctx, dict):
+        return False
+    return bool(sealable_keys(doc, ctx)) or bool(sealable_doc_fields(doc, ctx))
+
+
+def _still_sealed(doc: dict) -> bool:
+    from mantle.db.doc_boundary import SEALED
+    raw = doc.get("context")
+    try:
+        ctx = raw if isinstance(raw, dict) else json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return False
+    return isinstance(ctx, dict) and SEALED in ctx
 
 
 def _holders(db, doc: dict, roots: dict) -> list[str]:
@@ -117,7 +131,7 @@ def unseal_stored_titles(db, *, dry_run: bool = False) -> dict:
             raw = dict(doc)
             with acting_as(holder, principal_type="user"):
                 unseal_content_fields(raw)
-            if _plain_title(raw):
+            if not _still_sealed(raw):
                 db.artifacts.put_artifact(raw)
                 counts["unsealed"] += 1
                 break

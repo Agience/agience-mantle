@@ -162,15 +162,21 @@ def redacted_artifact(doc: Mapping[str, Any]) -> Dict[str, Any]:
     out = {k: v for k, v in dict(doc).items() if k not in FEED_BODY_FIELDS}
     if out.get("state") in LEGACY_LIVE_STATES:
         out["state"] = STATE_LIVE
-    # The context's content fields (the title, from the root type) are body too: the feed carries
-    # neither them nor their sealed form, and a subscriber reads them back through the authorized
-    # path. 2026-10-19: every title was in the event log in plain text.
+    # Everything the store seals is body too: the feed carries the structure alone, never the sealed
+    # fields nor their sealed form, and a subscriber reads them back through the authorized path.
+    # 2026-10-19: every title was in the event log in plain text; 2026-10-29: so were names,
+    # descriptions, tags and every other context key.
     _strip_content_fields(out)
     return out
 
 
 def _strip_content_fields(doc: Dict[str, Any]) -> None:
-    from mantle.db.doc_boundary import CONTENT_FIELDS, SEALED
+    """Keep the structural context keys (`doc_boundary.STRUCTURAL_CONTEXT_KEYS`) and drop the rest,
+    and drop the writer-supplied top-level fields (`SEALED_DOC_FIELDS`): the same rule the seal uses,
+    so the feed can never carry a field the store keeps sealed."""
+    from mantle.db.doc_boundary import SEALED_DOC_FIELDS, STRUCTURAL_CONTEXT_KEYS
+    for k in SEALED_DOC_FIELDS:
+        doc.pop(k, None)
     ctx = doc.get("context")
     as_string = isinstance(ctx, str)
     if as_string:
@@ -181,9 +187,7 @@ def _strip_content_fields(doc: Dict[str, Any]) -> None:
             return
     if not isinstance(ctx, dict):
         return
-    if not any(k in ctx for k in (*CONTENT_FIELDS, SEALED)):
-        return
-    ctx = {k: v for k, v in ctx.items() if k not in (*CONTENT_FIELDS, SEALED)}
+    ctx = {k: v for k, v in ctx.items() if k in STRUCTURAL_CONTEXT_KEYS}
     doc["context"] = json.dumps(ctx) if as_string else ctx
 
 

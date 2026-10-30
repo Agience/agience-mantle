@@ -451,7 +451,9 @@ async def test_the_upload_records_both_addresses_on_the_artifact(routed, client)
     ctx = _json.loads(db.artifacts.get_artifact("a-1")["context"])
     assert ctx["content_key"] == "artifacts/a-1.content"
     assert ctx["content_cas_ref"] == put.json()["content_ref"]
-    assert ctx["content_sha256"] == __import__("hashlib").sha256(b"body").hexdigest()
+    # The plaintext's SHA-256 confirms a guessed body, so it is sealed with the rest (2026-10-29);
+    # the two addresses are structure and stay readable.
+    assert "content_sha256" not in ctx and "sealed" in ctx
 
 
 @pytest.mark.asyncio

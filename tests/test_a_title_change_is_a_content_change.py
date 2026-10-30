@@ -57,10 +57,21 @@ def test_a_title_edit_keeps_the_title_it_replaced_and_names_it_as_parent(db):
     assert not any("superseded_by" in v for v in lineage)
 
 
-def test_a_change_that_is_not_content_is_written_in_place(db):
+def test_a_description_or_a_tag_is_content_and_makes_a_version(db):
+    """Sealing is the default (John, 2026-10-29), and what is sealed is content: a new description
+    or tag set makes a version as a new title does."""
     space, note = _note(db)
     with acting_as(USER, principal_type="user"):
         ws.update_artifact(db, USER, space, note.id, description="what this note is for")
-        ws.update_artifact(db, USER, space, note.id, caller_context=json.dumps({"title": "Draft one", "tags": ["x"]}))
+    assert len(db.artifacts.versions_of(note.root_id)) == 2, "a new description made no version"
+
+
+def test_a_change_that_is_not_content_is_written_in_place(db):
+    """Upload bookkeeping is structure the server writes, not content: a progress update makes no
+    version (`doc_boundary.STRUCTURAL_CONTEXT_KEYS`)."""
+    space, note = _note(db)
+    with acting_as(USER, principal_type="user"):
+        ws.update_artifact(db, USER, space, note.id,
+                           caller_context=json.dumps({"title": "Draft one", "upload": {"progress": 0.5}}))
     lineage = db.artifacts.versions_of(note.root_id)
     assert [v["id"] for v in lineage] == [note.id], "a non-content change made a version"

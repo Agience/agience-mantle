@@ -35,6 +35,9 @@ from mantle.entities.artifact import Artifact
 from mantle.entities.grant import Grant
 from mantle.services.dependencies import AuthContext, check_access
 
+# Fixtures here write sealed fields with no acting principal (`conftest.content_keys`).
+pytestmark = pytest.mark.usefixtures("content_keys")
+
 
 OWNER = "u-owner"
 STRANGER = "u-stranger"

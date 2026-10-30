@@ -59,8 +59,11 @@ def db(tmp_path, monkeypatch):
     # The body is addressed in a CAS this test has none of (conftest's `_addressed`); hydrating
     # it back is not the question — where the address is recorded is.
     from mantle.db import doc_boundary
-    monkeypatch.setattr(doc_boundary, "decrypt_artifact_content", lambda d, **k: d)
-    monkeypatch.setattr(store, "_decrypt_artifact_content", lambda d, **k: d)
+    # The context is still unsealed: everything but the structure is sealed, and a read that
+    # skipped the unseal would see none of it (2026-10-29, sealing everything).
+    _unseal = doc_boundary.unseal_content_fields
+    monkeypatch.setattr(doc_boundary, "decrypt_artifact_content", lambda d, **k: (_unseal(d), d)[1])
+    monkeypatch.setattr(store, "_decrypt_artifact_content", lambda d, **k: (_unseal(d), d)[1])
     monkeypatch.setattr(artifacts, "check_access", lambda *a, **k: None)
     return database
 

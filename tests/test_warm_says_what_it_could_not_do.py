@@ -24,6 +24,9 @@ from mantle.db import lattice_api as store
 from mantle.entities.artifact import Artifact as ArtifactEntity, WORKSPACE_CONTENT_TYPE
 from mantle.services import workspace_service as ws
 
+# Setup creates containers with no acting principal (`conftest.content_keys`).
+pytestmark = pytest.mark.usefixtures("content_keys")
+
 
 @pytest.fixture
 def db():
@@ -60,9 +63,10 @@ def test_a_failed_listing_is_not_reported_as_nothing_to_do(db, monkeypatch):
     def boom(*_a, **_k):
         raise RuntimeError("listing failed")
 
-    monkeypatch.setattr(ws.store, "list_collection_artifacts", boom)
-    failed = ws.warm_collection(db, cid)
-    monkeypatch.undo()
+    # Scoped, not `monkeypatch.undo()`: that would also undo `content_keys` for the rest of the test.
+    with monkeypatch.context() as m:
+        m.setattr(ws.store, "list_collection_artifacts", boom)
+        failed = ws.warm_collection(db, cid)
 
     assert failed["complete"] is False, "a swallowed failure still looks complete"
     assert failed["materialized"] == 0

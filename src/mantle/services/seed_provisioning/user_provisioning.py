@@ -126,6 +126,25 @@ def _is_platform_admin(store_db: Database, user_id: str) -> bool:
 def provision_user(
     store_db: Database,
     user_id: str,
+    **kwargs,
+) -> None:
+    """Provision a user on first login (`_provision_user`), acting as that user.
+
+    Everything it writes is theirs, and their Inbox's name is sealed under their key, so it runs
+    as them whoever called it: the first-login request (already them), or an admin script
+    (`manage_seed`, `manage_bootstrap`) that has no principal of its own. 2026-10-29, sealing
+    everything: run bare, the Inbox write was refused key material."""
+    if not user_id:
+        logger.warning("provision_user called with empty user_id — skipping")
+        return
+    from mantle.services.acting_principal import acting_as
+    with acting_as(str(user_id), principal_type="user"):
+        _provision_user(store_db, user_id, **kwargs)
+
+
+def _provision_user(
+    store_db: Database,
+    user_id: str,
     *,
     email: Optional[str] = None,
     name: Optional[str] = None,

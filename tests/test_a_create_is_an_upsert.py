@@ -34,6 +34,9 @@ from mantle.entities.artifact import Artifact as ArtifactEntity
 from mantle.entities.artifact import WORKSPACE_CONTENT_TYPE
 from mantle.services import workspace_service
 
+# Setup creates containers with no acting principal (`conftest.content_keys`).
+pytestmark = pytest.mark.usefixtures("content_keys")
+
 
 @pytest.fixture
 def db(tmp_path):

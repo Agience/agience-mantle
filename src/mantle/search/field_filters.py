@@ -331,6 +331,19 @@ def _validate(filt: FieldFilter) -> _Field:
     return spec
 
 
+def _opened(doc: dict) -> dict:
+    """A copy of `doc` with its sealed fields restored for the searcher, who is authorized by the
+    time a filter runs (`lightcone`): the title, description and tags are content and sealed
+    (2026-10-29), so read raw they matched nothing. A searcher the key service will not serve sees
+    them as absent, which is the answer they are entitled to."""
+    from mantle.db.doc_boundary import unseal_content_fields
+    from mantle.services.content_crypto import content_key_artifact
+    opened = dict(doc)
+    with content_key_artifact(opened.get("root_id") or opened.get("id")):
+        unseal_content_fields(opened)
+    return opened
+
+
 def compile_filters(
     filters: Iterable[FieldFilter],
 ) -> Optional[Callable[[dict], bool]]:
@@ -361,6 +374,8 @@ def compile_filters(
     wants_context = any(spec.needs_context for spec, _ in specs)
 
     def predicate(doc: dict) -> bool:
+        if wants_context:
+            doc = _opened(doc)
         ctx = parse_context(doc) if wants_context else _NO_CONTEXT
         for spec, filt in specs:
             hit = _matches(spec, filt, doc, ctx)

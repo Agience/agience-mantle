@@ -23,6 +23,9 @@ from mantle.entities.artifact import Artifact
 from mantle.entities.grant import Grant as GrantEntity
 from mantle.search.mantle.oracle import LightConeGrantVerifier
 
+# Fixtures here write sealed fields with no acting principal (`conftest.content_keys`).
+pytestmark = pytest.mark.usefixtures("content_keys")
+
 OWNER = "user-owner"
 ALICE = "user-alice"
 NCOLL = 6

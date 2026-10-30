@@ -58,7 +58,9 @@ async def test_the_stored_row_carries_the_title_only_sealed(db):
     raw = _raw(db, doc["id"])
     assert WORD not in json.dumps(raw), "the title is in the stored row in plain text"
     ctx = json.loads(raw["context"])
-    assert "title" not in ctx and ctx["kind"] == "note", "structure stays readable; the title does not"
+    # Sealing is the default and structure the exception (John, 2026-10-29): `kind` is sealed too.
+    assert set(ctx) <= doc_boundary.STRUCTURAL_CONTEXT_KEYS | {doc_boundary.SEALED}, sorted(ctx)
+    assert "title" not in ctx and "kind" not in ctx
     assert set(ctx[doc_boundary.SEALED]) == {"p", "blob"}
 
 
@@ -99,15 +101,20 @@ async def test_a_reader_the_oracle_will_not_serve_gets_no_title_and_no_error(db,
     raw = dict(_raw(db, doc["id"]))
     doc_boundary.unseal_content_fields(raw)
     ctx = json.loads(raw["context"])
-    assert "title" not in ctx and doc_boundary.SEALED not in ctx and ctx["kind"] == "note"
+    assert "title" not in ctx and "kind" not in ctx
+    # The blob stays, so a save of what this reader holds cannot erase the sealed fields
+    # (`test_a_failed_unseal_never_erases_what_it_seals.py`); a response drops it (`_artifact_body`).
+    assert doc_boundary.SEALED in ctx
 
 
-def test_the_change_feed_carries_no_title_in_either_form():
-    sealed = {"id": "a", "context": json.dumps({"title": "t", "sealed": {"p": "x", "blob": "y"}, "kind": "k"})}
-    plain = {"id": "b", "context": {"title": "t", "kind": "k"}}
+def test_the_change_feed_carries_the_structure_alone():
+    ct = {"content_type": "text/plain"}
+    sealed = {"id": "a", "name": "n", "context": json.dumps({"title": "t", "sealed": {"p": "x", "blob": "y"},
+                                                             "kind": "k", **ct})}
+    plain = {"id": "b", "description": "d", "context": {"title": "t", "kind": "k", "tags": ["x"], **ct}}
     out = event_bus.redact_content({"artifact": sealed, "artifacts": [plain]})
-    assert json.loads(out["artifact"]["context"]) == {"kind": "k"}
-    assert out["artifacts"][0]["context"] == {"kind": "k"}
+    assert json.loads(out["artifact"]["context"]) == ct and "name" not in out["artifact"]
+    assert out["artifacts"][0]["context"] == ct and "description" not in out["artifacts"][0]
 
 
 async def test_a_title_stored_before_sealing_is_sealed_by_the_pass(db):

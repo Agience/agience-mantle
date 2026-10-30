@@ -42,6 +42,9 @@ from mantle.events import event_bus                                     # noqa: 
 from mantle.routers import events_router as ev                          # noqa: E402
 from mantle.services.dependencies import AuthContext, check_access      # noqa: E402
 
+# Fixtures here write sealed fields with no acting principal (`conftest.content_keys`).
+pytestmark = pytest.mark.usefixtures("content_keys")
+
 OWNER = "u-1"
 #: `W` contains `A` through an origin edge — the containment the light cone actually walks.
 WORKSPACE = "ws-1"

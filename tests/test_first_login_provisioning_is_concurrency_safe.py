@@ -26,6 +26,10 @@ from mantle.entities.artifact import WORKSPACE_CONTENT_TYPE
 from mantle.services import workspace_service
 from mantle.services.seed_provisioning import user_provisioning as up
 
+# These call the provisioning steps below `provision_user`, which acts as the user; the race is
+# the question here, not the key (`conftest.content_keys`).
+pytestmark = pytest.mark.usefixtures("content_keys")
+
 
 @pytest.fixture
 def db(tmp_path):

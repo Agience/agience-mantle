@@ -29,6 +29,9 @@ from mantle.entities.artifact import Artifact as ArtifactEntity, WORKSPACE_CONTE
 from mantle.services import workspace_service as ws
 from mantle.services.acting_principal import acting_as
 
+# Fixtures here write sealed fields with no acting principal (`conftest.content_keys`).
+pytestmark = pytest.mark.usefixtures("content_keys")
+
 CAS_REF = "cas/" + "a" * 64
 
 

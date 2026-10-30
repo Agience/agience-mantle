@@ -395,9 +395,10 @@ class MantleSseSearchAccessor:
             allowed = set(scope)
             contexts = [(principal, col) for principal, col in contexts if col in allowed]
 
+        # The counts, never the query: what a person searched for is theirs (2026-10-29, sealing).
         logger.info(
-            "MantleSseSearchAccessor: '%s' narrowed to %d artifacts over %d contexts",
-            query.query_text, len(authorized.artifact_ids), len(contexts),
+            "MantleSseSearchAccessor: narrowed to %d artifacts over %d contexts",
+            len(authorized.artifact_ids), len(contexts),
         )
 
         if not contexts:
@@ -1095,9 +1096,8 @@ class MantleSseSearchAccessor:
             contexts = [(p, c) for p, c in contexts if c in allowed]
 
         logger.info(
-            "raw query: '%s' narrowed to %d artifacts over %d contexts (budget=%d)",
-            query.query_text, len(authorized.artifact_ids), len(contexts),
-            candidate_budget,
+            "raw query: narrowed to %d artifacts over %d contexts (budget=%d)",
+            len(authorized.artifact_ids), len(contexts), candidate_budget,
         )
         if not contexts:
             # Not a malformed request: the light cone is truthfully reporting zero authorized

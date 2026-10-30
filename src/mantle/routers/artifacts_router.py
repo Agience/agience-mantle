@@ -1155,6 +1155,24 @@ class ArtifactResponse(BaseModel):
 _ARTIFACT_KEYS: tuple = tuple(ArtifactResponse.model_fields)
 
 
+def _without_seal(d: Dict[str, Any]) -> Dict[str, Any]:
+    """The document without a sealed blob its reader could not open (`doc_boundary.unseal_content_fields`
+    keeps it so a save does not erase what it seals); a response never carries it."""
+    from mantle.db.doc_boundary import SEALED
+    ctx = d.get("context")
+    if isinstance(ctx, dict) and SEALED in ctx:
+        d["context"] = {k: v for k, v in ctx.items() if k != SEALED}
+    elif isinstance(ctx, str) and '"' + SEALED + '"' in ctx:
+        try:
+            parsed = json.loads(ctx)
+        except ValueError:
+            return d
+        if isinstance(parsed, dict):
+            parsed.pop(SEALED, None)
+            d["context"] = json.dumps(parsed)
+    return d
+
+
 def _artifact_body(doc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Fill the declared keys with `None` where absent, and drop nothing the document carries.
 
@@ -1170,7 +1188,7 @@ def _artifact_body(doc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     The result is that every key the document carries survives, and the declared ones are
     guaranteed present so a caller can rely on them without testing for existence.
     """
-    d = _public_state(dict(doc or {}))
+    d = _without_seal(_public_state(dict(doc or {})))
     for k in _ARTIFACT_KEYS:
         d.setdefault(k, None)
     return d
@@ -1204,7 +1222,7 @@ def _artifact_detail_body(doc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     model promising two fields it cannot find. Deriving `_ARTIFACT_DETAIL_KEYS` from
     `ArtifactDetailResponse` guarantees a field added to the model on the same commit.
     """
-    d = _public_state(dict(doc or {}))
+    d = _without_seal(_public_state(dict(doc or {})))
     for k in _ARTIFACT_DETAIL_KEYS:
         d.setdefault(k, None)
     return d

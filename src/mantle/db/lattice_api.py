@@ -249,11 +249,12 @@ def get_artifact(db: LatticeDatabase, artifact_id: str) -> Optional[ArtifactEnti
 #: persisting, `is None` would not have caught it either. The only failure that reaches a client
 #: is `put_artifact` RAISING, which propagates past every one of those guards.
 def _content_changed(db: LatticeDatabase, entity: ArtifactEntity) -> bool:
-    """Does writing `entity` change its artifact's CONTENT — the body, or a field the types declare
-    part of the content (the title, declared on the root type `*/*` and inherited by every type;
-    `doc_boundary.CONTENT_FIELDS` is the same list the seal uses)? Compared in plaintext, as this
-    reader opens the stored version: a sealed field cannot be compared sealed. A prior version this
-    reader cannot open is left to the store's own `content_ref` rule."""
+    """Does writing `entity` change its artifact's CONTENT — the body, or anything the store seals
+    (`doc_boundary.versioned_view`: every context key but the structural and the server's
+    bookkeeping, and the writer-supplied top-level fields)? A progress update or a completed
+    upload's digest cuts no version; a new description or tag does.
+    Compared in plaintext, as this reader opens the stored version: a sealed field cannot be compared
+    sealed. A prior version this reader cannot open is left to the store's own `content_ref` rule."""
     prior = db.artifacts.get_artifact(entity.id)
     if not prior:
         return False
@@ -268,15 +269,7 @@ def _content_changed(db: LatticeDatabase, entity: ArtifactEntity) -> bool:
     if not after.get("content_ref") and (before.get("content") or "") != (after.get("content") or ""):
         return True
 
-    def fields(ctx):
-        if isinstance(ctx, str):
-            try:
-                ctx = json.loads(ctx) if ctx else {}
-            except ValueError:
-                ctx = {}
-        return {k: (ctx or {}).get(k) for k in _boundary.CONTENT_FIELDS}
-
-    return fields(before.get("context")) != fields(after.get("context"))
+    return _boundary.versioned_view(before) != _boundary.versioned_view(after)
 
 
 def update_artifact(db: LatticeDatabase, entity: ArtifactEntity) -> ArtifactEntity:

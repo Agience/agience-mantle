@@ -41,15 +41,96 @@ class ContentDecryptionError(RuntimeError):
 #: attacker's choice.
 CONTENT_KEY_PRINCIPAL = "content_key_principal"
 
-#: The context fields that are part of an artifact's CONTENT, not its structure: declared by the root
-#: type (`*/*`, `context_schema` with `"part": "content"`) and so inherited by every type. They are
-#: sealed on the way into the store under the same key as the body (`context.sealed`) and restored on
-#: every authorized read, so the store, its files and the change feed carry them only as ciphertext.
-#: 2026-10-19 (John): "Title is really just part of content, and the content type definition should
-#: provide for that. It's a field inherited from the root artifact type." Titles were plaintext in the
-#: artifact row and in the event log.
+#: Sealing is the default and structure is the named exception (John, 2026-10-29: "everything related
+#: to content is encrypted; a grant is the ability to decrypt"). Every context key an artifact carries
+#: is sealed on the way into the store, under the same key as the body (`context.sealed`), and restored
+#: on every authorized read, except the keys below, which the store reads before any key is issued or
+#: writes itself. The top-level fields a writer supplies (`SEALED_DOC_FIELDS`) are sealed with them.
+#: Readers and reasons are measured in `_scratch/CURRENT/MANTLE-SEAL-EVERYTHING.md` ("Reader inventory").
+STRUCTURAL_CONTEXT_KEYS = frozenset({
+    # The issuer and type loaders select by it before authentication
+    # (`lattice_api.list_live_artifacts_by_context_content_type`), and it is the event filter.
+    "content_type",
+    # Read to hydrate the body from the CAS before the body's decrypt (`_decrypt_body`), and by the
+    # mirror drain, which runs with no person's key.
+    "content_key", "content_cas_ref",
+    # Card-key bindings: an authorization decision reads their grant key ids
+    # (`workspace_service.resolve_card_key`).
+    "stream", "inbound",
+    # Upload bookkeeping the server writes as bytes arrive; it is not what the writer said.
+    "upload", "processing", "storage",
+})
+
+#: Content types whose whole context is platform configuration, read before any person's key is
+#: issued: issuers at token verification (`services/issuers.py`), type definitions at boot
+#: (`services/type_offers.py`), anchors and crosswalks at recall routing (`search/anchors`), and
+#: subscriptions by the delivery and resume paths (`entities/subscription.py`). Their title is still
+#: sealed.
+READABLE_CONTEXT_TYPES = frozenset({
+    "application/vnd.agience.issuer+json",
+    "application/vnd.agience.type+json",
+    "application/vnd.agience.anchor+json",
+    "application/vnd.agience.crosswalk+json",
+    "application/vnd.agience.subscription+json",
+})
+
+#: Top-level fields a writer supplies: content, sealed with the context.
+SEALED_DOC_FIELDS = ("name", "description")
+
+#: Sealed even on a readable type: a title is part of the content of every artifact (`*/*`).
+#: 2026-10-19 (John): "Title is really just part of content".
 CONTENT_FIELDS = ("title",)
 SEALED = "sealed"
+
+#: The payload format is `{"v": 2, "context": {...}, "doc": {...}}`. A blob without `v` is the
+#: title-only format (`{"title": ...}`) sealed before 2026-10-29, and still opens.
+_PAYLOAD_VERSION = 2
+
+
+def _content_type_of(doc: dict, ctx: dict) -> str:
+    return str(ctx.get("content_type") or doc.get("content_type") or "").split(";", 1)[0].strip().lower()
+
+
+def sealable_keys(doc: dict, ctx: dict) -> list:
+    """The context keys of `doc` that are sealed: every one but the structural, and on a readable
+    type the title alone."""
+    if _content_type_of(doc, ctx) in READABLE_CONTEXT_TYPES:
+        return [k for k in CONTENT_FIELDS if k in ctx]
+    return [k for k in ctx if k not in STRUCTURAL_CONTEXT_KEYS and k != SEALED]
+
+
+def sealable_doc_fields(doc: dict, ctx: dict) -> list:
+    """The writer-supplied top-level fields of `doc` that are sealed: none on a readable type, whose
+    name and description are configuration like the rest of it."""
+    if _content_type_of(doc, ctx) in READABLE_CONTEXT_TYPES:
+        return []
+    return [k for k in SEALED_DOC_FIELDS if doc.get(k)]
+
+
+#: Sealed, but not what a new version is cut for: what the server records about the bytes and the
+#: mint (`services/mint_context.py`). They follow the body, and a new body already cuts a version
+#: through `content_ref`; counting them as well made every completed upload fork its artifact.
+UNVERSIONED_SEALED_KEYS = frozenset({
+    "content_sha256", "content_bytes", "size", "addressing",
+    "minted", "minted_by", "placement", "provenance",
+})
+
+
+def sealed_view(doc: dict) -> dict:
+    """What `doc` would seal, in plaintext: its sealable context keys and its writer-supplied
+    top-level fields."""
+    ctx, _ = _context_dict(doc)
+    ctx = ctx or {}
+    return {"context": {k: ctx[k] for k in sealable_keys(doc, ctx)},
+            "doc": {k: doc.get(k) for k in sealable_doc_fields(doc, ctx)}}
+
+
+def versioned_view(doc: dict) -> dict:
+    """What a new version is cut for (`lattice_api._content_changed`): the sealed view without the
+    server's bookkeeping (`UNVERSIONED_SEALED_KEYS`)."""
+    view = sealed_view(doc)
+    view["context"] = {k: v for k, v in view["context"].items() if k not in UNVERSIONED_SEALED_KEYS}
+    return view
 
 
 def _context_dict(doc: dict):
@@ -70,21 +151,52 @@ def _put_context(doc: dict, ctx: dict, as_string: bool) -> None:
     doc["context"] = json.dumps(ctx) if as_string else ctx
 
 
+def _open(principal, blob_b64, doc: dict) -> dict:
+    import base64
+
+    from mantle.services import content_crypto
+    plain = content_crypto.decrypt_content(
+        principal or content_key_principal(doc), base64.b64decode(blob_b64 or ""),
+        collection_id=content_key_scope(doc), require_encrypted=True)
+    payload = json.loads(plain.decode("utf-8"))
+    if isinstance(payload, dict) and payload.get("v") == _PAYLOAD_VERSION:
+        return {"context": payload.get("context") or {}, "doc": payload.get("doc") or {}}
+    return {"context": payload if isinstance(payload, dict) else {}, "doc": {}}   # title-only format
+
+
 def seal_content_fields(doc: dict) -> None:
-    """Move the context's content fields into `context.sealed`, encrypted under the body's key."""
+    """Move the context's sealable keys and the writer-supplied top-level fields into
+    `context.sealed`, encrypted under the body's key.
+
+    A context that already carries a blob (a reader that could not open it, then saved) is merged:
+    what was sealed stays, and what this write sets replaces it. A write that sets content on a row
+    whose seal it cannot open is refused rather than allowed to overwrite the seal."""
     ctx, as_string = _context_dict(doc)
-    if not ctx:
+    if ctx is None:
         return
-    fields = {k: ctx.pop(k) for k in CONTENT_FIELDS if k in ctx}
-    if not fields:
+    fields = {k: ctx.pop(k) for k in sealable_keys(doc, ctx)}
+    top = {k: doc.pop(k) for k in sealable_doc_fields(doc, ctx)}
+    if not fields and not top:
         return
     import base64
 
     from mantle.services import content_crypto
+    prior = ctx.get(SEALED)
+    if prior:
+        try:
+            opened = _open(prior.get("p"), prior.get("blob"), doc)
+        except KeyCustodyDenied:
+            raise
+        except Exception as exc:
+            raise ContentEncryptionError(
+                "this row's sealed fields cannot be opened by this writer; refusing to overwrite them") from exc
+        fields = {**opened["context"], **fields}
+        top = {**opened["doc"], **top}
     principal = content_key_principal(doc)
+    payload = {"v": _PAYLOAD_VERSION, "context": fields, "doc": top}
     try:
         blob = content_crypto.encrypt_content(
-            principal, json.dumps(fields).encode("utf-8"),
+            principal, json.dumps(payload).encode("utf-8"),
             collection_id=content_key_scope(doc), creator_id=doc.get("created_by"))
     except KeyCustodyDenied:
         raise
@@ -97,30 +209,32 @@ def seal_content_fields(doc: dict) -> None:
 
 
 def unseal_content_fields(raw: dict) -> None:
-    """Restore the sealed content fields into the context for an authorized reader.
+    """Restore the sealed context keys and top-level fields for an authorized reader.
 
     Fails soft: a reader the key oracle will not serve (a background path with no acting
-    principal, a row keyed elsewhere) gets the context WITHOUT the fields, never the ciphertext,
-    and never an error — a missing title is visible, a failed read of a workspace is an outage."""
+    principal, a row keyed elsewhere) gets the context without the fields and never an error — a
+    missing title is visible, a failed read of a workspace is an outage. The sealed blob stays in
+    that reader's context, so a save of what it read writes the fields back as they were sealed
+    (`seal_content_fields` merges into a blob it can open and refuses one it cannot). 2026-10-29:
+    the blob was taken out before the decrypt, and a background reader that then saved the row
+    erased the sealed fields for good. A blob reveals nothing to a reader the oracle will not serve,
+    and the feed and `_artifact_body` drop it."""
     ctx, as_string = _context_dict(raw)
     if not ctx or SEALED not in ctx:
         return
-    sealed = ctx.pop(SEALED)
+    sealed = ctx.get(SEALED) or {}
     try:
-        import base64
-
-        from mantle.services import content_crypto
-        plain = content_crypto.decrypt_content(
-            (sealed or {}).get("p") or content_key_principal(raw),
-            base64.b64decode((sealed or {}).get("blob") or ""),
-            collection_id=content_key_scope(raw), require_encrypted=True)
-        fields = json.loads(plain.decode("utf-8"))
-        for k in CONTENT_FIELDS:
-            if k in fields and k not in ctx:
-                ctx[k] = fields[k]
+        opened = _open(sealed.get("p"), sealed.get("blob"), raw)
     except Exception:  # noqa: BLE001 — see the docstring
         logger.debug("context fields of %s stay sealed for this reader",
                      raw.get("_key") or raw.get("id"), exc_info=True)
+        return
+    ctx.pop(SEALED, None)
+    for k, v in opened["context"].items():
+        ctx.setdefault(k, v)
+    for k, v in opened["doc"].items():
+        if not raw.get(k):
+            raw[k] = v
     _put_context(raw, ctx, as_string)
 
 
