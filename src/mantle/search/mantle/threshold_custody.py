@@ -13,8 +13,8 @@ shares of each 256-bit master key (`prism.trust.shamir`, x = 1, 2, 3):
               ``escrow/<sha256(principal)>.<kcv>.<escrow_id>.age``), never to the lattice, so
               losing this node's store loses one share. Each split writes a new object, only if
               absent, and the row names it (its ``kcv`` and ``escrow_id``); no escrow object is
-              ever overwritten, so an earlier split's share 3 survives a later one. The identity is kept offline, in ``ikailo_infra`` and on the
-              NAS; this node cannot open it. ``mantle.system.split_master_keys --export-escrow``
+              ever overwritten, so an earlier split's share 3 survives a later one. The identity
+              is kept offline by the operator; this node cannot open it. ``mantle.system.split_master_keys --export-escrow``
               copies every sealed escrow share into one file for the operator's offline copy.
 
 Threshold custody is refused at startup when no durable object store is configured: there would
