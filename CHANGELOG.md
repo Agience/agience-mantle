@@ -5,6 +5,19 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-10-31
+
+### Added
+- Threshold custody of master keys, selected by `MANTLE_MASTER_KEY_CUSTODY=threshold` (the default stays `lattice`). Each key is held as 2-of-3 Shamir shares: one in the `master-key:<principal>` row under the KEK, one at Origin (`/internal/key-shares`), and one sealed with pyrage to the escrow age recipient named by `MANTLE_ESCROW_RECIPIENT_FILE`, written to the durable object store at `escrow/<sha256(principal)>.<kcv>.<escrow_id>.age` and never to the lattice. Each split writes a new object only if none has that name, the row names its object, and recovery reads that one; no escrow object is overwritten. Threshold custody is refused at startup when no durable object store is configured. A key is used by combining this node's share with Origin's and checking the result against a stored key-check value; the escrow share is combined only in recovery mode (`MANTLE_MASTER_KEY_RECOVERY=escrow` with `MANTLE_ESCROW_IDENTITY_FILE`). A share that cannot be read, a missing Origin share, an unreachable Origin, or an Origin share while this node holds none all refuse; a key is minted only when nothing holds a share and Origin answers with an explicit "absent" body.
+- Every write of a key row under threshold custody takes the custody lock, a file beside the lattice (`<lattice>.custody.lock`), and is conditional on the stored form read under it: a put writes the row pending, then the escrow share (a failed write refuses the put), then Origin's share, and marks the row active only if it is still the row it wrote.
+- Each call to Origin for a share signs its own token: 30 seconds of life, a fresh `jti`, and claims naming the method, the route path and the principal.
+- Calls made while holding the custody lock are bounded inside its 30-second wait: Origin at 3 seconds to connect and 8 to read, the durable store at 3 and 8 with one attempt (`content_service._make_s3_client` takes optional timeouts and attempts). A hung peer refuses the put.
+- `mantle.system.split_master_keys` splits every whole master key into shares, sealing the escrow shares into one export file (`--escrow-out`) before any row is replaced, and replaces a row only after its shares, including Origin's stored copy, recombine to the key. Each row is re-read under the custody lock and left alone if it changed since the pass read it. `--dry-run` counts, `--combine` writes split keys back whole under the KEK for a rollback (dropping a pending row only if it is still pending), and `--export-escrow` copies every sealed escrow share from the durable store into one file for the operator's offline copy. A re-run splits only what is still whole. The keys do not change, so nothing they encrypt is rewritten.
+
+### Changed
+- `LatticeMasterKeyStore` refuses a row that holds a share of a split key instead of reading it as absent, so a node returned to whole-key custody without `--combine` cannot mint a replacement over a split key.
+- The `service` and `dev` extras require `agience-prism>=0.1.8` (for `prism.trust.shamir`) and `pyrage>=1.2`.
+
 ## [0.1.9] - 2026-10-30
 
 ### Changed

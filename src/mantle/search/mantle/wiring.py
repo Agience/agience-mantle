@@ -10,7 +10,9 @@ Wiring decisions:
 - **Master key store**: :class:`~.oracle.LatticeMasterKeyStore` — per-principal
   DEKs wrapped by the platform KEK and persisted in the lattice so they survive
   restarts. KEK custody is pluggable via :mod:`.key_provider` (local file |
-  cloud KMS | Vault); a future Shamir-threshold backend is just another provider.
+  cloud KMS | Vault). ``MANTLE_MASTER_KEY_CUSTODY=threshold`` selects
+  :class:`~.threshold_custody.ThresholdMasterKeyStore` instead: each key as 2-of-3
+  Shamir shares, one here under the KEK, one at Origin, one sealed to an offline escrow.
 - **Cell storage**: object storage under the ``mantle-cells/`` prefix when the operator
   configured edge object storage, and a local directory tree of the same shape when they
   did not — see :func:`_build_cell_store`. Cells live at
@@ -68,7 +70,7 @@ from .stores import CellStore
 logger = logging.getLogger(__name__)
 
 # Process-level oracle singleton — caches unwrapped master keys for the process
-# lifetime. The keys themselves are persisted durably by LatticeMasterKeyStore, so
+# lifetime. The keys themselves are persisted durably by the master key store, so
 # they survive restarts; the singleton only avoids re-unwrapping on every call
 # within one process.
 _oracle_singleton: Optional[OracleService] = None
@@ -108,10 +110,19 @@ def _build_oracle() -> Optional[OracleService]:
         # (an in-process-only store would lose them on every restart, orphaning all
         # encrypted cells — search would go empty).
         from mantle.db import backend as _backend
-        from .oracle import LatticeMasterKeyStore as _KeyStore
 
         def _master_key_db():
             return _backend.store_handle()
+
+        # Which store holds the keys: whole under the KEK in the lattice (default), or 2-of-3
+        # shares across this node, Origin and an offline escrow (`MANTLE_MASTER_KEY_CUSTODY=
+        # threshold`, see `threshold_custody`). A threshold store that cannot be built is "no
+        # search", never a fall back to the whole-key store.
+        try:
+            key_store = _master_key_store(kek, _master_key_db)
+        except Exception as exc:
+            logger.warning("MANTLE oracle: master key store unavailable: %s", exc)
+            return None
 
         # Key issuance is coupled to the grant check (canonical plan §5.3): the
         # oracle verifies every request against the same light cone the query path
@@ -125,12 +136,22 @@ def _build_oracle() -> Optional[OracleService]:
         from .oracle import LightConeGrantVerifier
 
         _oracle_singleton = OracleService(
-            _KeyStore(kek, _master_key_db),
+            key_store,
             grant_verifier=LightConeGrantVerifier(
                 _LazyDb(_master_key_db), ttl_s=_verifier_ttl_s(),
             ),
         )
         return _oracle_singleton
+
+
+def _master_key_store(kek, db_factory):
+    """The master key store ``MANTLE_MASTER_KEY_CUSTODY`` selects (``lattice`` | ``threshold``)."""
+    from .threshold_custody import build_threshold_store, custody_kind
+
+    if custody_kind() == "threshold":
+        return build_threshold_store(kek, db_factory)
+    from .oracle import LatticeMasterKeyStore
+    return LatticeMasterKeyStore(kek, db_factory)
 
 
 # ---------------------------------------------------------------------------

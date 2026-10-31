@@ -187,13 +187,24 @@ def _unframe_master_key(principal_id: str, raw: bytes) -> bytes:
     return raw[6 + pid_len:]
 
 
+#: The content type of a ``master-key:<principal>`` row that holds one Shamir share of the key
+#: rather than the whole key (`threshold_custody.ThresholdMasterKeyStore`). Defined here, beside
+#: the whole-key type, because `LatticeMasterKeyStore` must recognise it to refuse it.
+SHARE_CONTENT_TYPE = "application/vnd.agience.master-key-share+json"
+
+
 class LatticeMasterKeyStore:
     """The durable master key store over the standalone lattice — the production backend.
 
     Envelope contract: only wrapped DEKs touch storage — KEK custody stays with the KeyProvider
     (local file | KMS | Vault) — persisted as a typed plane in the one store, ids namespaced so
     a principal id can never collide with an artifact id.
-    Refusing to serve is recoverable; overwriting the only copy of the key is not."""
+    Refusing to serve is recoverable; overwriting the only copy of the key is not.
+
+    A row holding a share of a split key (:data:`SHARE_CONTENT_TYPE`) is refused, not read as
+    absent: absent would let the oracle mint a fresh key over the share, and the key it is a share
+    of would be gone wherever the other shares are. `mantle.system.split_master_keys --combine`
+    turns split keys back into this store's form."""
 
     CONTENT_TYPE = "application/vnd.agience.master-key+json"
 
@@ -214,6 +225,11 @@ class LatticeMasterKeyStore:
                 f"could not read the master key for {principal_id!r}; refusing to continue, "
                 f"because generating a replacement would overwrite it: {exc}"
             ) from exc
+        if doc is not None and doc.get("content_type") == SHARE_CONTENT_TYPE:
+            raise MasterKeyUnavailable(
+                f"the master key for {principal_id!r} is held as threshold shares; select "
+                f"MANTLE_MASTER_KEY_CUSTODY=threshold, or combine it back with "
+                f"`python -m mantle.system.split_master_keys --combine`. Refusing to mint over it.")
         if doc is not None and doc.get("content_type") != self.CONTENT_TYPE:
             doc = None                       # id-scoping: never read a non-key doc as a key
         token = (doc or {}).get("token")

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agience-mantle"
-version = "0.1.9"
+version = "0.1.10"
 description = "Agience Mantle — the standalone data store: SQLite + encrypted content-addressed filesystem, artifacts/collections with immutable version lineage, CRUDEASIO access grants, and a Merkle-synced mesh. Runs with zero external database processes."
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -147,7 +147,11 @@ search = ["agience-mantle[lexical,semantic]"]
 service = [
     "agience-mantle[s3,search]",
     # Distribution `agience-prism`; import name `prism`; GitHub repo `agience-prism-py`.
-    "agience-prism>=0.1.5",
+    # 0.1.8: threshold master-key custody splits with `prism.trust.shamir`, introduced there.
+    "agience-prism>=0.1.8",
+    # Threshold master-key custody seals each escrow share to the operator's age recipient
+    # (`search/mantle/threshold_custody.py`); pyrage binds the reference Rust implementation.
+    "pyrage>=1.2",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.30",
     "starlette>=0.37",
@@ -191,7 +195,8 @@ service = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=1.0",
-    "agience-prism>=0.1.5",
+    "agience-prism>=0.1.8",
+    "pyrage>=1.2",
     "threadpoolctl>=3.0",
 ]
 

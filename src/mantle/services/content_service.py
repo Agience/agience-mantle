@@ -105,8 +105,22 @@ def _make_s3_client(
     secret_access_key: Optional[str],
     region_name: str,
     endpoint_url: Optional[str] = None,
+    connect_timeout: Optional[float] = None,
+    read_timeout: Optional[float] = None,
+    total_max_attempts: Optional[int] = None,
 ):
-    config = Config(s3={"addressing_style": "path"}) if endpoint_url else None
+    """An S3 client. Timeouts and attempts are botocore's defaults unless given; a caller that
+    holds a lock across a call passes bounds that fit inside it."""
+    opts: dict = {}
+    if endpoint_url:
+        opts["s3"] = {"addressing_style": "path"}
+    if connect_timeout is not None:
+        opts["connect_timeout"] = connect_timeout
+    if read_timeout is not None:
+        opts["read_timeout"] = read_timeout
+    if total_max_attempts is not None:
+        opts["retries"] = {"total_max_attempts": total_max_attempts}
+    config = Config(**opts) if opts else None
     kwargs = {
         "service_name": "s3",
         "aws_access_key_id": access_key_id,

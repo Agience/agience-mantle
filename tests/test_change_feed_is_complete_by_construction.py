@@ -209,6 +209,14 @@ WRITE_SITES: dict[tuple[str, str], tuple[str, str]] = {
                   "are superseded versions of that root, as `vertex._snapshot_prior` writes them, "
                   "and the bulk relabel of `committed` to `live` changes no value any reader "
                   "returns."),
+    ("system/split_master_keys.py", "split_master_keys"): (
+        OFF_FEED, "master-key custody, a release migration: it replaces a key row's stored form "
+                  "(whole under the KEK) with shares of the same key. Key rows are not artifacts "
+                  "any reader sees, and the key does not change, so nothing is announced."),
+    ("system/split_master_keys.py", "combine_master_keys"): (
+        OFF_FEED, "the reverse of the master-key split, run before a rollback: it writes the same "
+                  "key back whole, or drops a pending key row that was never served. Key rows "
+                  "are not artifacts any reader sees."),
     ("system/seal_titles.py", "seal_stored_titles"): (
         OFF_FEED, "title sealing, a release migration: it rewrites only the stored form of a title "
                   "(plain to sealed) on rows as they are. No reader sees a different artifact, and "
