@@ -164,10 +164,15 @@ def grant_to_account(db: Database, user_id: str) -> int:
 def grant_to_every_account(db: Database) -> Dict[str, int]:
     """Grant every account the store knows (every grantee of a user grant) the public operators."""
     from mantle.db import lattice_api as la
+    from mantle.services.peer_signing import get_system_principal_id
+    # The platform's own system principal holds principal-typed grants on the platform's
+    # collections (`ensure_platform_principal_grant`) and is not an account.
+    not_accounts = {get_system_principal_id()} - {""}
     accounts = set()
     for doc in la._grant_docs(db, state="active"):
         if doc.get("grantee_type") == "user" and doc.get("grantee_id"):
             accounts.add(str(doc["grantee_id"]))
+    accounts -= not_accounts
     granted = sum(1 for a in sorted(accounts) if grant_to_account(db, a))
     return {"accounts": len(accounts), "granted": granted}
 

@@ -18,6 +18,7 @@ glue here; step 2 is pure declarative seeding via the loader.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -237,18 +238,19 @@ def _ensure_people_collection(store_db: Database) -> str:
 
     if db_get_collection_by_id(store_db, people_id) is None:
         now = datetime.now(timezone.utc).isoformat()
-        db_create_collection(store_db, CollectionEntity(
-            id=people_id,
-            name="People",
-            description=(
-                "Platform people directory — each member's profile lives here. "
-                "Members manage only their own card; the platform/admin manages all."
-            ),
-            created_by=AGIENCE_PLATFORM_USER_ID,
-            content_type=COLLECTION_CONTENT_TYPE,
-            state=CollectionEntity.STATE_LIVE,
-            created_time=now, modified_time=now,
-        ))
+        with _as_the_platform():
+            db_create_collection(store_db, CollectionEntity(
+                id=people_id,
+                name="People",
+                description=(
+                    "Platform people directory — each member's profile lives here. "
+                    "Members manage only their own card; the platform/admin manages all."
+                ),
+                created_by=AGIENCE_PLATFORM_USER_ID,
+                content_type=COLLECTION_CONTENT_TYPE,
+                state=CollectionEntity.STATE_LIVE,
+                created_time=now, modified_time=now,
+            ))
         _persist_seed_ids(store_db, {PEOPLE_COLLECTION_SLUG: people_id})
         logger.info("Created People collection %s at runtime", people_id)
 
@@ -265,7 +267,58 @@ def _ensure_people_collection(store_db: Database) -> str:
             )
         except Exception:
             logger.debug("People: operator grant upsert failed", exc_info=True)
+    ensure_platform_principal_grant(store_db, people_id)
     return people_id
+
+
+@contextlib.contextmanager
+def _as_the_platform():
+    """Write one of the platform's own collections as the platform's id, its `created_by`, so the
+    key oracle's creator rule mints its key. Provisioning runs as the member signing in, who holds
+    no key to a platform row: on a fresh node the first login was refused the key for the People
+    directory's name (2026-10-30). The platform system principal is granted the collection once it
+    exists (`ensure_platform_principal_grant`), and reads it from then on."""
+    from mantle.services.acting_principal import acting_as
+    with acting_as(AGIENCE_PLATFORM_USER_ID, principal_type="service", scope="platform.provision",
+                   source="system"):
+        yield
+
+
+#: The ledger's grantee type for any principal that acts by id, a service included
+#: (`search.mantle.lightcone.ledger_grantee_type`): a grant typed "service" is found by no lookup.
+_PRINCIPAL_GRANTEE = "user"
+
+
+def _platform_holds(store_db: Database, collection_id: str) -> bool:
+    from mantle.services.peer_signing import get_system_principal_id
+    system = get_system_principal_id()
+    return bool(system) and any(
+        getattr(g, "grantee_type", None) == _PRINCIPAL_GRANTEE and getattr(g, "can_read", False)
+        and getattr(g, "can_update", False)
+        for g in db_get_grants_for_principal_resource(store_db, system, collection_id))
+
+
+def ensure_platform_principal_grant(store_db: Database, collection_id: str) -> bool:
+    """Grant the platform system principal read and update on a collection the platform owns
+    (idempotent). True when a grant was made.
+
+    The platform's collections are created by `AGIENCE_PLATFORM_USER_ID`, a name no request ever
+    acts as, so nothing held their key: work the platform does on its own rows (sealing them, the
+    rollback's unsealing) runs as the system principal (`system_acting_context`) and was refused.
+    2026-10-30, on the release candidate: the People directory, its 41 member profiles and the
+    Authorities collection could be sealed by no actor and were left in plain text."""
+    from mantle.services.peer_signing import get_system_principal_id
+    system = get_system_principal_id()
+    if not system or not collection_id:
+        return False
+    if _platform_holds(store_db, collection_id):
+        return False
+    db_create_grant(store_db, GrantEntity(
+        resource_id=collection_id, grantee_type=_PRINCIPAL_GRANTEE, grantee_id=system,
+        granted_by=AGIENCE_PLATFORM_USER_ID, can_read=True, can_update=True,
+        name="Platform rows (read + update)",
+    ))
+    return True
 
 
 def ensure_authority_collection(store_db: Database) -> str:
@@ -284,17 +337,19 @@ def ensure_authority_collection(store_db: Database) -> str:
 
     if db_get_collection_by_id(store_db, authority_id) is None:
         now = datetime.now(timezone.utc).isoformat()
-        db_create_collection(store_db, CollectionEntity(
-            id=authority_id,
-            name="Authorities",
-            description="Platform authority root — platform-admin grants live here.",
-            created_by=AGIENCE_PLATFORM_USER_ID,
-            content_type=COLLECTION_CONTENT_TYPE,
-            state=CollectionEntity.STATE_LIVE,
-            created_time=now, modified_time=now,
-        ))
+        with _as_the_platform():
+            db_create_collection(store_db, CollectionEntity(
+                id=authority_id,
+                name="Authorities",
+                description="Platform authority root — platform-admin grants live here.",
+                created_by=AGIENCE_PLATFORM_USER_ID,
+                content_type=COLLECTION_CONTENT_TYPE,
+                state=CollectionEntity.STATE_LIVE,
+                created_time=now, modified_time=now,
+            ))
         _persist_seed_ids(store_db, {AUTHORITY_COLLECTION_SLUG: authority_id})
         logger.info("Created Authorities collection %s at runtime", authority_id)
+    ensure_platform_principal_grant(store_db, authority_id)
     return authority_id
 
 

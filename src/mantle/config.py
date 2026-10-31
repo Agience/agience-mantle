@@ -23,13 +23,6 @@ from urllib.parse import urlparse as _urlparse, urlunparse as _urlunparse
 #: Module logger, read by `_announce_ignored_env`.
 _log = logging.getLogger(__name__)
 
-try:                                    # python-dotenv is optional at import time
-    from dotenv import load_dotenv as _load_dotenv
-except ImportError:                     # pragma: no cover - only when the extra is absent
-    def _load_dotenv(*_a, **_k):        # type: ignore[misc]
-        return False
-
-
 def _origin_only(uri: str) -> str:
     """Return scheme+host+port (strip path, query, fragment)."""
     p = _urlparse(uri)
@@ -139,6 +132,17 @@ def _announce_ignored_env(path) -> list:
             "container, or the unit file) instead.",
             path, ", ".join(ignored))
     return ignored
+
+
+def _load_dotenv(path: Path, override: bool = False) -> bool:
+    """python-dotenv, imported here rather than at module load: the store's embeddable surface
+    imports this module and loads nothing outside the standard library
+    (`db/test_embeddable_surface`). Absent, a `.env` is not read."""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:                 # pragma: no cover - only when the extra is absent
+        return False
+    return load_dotenv(path, override=override)
 
 
 def load_env(base_dir: Optional[Path] = None) -> Optional[Path]:

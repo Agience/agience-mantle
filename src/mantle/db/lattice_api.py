@@ -166,6 +166,10 @@ def _strip_nones(obj: Any) -> Any:
     return obj
 
 
+#: A grant's fields sealed under the node's key (`db/node_seal`).
+GRANT_SEALED_FIELDS = ("target_entity", "name", "notes")
+
+
 def to_lattice_doc(entity: Any) -> Dict[str, Any]:
     """Entity → lattice doc. Mirrors `to_store_doc` minus the `_key` rename. Artifact content is
     envelope-encrypted at this boundary via the shared `db.doc_boundary` implementation — same
@@ -184,6 +188,17 @@ def to_lattice_doc(entity: Any) -> Dict[str, Any]:
     doc["_type"] = ent_type
     if ent_type == "Artifact":
         _boundary.encrypt_artifact_content(doc)
+    elif ent_type == "Grant":
+        # An invite's address, and a grant's name and notes, under the node's key
+        # (`db/node_seal`): read for a claimant who holds no grant yet, written by paths with no
+        # person's key. 2026-10-30: all three were plain text in the store.
+        from mantle.db import node_seal
+        kept = getattr(entity, "_node_sealed", None)
+        if kept:
+            # Read but not opened on this node (`from_lattice_doc`): written back as it was, and a
+            # write that sets a sealed field is refused rather than allowed to overwrite it.
+            doc[node_seal.SEALED] = kept
+        node_seal.seal_fields(doc, GRANT_SEALED_FIELDS)
     return doc
 
 
@@ -199,6 +214,14 @@ def from_lattice_doc(raw: Optional[Dict[str, Any]], cls: Type[T]) -> Optional[T]
     # plaintext (or a loud failure; never ciphertext dressed as content).
     if getattr(cls, "PREFIX", None) == "Artifact":
         _boundary.decrypt_artifact_content(doc)
+    elif getattr(cls, "PREFIX", None) == "Grant":
+        from mantle.db import node_seal
+        node_seal.unseal_fields(doc)
+        kept = doc.pop(node_seal.SEALED, None)        # present only when it would not open here
+        entity = cls.from_dict(doc)
+        if kept:
+            entity._node_sealed = kept
+        return entity
     return cls.from_dict(doc)
 
 
@@ -568,6 +591,49 @@ def order_fingerprint(db: LatticeDatabase, collection_id: str) -> int:
     return int.from_bytes(hashlib.sha256(payload.encode("utf-8")).digest()[:6], "big")
 
 
+#: Edge labels the store walks or writes itself; they stay readable. Every other label is a name a
+#: person gave a link, stored as a keyed token (`node_seal.keyed_token`) with the name sealed in the
+#: edge's props for display (`label_sealed`), and a token per dotted prefix (`label_prefixes`) so
+#: `remove_links` and the `links` filter still match `step1` against `step1.collection_id`.
+#: 2026-10-30: a link's name was plain text in `edge.label` and in its `counter.name`.
+_SYSTEM_LABELS = frozenset({_CONTAINS, "context", "authorizer", "link"})
+
+
+def _label_token(name: str) -> str:
+    from mantle.db import node_seal
+    return node_seal.keyed_token("edge-label", name)
+
+
+def _stored_label(relationship: Optional[str]) -> str:
+    if not relationship or relationship in _SYSTEM_LABELS:
+        return relationship or _CONTAINS
+    return _label_token(relationship)
+
+
+def _label_props(relationship: Optional[str]) -> dict:
+    if not relationship or relationship in _SYSTEM_LABELS:
+        return {}
+    from mantle.db import node_seal
+    parts = relationship.split(".")
+    return {"label_sealed": node_seal.seal_value(relationship),
+            "label_prefixes": [_label_token(".".join(parts[:i])) for i in range(1, len(parts))]}
+
+
+def _shown_label(e: dict) -> Optional[str]:
+    """The name a person gave the link, or None for containment."""
+    label = e.get("label")
+    if label == _CONTAINS:
+        return None
+    from mantle.db import node_seal
+    if not node_seal.is_token(label or ""):
+        return label
+    sealed = _eprop(e, "label_sealed")
+    try:
+        return node_seal.open_value(sealed) if sealed else label
+    except Exception:  # noqa: BLE001 — sealed under another node's key; the name is not ours to show
+        return label        # the token: still a named link, never mistaken for containment
+
+
 def add_artifact_to_collection(db: LatticeDatabase, collection_id: str, root_id: str,
                                order_key: Optional[str] = None, *,
                                origin: bool = True,
@@ -579,9 +645,10 @@ def add_artifact_to_collection(db: LatticeDatabase, collection_id: str, root_id:
     if order_key is None:
         order_key = after_key(get_last_order_key(db, collection_id))
     try:
-        db.graph.add_edge(collection_id, root_id, (relationship or _CONTAINS),
+        db.graph.add_edge(collection_id, root_id, _stored_label(relationship),
                           {"order_key": order_key, "is_origin": bool(origin),
-                           "propagate": _ser_propagate(propagate), "root_id": root_id})
+                           "propagate": _ser_propagate(propagate), "root_id": root_id,
+                           **_label_props(relationship)})
         return True
     except Exception:
         return False
@@ -613,9 +680,14 @@ def remove_links(db: LatticeDatabase, artifact_id: str, relationship: str) -> in
     if not relationship or relationship == _CONTAINS:
         return 0
     removed = 0
+    token = _label_token(relationship)
     for e in _membership_edges(db, artifact_id):
         label = e.get("label") or ""
-        if label == _CONTAINS or not (label == relationship or label.startswith(relationship + ".")):
+        if label == _CONTAINS:
+            continue
+        named = (label == relationship or label.startswith(relationship + ".")          # plain, as stored before
+                 or label == token or token in (_eprop(e, "label_prefixes") or []))
+        if not named:
             continue
         db.graph.delete_edge(artifact_id, e.get("dst"), label)
         removed += 1
@@ -681,7 +753,7 @@ def list_collection_artifacts(db: LatticeDatabase, collection_id: str, *,
         d["order_key"] = _eprop(e, "order_key")
         d["origin"] = bool(_eprop(e, "is_origin"))
         d["propagate"] = _prop_mask(e)
-        d["relationship"] = None if e.get("label") == _CONTAINS else e.get("label")
+        d["relationship"] = _shown_label(e)
         out.append(d)
     out.sort(key=lambda d: (d.get("order_key") is None, d.get("order_key") or ""))
     return out
@@ -712,7 +784,7 @@ def get_edge(db: LatticeDatabase, collection_id: str, root_id: str) -> Optional[
     e = _find_membership(db, collection_id, root_id)
     if e is None:
         return None
-    rel = None if e.get("label") == _CONTAINS else e.get("label")
+    rel = _shown_label(e)
     return {
         "root_id": root_id,
         "order_key": _eprop(e, "order_key"),
@@ -933,8 +1005,11 @@ def get_relationship_target(db: LatticeDatabase, from_root_id: str,
     about a typed relationship's target while both held the same edges.
     """
     try:
-        for e in (db.graph.edges_of(from_root_id, label=relationship, direction="out") or []):
-            return e.get("dst")
+        # The stored label (a token for a name a person gave), then the plain name an edge written
+        # before names were tokenized still carries.
+        for label in dict.fromkeys((_stored_label(relationship), relationship)):
+            for e in (db.graph.edges_of(from_root_id, label=label, direction="out") or []):
+                return e.get("dst")
     except EdgesTruncated:
         raise
     except Exception:

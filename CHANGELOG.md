@@ -5,6 +5,26 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-10-30
+
+### Changed
+- A grant's `name`, `notes` and invite address (`target_entity`) are sealed under the node's data key (`db/node_seal`), and the `grant.invite.created` event carries `has_target` instead of the address. A grant stored in plaintext is sealed by `mantle.system.seal_titles`, and `--unseal` restores it for a rollback.
+- The name a person gives a link is stored as a keyed token, with the name sealed in the edge for display and a token per dotted prefix, so `remove_links` and the `links` filter still match. The store's own labels (`contains`, `context`, `authorizer`, `link`) stay readable. `mantle.system.seal_titles` rewrites a link named before this the same way and drops the emptied label counter that spelled its name; `--unseal` puts each name back for a rollback.
+- The platform system principal holds read and update on the platform's own collections (People, Authorities, and every collection the platform created), granted at provisioning and by `mantle.system.seal_titles`, which then seals the platform's rows. People and Authorities are written as the platform's own id.
+- A row's sealed fields open for a grant on the row alone, on every path that reads them, as its body does.
+- `mantle.system.drop_plaintext_index` drops the plaintext lexical index an earlier Ember wrote into the store (`fts`, `fts_map`, `fts_vocab` and their shadow tables) and its `fts:total` counter.
+- A person's provenance record (`services.principal.person_artifact`) carries no `lemmas`: they were the words of its `sub`, often an email address, stored in the clear and indexed.
+
+### Removed
+- The embeddings cache (`search/embeddings_cache.py`, `EMBEDDINGS_CACHE`, `EMBEDDINGS_CACHE_PATH`). Mantle makes no vectors, so it held none, and a cache keyed by a hash of the text would hold a confirmable fingerprint of each text outside every key.
+
+### Fixed
+- A grant whose fields were sealed under another node's key (a copied or restored store) failed every lookup for its grantee. Its fields stay absent, its structure authorizes as before, and a save writes the sealed blob back unchanged.
+- `platform_operators.grant_to_every_account` does not count the platform system principal as an account.
+- A link name that does not open on this node shows as its token, never as a plain membership.
+- On a fresh node, the first sign-in was refused the key for the People directory's name, because provisioning acts as the member.
+- `mantle.config` imports `python-dotenv` only when `load_env` runs, so the embeddable store surface loads nothing outside the standard library.
+
 ## [0.1.8] - 2026-10-30
 
 ### Changed

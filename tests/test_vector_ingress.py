@@ -158,10 +158,9 @@ def test_the_facade_passes_an_injected_provider_through():
     assert out == [_VEC]
 
 
-def test_the_empty_vector_contract_still_holds(monkeypatch):
-    """No writer vector, no cache entry: an empty vector per text, exactly as before.
+def test_the_empty_vector_contract_still_holds():
+    """No writer vector: an empty vector per text, exactly as before.
     This is what keeps every write that carries no vector unchanged."""
-    monkeypatch.setattr("mantle.search.embeddings._get_cache", lambda: None)
     assert Embeddings()(["a", "b"]) == [[], []]
 
 

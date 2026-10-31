@@ -1,16 +1,14 @@
 """Embeddings read seam — vectors that already exist, never vectors Mantle makes.
 
 Mantle does not embed on its own behalf, so there is no provider to configure in the
-usual direction. Two sources of a real vector exist, and neither is a model:
+usual direction. One source of a real vector exists, and it is not a model: the writer.
+:class:`WriterSuppliedEmbeddings` carries a vector handed to Mantle on the write that produced
+the text — the seam runs inward instead of outward. This is the semantic arm's ingress
+(``api/vectors.py`` validates the shape).
 
-* **The writer.** :class:`WriterSuppliedEmbeddings` carries a vector handed to Mantle
-  on the write that produced the text — the seam runs inward instead of outward. This
-  is the semantic arm's ingress (``api/vectors.py`` validates the shape).
-* **The long-term cache** (``embeddings_cache.py``) — a text already at rest resolves;
-  a new text comes back empty.
-
-With neither, :class:`_UnconfiguredEmbeddings` returns empty vectors and search
-degrades to lexical for that text.
+Without one, :class:`_UnconfiguredEmbeddings` returns empty vectors and search degrades to
+lexical for that text. Nothing caches vectors: Mantle makes none, and a cache keyed by a hash of
+the text would hold a confirmable fingerprint of every text it saw, outside every key.
 
 Call as ``Embeddings()(["text 1", "text 2"]) -> [[float], [float]]``. Search ingest and
 the accessor call this signature directly and treat an empty vector as "degrade to
@@ -24,7 +22,6 @@ import logging
 import os
 from typing import List, Optional, Protocol, Sequence
 
-from mantle import config
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +35,7 @@ def model_id() -> str:
     ``EMBEDDINGS_MODEL``, is the only answer there is.
 
     No provider currently produces vectors under this id; it labels vectors
-    already at rest (embeddings cache keys, stored cell records). The
+    already at rest (stored cell records). The
     default stays ``BAAI/bge-m3`` because that is the model that produced
     that stored data — changing it would orphan the stored data's
     provenance.
@@ -102,8 +99,7 @@ class WriterSuppliedEmbeddings:
 class _UnconfiguredEmbeddings:
     """Returns empty lists — search degrades to lexical.
 
-    The answer when no writer supplied a vector and the cache has never seen this
-    text. There is deliberately no seam for a *model* here. A remote embedding
+    The answer when no writer supplied a vector. There is deliberately no seam for a *model* here. A remote embedding
     endpoint is still trained weights; hosting it elsewhere changes who pays for the
     disk, not what the capability is. The question is "does this return learned
     vectors?", not "does this import a model runtime?" — the second is a leaky proxy
@@ -121,7 +117,7 @@ class _UnconfiguredEmbeddings:
         if input and not self._warned:
             logger.warning(
                 "embeddings: Mantle produces no vectors of its own; text with no "
-                "writer-supplied vector and no cache entry returns an empty vector — "
+                "writer-supplied vector returns an empty vector — "
                 "search is lexical-only for it"
             )
             self._warned = True
@@ -133,10 +129,6 @@ class _UnconfiguredEmbeddings:
 # ---------------------------------------------------------------------------
 
 _provider: EmbeddingsProvider | None = None
-
-# Long-term embeddings cache (lazy singleton). See embeddings_cache.py.
-_cache = None
-_cache_loaded = False
 
 
 def _build_provider() -> EmbeddingsProvider:
@@ -150,63 +142,18 @@ def _build_provider() -> EmbeddingsProvider:
 
 
 def reset_provider() -> None:
-    """Drop the cached provider and the cache singleton so the next call rebuilds.
-
-    The reset seam for anything that changes where cached vectors live.
-    """
-    global _provider, _cache, _cache_loaded
+    """Drop the cached provider so the next call rebuilds."""
+    global _provider
     _provider = None
-    _cache = None
-    _cache_loaded = False
-
-
-def _get_cache():
-    """Lazy singleton embeddings cache. ``None`` when disabled/unavailable."""
-    global _cache, _cache_loaded
-    if _cache_loaded:
-        return _cache
-    if os.getenv("EMBEDDINGS_CACHE", "1").strip().lower() in {"0", "false", "no", "off"}:
-        _cache, _cache_loaded = None, True
-        return None
-    try:
-        from mantle.search.embeddings_cache import EmbeddingsCache
-        path = os.getenv("EMBEDDINGS_CACHE_PATH") or str(
-            config.BASE_DIR / ".data" / "mantle" / "mantle.embeddings_cache.sqlite"
-        )
-        _cache = EmbeddingsCache(path)
-        logger.info("Embeddings cache enabled: %s (%d entries)", path, _cache.count())
-    except Exception:
-        logger.warning("Embeddings cache unavailable; continuing without it", exc_info=True)
-        _cache = None
-    _cache_loaded = True
-    return _cache
 
 
 class Embeddings:
-    """Provider facade with a transparent long-term cache.
+    """Provider facade. Call as ``Embeddings()([texts])``: the shared provider returns an empty
+    vector per text. ``Embeddings(provider=WriterSuppliedEmbeddings(...))`` is the ingress form —
+    the ingest arm builds one per vector-bearing write."""
 
-    Call as ``Embeddings()([texts])``. Cached vectors (keyed by model_id + text)
-    short-circuit the provider: a text already in the cache resolves, a new text comes
-    back empty. Empty/degraded results are never cached, so a degraded run cannot
-    poison the cache.
-
-    ``Embeddings(provider=WriterSuppliedEmbeddings(...))`` is the ingress form — the
-    ingest arm builds one per vector-bearing write. It runs with the cache OFF, and
-    deliberately: the cache is keyed by :func:`model_id`, which names the space Mantle
-    would have labelled a vector with, and a writer's vector lives in the space the
-    writer named. Storing it under the other name would make two incomparable vectors
-    look like siblings — the exact confusion ``space_id`` exists to prevent.
-    """
-
-    def __init__(
-        self,
-        provider: Optional[EmbeddingsProvider] = None,
-        *,
-        cache: Optional[bool] = None,
-    ) -> None:
+    def __init__(self, provider: Optional[EmbeddingsProvider] = None) -> None:
         self._override = provider
-        #: Default: cache on for the shared provider, off for an injected one.
-        self._use_cache = (provider is None) if cache is None else bool(cache)
 
     def __call__(self, input: List[str]) -> List[List[float]]:
         global _provider
@@ -217,30 +164,7 @@ class Embeddings:
             provider = _provider
         if not input:
             return []
-
-        cache = _get_cache() if self._use_cache else None
-        if cache is None:
-            return _pad(provider(input), len(input))
-
-        mid = model_id()
-        cached = cache.get_many(mid, input)
-        misses = [i for i, v in enumerate(cached) if v is None]
-        if misses:
-            fresh = provider([input[i] for i in misses]) or []
-            store_texts: List[str] = []
-            store_vecs: List[List[float]] = []
-            for j, i in enumerate(misses):
-                v = fresh[j] if j < len(fresh) else None
-                cached[i] = v
-                if v:
-                    store_texts.append(input[i])
-                    store_vecs.append(v)
-            if store_vecs:
-                try:
-                    cache.put_many(mid, store_texts, store_vecs)
-                except Exception:
-                    logger.debug("embeddings cache write failed", exc_info=True)
-        return [v if v else [] for v in cached]
+        return _pad(provider(input), len(input))
 
 
 def _pad(vectors: List[List[float]], n: int) -> List[List[float]]:

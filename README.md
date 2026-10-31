@@ -21,17 +21,27 @@ touch and what key is issued. Revocation is a single grant edit — no re-encryp
 
 *Grants are keys, not metadata.*
 
-**What is encrypted, and what is not.** An artifact's content and its `context.title` are
-encrypted per principal and bound cryptographically to the collection they were written for. The
-search index holds no plaintext terms: every artifact is indexed by blind token, and there is no
-plaintext lexical index to fall back to.
+**What is encrypted, and what is not.** An artifact's content and every one of its fields — title,
+name, description, tags, filename, custom keys, and the body's SHA-256 and byte length — are sealed
+per principal, bound cryptographically to the collection they were written for, and opened only for
+a grant that reaches them. The search index holds blind tokens, never terms, with no plaintext index
+to fall back to, and recall logs no query. The change feed carries structure only.
 
-The rest of the record is stored readable and governed by grants rather than by encryption, both in
-the artifact row and in the durable change feed: an artifact's `name` and `description`, every
-`context` key other than `title` (tags, filename, custom keys), relationship names on typed links,
-and a grant's name, notes and invite address. Identifiers and structure are readable too — ids,
-content type, creator and timestamps, graph edges, the access log, the ids beside each blind token,
-and each body's SHA-256 and byte length. Recall logs its query text at `INFO`.
+What the store reads is structure, which it needs before any key is issued: ids, content type,
+creator and timestamps, the content's storage addresses, graph edges and the grants it walks to
+decide who is issued a key, the access log, and the ids beside each blind token
+(`db/doc_boundary.STRUCTURAL_CONTEXT_KEYS` names each readable key and why). Issuers, type
+definitions, anchors, crosswalks and subscriptions keep their context readable, because it is read
+before anyone signs in; their title is still sealed.
+
+A few fields are read for a caller who holds no grant yet, or written by a path with no person's
+key: a grant's name, notes and invite address, and the name a person gives a link. These are sealed
+under the node's own data key (`db/node_seal`), and a link's name is stored as a keyed token the
+store matches without reading. That keeps them out of the store's files and backups, not from the
+node itself; keys held by the principals rather than the node is the open item. The platform's own
+collections are granted to its system principal, so the back-fill
+(`mantle.system.seal_titles`) seals the platform's rows like everyone else's; a row it cannot seal
+is reported as `left_plain`, never sealed blind.
 
 Durability is an operator responsibility — [Backing a node up](#backing-a-node-up) is the procedure.
 
@@ -61,7 +71,7 @@ An install puts four commands on the path:
 | `mantle-wal-checkpoint` | reclaims the write-ahead log without a restart, for a node that has been up for weeks and cannot be bounced. It needs the readers quiet and exits non-zero when they were not |
 
 **Set `AGIENCE_BASE_DIR` on a pip-installed node.** It is the root every derived default hangs off —
-the SSE index, the encrypted cells, the embeddings cache, `KEYS_DIR` and `MANTLE_LATTICE_PATH`.
+the SSE index, the encrypted cells, `KEYS_DIR` and `MANTLE_LATTICE_PATH`.
 Unset, an installed node derives it from **the directory it was started in**, so starting the same
 node from elsewhere brings it up healthy on an empty universe. A checkout keeps deriving the repo
 root, so `.data/` stays beside `src/` when developing here.
@@ -372,7 +382,7 @@ server recorded in `actor`, and the peer that issues it is the authority issuer.
 | [`services/`](src/mantle/services/) | orchestration — workspaces, collections, grants, content, contexts, OIDC, seed provisioning, and `peer_signing.py`. `content_crypto.py` is the per-principal content envelope; `acting_principal.py` answers who is acting, `principal.py` what artifact a principal *is* |
 | [`api/`](src/mantle/api/) | Pydantic request/response models by domain, including `vectors.py` |
 | [`entities/`](src/mantle/entities/) | entity models and serialization. A collection *is* an artifact; `collection.py` says so literally, and `context.py` and `subscription.py` are the same move |
-| [`search/`](src/mantle/search/) | retrieval. `embeddings.py` and `embeddings_cache.py` are the vector arm's provider facade and cache; `mantle/sse/` is the encrypted lexical arm; `mantle/lightcone.py` is authorization as reachability; `anchors/` and `beacon/` are the semantic arm and its result cut; `ingest/` is the indexing queue |
+| [`search/`](src/mantle/search/) | retrieval. `embeddings.py` is the vector arm's provider facade, which takes a writer's vectors and makes none; `mantle/sse/` is the encrypted lexical arm; `mantle/lightcone.py` is authorization as reachability; `anchors/` and `beacon/` are the semantic arm and its result cut; `ingest/` is the indexing queue |
 | [`attenuation.py`](src/mantle/attenuation.py) | the one authorization meet — CRUDEASIO masks, deny absorbing, composed along every path |
 | [`events/`](src/mantle/events/) | the change feed: in-process fan-out with a durable log, plus the optional back-plane |
 | [`system/`](src/mantle/system/) | boot and operations — logging, `runner_hooks.py`, and the `manage_*.py` bootstrap, seed, addon and anchor operations |

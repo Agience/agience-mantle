@@ -281,10 +281,6 @@ def test_a_read_only_audit_writes_no_certificate(tmp_path):
 #: one cannot hide behind an existing exemption. Each is a count against a DIFFERENT database —
 #: none of them touches the lattice, which is what the rule is about:
 #:
-#:   search/embeddings_cache.py
-#:                         the embeddings sidecar DB (its own file, `embeddings` table). Not the
-#:                         lattice. IN SCOPE of the scan, OUT OF SCOPE of the ban — but pinned,
-#:                         so if it ever grows a second one somebody has to say why here.
 #:   shard/sqlite_store.py the legacy shard store, whose module header already names `count(*)`
 #:                         and `LIMIT ? OFFSET ?` as "the three things the lattice store exists
 #:                         to fix". A different backend, kept for the shard path.
@@ -292,7 +288,6 @@ def test_a_read_only_audit_writes_no_certificate(tmp_path):
 #:                         `_vertices(store) is None` — i.e. explicitly NOT a lattice; the
 #:                         lattice branch returns above it without a scan.
 _COUNT_STAR_CEILING = {
-    os.path.join("mantle", "search", "embeddings_cache.py"): 1,
     os.path.join("mantle", "shard", "sqlite_store.py"): 2,
     os.path.join("mantle", "mesh", "sync.py"): 1,
 }

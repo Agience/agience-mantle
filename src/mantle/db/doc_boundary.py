@@ -155,9 +155,15 @@ def _open(principal, blob_b64, doc: dict) -> dict:
     import base64
 
     from mantle.services import content_crypto
-    plain = content_crypto.decrypt_content(
-        principal or content_key_principal(doc), base64.b64decode(blob_b64 or ""),
-        collection_id=content_key_scope(doc), require_encrypted=True)
+    # The row is named to the key oracle, as `decrypt_artifact_content` names it, so a grant on the
+    # row alone opens its sealed fields on every path that reads them, not only a full read. A
+    # member's profile is keyed to the People directory, which members hold no grant on; their
+    # grant is on their own card. 2026-10-30, on the release candidate: the seal pass could not
+    # read back a single member profile as its member.
+    with content_crypto.content_key_artifact(doc.get("root_id") or doc.get("id")):
+        plain = content_crypto.decrypt_content(
+            principal or content_key_principal(doc), base64.b64decode(blob_b64 or ""),
+            collection_id=content_key_scope(doc), require_encrypted=True)
     payload = json.loads(plain.decode("utf-8"))
     if isinstance(payload, dict) and payload.get("v") == _PAYLOAD_VERSION:
         return {"context": payload.get("context") or {}, "doc": payload.get("doc") or {}}

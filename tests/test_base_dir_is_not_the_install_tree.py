@@ -1,6 +1,6 @@
 """`BASE_DIR` is the root every derived default hangs off, and it must not be site-packages.
 
-`KEYS_DIR`, `MANTLE_LATTICE_PATH`, `MANTLE_SSE_DIR`, `MANTLE_CELL_DIR` and the embeddings cache all
+`KEYS_DIR`, `MANTLE_LATTICE_PATH`, `MANTLE_SSE_DIR` and `MANTLE_CELL_DIR` all
 default to `<BASE_DIR>/.data/…`. Derived from the directory the `mantle` package sits in, that is
 `<venv>/Lib/site-packages` on an installed node — a tree the next `pip install --upgrade` rewrites,
 holding indexes the README calls data rather than cache and whose rebuild is measured in
@@ -133,7 +133,6 @@ def test_no_derived_default_lands_in_an_install_tree(monkeypatch, tmp_path):
         derived = [
             base / ".data" / "keys",
             base / ".data" / "mantle-lattice.db",
-            base / ".data" / "mantle" / "mantle.embeddings_cache.sqlite",
             Path(wiring.local_sse_root()),
             Path(wiring.local_cell_root()),
         ]

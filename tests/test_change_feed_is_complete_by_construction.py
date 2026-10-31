@@ -218,6 +218,14 @@ WRITE_SITES: dict[tuple[str, str], tuple[str, str]] = {
                   "form of a title (sealed to plain) on rows as they are. No reader sees a different "
                   "artifact, and the feed carries no title in either form, so there is nothing to "
                   "announce."),
+    ("system/seal_titles.py", "_seal_grant"): (
+        OFF_FEED, "the same migration for a grant: it rewrites only the stored form of its name, "
+                  "notes and invite address (plain to sealed under the node's key). A grant is not "
+                  "an artifact a subscriber follows, and no reader sees a different grant."),
+    ("system/seal_titles.py", "_relabel"): (
+        OFF_FEED, "the same migration for a link's name: it rewrites only the stored form of the "
+                  "label (plain to keyed token, and back for a rollback) on an edge that stays the "
+                  "same link. Every reader shows the same name, so there is nothing to announce."),
     ("system/type_uploads.py", "type_stored_uploads"): (
         OFF_FEED, "the release migration that types stored uploads from their context. It runs "
                   "before Mantle starts (`platform_release` migrates a service, then starts it), so "

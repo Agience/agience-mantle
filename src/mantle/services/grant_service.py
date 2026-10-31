@@ -287,7 +287,7 @@ def create_invite(
 
     _emit_invite_event(
         resource_id, "grant.invite.created",
-        {"grant_id": created.id, "role": role, "target_email": target_email},
+        {"grant_id": created.id, "role": role, "has_target": bool(target_email)},  # never the address
         actor_id=user_id,
     )
 

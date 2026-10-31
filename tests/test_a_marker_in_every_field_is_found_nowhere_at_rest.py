@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import logging
 
-import pytest
 
 from fastapi.responses import Response
 from starlette.requests import Request
@@ -83,11 +82,9 @@ async def test_every_artifact_field_is_found_nowhere_at_rest_nor_in_the_log(tmp_
     assert not leaks["files"] and not leaks["loggers"], leaks
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "open, 2026-10-30: a relationship label is plaintext in `edge.label` and `counter.name`, and an "
-    "invite's email, name and notes are plaintext on the grant (MANTLE-SEAL-EVERYTHING.md). Strict, "
-    "so this fails the suite the day they are sealed and the marker has to come off."))
 async def test_a_link_label_and_an_invite_are_found_nowhere_at_rest(tmp_path, monkeypatch, caplog):
+    """A link's name (2026-10-30: plain in `edge.label` and `counter.name`) and an invite's address,
+    name and notes (plain on the grant, the address also in the event log)."""
     leaks = await _leaks(tmp_path, monkeypatch, caplog, links_and_grants=True)
     assert not leaks["files"] and not leaks["loggers"], leaks
 

@@ -122,7 +122,8 @@ def person_artifact(sub: str, *, issuer: str = LOCAL_ISSUER,
         "content_type": PERSON_CONTENT_TYPE,
         "name": name or sub,
         "context": ctx,
-        "lemmas": [w for w in str(sub).lower().replace("@", " ").replace(".", " ").split() if w],
+        # No `lemmas`: a person's `sub` is often an email address, and `lemmas` is stored in the
+        # clear and indexed (`vertex.LIST_INDEX_FIELDS`). Nothing looks a person up by lemma.
         "content": "",
         "created_by": pid,
     }
