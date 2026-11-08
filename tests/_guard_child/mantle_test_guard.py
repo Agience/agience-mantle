@@ -75,7 +75,23 @@ def _names_guarded(args) -> bool:
     return False
 
 
+#: Who is told of a refusal. One hook per process: a pytest-xdist worker is a child Python, so
+#: `sitecustomize` installs the guard there before `conftest.py` does, and a second hook would
+#: refuse in the first one before the second could record (2026-11-08: the detector test failed
+#: under `-n 4`, the way the sovereign CI runs mantle). A later `install` adds its recorder to the
+#: hook already in place.
+_ON_REFUSE: list = []
+_INSTALLED = False
+
+
 def install(on_refuse=None):
+    global _INSTALLED
+    if on_refuse is not None:
+        _ON_REFUSE.append(on_refuse)
+    if _INSTALLED:
+        return
+    _INSTALLED = True
+
     def audit(event, args):
         hit = None
         if event in _WATCHED and args:
@@ -90,8 +106,8 @@ def install(on_refuse=None):
             if _names_guarded(argv) or (cwd is not None and guarded(cwd)):
                 hit = f"subprocess: {argv!r} in {cwd!r}"
         if hit is not None:
-            if on_refuse is not None:
-                on_refuse(event, hit)
+            for record in tuple(_ON_REFUSE):
+                record(event, hit)
             raise PermissionError(f"a test may not touch the install-root store: {hit}")
 
     sys.addaudithook(audit)
