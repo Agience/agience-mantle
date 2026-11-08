@@ -22,6 +22,7 @@ import sqlite3
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from . import constants as K
+from . import reach_journal as _journal
 from . import schema as _schema
 from . import seq as _seq
 # `edge` imports only constants/schema/seq, so this is not a cycle — see `edge_mark` below for why
@@ -285,6 +286,21 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
                 if pdoc.get(self.TIME_CLAIM_KEY) is not None:
                     d[self.TIME_CLAIM_KEY] = pdoc[self.TIME_CLAIM_KEY]
 
+        # A grant written is journaled for the authority ledger (`reach_journal`). An invite's
+        # target digest is carried forward when this write could not compute it (its address
+        # sealed under a key this node does not hold), so a rewrite never loosens the invite.
+        is_grant = d.get("content_type") == _journal.GRANT_CT and not (
+            d.get("state") == "archived" and "@" in str(aid))
+        prior_doc = None
+        if prev is not None:
+            try:
+                prior_doc = json.loads(prev["doc"]) if prev["doc"] else None
+            except Exception:
+                prior_doc = None
+        if (is_grant and d.get("grantee_type") == "invite" and not d.get("target_digest")
+                and (prior_doc or {}).get("target_digest")):
+            d["target_digest"] = prior_doc["target_digest"]
+
         leaf = K.leaf_of(aid, self.leaves)
         cols = self._columns(d)
         cur.execute(
@@ -322,7 +338,11 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
         # doc it points at can never be observed disagreeing, and an update that changes `ct`
         # re-posts under the new type rather than leaving a stale discriminator behind.
         self._index_lists(cur, aid, d, cols["ct"], had_prev=prev is not None)
-        self._place(cur, d, stamp_rev=True)
+        if is_grant:
+            entry = _journal.grant_entry(d)
+            if prior_doc is None or _journal.grant_entry(prior_doc) != entry:
+                _journal.record(entry, f"grant:{aid}")
+        self._place(cur, d, stamp_rev=True, is_new=prev is None)
         return d
 
     def _recount(self, cur: sqlite3.Cursor, old: Optional[Dict[str, Any]],
@@ -417,8 +437,9 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
              new.get("claimed_at"), new.get("next_retry_at"), new.get("completed_at")))
 
     # ── ArtifactStore: single put ────────────────────────────────────────────
+    @_seq.cosigned(lambda a: a[0].db)
     def put_artifact(self, doc: Dict[str, Any], *, stamp_rev: bool = True,
-                     new_version: bool = False) -> Dict[str, Any]:
+                     new_version: bool = False, snapshot: bool = True) -> Dict[str, Any]:
         """Idempotent upsert keyed on `id`. Returns the stored doc.
 
             stamp_rev=True   Local authorship. Allocates a fresh `_seq` from this
@@ -431,12 +452,17 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
                              mesh forever, and the peer's merkle leaf for that row
                              matches ours once applied.
 
+        `snapshot=False` rewrites the row in place even when `content_ref` changes: the same
+        content under a new key or address is not a new version (`system.rekey_collections`).
+
         With `stamp_rev=False` a doc carrying no `(_origin, _seq)` raises `ValueError`
         rather than being re-stamped locally: re-stamping would claim this node
         authored a peer's event, corrupting the only causal record the system has."""
         if not doc.get("id"):
             raise ValueError("put_artifact: doc has no 'id'")
         with self.db.write() as cur:
+            if not stamp_rev and self._held(cur, doc, str(doc.get("_origin") or "")):
+                return doc                         # held for a person here to accept
             # ── content decides whether this is a new version ────────────────────────────────
             # The deciding information is `content_ref` = cas/<sha256-of-the-content>:
             #   · same content_ref — the bytes are unchanged; this is a re-describe (offer,
@@ -452,7 +478,7 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
             #     is part of the content (the root type declares it so) and is stored sealed, so
             #     two seals of one title differ and the bytes here cannot tell a change from none.
             #     `lattice_api.update_artifact` compares the plaintext and says so.
-            if stamp_rev and (doc.get("content_ref") or new_version):
+            if stamp_rev and snapshot and (doc.get("content_ref") or new_version):
                 prev = cur.execute(
                     "SELECT content_ref, root_id, doc FROM vertex WHERE id = ?",
                     (doc["id"],)).fetchone()
@@ -464,6 +490,20 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
             if not stamp_rev:
                 _seq.observe_seq(cur, origin, seq_val)
             return self._write_row(cur, doc, origin, seq_val)
+
+    def _held(self, cur: sqlite3.Cursor, doc: Dict[str, Any], origin: str) -> bool:
+        """Hold a grant a peer sent that widens reach, under threshold custody, instead of
+        writing it (`reach_journal.hold`). A narrowing is written, and journaled, as usual."""
+        if doc.get("content_type") != _journal.GRANT_CT or not _journal.required():
+            return False
+        prev = cur.execute("SELECT doc FROM vertex WHERE id = ?", (doc["id"],)).fetchone()
+        prior = json.loads(prev["doc"]) if prev is not None and prev["doc"] else None
+        if not _journal.grant_widens(_journal.grant_entry(prior) if prior else None,
+                                     _journal.grant_entry(doc)):
+            return False
+        _journal.hold(cur, "grant", f"grant:{doc['id']}",
+                      {k: v for k, v in doc.items() if not k.startswith("_")}, origin)
+        return True
 
     def _snapshot_prior(self, cur: sqlite3.Cursor, aid: str, prev: sqlite3.Row) -> Optional[str]:
         """Preserve the prior version of `aid` under a derived, archived id before its content is
@@ -568,6 +608,7 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
             handled += self._put_chunk(chunk, stamp_rev, on_unordered)
         return handled
 
+    @_seq.cosigned(lambda a: a[0].db)
     def _put_chunk(self, chunk: List[Dict[str, Any]], stamp_rev: bool,
                    on_unordered: str) -> int:
         handled = 0
@@ -592,6 +633,8 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
         if not doc.get("id"):
             raise ValueError("put_many: doc has no 'id'")
         origin, seq_val = self._version_for(cur, doc, stamp_rev)
+        if not stamp_rev and self._held(cur, doc, origin):
+            return 1                               # held for a person here to accept
         if not stamp_rev:
             _seq.observe_seq(cur, origin, seq_val)
             verdict = self._lww(cur, doc["id"], origin, seq_val)
@@ -616,7 +659,8 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
     #: guarantee `open_lattice` gives when it constructs them together.
     _graph_face = None
 
-    def _place(self, cur: sqlite3.Cursor, doc: Dict[str, Any], stamp_rev: bool = True) -> None:
+    def _place(self, cur: sqlite3.Cursor, doc: Dict[str, Any], stamp_rev: bool = True,
+               is_new: bool = True) -> None:
         """Write the origin containment edge for `doc["collection_id"]`.
 
         An artifact's collection is ONE fact and this is the one write that records it. The
@@ -674,13 +718,26 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
                 "reachable by no grant.", aid, cid)
             self.unplaced += 1
             return
+        # ── one creation edge, written once ─────────────────────────────────────────────────
+        # An existing membership is left as it is: rewriting it on every put reset its
+        # `propagate` mask to NULL, which conducts everything. And `is_origin` marks the creation
+        # lineage, which does not change after creation: an artifact first placed here gets it;
+        # an existing artifact that names a new collection (a move) is placed there as secondary
+        # containment, so a move never re-roots it. This is how the authority ledger records a
+        # move too: one creation edge per member, ever.
+        if cur.execute("SELECT 1 FROM edge WHERE src = ? AND dst = ? AND label = 'contains'",
+                       (cid, aid)).fetchone():
+            return
+        has_parent = cur.execute(
+            "SELECT 1 FROM edge WHERE dst = ? AND label = 'contains' AND is_origin = 1",
+            (aid,)).fetchone() is not None
         if self._graph_face is None:
             from .edge import LatticeGraphStore
             self._graph_face = LatticeGraphStore(self.db, origin=self.origin, leaves=self.leaves)
         self._graph_face._add_one(
             cur,
             (cid, aid, "contains",
-             {"root_id": aid, "is_origin": 1}),
+             {"root_id": aid, "is_origin": 1 if (is_new and not has_parent) else 0}),
             stamp_rev,
         )
 
@@ -962,6 +1019,7 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
             cursor = ids[-1]
         return {"relabelled": done, "batches": batches}
 
+    @_seq.cosigned(lambda a: a[0].db)
     def delete_artifact(self, artifact_id: str, *, accounted: bool = True) -> None:
         with self.db.write() as cur:
             r = cur.execute("SELECT ct, _seq, _origin, _leaf, doc FROM vertex WHERE id = ?",
@@ -971,6 +1029,8 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
                 return
             old = json.loads(r["doc"])
             cur.execute("DELETE FROM vertex WHERE id = ?", (artifact_id,))
+            if accounted and old.get("content_type") == _journal.GRANT_CT:
+                _journal.record(_journal.grant_entry(old, state="deleted"), f"grant:{artifact_id}")
             if accounted:
                 # And the edges go with it. `edge_key = blake2b(src ‖ dst ‖ label)` is derived
                 # from the id strings, so an edge left behind is not inert garbage: the next

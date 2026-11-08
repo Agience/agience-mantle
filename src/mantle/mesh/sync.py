@@ -52,7 +52,22 @@ _OP_EXCLUDE = {                # operational state is per-box, never replicated 
     # beside the code that would violate it is not a rule.
     "application/vnd.agience.sensor+json",
     "application/x-ember-state",
+    # Key custody is per box (review 26, I2): this node's master-key and key-share rows hold its
+    # own share under its own KEK. Published, a peer would hold them; applied, a peer's row would
+    # replace this node's key. `_apply_artifacts` also refuses any inbound row under the key-row
+    # id prefix, whatever content type it claims.
+    "application/vnd.agience.master-key+json",
+    "application/vnd.agience.master-key-share+json",
+    # A settle of a replaced key row still due on this box (`db/scrub.py`).
+    "application/vnd.agience.custody-scrub-due+json",
+    # This box's record that a person's content is re-keyed (`services/owner_rekey.py`).
+    "application/vnd.agience.owner-rekeyed+json",
 }
+
+#: The id prefixes of every key row (`oracle.LatticeMasterKeyStore._id`) and every per-box custody
+#: record (`custody:`, `db/scrub.py`, `services/owner_rekey.py`): never applied from a peer
+#: (reviews 26 and 27).
+_KEY_ROW_PREFIX = ("master-key:", "custody:")
 
 
 def _is_replicated(content_type) -> bool:
@@ -293,13 +308,36 @@ def _mesh_s3(store):
         return SpoolPlane(spool)
 
     remote = getattr(getattr(store, "content", None), "remote", None)
-    if remote is not None:
-        return remote
-    try:
-        from mantle.shard.content_tier import open_ovh_store
-        return open_ovh_store(store.keys_dir)
-    except Exception:
-        return None
+    if remote is None:
+        try:
+            from mantle.shard.content_tier import open_ovh_store
+            remote = open_ovh_store(store.keys_dir)
+        except Exception:
+            return None
+    return remote if _own_bucket(remote) else None
+
+
+def _own_bucket(plane) -> bool:
+    """Is this plane on Mantle's own content bucket (review 17, as Ember checks its mirror)? Not
+    on Ember's (`EMBER_OVH_BUCKET`) or any `MANTLE_FORBIDDEN_BUCKETS` names, and, when
+    `CONTENT_DURABLE_BUCKET` is set, that one. A plane naming no bucket (a spool) is not checked."""
+    import logging
+    import os
+
+    bucket = getattr(plane, "bucket", None)
+    if bucket is None:
+        return True
+    forbidden = {b.strip() for b in (os.getenv("MANTLE_FORBIDDEN_BUCKETS") or "").split(",")
+                 if b.strip()}
+    ember = (os.getenv("EMBER_OVH_BUCKET") or "").strip()
+    if ember:
+        forbidden.add(ember)
+    mine = (os.getenv("CONTENT_DURABLE_BUCKET") or "").strip()
+    if bucket in forbidden or (mine and bucket != mine):
+        logging.getLogger(__name__).error(
+            "the mesh plane %r is not Mantle's own content bucket; no plane is used", bucket)
+        return False
+    return True
 
 
 def _node_id() -> str:
@@ -529,7 +567,8 @@ def _apply_artifacts(store, items: List[Dict[str, Any]], *, stats: Optional[Dict
     `stats['reapplied']` (via `_new_docs`, a read) — so a caller can tell real convergence from
     no-op re-applies. Populating it changes nothing about what is written or the load-bearing
     `handled` return / cursor guard; the default (None) is a pure no-op."""
-    batch = [d for d in items if d.get("id") and _is_replicated(d.get("content_type"))]
+    batch = [d for d in items if d.get("id") and _is_replicated(d.get("content_type"))
+             and not str(d.get("id")).startswith(_KEY_ROW_PREFIX)]
     batch, refused_authority = _withhold_unverified_authority(batch, stats=stats)
     if not batch:
         return refused_authority

@@ -410,6 +410,11 @@ class MantleQueryEngine:
 
         cached = self._cache.get(principal_id, collection_id, cluster_id)
         if cached is not None:
+            # A hit opens no key, so it would otherwise be served on Mantle's own walk alone:
+            # under threshold custody Origin's verdict is asked as a key open asks it.
+            verdict = getattr(self._oracle, "verdict", None)
+            if verdict is not None:
+                verdict(principal_id, collection_id, request)
             return cached, None
 
         blob = self._cells.get(principal_id, collection_id, cluster_id)

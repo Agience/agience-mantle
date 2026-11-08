@@ -32,6 +32,20 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/grants", tags=["Grants"])
 
 
+def authority_changes_are_made_at_origin() -> None:
+    """With Origin's authority ledger installed, no Mantle route changes authority (review 12,
+    John 2026-11-03): a grant, an invite, a deny, a claim, a grant key or its members is made at
+    Origin, in the person's Origin session, and reaches this store from Origin's feed. Answered 409,
+    naming where to go. A creation grant for what a person creates here is made by the create
+    itself and is unaffected. Without the ledger (a node with no Origin), Mantle decides alone."""
+    from mantle.db import reach_journal
+    if reach_journal.installed():
+        raise HTTPException(
+            status_code=409,
+            detail="authority changes are made at Origin, in your Origin session; this node "
+                   "applies them from Origin's ledger")
+
+
 #: `responses=` for one route. Declaration only, no runtime effect.
 #:
 #: Declaring only `422` when the handlers raise 400, 401, 403, 404 and 410 would leave a
@@ -383,41 +397,9 @@ def _require_share_or_admin(auth: AuthContext, resource_id: str, store_db: Datab
 # Endpoints
 # =============================================================================
 
-@router.get("/invite-context",
-    responses=_errors(404, ok=InviteContextResponse),
-)
-async def get_invite_context_endpoint(
-    token: str = Query(..., description="Raw invite claim token"),
-    store_db: Database = Depends(get_store_db),
-):
-    """Non-PII invite metadata. Safe to call pre-auth."""
-    from mantle.services import grant_service
-    ctx = await offload_sync(grant_service.get_invite_context, store_db, token)
-    if not ctx:
-        raise HTTPException(status_code=404, detail="Invite not found or expired")
-    return ctx
-
-
-@router.get("/invite-details",
-    responses=_errors(401, 404, ok=InviteDetailsResponse),
-)
-async def get_invite_details_endpoint(
-    token: str = Query(..., description="Raw invite claim token"),
-    auth: AuthContext = Depends(get_auth),
-    store_db: Database = Depends(get_store_db),
-):
-    """Full invite details after verifying caller identity."""
-    if not auth.user_id:
-        raise HTTPException(status_code=401, detail="User identification required")
-    from mantle.services import grant_service
-    # The same verified-address gate as `/claim`, so the details agree with what a claim would do.
-    _claimant_email = auth.email if getattr(auth, "email_verified", False) else ""
-    details = await offload_sync(
-        grant_service.get_invite_details, store_db, token, auth.user_id, _claimant_email
-    )
-    if not details:
-        raise HTTPException(status_code=404, detail="Invite not found or expired")
-    return details
+# An invite's context, details and claim are Origin's (round 13): Origin makes the invite for one
+# address and mails its link, and the claim page asks Origin, in the person's Origin session. No
+# route here takes an invite's raw claim token.
 
 
 @router.get("/mine-sent",
@@ -440,6 +422,7 @@ async def list_invites_sent_endpoint(
 
 
 @router.post("/claim", status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(authority_changes_are_made_at_origin)],
     responses=_errors(401, 403, 404, 410, ok=GrantResponse, ok_code=201),
 )
 async def claim_invite_endpoint(
@@ -539,6 +522,7 @@ async def my_access_endpoint(
 
 
 @router.post("", status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(authority_changes_are_made_at_origin)],
     responses=_errors(400, 401, ok=GrantWithClaimResponse, ok_code=201),
 )
 async def create_grant_endpoint(
@@ -553,6 +537,12 @@ async def create_grant_endpoint(
     """
     if not auth.user_id:
         raise HTTPException(status_code=401, detail="User identification required")
+    # A narrowed delegation (Ember's, a persona's) makes no grant at all: sharing happens only in
+    # the person's own session (John, 2026-11-02, review 11).
+    from mantle.services.dependencies import is_narrowed
+    if is_narrowed(auth):
+        raise HTTPException(status_code=403, detail="a narrowed delegation makes no grant; "
+                            "sharing happens only in the person's own session")
 
     if body.grantee_type == GrantEntity.GRANTEE_INVITE:
         await offload_sync(_require_share_or_admin, auth, body.resource_id, store_db)
@@ -721,6 +711,7 @@ def _require_key_owner(grant: GrantEntity, auth: AuthContext) -> None:
 
 
 @router.post("/keys", status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(authority_changes_are_made_at_origin)],
     responses=_errors(400, 401, 403, ok=GrantKeyCreatedResponse, ok_code=201),
 )
 async def create_grant_key_endpoint(
@@ -809,6 +800,7 @@ async def read_grant_key_endpoint(
 
 
 @router.delete("/keys/{key_id}",
+    dependencies=[Depends(authority_changes_are_made_at_origin)],
     responses=_errors(401, 404, ok=RevokedResponse),
 )
 async def revoke_grant_key_endpoint(
@@ -834,6 +826,7 @@ async def revoke_grant_key_endpoint(
 
 
 @router.post("/keys/{key_id}/members", status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(authority_changes_are_made_at_origin)],
     responses=_errors(400, 401, 404, ok=GrantResponse, ok_code=201),
 )
 async def add_bundle_member_endpoint(
@@ -877,6 +870,7 @@ async def add_bundle_member_endpoint(
 
 
 @router.delete("/keys/{key_id}/members/{member_id}",
+    dependencies=[Depends(authority_changes_are_made_at_origin)],
     responses=_errors(401, 404, ok=RevokedResponse),
 )
 async def remove_bundle_member_endpoint(
@@ -930,6 +924,7 @@ async def read_grant(
 
 
 @router.delete("/{grant_id}",
+    dependencies=[Depends(authority_changes_are_made_at_origin)],
     responses=_errors(401, 404, ok=RevokedResponse),
 )
 async def revoke_grant(
@@ -1013,6 +1008,7 @@ async def resend_invite(
 
 
 @router.post("/{grant_id}/accept",
+    dependencies=[Depends(authority_changes_are_made_at_origin)],
     responses=_errors(400, 401, 403, 404, ok=GrantResponse),
 )
 async def accept_grant(

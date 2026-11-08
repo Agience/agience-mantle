@@ -138,6 +138,7 @@ from mantle.events import event_bus
 from mantle.db.doc_boundary import CREATED as _CREATED
 from mantle.entities.grant import grant_is_deny
 from mantle.services.acting_principal import acting_from_auth, set_acting_principal
+from mantle.services.dependencies import forwarded_credential
 from mantle.services.dependencies import get_store_db
 from mantle.services.dependencies import (
     AuthContext,
@@ -617,7 +618,7 @@ class _Session:
             return False
         self._deadline = time.monotonic() + _AUTH_TTL_SECONDS
         if self.auth.principal_id or self.auth.user_id:
-            set_acting_principal(acting_from_auth(self.auth))
+            set_acting_principal(acting_from_auth(self.auth, forwarded_credential(self.token, self.auth)))
         return True
 
 
@@ -887,7 +888,7 @@ async def _authenticate_ws(ws: WebSocket) -> Optional["_Session"]:
     # connection's own task, so it covers the whole socket lifetime including the
     # subscription pump spawned from here.
     if auth.principal_id or auth.user_id:
-        set_acting_principal(acting_from_auth(auth))
+        set_acting_principal(acting_from_auth(auth, forwarded_credential(token, auth)))
 
     return _Session(token, auth, store_db)
 

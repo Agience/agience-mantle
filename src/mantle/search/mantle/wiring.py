@@ -149,6 +149,9 @@ def _master_key_store(kek, db_factory):
     from .threshold_custody import build_threshold_store, custody_kind
 
     if custody_kind() == "threshold":
+        # Only isolated production claims custody (John, 2026-11-02).
+        from mantle.services import custody_plane
+        custody_plane.require_isolated_production(custody_plane.keys_dir())
         return build_threshold_store(kek, db_factory)
     from .oracle import LatticeMasterKeyStore
     return LatticeMasterKeyStore(kek, db_factory)

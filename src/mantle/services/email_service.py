@@ -86,11 +86,17 @@ async def _send_gmail(to: str, subject: str, html_body: str, text: str) -> bool:
     return True
 
 
+#: Each outbox message's place in this process's sending order: a clock that ticks coarser than
+#: the sends (Windows' does) gives two messages one timestamp, and the name must still sort them.
+_OUTBOX_SEQ = __import__("itertools").count(1)
+
+
 def _send_outbox(to: str, subject: str, html_body: str, text: str) -> bool:
     folder = (os.getenv("EMAIL_OUTBOX_DIR", "") or "").strip()
     os.makedirs(folder, exist_ok=True)
     now = datetime.now(timezone.utc)
-    name = f"{now.strftime('%Y%m%dT%H%M%S%fZ')}-{secrets.token_hex(4)}.json"
+    name = (f"{now.strftime('%Y%m%dT%H%M%S%fZ')}-{next(_OUTBOX_SEQ):010d}-"
+            f"{secrets.token_hex(4)}.json")
     tmp = os.path.join(folder, "." + name)
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"to": to, "subject": subject, "text": text, "html": html_body,

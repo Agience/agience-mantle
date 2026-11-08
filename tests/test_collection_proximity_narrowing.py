@@ -495,7 +495,7 @@ class TestAProximityMatchOnlyEverNarrows:
     def test_an_unreadable_digest_is_the_same_answer_as_an_absent_one(self, stack):
         """A corrupt digest must not be distinguishable from a collection that has none —
         the same trade `TokenNarrower._entries` takes for an unreadable posting list."""
-        key = stack["oracle"].derive_sse_key(OWNER, _read_request())
+        key = stack["oracle"].derive_sse_key(OWNER, _read_request(), collection_id=COL_B)
         token = CP.digest_slot_token(key, COL_B)
         stack["postings"].put_posting(OWNER, token, b"garbage that will not open")
         assert stack["slot"].get(OWNER, COL_B, _read_request()) is None
@@ -674,7 +674,7 @@ class TestTheRecordSaysWhatItWasReadBy:
         from mantle.search.mantle.sse.blind_tokens import blind_token
         from mantle.search.mantle.sse.tokenizer import bigrams, tokenize
 
-        key = stack["oracle"].derive_sse_key(OWNER, _read_request())
+        key = stack["oracle"].derive_sse_key(OWNER, _read_request(), collection_id=COL_A)
         slot = CP.digest_slot_token(key, COL_A)
         stems = tokenize(" ".join(_CORPUS[COL_A]) + " proximity digest col a")
         for term in list(stems) + bigrams(stems):

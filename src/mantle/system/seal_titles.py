@@ -318,6 +318,8 @@ def main() -> int:
     init_nonce_secret()
     from mantle.services import peer_signing
     peer_signing.init()
+    from mantle.services.authority_ledger import install_for_cli
+    install_for_cli()
     from mantle.services.dependencies import get_store_db
 
     db = next(get_store_db())

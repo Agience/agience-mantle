@@ -105,6 +105,21 @@ def _mint_container_context(db, container_id, content_type, content, context, mi
                        exc_info=True)
         return _mc.with_client_keys({}, _mc.client_part(context))
 
+
+def _in_one_batch(fn):
+    """One operation's changes to reach go to the authority as one batch, so a creation and its
+    creation grant are co-signed together (`reach_journal.batch`)."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        from mantle.db import reach_journal as _rj
+        with _rj.batch():
+            return fn(*args, **kwargs)
+    return wrapper
+
+
+@_in_one_batch
 def create_container(
     db: Database,
     user_id: str,
@@ -167,6 +182,17 @@ def create_container(
             collection_id=container_id, creator_id=user_id)
         context = _record_content_address(context or "", _key, cas_ref)
 
+    # A self-rooted id comes into being at the authority by its root, made by its creator now,
+    # and its creation grant goes in the same batch (architecture §51: all access, the
+    # creator's included, is by explicit grant issued at creation time). The root is asked for
+    # before the row is written, so a root Origin refuses leaves no row behind.
+    from datetime import datetime as _dt, timezone as _tz
+
+    from mantle.db import reach_journal as _rj
+    with _rj.proof(created_by=str(user_id), created_at=_dt.now(_tz.utc).isoformat()):
+        root = _rj.root_entry(container_id)
+        root_receipt = _rj.submit(root)
+
     entity = CollectionEntity(
         id=container_id,
         name=name,
@@ -181,6 +207,7 @@ def create_container(
         modified_time=_now_iso(),
     )
     store.create_collection(db, entity)
+    _rj.confirm_submitted(root, root_receipt, db)            # the row is written now
 
     # Issue explicit full-CRUDEASIO grant to the creator.
     store.upsert_user_collection_grant(
@@ -206,6 +233,10 @@ def create_container(
         invalidate_grant_cache(user_id)
     except Exception:
         logger.debug("grant-cache invalidation failed", exc_info=True)
+
+    # The container's own collection key, minted as it is created, after its creator's grant.
+    from mantle.services.collection_service import ensure_collection_key
+    ensure_collection_key(db, entity, user_id)
 
     # Index AFTER grant + cache-invalidation so the descriptor's cell encryption can mint
     # the container's DEK on the first attempt (see the ordering note above).
@@ -1144,7 +1175,12 @@ def _link_to_target_collections(
     the workspace context, so it confers nothing, and read on a collection is not the right to put
     things in it.
     """
-    target_ids = resolve_binding_multi(db, user_id, workspace_id, "target_collections")
+    try:
+        target_ids = resolve_binding_multi(db, user_id, workspace_id, "target_collections")
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        return            # a create-only sender cannot read the workspace, nor its bindings
     for target_id in target_ids:
         try:
             if not _user_can_add_to_collection(db, user_id, target_id):
@@ -1153,7 +1189,8 @@ def _link_to_target_collections(
                     user_id, target_id,
                 )
                 continue
-            store.add_artifact_to_collection(db, target_id, artifact.root_id)
+            # Secondary containment: the artifact's creation edge is in its own container.
+            store.add_artifact_to_collection(db, target_id, artifact.root_id, origin=False)
             # Addressed to the target collection, not the workspace: a subscriber watching the
             # collection the artifact just entered is the one that needs to hear about it.
             event_bus.emit_artifact_event_sync(
@@ -1167,12 +1204,104 @@ def _link_to_target_collections(
                 actor_id=user_id,
             )
         except Exception:
-            logger.info(
+            logger.warning(
                 "Failed to link artifact %s to target_collection %s",
                 artifact.id, target_id, exc_info=True,
             )
 
 
+def _persona_sealed(content_type: Optional[str], artifact_id: str, content: str,
+                    endpoints: Optional[list] = None):
+    """A credential's secret, sealed to the personas that use it, as it is written, with the
+    endpoints it may be sent to: the persona sends it nowhere else (review 10, R1)."""
+    from mantle.services.bootstrap_types import CREDENTIAL_CONTENT_TYPE
+
+    if content_type != CREDENTIAL_CONTENT_TYPE or not content:
+        return None
+    from mantle.services.credential_sealing import seal_for_personas
+    payload = json.dumps({"material": content, "endpoints": list(endpoints or [])},
+                         separators=(",", ":"), ensure_ascii=False)
+    return seal_for_personas(artifact_id, payload) or None
+
+
+def credential_endpoints(content_type: Optional[str], context: Any) -> Optional[list]:
+    """The endpoints a credential's writer names (`allowed_endpoints` in its context): https URLs,
+    no query or fragment, as a list. None for anything but a credential; 400 for a malformed list.
+    A credential that names none is used nowhere."""
+    from urllib.parse import urlsplit
+
+    from mantle.services.bootstrap_types import CREDENTIAL_CONTENT_TYPE
+
+    if content_type != CREDENTIAL_CONTENT_TYPE:
+        return None
+    try:
+        ctx = json.loads(context) if isinstance(context, str) and context.strip() else (context or {})
+    except (TypeError, ValueError):
+        ctx = {}
+    raw = ctx.get("allowed_endpoints") if isinstance(ctx, dict) else None
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or len(raw) > 32:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "allowed_endpoints is a list of at most 32 https URLs")
+    out = []
+    for e in raw:
+        p = urlsplit(str(e or "").strip()) if isinstance(e, str) else None
+        if p is None or p.scheme != "https" or not p.hostname or p.query or p.fragment \
+                or p.username or p.password:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                f"allowed_endpoints names {e!r}: each is an https URL with no "
+                                "query, fragment or credentials")
+        path = _decoded_path(p.path)
+        if path is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                f"allowed_endpoints names {e!r}: its path decodes to a traversal, "
+                                "a separator or a control character")
+        out.append(f"https://{p.netloc.lower()}{path}")
+    return sorted(set(out))
+
+
+def _decoded_path(path: str) -> Optional[str]:
+    """`path` percent-decoded until it no longer changes (review 12), or None when what it decodes
+    to is not one plain path: a `.` or `..` segment, a backslash, or a control character."""
+    from urllib.parse import unquote
+
+    for _ in range(8):
+        nxt = unquote(path)
+        if nxt == path:
+            break
+        path = nxt
+    else:
+        return None
+    if "\\" in path or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in path):
+        return None
+    if any(seg in (".", "..") for seg in path.split("/")):
+        return None
+    return path
+
+
+def _reads(db: Database, user_id: str, container_id: str) -> bool:
+    """Does `user_id` reach `container_id` for Read? Only then is a content key theirs."""
+    from mantle.search.mantle.oracle import LightConeGrantVerifier
+
+    return LightConeGrantVerifier(db, ttl_s=0)._reaches(str(user_id), "user", str(container_id),
+                                                         "read")
+
+
+def _holds_owners_rights(db: Database, user_id: str, container_id: str) -> bool:
+    """Does `user_id` already reach every action an owner grant carries on `container_id`, by the
+    light-cone walk? Only then is their creation also their own (`create_workspace_artifact`).
+    The same test Origin applies to a member's creator, so Mantle asks for no grant Origin refuses."""
+    from mantle.attenuation import ACTIONS
+    from mantle.search.mantle.oracle import LightConeGrantVerifier
+
+    if not container_id:
+        return True
+    verifier = LightConeGrantVerifier(db, ttl_s=0)
+    return all(verifier._reaches(str(user_id), "user", str(container_id), a) for a in ACTIONS)
+
+
+@_in_one_batch
 def create_workspace_artifact(
     db: Database,
     user_id: str,
@@ -1212,7 +1341,11 @@ def create_workspace_artifact(
     version in place (pharos `design/architecture.md` §23, "The Commit boundary dissolves into
     mass").
     """
-    get_workspace(db, user_id, workspace_id, required="create")
+    # Create, or Add (fire-and-forget intake: an inbox sender), each standing alone.
+    try:
+        get_workspace(db, user_id, workspace_id, required="create")
+    except HTTPException:
+        get_workspace(db, user_id, workspace_id, required="add")
 
     now = _now_iso()
     # ── the FIRST version of a named lineage IS its root ─────────────────────────────────────
@@ -1245,14 +1378,28 @@ def create_workspace_artifact(
     else:
         context = _mint_member_context(db, artifact_id, workspace_id, content_type, content,
                                        context)
+    # Where a credential's secret may be sent, as its writer names it: fixed now, sealed with it.
+    endpoints = credential_endpoints(content_type, _mc.client_view(context))
+
+    # A writer who holds Add or Create and not Read on the container is given no content key
+    # (architecture §51): what they write is sealed to the container's drop key, and the first
+    # reader re-keys it (`lattice_api.get_artifact`). The artifact is named while it is sealed,
+    # since a drop binds its artifact.
+    from mantle.services import content_crypto as _cc
+    root = root_id or artifact_id
+    from mantle.services.acting_principal import current_acting_principal as _acting_now
+    _now_acting = _acting_now()
+    dropped = (bool(getattr(_now_acting, "narrowed", None))
+               or not _reads(db, user_id, workspace_id))
 
     # Store content in the CAS; update context with content_key.
     resolved_content = content
     cas_ref: Optional[str] = None      # an artifact with no content has no bytes to address
     if content:
-        content_key, resolved_content, cas_ref = _store_content_in_s3(
-            artifact_id, content, context, owner_id=user_id,
-            collection_id=workspace_id, creator_id=user_id)
+        with _cc.content_key_artifact(root):
+            content_key, resolved_content, cas_ref = _store_content_in_s3(
+                artifact_id, content, context, owner_id=user_id,
+                collection_id=workspace_id, creator_id=user_id)
         context = _record_content_address(context, content_key, cas_ref)
 
     artifact = ArtifactEntity(
@@ -1270,8 +1417,12 @@ def create_workspace_artifact(
         name=name,
         description=description,
         content_type=content_type,
+        content_dropped=dropped or None,
+        persona_sealed=_persona_sealed(content_type, root, content, endpoints),
+        credential_endpoints=endpoints,
     )
-    store.create_artifact(db, artifact)
+    with _cc.content_key_artifact(root):
+        store.create_artifact(db, artifact)
 
     # Insert the stable collection_artifacts edge pointing at root_id.
     if order_key is None:
@@ -1287,33 +1438,47 @@ def create_workspace_artifact(
     # artifact, so it survives the artifact being evicted from the collection — a
     # collection is just an artifact with child edges. (The container edge still
     # propagates the collection's grants to OTHER members for sharing; see `origin`.)
-    try:
-        store.upsert_user_collection_grant(
-            db, user_id=user_id, collection_id=artifact.root_id, granted_by=user_id,
-            can_create=True, can_read=True, can_update=True, can_delete=True,
-            can_evict=True, can_invoke=True, can_add=True, can_share=True, can_admin=True,
-        )
-    except Exception:
-        # `warning`, not `debug`: this failure produces a durably unreachable artifact. Most
-        # `logger.debug(... failed)` in this codebase are best-effort notifications — an event that
-        # did not emit, a websocket send, a probe. This is not one of them. Authorization is
-        # grant-based and `services/dependencies.py::check_access` walks grants — `created_by` is
-        # never consulted — so a create whose owner grant failed leaves a row that EXISTS and that
-        # no principal can read, update or contain anything in. Every API surface answers 404.
-        #
-        # An artifact in this state is one row of genuinely probed content answering 404 from
-        # `get_artifact`, indefinitely, because nothing says anything. The 404 cannot tell you
-        # which it is either: `check_access` returns the same code
-        # for "absent" and "present but you hold no grant", deliberately, so it is not an existence
-        # oracle. **This log line is the only place the difference would ever have been visible.**
-        logger.warning("owner grant on create FAILED for %s — the artifact will exist and be "
-                       "unreachable through every API surface", getattr(artifact, "id", "?"),
-                       exc_info=True)
+    #
+    # Only for a creator who already holds the owner's rights on the container (John,
+    # 2026-11-01). A contributor who does not (an inbox's create-only sender, a `contributor`)
+    # gets nothing extra: what they add belongs to the collection's owner, and no grant is asked
+    # of the authority for it.
+    if _holds_owners_rights(db, user_id, workspace_id):
+        try:
+            store.upsert_user_collection_grant(
+                db, user_id=user_id, collection_id=artifact.root_id, granted_by=user_id,
+                can_create=True, can_read=True, can_update=True, can_delete=True,
+                can_evict=True, can_invoke=True, can_add=True, can_share=True, can_admin=True,
+            )
+        except Exception:
+            # `warning`, not `debug`: this failure produces a durably unreachable artifact. Most
+            # `logger.debug(... failed)` in this codebase are best-effort notifications — an event that
+            # did not emit, a websocket send, a probe. This is not one of them. Authorization is
+            # grant-based and `services/dependencies.py::check_access` walks grants — `created_by` is
+            # never consulted — so a create whose owner grant failed leaves a row that EXISTS and that
+            # no principal can read, update or contain anything in. Every API surface answers 404.
+            #
+            # An artifact in this state is one row of genuinely probed content answering 404 from
+            # `get_artifact`, indefinitely, because nothing says anything. The 404 cannot tell you
+            # which it is either: `check_access` returns the same code
+            # for "absent" and "present but you hold no grant", deliberately, so it is not an existence
+            # oracle. **This log line is the only place the difference would ever have been visible.**
+            logger.warning("owner grant on create FAILED for %s — the artifact will exist and be "
+                           "unreachable through every API surface", getattr(artifact, "id", "?"),
+                           exc_info=True)
+
+    if artifact.persona_sealed:
+        # Origin keeps the digests of the copies its writer made (review 22, F2), from a subject
+        # who may update the credential now (review 24), which Origin can tell only once the
+        # creation edge and the owner grant are written, so they go after both.
+        from mantle.services.credential_sealing import record_at_origin
+        record_at_origin(root, artifact.persona_sealed, endpoints)
 
     # WHERE index: eager (default) or deferred to first access (lazy). A latent
     # write skips indexing and carries no materialization marker (WHO+WHEN only).
     from mantle.search.lazy import resolve_lazy
-    if enqueue_index and not resolve_lazy(index):
+    # A drop is indexed by its first reader, as that reader: its writer cannot open it.
+    if enqueue_index and not dropped and not resolve_lazy(index):
         try:
             from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
             enqueue_index_artifact(
@@ -1674,6 +1839,7 @@ def update_artifact(
     if description is not None and description != target.description:
         target.description = description
         dirty = True
+    resealed_now = False
     if context is not None and context != target.context:
         target.context = context
         dirty = True
@@ -1692,7 +1858,7 @@ def update_artifact(
         if content:
             content_key, stored_content, cas_ref = _store_content_in_s3(
                 target.id, content, target.context, owner_id=target.created_by,
-                collection_id=target.collection_id)
+                collection_id=target.content_key_scope or target.collection_id)
             target.content_ref = cas_ref or target.content_ref
             target.context = _record_content_address(target.context, content_key, cas_ref)
             target.content = stored_content
@@ -1700,6 +1866,13 @@ def update_artifact(
             target.content = content
         # The mint's `addressing` follows the bytes (`mint_context.readdressed`).
         target.context = _mc.readdressed(target.context, content)
+        # A credential's new secret is sealed again to its personas, so the old copy is never
+        # served again (review 23, M3).
+        resealed = _persona_sealed(target.content_type, target.root_id or target.id, content,
+                                   getattr(target, "credential_endpoints", None))
+        if resealed is not None or getattr(target, "persona_sealed", None):
+            target.persona_sealed = resealed
+            resealed_now = True
         dirty = True
     if not dirty and vector is None:
         return target
@@ -1712,6 +1885,14 @@ def update_artifact(
     #: A failed persist still reaches the caller: `put_artifact` raises and nothing here catches
     #: it.
     store.update_artifact(db, target)
+    if resealed_now and target.persona_sealed:
+        # Its new seals go to Origin on the updater's own credential. Origin keeps them from a
+        # subject who may update the credential now (review 24), so an updater Origin would refuse
+        # leaves no record that matches, and the credential gets no verdict until one who may
+        # writes it.
+        from mantle.services.credential_sealing import record_at_origin
+        record_at_origin(target.root_id or target.id, target.persona_sealed,
+                         getattr(target, "credential_endpoints", None))
 
     if reindex:
         try:
@@ -1734,6 +1915,7 @@ def update_artifact(
     return target
 
 
+@_in_one_batch
 def upsert_identity_member(
     db: Database,
     user_id: str,
@@ -1782,6 +1964,12 @@ def upsert_identity_member(
     get_workspace(db, user_id, workspace_id, required="create")
 
     target = store.get_latest_live_artifact(db, root_id, workspace_id)
+    if target is None and store.get_raw_artifact(db, root_id) is not None and not any(
+            (v.get("collection_id") == workspace_id) for v in (db.artifacts.versions_of(root_id) or [])):
+        # The identity is a root that lives in another container: writing here would leave a
+        # version row under a root this container does not hold.
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            "this identity names an artifact in another container")
 
     if target is None:
         created = create_workspace_artifact(
@@ -1813,7 +2001,7 @@ def upsert_identity_member(
         if content:
             content_key, stored_content, cas_ref = _store_content_in_s3(
                 target.id, content, target.context, owner_id=target.created_by,
-                collection_id=target.collection_id)
+                collection_id=target.content_key_scope or target.collection_id)
             target.content_ref = cas_ref or target.content_ref
             target.context = _record_content_address(target.context, content_key, cas_ref)
             target.content = stored_content

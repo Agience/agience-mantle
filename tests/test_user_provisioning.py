@@ -4,7 +4,6 @@ stubbed (they loop over live DB state and are covered by their own paths).
 """
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest

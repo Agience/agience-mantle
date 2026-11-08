@@ -46,6 +46,11 @@ def _test_master_key(monkeypatch):
         content_crypto, "_default_master_key",
         lambda principal_id, collection_id=None, *, may_create=False, creator_id=None: b"\x01" * 32,
     )
+    # Collection-scoped content is keyed under the collection's own key; stubbed the same way.
+    monkeypatch.setattr(
+        content_crypto, "_default_collection_key",
+        lambda principal_id, collection_id, *, may_create=False, creator_id=None: b"\x02" * 32,
+    )
 
 
 @pytest.fixture()

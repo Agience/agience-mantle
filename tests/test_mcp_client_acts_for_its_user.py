@@ -30,6 +30,8 @@ does the work on behalf of, and `actor` names the machine either way.
 """
 from __future__ import annotations
 
+import time
+
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -49,7 +51,7 @@ def _mcp_payload(**overrides) -> dict:
     base = {
         "sub": USER,
         "aud": CLIENT,
-        "iss": AUTHORITY_ISSUER,
+        "iss": AUTHORITY_ISSUER, "iat": int(time.time()),
         "principal_type": "mcp_client",
         "scopes": ["read"],
     }
@@ -249,7 +251,7 @@ class TestEveryOtherPrincipalTypeIsUnchanged:
     def test_a_delegation_still_normalizes_to_the_user_with_its_server_as_actor(self):
         """The precedent this change followed, unchanged by having followed it."""
         ctx = _resolve({"sub": "user-42", "aud": "agience-server-astra",
-                        "iss": AUTHORITY_ISSUER, "act": {"sub": "agience-server-astra"},
+                        "iss": AUTHORITY_ISSUER, "iat": int(time.time()), "act": {"sub": "agience-server-astra"},
                         "principal_type": "delegation", "host_id": "host-abc"})
 
         assert (ctx.principal_id, ctx.principal_type, ctx.user_id, ctx.actor) == (

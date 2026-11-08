@@ -51,7 +51,6 @@ _PATHS = {(m, r.path) for r in _routes() for m in r.methods}
 @pytest.mark.parametrize("method,path", [
     ("POST", "/artifacts/recall"),
     ("GET", "/system/issuers"),
-    ("POST", "/system/issuers"),
     ("DELETE", "/system/issuers/{artifact_id}"),
     ("GET", "/system/users"),
     ("POST", "/system/seed"),

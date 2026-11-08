@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agience-mantle"
-version = "0.1.10"
+version = "0.1.11"
 description = "Agience Mantle — the standalone data store: SQLite + encrypted content-addressed filesystem, artifacts/collections with immutable version lineage, CRUDEASIO access grants, and a Merkle-synced mesh. Runs with zero external database processes."
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -116,7 +116,7 @@ lexical = []
 # The semantic arm names prism here rather than relying on a dev workspace's editable install to
 # satisfy it. The base install is unaffected: `db/test_embeddable_surface.py` holds by AST scan that
 # the store subtree has no sibling-package imports.
-semantic = ["numpy>=1.24", "agience-prism>=0.1.5"]
+semantic = ["numpy>=1.24", "agience-prism>=0.1.9"]
 
 # Both arms together. `[lexical]` alone is the lighter option for a consumer that needs encrypted
 # term search without the vector arm's weight.
@@ -148,7 +148,9 @@ service = [
     "agience-mantle[s3,search]",
     # Distribution `agience-prism`; import name `prism`; GitHub repo `agience-prism-py`.
     # 0.1.8: threshold master-key custody splits with `prism.trust.shamir`, introduced there.
-    "agience-prism>=0.1.8",
+    # 0.1.9: the ledger's entry kinds, `shamir.shares_through` and the use verdict, which shipped
+    # after the tagged 0.1.8.
+    "agience-prism>=0.1.9",
     # Threshold master-key custody seals each escrow share to the operator's age recipient
     # (`search/mantle/threshold_custody.py`); pyrage binds the reference Rust implementation.
     "pyrage>=1.2",
@@ -195,7 +197,7 @@ service = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=1.0",
-    "agience-prism>=0.1.8",
+    "agience-prism>=0.1.9",
     "pyrage>=1.2",
     "threadpoolctl>=3.0",
 ]

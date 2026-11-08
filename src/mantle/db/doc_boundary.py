@@ -40,6 +40,8 @@ class ContentDecryptionError(RuntimeError):
 #: recorded root is edited fails to authenticate rather than decrypting under the
 #: attacker's choice.
 CONTENT_KEY_PRINCIPAL = "content_key_principal"
+#: The collection a member's content is keyed under: its creation parent, stamped once.
+CONTENT_KEY_SCOPE = "content_key_scope"
 
 #: Sealing is the default and structure is the named exception (John, 2026-10-29: "everything related
 #: to content is encrypted; a grant is the ability to decrypt"). Every context key an artifact carries
@@ -307,9 +309,19 @@ def content_key_scope(doc: dict) -> str:
     on it to `(artifact_id, artifact_id)`, so naming the artifact is what lets a grantee's own grant
     reach the key.
 
+    The collection is the creation parent, stamped on the row when it is created
+    (`CONTENT_KEY_SCOPE`), because reach follows the creation edge: a move is secondary
+    containment, so the content stays under the key of the collection it was made in, and readers
+    of the move target do not open it unless they reach the artifact. A row written before the
+    stamp falls back to `collection_id`, the collection it was created in for every row a move has
+    not touched.
+
     Server-derived, never caller-supplied — every value comes off the stored doc, so a caller
     cannot nominate the scope its key is checked against.
     """
+    stamped = doc.get(CONTENT_KEY_SCOPE)
+    if stamped:
+        return stamped
     coll = doc.get("collection_id")
     if coll:
         return coll
@@ -584,7 +596,7 @@ def emit_artifact_change(entity, event_name: str) -> None:
 
 __all__ = [
     "ContentEncryptionError", "ContentDecryptionError",
-    "CONTENT_KEY_PRINCIPAL", "ORIGIN_ROOT",
+    "CONTENT_KEY_PRINCIPAL", "CONTENT_KEY_SCOPE", "ORIGIN_ROOT",
     "CREATED", "UPDATED", "DELETED", "CHANGE_EVENTS",
     "content_key_principal", "content_key_scope", "encrypt_artifact_content", "decrypt_artifact_content",
     "emit_artifact_change",

@@ -39,15 +39,17 @@ def test_a_share_is_fetched_with_mantle_s_service_token():
         seen["path"] = req.url.raw_path.decode()
         return httpx.Response(200, json={"principal_id": "a/b", "x": 2, "y": "AA==", "kcv": "k"})
 
-    assert _client(handler).get_share("a/b") == {"x": 2, "y": "AA==", "kcv": "k"}
+    # A release that says nothing of `pending` reads as pending (review 29, L1).
+    assert _client(handler).get_share("a/b", credential="c") == {"x": 2, "y": "AA==", "kcv": "k",
+                                                                 "pending": True}
     assert seen == {"auth": "Bearer jwt-for-origin", "path": "/internal/key-shares/a%2Fb"}
 
 
 def test_each_token_is_bound_to_its_call():
     ok = lambda r: httpx.Response(200, json={"x": 2, "y": "AA==", "kcv": "k", "outcome": "stored"})  # noqa: E731
     c = _client(ok)
-    c.get_share("p-1")
-    c.get_share("p-1")
+    c.get_share("p-1", credential="c")
+    c.get_share("p-1", credential="c")
     c.put_share("p-2", {"x": 2, "y": "AA==", "kcv": "k"})
     g1, g2, p = SIGNED
     assert g1["ttl"] <= 60 and g1["aud"] == "origin"
@@ -57,14 +59,14 @@ def test_each_token_is_bound_to_its_call():
 
 
 def test_only_an_explicit_absent_body_is_absent():
-    assert _client(lambda r: httpx.Response(404, json={"absent": True})).get_share("p") is None
+    assert _client(lambda r: httpx.Response(404, json={"absent": True})).get_share("p", credential="c") is None
     for resp in (httpx.Response(404), httpx.Response(404, json={"detail": "Not Found"}),
                  httpx.Response(404, text="<html>not found</html>")):
         with pytest.raises(oc.CustodianUnavailable):
-            _client(lambda r, x=resp: x).get_share("p")
+            _client(lambda r, x=resp: x).get_share("p", credential="c")
     for status in (401, 403, 500, 503):
         with pytest.raises(oc.CustodianUnavailable):
-            _client(lambda r, s=status: httpx.Response(s)).get_share("p")
+            _client(lambda r, s=status: httpx.Response(s)).get_share("p", credential="c")
 
 
 def test_an_unreachable_origin_raises():
@@ -72,7 +74,7 @@ def test_an_unreachable_origin_raises():
         raise httpx.ConnectError("refused", request=req)
 
     with pytest.raises(oc.CustodianUnavailable):
-        _client(handler).get_share("p")
+        _client(handler).get_share("p", credential="c")
     with pytest.raises(oc.CustodianUnavailable):
         _client(handler).put_share("p", {"x": 2, "y": "AA==", "kcv": "k"})
 

@@ -66,10 +66,16 @@ _OPERATOR_SLUG = "platform-email-sender"
 _AUTHORIZER_SLUG = "platform-email-authorizer"
 _CLIENT_SECRET_SLUG = "platform-email-client-secret"
 _REFRESH_TOKEN_SLUG = "platform-email-refresh-token"
+#: The platform collection the two credentials are members of (review 26, M1). The system
+#: principal holds Admin on it, so Origin counts a credential whose creation edge from it the
+#: cutover bootstrap stated as the system's (`use_verdict.system_written`), and a seed may record
+#: its seals.
+_CREDENTIALS_SLUG = "platform-email-credentials"
 
 _OPERATOR_CT = "application/vnd.agience.operator+json"
 _AUTHORIZER_CT = "application/vnd.agience.authorizer+json"
 _CREDENTIAL_CT = CREDENTIAL_CONTENT_TYPE
+COLLECTION_CT = "application/vnd.agience.collection+json"
 
 _GMAIL_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 _GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
@@ -162,8 +168,10 @@ def ensure_platform_email_sender(db: Database) -> bool:
     authz_id = derive_uuid(ns, _NS, _AUTHORIZER_SLUG)
     cs_id = derive_uuid(ns, _NS, _CLIENT_SECRET_SLUG)
     rt_id = derive_uuid(ns, _NS, _REFRESH_TOKEN_SLUG)
+    coll_id = derive_uuid(ns, _NS, _CREDENTIALS_SLUG)
     for slug, uid in ((_OPERATOR_SLUG, op_id), (_AUTHORIZER_SLUG, authz_id),
-                      (_CLIENT_SECRET_SLUG, cs_id), (_REFRESH_TOKEN_SLUG, rt_id)):
+                      (_CLIENT_SECRET_SLUG, cs_id), (_REFRESH_TOKEN_SLUG, rt_id),
+                      (_CREDENTIALS_SLUG, coll_id)):
         register_id(slug, uid)
 
     # Every write below is made AS the operator, because the operator is the artifacts'
@@ -175,7 +183,7 @@ def ensure_platform_email_sender(db: Database) -> bool:
     try:
         with acting_as(operator, principal_type="user", scope="platform.email-provisioning"):
             _provision(db, operator, op_id, authz_id, cs_id, rt_id,
-                       client_id=client_id, client_secret=client_secret,
+                       coll_id=coll_id, client_id=client_id, client_secret=client_secret,
                        refresh_token=refresh_token, sender=sender)
         logger.info("platform_email: provisioned email operator %s (sender=%s, owner=%s)",
                     op_id, sender or "(unset)", operator)
@@ -188,8 +196,17 @@ def ensure_platform_email_sender(db: Database) -> bool:
 def _provision(
     db: Database, operator: str, op_id: str, authz_id: str, cs_id: str, rt_id: str,
     *, client_id: str, client_secret: str, refresh_token: str, sender: str,
+    coll_id: str = "",
 ) -> None:
     """Write the graph. Runs inside the operator's acting context (see the caller)."""
+    # 0. The platform collection the credentials are members of (review 26, M1).
+    if coll_id:
+        _ensure_artifact(
+            db, coll_id, content_type=COLLECTION_CT, name="Platform Email credentials",
+            description="The platform mail sender's two credentials.",
+            context={"content_type": COLLECTION_CT, "title": "Platform Email credentials"},
+            content="", owner=operator,
+        )
     # 1. Credential artifacts. The value IS the content, so the envelope encrypts it
     #    at rest; it is re-written every run so rotated creds self-heal. `context` is
     #    plaintext and carries only what is safe to read without the grant.
@@ -209,6 +226,16 @@ def _provision(
                  "is_default": True},
         content=_credential_content(refresh_token), owner=operator,
     )
+
+    # 1b. Each credential is a member of the platform collection, by its creation edge. A root
+    #     that has none takes this one (`add_artifact_to_collection` with `origin` left to the
+    #     store), so a credential first written as a root is placed here at the next start. Made
+    #     before the cutover's bootstrap, which states the edge with no adder: Origin then counts
+    #     the credential as the system principal's, since the system principal holds Admin on the
+    #     collection (`use_verdict.system_written`). Idempotent.
+    if coll_id:
+        for member in (cs_id, rt_id):
+            db_add_edge(db, coll_id, member)
 
     # 2. Authorizer — config only; references the two credential artifacts by id.
     authz_config = {
@@ -277,14 +304,24 @@ def _provision(
     def flags(grantee: str, resource: str) -> tuple[bool, bool]:
         if grantee == operator:
             return True, True
+        if resource == coll_id:
+            return False, False
         return resource in (op_id, authz_id), True
 
+    # The system principal holds Admin on the credentials' collection and nothing more there: no
+    # Read, so it opens neither secret (Admin releases no content key). That Admin is what makes
+    # the credentials count as the system's for a seed's seal record (review 26, M1); it is also
+    # an Admin that could grant, and every grant it makes is alerted at Origin.
+    resources = (op_id, authz_id, cs_id, rt_id) + ((coll_id,) if coll_id else ())
     for grantee in grantees:
-        for resource in (op_id, authz_id, cs_id, rt_id):
+        for resource in resources:
             read, invoke = flags(grantee, resource)
             db_upsert_user_collection_grant(
                 db, user_id=grantee, collection_id=resource, granted_by=operator,
                 can_read=read, can_invoke=invoke,
+                # The operator rotates the secrets (from the environment, each start), so their
+                # record of the seals stands only while they may Update them (review 26, M1).
+                can_update=(grantee == operator),
                 # ⛔ THE OPERATOR NEEDS `can_admin` OR THIS GRAPH CAN NEVER BE CHANGED.
                 #
                 # `grant_service.can_admin` is "A GRANT with can_admin — no creator fast-path",
@@ -302,7 +339,7 @@ def _provision(
                 # ⚠ THE OPERATOR ONLY. The system principal keeps read+invoke — it performs
                 # background sends, which needs neither. Whoever may widen access to a credential
                 # should be the person, not the automation that uses it.
-                can_admin=(grantee == operator),
+                can_admin=(grantee == operator or (resource == coll_id and bool(coll_id))),
                 name="Platform email sender",
             )
 

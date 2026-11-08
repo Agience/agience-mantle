@@ -72,7 +72,9 @@ def narrower(oracle, posting_store) -> TokenNarrower:
 
 @pytest.fixture
 def owner_key(oracle: OracleService) -> bytes:
-    return oracle.derive_sse_key("owner-A", self_request("owner-A", "update"))
+    # Postings are keyed per collection (the collection key); these tests index into `col-1`.
+    return oracle.derive_sse_key("owner-A", self_request("owner-A", "update"),
+                                 collection_id="col-1")
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +125,8 @@ def _read_manifest(
     principal_id: str,
     artifact_id: str,
 ) -> list[str]:
-    blob = posting_store.get_manifest(principal_id, artifact_id)
+    # Manifests are kept per collection (`SseIndexer._manifest_slot`); these tests index into col-1.
+    blob = posting_store.get_manifest(principal_id, f"col-1~{artifact_id}")
     if blob is None:
         return []
     key = posting.derive_manifest_key(owner_key, artifact_id)
@@ -142,14 +145,14 @@ class TestIndexArtifactBasic:
         n = indexer.index_artifact("owner-A", "col-1", "art-1", {}, self_request("owner-A", "update"))
         assert n == 0
         assert posting_store.list_tokens_for_owner("owner-A") == []
-        assert posting_store.get_manifest("owner-A", "art-1") is None
+        assert posting_store.get_manifest("owner-A", "col-1~art-1") is None
 
     def test_empty_text_field_skipped(self, indexer, posting_store):
         n = indexer.index_artifact(
             "owner-A", "col-1", "art-1", {"title": ""}
         , self_request("owner-A", "update"))
         assert n == 0
-        assert posting_store.get_manifest("owner-A", "art-1") is None
+        assert posting_store.get_manifest("owner-A", "col-1~art-1") is None
 
     def test_unknown_field_ignored(self, indexer, posting_store):
         n = indexer.index_artifact(
@@ -409,7 +412,8 @@ class TestReindex:
 
 class TestRemoveArtifact:
     def test_remove_unknown_artifact_is_noop(self, indexer, posting_store):
-        n = indexer.remove_artifact("owner-A", "art-not-indexed", self_request("owner-A", "update"))
+        n = indexer.remove_artifact("owner-A", "art-not-indexed", self_request("owner-A", "update"),
+                                collection_id="col-1")
         assert n == 0
 
     def test_removes_all_traces(
@@ -420,15 +424,16 @@ class TestRemoveArtifact:
             {"title": "alpha beta", "content": "the quick brown"},
         self_request("owner-A", "update"))
         # Verify present.
-        assert posting_store.get_manifest("owner-A", "art-1") is not None
+        assert posting_store.get_manifest("owner-A", "col-1~art-1") is not None
         assert len(posting_store.list_tokens_for_owner("owner-A")) > 0
 
         # Remove.
-        n = indexer.remove_artifact("owner-A", "art-1", self_request("owner-A", "update"))
+        n = indexer.remove_artifact("owner-A", "art-1", self_request("owner-A", "update"),
+                                collection_id="col-1")
         assert n > 0  # touched at least one posting list
 
         # Manifest gone, posting lists empty.
-        assert posting_store.get_manifest("owner-A", "art-1") is None
+        assert posting_store.get_manifest("owner-A", "col-1~art-1") is None
         assert posting_store.list_tokens_for_owner("owner-A") == []
 
     def test_remove_one_keeps_other_artifacts(
@@ -442,10 +447,11 @@ class TestRemoveArtifact:
         self_request("owner-A", "update"))
 
         # Remove art-1 only.
-        indexer.remove_artifact("owner-A", "art-1", self_request("owner-A", "update"))
+        indexer.remove_artifact("owner-A", "art-1", self_request("owner-A", "update"),
+                                collection_id="col-1")
 
         # art-2's manifest still there.
-        assert posting_store.get_manifest("owner-A", "art-2") is not None
+        assert posting_store.get_manifest("owner-A", "col-1~art-2") is not None
 
         # Posting lists referencing art-2 still present.
         all_tokens = posting_store.list_tokens_for_owner("owner-A")
@@ -486,7 +492,8 @@ class TestMultiArtifact:
         self_request("owner-A", "update"))
 
         # Remove art-1 — the shared "alpha" posting list keeps art-2.
-        indexer.remove_artifact("owner-A", "art-1", self_request("owner-A", "update"))
+        indexer.remove_artifact("owner-A", "art-1", self_request("owner-A", "update"),
+                                collection_id="col-1")
         from mantle.search.mantle.sse.tokenizer import tokenize
         stem = tokenize("alpha")[0]
         tok = bt.blind_token(owner_key, bt.FIELD_TITLE, stem)
@@ -507,17 +514,14 @@ class TestMultiArtifact:
         self_request("owner-A", "update"))
         from mantle.search.mantle.sse.tokenizer import tokenize
         stem = tokenize("alpha")[0]
-        tok = bt.blind_token(owner_key, bt.FIELD_TITLE, stem)
-        entries = _read_posting(posting_store, owner_key, "owner-A", tok)
-        # The manifest is keyed by artifact_id alone, with no collection info,
-        # so a second index_artifact call for the same artifact_id is treated
-        # as a re-index: the re-index path strips entries using the NEW
-        # collection_id, so only the latest collection's entry survives.
-        # The contract is "one artifact lives in one collection"; moving an
-        # artifact between collections requires remove_artifact followed by
-        # index_artifact into the new one — the caller is responsible for that.
-        ids_collections = {(e["artifact_id"], e["collection_id"]) for e in entries}
-        assert ("art-1", "col-2") in ids_collections
+        # Postings are keyed per collection: each collection's index is under its own key, so
+        # the artifact is filed under a different token in each, and one collection's key reads
+        # its own entry and nothing of the other's.
+        col2_key = TestSlotBindingIsWired._owner_key(indexer._oracle, collection="col-2")
+        for key, coll in ((owner_key, "col-1"), (col2_key, "col-2")):
+            tok = bt.blind_token(key, bt.FIELD_TITLE, stem)
+            entries = _read_posting(posting_store, key, "owner-A", tok)
+            assert {(e["artifact_id"], e["collection_id"]) for e in entries} == {("art-1", coll)}
 
 
 # ---------------------------------------------------------------------------
@@ -568,7 +572,7 @@ class TestAtRestLeakage:
             blob = posting_store.get_posting("owner-A", tok)
             if blob is not None:
                 all_blobs.append(blob)
-        manifest = posting_store.get_manifest("owner-A", "art-1")
+        manifest = posting_store.get_manifest("owner-A", "col-1~art-1")
         if manifest is not None:
             all_blobs.append(manifest)
 
@@ -615,6 +619,15 @@ def _legacy_unbound_blob(plaintext: bytes, key: bytes) -> bytes:
     return nonce + AESGCM(key).encrypt(nonce, plaintext, None)
 
 
+def _opens(posting_store, key, token) -> bool:
+    try:
+        posting.unpack_posting(posting_store.get_posting("owner-A", token),
+                               posting.derive_posting_key(key, token), allow_unbound=True)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _seed_corpus(indexer: SseIndexer, owner: str = "owner-A") -> None:
     """A small corpus spanning two collections and two fields."""
     indexer.index_artifact(owner, "col-1", "art-1", {"title": "encryption library"},
@@ -637,8 +650,9 @@ def _narrow(narrower: TokenNarrower, text: str, scope) -> dict:
 
 class TestSlotBindingIsWired:
     @staticmethod
-    def _owner_key(oracle, owner="owner-A"):
-        return oracle.derive_sse_key(owner, self_request(owner, "update"))
+    def _owner_key(oracle, owner="owner-A", collection="col-1"):
+        return oracle.derive_sse_key(owner, self_request(owner, "update"),
+                                     collection_id=collection)
 
     @staticmethod
     def _title_token(owner_key, term):
@@ -679,7 +693,7 @@ class TestSlotBindingIsWired:
                 allow_unbound=False)
 
         # --- manifest -----------------------------------------------------
-        mblob = posting_store.get_manifest("owner-A", "art-1")
+        mblob = posting_store.get_manifest("owner-A", "col-1~art-1")
         mkey = posting.derive_manifest_key(owner_key, "art-1")
         with pytest.raises(posting.PostingTampered):
             posting.unpack_manifest(mblob, mkey)
@@ -756,7 +770,9 @@ class TestSlotBindingIsWired:
         this test is what fails — which is the point: enabling binding must not require one.
         """
         _seed_corpus(indexer)
-        owner_key = self._owner_key(oracle)
+        # Each collection's postings are under its own key.
+        keys = {c: self._owner_key(oracle, collection=c) for c in ("col-1", "col-2")}
+        homes = {"art-1": "col-1", "art-2": "col-1", "art-3": "col-2", "art-4": "col-2"}
         scope = [("owner-A", "col-1"), ("owner-A", "col-2")]
 
         expected = _narrow(narrower, "encryption library", scope)
@@ -767,7 +783,8 @@ class TestSlotBindingIsWired:
         # before either change looks like — pre-binding AND pre-entry-layout — so this proves
         # both dual-reads at once.
         for token in list(posting_store.list_tokens_for_owner("owner-A")):
-            pkey = posting.derive_posting_key(owner_key, token)
+            cid0 = posting_store.get_entries("owner-A", token)[0][1]
+            pkey = posting.derive_posting_key(keys[cid0], token)
             entries = [
                 posting.unpack_entry(
                     blob, pkey,
@@ -779,19 +796,21 @@ class TestSlotBindingIsWired:
             posting_store.put_posting("owner-A", token, _legacy_unbound_blob(
                 posting.serialize_entries(entries), pkey))
 
-        for artifact_id in ("art-1", "art-2", "art-3", "art-4"):
-            mkey = posting.derive_manifest_key(owner_key, artifact_id)
+        for artifact_id, home in homes.items():
+            mkey = posting.derive_manifest_key(keys[home], artifact_id)
+            slot = f"{home}~{artifact_id}"
             tokens = posting.unpack_manifest(
-                posting_store.get_manifest("owner-A", artifact_id), mkey,
+                posting_store.get_manifest("owner-A", slot), mkey,
                 aad=posting.manifest_aad("owner-A", artifact_id))
-            posting_store.put_manifest("owner-A", artifact_id, _legacy_unbound_blob(
+            posting_store.put_manifest("owner-A", slot, _legacy_unbound_blob(
                 posting.serialize_manifest(tokens), mkey))
 
         # Sanity: the corpus really is in the old form now — it opens with NO aad at all.
         any_token = posting_store.list_tokens_for_owner("owner-A")[0]
+        any_key = next(k for k in keys.values() if _opens(posting_store, k, any_token))
         assert posting.unpack_posting(
             posting_store.get_posting("owner-A", any_token),
-            posting.derive_posting_key(owner_key, any_token),
+            posting.derive_posting_key(any_key, any_token),
             allow_unbound=False) is not None
 
         assert _narrow(narrower, "encryption library", scope) == expected
@@ -812,7 +831,7 @@ class TestSlotBindingIsWired:
         mkey = posting.derive_manifest_key(owner_key, "art-1")
         aad = posting.manifest_aad("owner-A", "art-1")
         tokens = posting.unpack_manifest(
-            posting_store.get_manifest("owner-A", "art-1"), mkey, aad=aad)
+            posting_store.get_manifest("owner-A", "col-1~art-1"), mkey, aad=aad)
 
         import json
         legacy = json.dumps(
@@ -823,13 +842,13 @@ class TestSlotBindingIsWired:
             "owner-A", "art-1", posting.encrypt_blob(legacy, mkey, aad=aad))
 
         assert posting.unpack_manifest(
-            posting_store.get_manifest("owner-A", "art-1"), mkey, aad=aad) == sorted(tokens)
+            posting_store.get_manifest("owner-A", "col-1~art-1"), mkey, aad=aad) == sorted(tokens)
 
         # And the indexer's own reader — the re-index path — is unbothered by it.
         indexer.index_artifact("owner-A", "col-1", "art-1", {"title": "encryption library"},
                                self_request("owner-A", "update"))
         assert posting.unpack_manifest(
-            posting_store.get_manifest("owner-A", "art-1"), mkey, aad=aad) == sorted(tokens)
+            posting_store.get_manifest("owner-A", "col-1~art-1"), mkey, aad=aad) == sorted(tokens)
 
     def test_a_legacy_whole_slot_blob_converts_on_its_next_write(
         self, oracle, posting_store, indexer,

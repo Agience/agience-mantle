@@ -110,6 +110,12 @@ def create_issuer_artifact(
     on bad input, RuntimeError if the system principal is unavailable."""
     if not issuer:
         raise ValueError("issuer is required")
+    from mantle.services.oidc import _manifest_pinned_names
+    if issuer in _manifest_pinned_names() or role == "platform":
+        # The manifest pins Origin's issuer and every platform service; nothing stored may
+        # name one (review 12, H1).
+        raise ValueError("this issuer is pinned by the authority manifest; it is never an "
+                         "issuer artifact")
     if not jwks and not jwks_uri:
         raise ValueError("jwks or jwks_uri is required")
     if role not in ("external", "platform"):
@@ -200,23 +206,11 @@ def seed_platform_issuer_artifacts(db: Any) -> int:
             existing.add(ctx["issuer"])
 
     from mantle import config
-    from mantle.services.oidc import _read_authority_manifest
 
+    # The manifest's anchors are read from the manifest alone and never copied into the store, so
+    # no copy outlives a rotation (review 12, H2). Only the configured external issuers get an
+    # artifact, which keeps each live until revoked.
     desired: List[Dict[str, Any]] = []
-    manifest = _read_authority_manifest()
-    if manifest:
-        anchors = manifest.get("trust_anchors", {}) or {}
-        for name, anchor in anchors.items():
-            jwks = anchor.get("jwks") if isinstance(anchor, dict) else None
-            if isinstance(jwks, dict):
-                desired.append({"issuer": name, "jwks": jwks, "role": "platform"})
-        # Origin-signed USER tokens carry iss = AUTHORITY_ISSUER (a URL), verified
-        # against origin's JWKS.
-        origin_jwks = (anchors.get("origin") or {}).get("jwks")
-        auth_issuer = getattr(config, "AUTHORITY_ISSUER", None)
-        if isinstance(origin_jwks, dict) and auth_issuer:
-            desired.append({"issuer": auth_issuer, "jwks": origin_jwks, "role": "platform"})
-
     for d in getattr(config, "TRUSTED_ISSUERS", []) or []:
         if isinstance(d, dict) and d.get("issuer"):
             desired.append({**d, "role": d.get("role", "external")})

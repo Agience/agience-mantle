@@ -48,6 +48,7 @@ from mantle.db.constants import state_of
 #: failure where absorbing it produces a WRONG answer rather than a conservative one. Every
 #: `except Exception` around an `edges_of` call in this module re-raises this first.
 from mantle.db.edge import EdgesTruncated
+from mantle.db import reach_journal as _journal
 # Stdlib-only module (it says so), so importing it here adds no cycle. Needed as an
 # `except` clause, which cannot be satisfied by a lazy in-function import.
 from mantle.services.acting_principal import KeyCustodyDenied as _KeyCustodyDenied
@@ -120,6 +121,18 @@ class LatticeDatabase:
         self.origin = L.origin
 
 
+def refuse_default_under_pytest(explicit: bool) -> None:
+    """Under pytest, the node's default store is never opened (review 23): it is the developer's
+    real one, under `<repo>/.data/`. A test names its store, with `MANTLE_LATTICE_PATH` or a path,
+    and a test that names none is refused here rather than reaching it by accident, whether or not
+    it runs under this repo's pytest config."""
+    import sys
+    if not explicit and "pytest" in sys.modules:
+        raise RuntimeError(
+            "refusing to open the default store under pytest: set MANTLE_LATTICE_PATH, or pass a "
+            "path, to a store of the test's own")
+
+
 def open_database(path: Optional[str] = None, *, origin: Optional[str] = None) -> LatticeDatabase:
     """Open (or create) standalone Mantle's database. Env-configurable, zero external processes.
 
@@ -127,6 +140,7 @@ def open_database(path: Optional[str] = None, *, origin: Optional[str] = None) -
     key, nonce secret, issuer, and URIs it already logs — the path that decides what this node
     actually serves is as visible at boot as everything else that matters.
     """
+    refuse_default_under_pytest(bool(path or os.getenv("MANTLE_LATTICE_PATH")))
     raw = path or os.getenv("MANTLE_LATTICE_PATH", str(DEFAULT_LATTICE_PATH))
     resolved = os.path.abspath(os.path.expanduser(str(raw)))
     origin = origin or os.getenv("MANTLE_ORIGIN") or os.getenv("EMBER_NODE_ID") or "mantle"
@@ -198,6 +212,16 @@ def to_lattice_doc(entity: Any) -> Dict[str, Any]:
             # Read but not opened on this node (`from_lattice_doc`): written back as it was, and a
             # write that sets a sealed field is refused rather than allowed to overwrite it.
             doc[node_seal.SEALED] = kept
+        # The authority ledger carries an invite's target as a digest (`reach_journal`), taken
+        # here while the address is still in hand: the stored field is sealed below.
+        from mantle.db import reach_journal
+        if doc.get("grantee_type") == "invite" and doc.get("target_entity"):
+            doc["target_digest"] = reach_journal.target_digest(doc.get("target_entity_type"),
+                                                               doc.get("target_entity"))
+        elif doc.get("grantee_type") == "invite" and getattr(entity, "target_digest", None):
+            # An invite applied from Origin's ledger carries its target as the digest alone (no
+            # address ever reaches Mantle): kept as Origin stated it (review 19).
+            doc["target_digest"] = entity.target_digest
         node_seal.seal_fields(doc, GRANT_SEALED_FIELDS)
     return doc
 
@@ -250,14 +274,55 @@ def _stamp_origin_root(db: LatticeDatabase, entity: ArtifactEntity) -> None:
 
 def create_artifact(db: LatticeDatabase, entity: ArtifactEntity) -> ArtifactEntity:
     _stamp_origin_root(db, entity)
+    # The content key follows the creation parent, fixed now: a later move does not re-key.
+    # Never taken from the caller: always the collection it is created in.
+    entity.content_key_scope = getattr(entity, "collection_id", None) or None
     db.artifacts.put_artifact(to_lattice_doc(entity))
     _boundary.emit_artifact_change(entity, "artifact.created")
     return entity
 
 
 def get_artifact(db: LatticeDatabase, artifact_id: str) -> Optional[ArtifactEntity]:
-    """Fetch a single artifact version by its id (version id)."""
-    return from_lattice_doc(db.artifacts.get_artifact(artifact_id), ArtifactEntity)
+    """Fetch a single artifact version by its id (version id). A drop (`content_dropped`) that
+    this caller can read is re-keyed under its collection key, as this caller, the first time,
+    and then indexed as this caller (`_rekey_drop`)."""
+    raw = db.artifacts.get_artifact(artifact_id)
+    entity = from_lattice_doc(raw, ArtifactEntity)
+    if raw and raw.get("content_dropped") and entity is not None and not _REKEYING.get():
+        _rekey_drop(db, raw, entity)
+    return entity
+
+
+import contextvars as _contextvars  # noqa: E402
+
+_REKEYING: _contextvars.ContextVar[bool] = _contextvars.ContextVar("lattice_rekeying_drop",
+                                                                   default=False)
+
+
+def _rekey_drop(db: LatticeDatabase, raw: dict, entity: Any) -> None:
+    """The reader who just opened a drop re-keys it under the collection key, and indexes it as
+    themselves. Failing here leaves the drop as it was, for the next reader."""
+    token = _REKEYING.set(True)
+    try:
+        from mantle.system import rekey_collections as rk
+
+        outcome = rk.rekey_one(db, raw, rk.Cas.default(), as_caller=True)
+        if outcome != "rekeyed":
+            return
+        try:
+            from mantle.search.ingest.pipeline_unified import enqueue_index_artifact
+            from mantle.services.acting_principal import current_acting_principal
+
+            reader = current_acting_principal()
+            enqueue_index_artifact(entity, entity.collection_id,
+                                   tenant_id=reader.principal_id if reader else None)
+        except Exception:  # noqa: BLE001 — indexing is retried as any other
+            _log.warning("a re-keyed drop %s was not queued for indexing", raw.get("id"),
+                           exc_info=True)
+    except Exception:  # noqa: BLE001 — the drop stays a drop
+        _log.warning("drop %s not re-keyed on read", raw.get("id"), exc_info=True)
+    finally:
+        _REKEYING.reset(token)
 
 
 #: NOT `Optional`. The annotation said this could
@@ -309,6 +374,8 @@ def delete_artifact(db: LatticeDatabase, artifact_id: str) -> bool:
     try:
         db.artifacts.delete_artifact(artifact_id)
         return True
+    except _journal.ReachChangeRefused:
+        raise                   # refused by the authority ledger: not written, and said so
     except Exception:
         return False
 
@@ -524,6 +591,8 @@ def delete_collection(db: LatticeDatabase, id: str) -> bool:
     try:
         db.artifacts.delete_artifact(id)
         return True
+    except _journal.ReachChangeRefused:
+        raise                   # refused by the authority ledger: not written, and said so
     except Exception:
         return False
 
@@ -636,20 +705,34 @@ def _shown_label(e: dict) -> Optional[str]:
 
 def add_artifact_to_collection(db: LatticeDatabase, collection_id: str, root_id: str,
                                order_key: Optional[str] = None, *,
-                               origin: bool = True,
+                               origin: Optional[bool] = None,
                                propagate: Optional[list] = None,
                                relationship: Optional[str] = None) -> bool:
     """Upsert the membership edge collection → root. No `order_key` → placed at the end.
     `origin` marks the creation edge (grants propagate through it); `relationship=None` is
-    containment (`contains`), else the relationship IS the edge label."""
+    containment (`contains`), else the relationship IS the edge label.
+
+    `origin=None` (the default) never makes a second creation edge, nor demotes the one there
+    is: an existing edge keeps what it is, and a new one is the creation edge only for a root
+    that has none yet. Linking an artifact somewhere else is secondary containment."""
     if order_key is None:
         order_key = after_key(get_last_order_key(db, collection_id))
+    if origin is None:
+        existing = _find_membership(db, collection_id, root_id)
+        if existing is not None:
+            origin = bool(_eprop(existing, "is_origin"))
+        else:
+            # A typed link keeps the default it always had; containment is the creation edge
+            # only for a root that has none.
+            origin = relationship is not None or get_origin_parent(db, root_id) is None
     try:
         db.graph.add_edge(collection_id, root_id, _stored_label(relationship),
                           {"order_key": order_key, "is_origin": bool(origin),
                            "propagate": _ser_propagate(propagate), "root_id": root_id,
                            **_label_props(relationship)})
         return True
+    except _journal.ReachChangeRefused:
+        raise                   # refused by the authority ledger: not written, and said so
     except Exception:
         return False
 
@@ -669,6 +752,8 @@ def remove_artifact_from_collection(db: LatticeDatabase, collection_id: str, roo
     try:
         db.graph.delete_edge(collection_id, root_id, e.get("label"))
         return True
+    except _journal.ReachChangeRefused:
+        raise                   # refused by the authority ledger: not written, and said so
     except Exception:
         return False
 
@@ -708,6 +793,8 @@ def set_edge_order_key(db: LatticeDatabase, collection_id: str, root_id: str,
     try:
         db.graph.add_edge(collection_id, root_id, e.get("label"), props)
         return True
+    except _journal.ReachChangeRefused:
+        raise                   # refused by the authority ledger: not written, and said so
     except Exception:
         return False
 
@@ -820,6 +907,8 @@ def remove_all_edges_for_root(db: LatticeDatabase, root_id: str) -> int:
         # reporting the count it managed would read as completion. `graph.delete_edges_touching`
         # is the uncapped form if a caller needs one.
         raise
+    except _journal.ReachChangeRefused:
+        raise                   # refused by the authority ledger: not written, and said so
     except Exception:
         return removed
     return removed
@@ -1048,6 +1137,8 @@ def delete_artifacts_by_root(db: LatticeDatabase, root_id: str) -> list:
         try:
             db.artifacts.delete_artifact(vid)
             deleted.append(vid)
+        except _journal.ReachChangeRefused:
+            raise                   # refused by the authority ledger: not written, and said so
         except Exception:
             continue
     return deleted
@@ -1182,18 +1273,21 @@ def _grant_docs_by(db: LatticeDatabase, field: str, value: Any) -> list:
 
 
 def _unexpired(doc: Dict[str, Any]) -> bool:
+    """Is this grant's expiry still ahead? Read as a time, the way Origin reads it (review 18):
+    stripped, `Z` as UTC, naive as UTC. An expiry that does not parse is already past: never
+    compared as text."""
     exp = doc.get("expires_at")
     if not exp:
         return True
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
     try:
-        e = datetime.fromisoformat(exp.replace("Z", "+00:00"))
-        if e.tzinfo is None:
-            e = e.replace(tzinfo=timezone.utc)
-        return e > now
-    except (ValueError, AttributeError):
-        return str(exp) > now.isoformat()
+        e = datetime.fromisoformat(str(exp).strip().replace("Z", "+00:00"))
+    except (ValueError, AttributeError, TypeError):
+        return False
+    if e.tzinfo is None:
+        e = e.replace(tzinfo=timezone.utc)
+    return e > now
 
 
 def create_grant(db: LatticeDatabase, entity: Any) -> Any:
@@ -1221,10 +1315,15 @@ def get_active_grants_for_principal_resource(db: LatticeDatabase, grantee_id: st
 
     Seeks by `grantee_id` rather than by `resource_id` because a principal's grant count is
     bounded by what that person was given, while a resource's is bounded by how widely it was
-    shared; the former is the smaller and steadier of the two."""
+    shared; the former is the smaller and steadier of the two.
+
+    An invite is no principal's grant until it is claimed, whatever its grantee id says (the
+    claim token's hash, which no principal id matches): the light-cone verifier reads only
+    principal grants, and so does this."""
     return [from_lattice_doc(d, GrantEntity) for d in _grant_docs_by(db, "grantee_id", grantee_id)
             if d.get("state") == "active"
             and d.get("resource_id") == resource_id
+            and d.get("grantee_type") != "invite"
             and _unexpired(d)]
 
 
@@ -1314,8 +1413,9 @@ def upsert_user_collection_grant(db: LatticeDatabase, *, user_id: str, collectio
         #: have — and the two sides were the same object anyway.
         update_grant(db, user_grant)
         return user_grant, True
+    from mantle.services.seed_plan import grant_id as _planned_id
     grant = GrantEntity(
-        id=str(_uuid.uuid4()),
+        id=_planned_id(collection_id, "user", user_id) or str(_uuid.uuid4()),
         resource_id=collection_id,
         grantee_type="user",
         grantee_id=user_id,

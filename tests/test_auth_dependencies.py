@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -229,7 +231,7 @@ def _delegation_payload(**overrides):
     base = {
         "sub": "user-42",
         "aud": "agience-server-astra",
-        "iss": AUTHORITY_ISSUER,
+        "iss": AUTHORITY_ISSUER, "iat": int(time.time()),
         "act": {"sub": "agience-server-astra"},
         "principal_type": "delegation",
         "host_id": "host-abc",

@@ -247,7 +247,33 @@ def create_new_collection(
         from mantle.db.backend import add_artifact_to_collection as db_add_to_container
         db_add_to_container(db, container_id, created.root_id or created.id, origin=True)
 
+    ensure_collection_key(db, created, owner_id)
     return created
+
+
+def ensure_collection_key(db: Database, collection: CollectionEntity, creator_id: str) -> None:
+    """Mint the collection's own content key now, as it is created, after its creator's grant
+    (the key is checked against that grant). Its content, cells and postings are keyed under it.
+
+    A node with no key oracle yet (setup, an embedded store) mints it on the first write instead;
+    under threshold custody that is refused, since every collection's key must exist and be split
+    before its content is."""
+    from mantle.db.doc_boundary import content_key_principal
+    from mantle.services import content_crypto
+
+    principal = content_key_principal(collection.to_dict()) or getattr(collection, "origin_root",
+                                                                       None) or collection.id
+    from mantle.services.acting_principal import NoActingPrincipal
+
+    try:
+        content_crypto._default_collection_key(principal, collection.id, may_create=True,
+                                               creator_id=creator_id)
+    except (RuntimeError, NoActingPrincipal) as exc:
+        from mantle.search.mantle.threshold_custody import custody_kind
+        if custody_kind() == "threshold":
+            raise
+        logger.debug("collection key for %s not minted at creation (%s); minted on first write",
+                     collection.id, exc)
 
 
 def get_collections_for_user(

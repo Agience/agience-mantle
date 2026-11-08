@@ -21,7 +21,7 @@ from mantle.search.mantle.oracle import (
     SHARE_CONTENT_TYPE, KeyPurpose, KeyRequest, LatticeMasterKeyStore, MasterKeyUnavailable,
     OracleService,
 )
-from mantle.services.acting_principal import acting_as
+from mantle.services.acting_principal import ForwardedCredential, acting_as
 from prism.trust import shamir
 
 ALICE_KEY = bytes(range(32))
@@ -81,14 +81,26 @@ class FakeOrigin:
         self.down = False
         self.puts = 0
         self.on_put = None
+        #: Whether a job grant covers the background work, and what was minted under it.
+        self.background = True
+        self.minted = []
+        #: Shares Origin holds as replaceable (`rekey_pending`): a first share until `activate`.
+        self.pending = set()
 
-    def get_share(self, principal_id):
+    def get_share(self, principal_id, *, credential=None, collection_id=None, artifact_id=None):
         if self.down:
             raise RuntimeError("Origin is unreachable")
         s = self.shares.get(principal_id)
         return dict(s) if s else None
 
-    def put_share(self, principal_id, share, *, supersedes=None):
+    def background_delegation(self, principal_id, job=""):
+        self.jobs = getattr(self, "jobs", []) + [job]
+        if not self.background:
+            raise RuntimeError("403 no live job grant names this job and key")
+        self.minted.append(principal_id)
+        return f"background:{principal_id}"
+
+    def put_share(self, principal_id, share, *, supersedes=None, credential=None):
         if self.down:
             raise RuntimeError("Origin is unreachable")
         self.puts += 1
@@ -99,8 +111,18 @@ class FakeOrigin:
             return "unchanged"
         if old and old["kcv"] != share["kcv"] and old["kcv"] != supersedes:
             raise RuntimeError("409 a share of another key is stored")
+        if old and principal_id not in self.pending:
+            # Any write to a share Origin holds, whatever key check it claims (the sixth review).
+            raise RuntimeError("403 not replaced: this share is not marked for re-key")
+        if not old:
+            self.pending.add(principal_id)
         self.shares[principal_id] = dict(share)
         return "replaced" if old else "stored"
+
+    def activate_share(self, principal_id, credential=None):
+        if self.down:
+            raise RuntimeError("Origin is unreachable")
+        self.pending.discard(principal_id)
 
 
 class FakeEscrow:
@@ -127,7 +149,8 @@ class FakeEscrow:
 class _SelfOnly:
     """A verifier that authorizes a principal for its own key and nothing else."""
 
-    def authorized(self, *, requester_id, requester_type, principal_id, collection_id, action):
+    def authorized(self, *, requester_id, requester_type, principal_id, collection_id, action,
+                   **_scope):
         return requester_id == principal_id
 
 
@@ -141,6 +164,15 @@ def make_env(tmp_path, **kw):
                                                     e.escrow, e.lock, **k)
     e.store = e.make(**kw)
     return e
+
+
+@pytest.fixture(autouse=True)
+def _a_person_is_acting():
+    """Origin releases a share only on the acting caller's credential
+    (`test_a_share_needs_the_acting_credential.py`); these tests act as a signed-in person."""
+    with acting_as("alice", principal_type="user", source="request",
+                   credential=ForwardedCredential("alice-token")):
+        yield
 
 
 @pytest.fixture()
@@ -236,9 +268,14 @@ def test_no_row_while_origin_is_unreachable_refuses(env):
 
 
 def test_a_whole_key_row_is_refused_not_minted_over(env):
+    """Anyone but its owner is refused a whole key (its owner's own call splits it, review 25:
+    `test_review25_a_whole_key_is_split_on_its_owner_s_credential.py`), and nothing is written
+    over it."""
     LatticeMasterKeyStore(env.kek, lambda: env.db).put("alice", ALICE_KEY)
-    with pytest.raises(MasterKeyUnavailable, match="split_master_keys"):
-        env.store.get("alice")
+    with acting_as("bob", principal_type="user", source="request",
+                   credential=ForwardedCredential("bob-token")):
+        with pytest.raises(MasterKeyUnavailable, match="split_master_keys"):
+            env.store.get("alice")
     with pytest.raises(MasterKeyUnavailable):
         env.store.put("alice", ALICE_KEY)
 
@@ -282,6 +319,7 @@ def test_a_pending_put_whose_origin_share_landed_is_superseded(env):
     row, share, _e, _s = tc.split_key("alice", OTHER_KEY, env.kek, env.recipient, state="pending")
     env.db.artifacts.put_artifact(row)
     env.origin.shares["alice"] = share
+    env.origin.pending.add("alice")              # a first share, not yet activated
     assert env.store.get("alice") is None
     env.store.put("alice", ALICE_KEY)
     assert env.store.get("alice") == ALICE_KEY
@@ -314,7 +352,8 @@ def test_a_put_waits_for_the_custody_lock_another_process_holds(env, tmp_path):
 
 def test_the_oracle_mints_once_and_reads_back_through_the_shares(env):
     oracle = OracleService(env.store, grant_verifier=_SelfOnly())
-    with acting_as("alice", principal_type="user"):
+    with acting_as("alice", principal_type="user", source="request",
+                   credential=ForwardedCredential("alice-token")):
         key = oracle.get_or_create_master_key(
             "alice", KeyRequest(requester_id="alice", purpose=KeyPurpose.SELF, action="create"))
         oracle.evict()
@@ -507,3 +546,29 @@ def test_an_unknown_custody_is_refused(monkeypatch):
     monkeypatch.setenv("MANTLE_MASTER_KEY_CUSTODY", "shamir")
     with pytest.raises(ValueError):
         tc.custody_kind()
+
+
+def _identity_file(tmp_path):
+    p = tmp_path / "escrow.identity"
+    p.write_text(str(pyrage.x25519.Identity.generate()) + "\n")
+    return str(p)
+
+
+def test_a_running_node_refuses_to_start_with_the_escrow_identity_on_it(monkeypatch, tmp_path):
+    """Review 7: the recovery identity never sits on a running node. Under threshold custody the
+    server's store refuses at startup when `MANTLE_ESCROW_IDENTITY_FILE` is set, recovery or not;
+    recovery runs offline (`split_master_keys --combine`)."""
+    _threshold_settings(monkeypatch, tmp_path)
+    monkeypatch.setenv("MANTLE_MASTER_KEY_RECOVERY", "escrow")
+    monkeypatch.setenv("MANTLE_ESCROW_IDENTITY_FILE", _identity_file(tmp_path))
+    from mantle.search.mantle import wiring
+    with pytest.raises(ValueError, match="running node"):
+        wiring._master_key_store(_FakeKek(), _FakeDb)
+
+
+def test_the_offline_recovery_still_reads_the_escrow_identity(monkeypatch, tmp_path):
+    _threshold_settings(monkeypatch, tmp_path)
+    monkeypatch.setenv("MANTLE_MASTER_KEY_RECOVERY", "escrow")
+    monkeypatch.setenv("MANTLE_ESCROW_IDENTITY_FILE", _identity_file(tmp_path))
+    store = tc.build_threshold_store(_FakeKek(), _FakeDb, offline=True)
+    assert store._recovery_identity is not None

@@ -9,7 +9,6 @@ whether it was ever verified.
 
 from __future__ import annotations
 
-import asyncio
 
 import pytest
 
@@ -18,7 +17,7 @@ from mantle.entities.grant import Grant as GrantEntity
 from mantle.entities.person import Person
 from mantle.services import grant_service as gs
 from mantle.services import person_service
-from mantle.services.dependencies import AuthContext, _claim_email, _claim_email_verified
+from mantle.services.dependencies import _claim_email, _claim_email_verified
 
 RESOURCE = "col-1"
 OWNER = "user-owner"
@@ -99,23 +98,4 @@ def test_a_verified_token_address_claims_it(db, invite_token):
     assert claimed.grantee_id == CLAIMANT
 
 
-# ---------------------------------------------------------------------------
-# The invite-details route passes the verified address, as /claim does
-# ---------------------------------------------------------------------------
-
-def _auth(email, verified):
-    return AuthContext(user_id=CLAIMANT, principal_id=CLAIMANT, principal_type="user",
-                       email=email, email_verified=verified)
-
-
-def test_invite_details_reads_the_verified_token_address(db, invite_token):
-    from mantle.routers.grants_router import get_invite_details_endpoint
-    details = asyncio.run(get_invite_details_endpoint(invite_token, _auth(TARGET, True), db))
-    assert details.get("identity_mismatch") is not True
-    assert details["resource_id"] == RESOURCE
-
-
-def test_invite_details_ignores_an_unverified_token_address(db, invite_token):
-    from mantle.routers.grants_router import get_invite_details_endpoint
-    details = asyncio.run(get_invite_details_endpoint(invite_token, _auth(TARGET, False), db))
-    assert details == {"valid": True, "identity_mismatch": True}
+# The invite-details route is gone (round 13): an invite is described and claimed at Origin.

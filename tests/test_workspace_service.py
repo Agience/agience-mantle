@@ -205,6 +205,7 @@ class TestWorkspaceCrud:
             patch("mantle.services.workspace_service.store.add_artifact_to_collection"),
             patch("mantle.services.workspace_service._link_to_target_collections"),
             patch("mantle.services.workspace_service._emit_event"),
+            patch("mantle.services.workspace_service._holds_owners_rights", return_value=True),
             patch("mantle.services.workspace_service.store.upsert_user_collection_grant") as grant,
         ):
             art = ws_svc.create_workspace_artifact(
@@ -216,6 +217,22 @@ class TestWorkspaceCrud:
         assert kw["user_id"] == "user-1"
         assert kw["collection_id"] == art.root_id
         assert kw["can_admin"] is True and kw["can_read"] is True
+
+    def test_a_creator_without_the_owner_s_rights_gets_no_grant(self):
+        """John, 2026-11-01: what a contributor adds is the collection's owner's."""
+        db = MagicMock()
+        with (
+            patch("mantle.services.workspace_service.get_workspace"),
+            patch("mantle.services.workspace_service.store.create_artifact"),
+            patch("mantle.services.workspace_service.store.add_artifact_to_collection"),
+            patch("mantle.services.workspace_service._link_to_target_collections"),
+            patch("mantle.services.workspace_service._emit_event"),
+            patch("mantle.services.workspace_service._holds_owners_rights", return_value=False),
+            patch("mantle.services.workspace_service.store.upsert_user_collection_grant") as grant,
+        ):
+            ws_svc.create_workspace_artifact(db, "user-1", "ws-1", context="{}", content="",
+                                             order_key="a0", enqueue_index=False)
+        grant.assert_not_called()
 
     def test_get_workspace_no_grant_404(self):
         """Workspace exists but user has no the lattice grant → 404.

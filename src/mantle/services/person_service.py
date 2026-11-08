@@ -46,25 +46,17 @@ def get_user_by_id(db, id: str,  # noqa: A002 — keep `id` for compat
     `/internal/delegation-token` already applies, which is why it is sent under that route's own
     field name (:data:`SUBJECT_TOKEN_HEADER`).
 
-    Additive, and it must stay that way. Origin's requirement is gated off by default, and other
-    live callers of this same route send service headers only. So this is a header an ungated
-    Origin ignores, never a precondition Mantle enforces locally: sending it cannot make a call
-    fail that would otherwise have succeeded, and omitting it leaves the call exactly as it was.
+    Every caller sends one (review 21, F4), and a caller with none asks Origin nothing, so
+    production requires it (`PERSON_LOOKUP_SUBJECT_TOKEN_REQUIRED`):
 
-    **Not every caller has one, and none of them invents one.** `None` is the honest value for a
-    path with no request-scoped bearer, and the call is then the unscoped one it has always been:
+      * ``services/dependencies.get_person``: the person being read IS the authenticated caller
+        (`auth.user_id`), so its bearer is by construction the subject's own token.
+      * ``services/grant_service.send_invite_email`` and first-sign-in provisioning
+        (``seed_provisioning/user_provisioning._resolve_profile``) take it from the request they
+        run in (:func:`own_subject_token`), and skip the lookup without one.
 
-      * ``services/dependencies.get_person`` HAS one. The person being read IS the authenticated
-        caller (`auth.user_id`), so its bearer is by construction the subject's own token.
-      * ``services/grant_service._send_invite_email`` does NOT. It runs several frames below the
-        route, off the invite-creation path, and is handed a `user_id` rather than a request.
-      * ``services/seed_provisioning/user_provisioning`` does NOT. It is bootstrap, running under
-        no user's request.
-
-    A token is never taken from anywhere but the call site's own request. `acting_principal` is
-    deliberately not a carrier for one ("this is deliberately not a token — it holds an
-    already-verified chain"), and manufacturing a token for a background path would be inventing
-    the very authority this parameter exists to stop asserting.
+    A token is never taken from anywhere but the call site's own request, and never minted for a
+    background path.
     """
     del db
     if not id:
@@ -99,6 +91,45 @@ def get_user_by_id(db, id: str,  # noqa: A002 — keep `id` for compat
         return PersonEntity.from_dict(resp.json() or {})
     except (ValueError, KeyError):
         return None
+
+
+def _authority_issuer() -> str:
+    from mantle import config
+    return getattr(config, "AUTHORITY_ISSUER", "") or ""
+
+
+def _claims_of(token: str) -> dict:
+    """A token's claims, unverified: the signature was verified where it was presented, and
+    Origin verifies it again before it answers."""
+    import base64
+    import json
+
+    try:
+        seg = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
+    except (IndexError, ValueError, TypeError):
+        return {}
+    return claims if isinstance(claims, dict) else {}
+
+
+def own_subject_token(person_id: str) -> Optional[str]:
+    """The person's own access token, when the request this runs in was made on it, else None
+    (review 21, F4): the acting principal's forwarded bearer, if it is Origin's access token for
+    `person_id` itself. A delegation, a grant key, a program's token or another person's is
+    never one, and nothing is minted to stand in for it."""
+    from mantle.services.acting_principal import current_acting_principal
+
+    acting = current_acting_principal()
+    held = getattr(getattr(acting, "credential", None), "token", "") if acting else ""
+    if not held or not person_id or getattr(acting, "principal_id", None) != str(person_id):
+        return None
+    claims = _claims_of(held)
+    if (not claims or claims.get("iss") != _authority_issuer()
+            or str(claims.get("sub") or "") != str(person_id)
+            or claims.get("principal_type", "user") != "user"
+            or claims.get("act") or claims.get("token_type")):
+        return None
+    return held
 
 
 async def record_person_event(payload: dict, event_type: str = "person") -> None:

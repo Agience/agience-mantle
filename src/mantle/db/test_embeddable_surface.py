@@ -48,7 +48,8 @@ STDLIB = set(sys.stdlib_module_names)
 STORE_MODULES = frozenset({
     "__init__.py", "access.py", "audit.py", "backend.py", "constants.py", "content_cache.py",
     "content_tier.py", "doc_boundary.py", "edge.py", "identity_backend.py", "lattice_api.py",
-    "lattice_identity.py", "plane.py", "s3_content.py", "schema.py", "seq.py", "store.py",
+    "lattice_identity.py", "plane.py", "reach_journal.py", "s3_content.py", "schema.py", "seq.py",
+    "store.py",
     "typed_fetch.py", "vertex.py",
 })
 

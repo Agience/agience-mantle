@@ -219,6 +219,8 @@ def action_migrate(store_db: Database, dry_run: bool) -> None:
 # ── CLI ────────────────────────────────────────────────────────────────────
 
 def main():
+    from mantle.services.authority_ledger import install_for_cli
+    install_for_cli()             # its grants and edges are journaled like the server's
     parser = argparse.ArgumentParser(
         description="Manage Agience platform inbox-seed collection.",
         formatter_class=argparse.RawDescriptionHelpFormatter,

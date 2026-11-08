@@ -16,7 +16,7 @@ and why none of them may be reordered casually.
 ``load_env``
     Mantle's own ``.env``, defaults only: the environment already set wins.
 Phase 0 — key material
-    ``init_encryption_key`` / ``init_nonce_secret`` / ``init_setup_token`` from the trust floor,
+    ``init_encryption_key`` / ``init_nonce_secret`` from the trust floor,
     then ``peer_signing.init()``. Fatal on failure: nothing below can run without keys.
 Phase 1.5 — bootstrap settings
     ``config.load_bootstrap_settings()`` reads what the key files carry, then the edge S3
@@ -27,7 +27,9 @@ Phase 2 — the store, then settings
     clients are rebuilt a second time against the DB-supplied ``CONTENT_URI`` and the content
     bucket is ensured; the log level is reapplied from the DB value.
 Phase 3 — setup
-    Origin owns the setup wizard, so this only clears the setup token.
+    Origin owns the setup wizard and its token (``KEYS_DIR/setup.token``); Mantle leaves both
+    alone. A single-host install shares one ``KEYS_DIR``, and Origin needs the token until setup
+    completes.
 Phase 4 — platform identity, trust, workers
     Platform singleton ids are pre-resolved (fatal on failure); trusted-issuer artifacts are
     seeded and loaded into the token verifier (non-fatal — the authority manifest is the
@@ -88,6 +90,7 @@ from mantle.search.ingest.index_queue import start_worker as start_index_worker,
 from mantle.routers.artifacts_router import router as artifacts_router  # noqa: E402
 from mantle.routers.events_router import router as events_router  # noqa: E402
 from mantle.routers.grants_router import router as grants_router  # noqa: E402
+from mantle.routers.held_reach_router import router as held_reach_router  # noqa: E402
 from mantle.routers.system_router import router as system_router  # noqa: E402
 from mantle.routers.type_definitions_router import router as type_definitions_router  # noqa: E402
 from mantle.routers.mcp_router import mcp_router  # noqa: E402
@@ -217,6 +220,11 @@ async def lifespan(app: FastAPI):
     # Explicit, at startup — importing the shared `origin.config` must not pull origin's `.env`
     # into this process.
     config.load_env(Path(__file__).resolve().parent.parent)
+    # The server's lock, held for the life of this process (reviews 32 and 33): step 21's
+    # rotation of charged roots' keys refuses while it is held. On the production plane a server
+    # that cannot take it does not start; elsewhere it is logged.
+    from mantle.services import server_lock
+    server_lock.take_for_server()
 
     # `load_env` is `override=False`, so `.env` only fills variables the shell left unset, and
     # `AUTHORITY_ISSUER` outranks the `ORIGIN_URI` fallback. A shell that sets only `ORIGIN_URI`
@@ -243,14 +251,12 @@ async def lifespan(app: FastAPI):
     try:
         from prism.trust.key_manager import (
             init_encryption_key,
-            init_setup_token,
             init_nonce_secret,
         )
         from mantle.services import peer_signing
 
         init_encryption_key()
         init_nonce_secret()
-        init_setup_token()
         # Mantle signs its own outbound peer JWTs with mantle.private.pem via its
         # self-contained signer (no shared trust library). It does NOT sign user
         # tokens — only Origin does; inbound peer JWTs are verified generically.
@@ -293,6 +299,37 @@ async def lifespan(app: FastAPI):
         config.AUTHORITY_ISSUER, config.ORIGIN_URI, getattr(config, "MANTLE_URI", "<unset>"),
     )
 
+    # Changes to reach go to Origin to be co-signed (`services.authority_ledger`): enforced under
+    # threshold custody, recorded otherwise. Installed once ORIGIN_URI is resolved, just above.
+    # Under threshold custody a ledger that cannot be installed is fatal: changes would be written
+    # that Origin never checked.
+    from mantle.db.reach_journal import installed as reach_journal_installed
+    from mantle.services import authority_ledger
+    # Threshold custody is claimed only by isolated production: refused here, at start, on the
+    # home or development plane or wherever isolation is absent (`services.custody_plane`).
+    from mantle.search.mantle.threshold_custody import custody_kind as _custody_kind
+    if _custody_kind() == "threshold":
+        from mantle.services import custody_plane
+        custody_plane.require_isolated_production(custody_plane.keys_dir())
+    try:
+        authority_ledger.install()
+    except Exception:
+        from mantle.search.mantle.threshold_custody import custody_kind
+        if custody_kind() == "threshold":
+            logger.exception("authority ledger could not be installed under threshold custody")
+            raise
+        logger.exception("authority ledger could not be installed; changes are not co-signed")
+    # A withdrawal Origin did not take (a write that failed after Origin co-signed it) is retried
+    # now; while one is outstanding, changes to reach are refused under threshold custody.
+    if reach_journal_installed():
+        try:
+            from mantle.services.dependencies import get_store_db
+            authority_ledger.retry_outstanding(next(get_store_db()))
+        except Exception:
+            logger.exception("authority ledger: outstanding withdrawals could not be retried")
+        # The operator's revocations and resolutions at Origin reach this store within 30 s.
+        authority_ledger.start_feed(lambda: next(get_store_db()))
+
     # Re-initialize edge S3 clients now that config.CONTENT_URI is set from DB,
     # then eagerly ensure the content bucket exists.
     from mantle.services.content_service import reinit_edge_clients, ensure_content_bucket
@@ -311,14 +348,9 @@ async def lifespan(app: FastAPI):
     logging.getLogger().setLevel(debug_level_map.get(log_level, logging.INFO))
 
     # ------------------------------------------------------------------
-    # Phase 3 — Origin owns the setup wizard; Mantle just starts up. Operators
+    # Phase 3 — Origin owns the setup wizard and its token; Mantle just starts up. Operators
     # see setup state via Origin's /setup/status.
     # ------------------------------------------------------------------
-    # init_setup_token() in Phase 0 recreates the file if it was deleted by
-    # delete_setup_token() during setup completion.  Clean it up now that we
-    # know setup is done so no orphan token lingers on disk between restarts.
-    from prism.trust.key_manager import delete_setup_token as _delete_setup_token
-    _delete_setup_token()
 
     # store_db already initialized in Phase 2
 
@@ -342,6 +374,11 @@ async def lifespan(app: FastAPI):
     # which requires an identity to obtain a content key. The non-fatal try/except
     # means a missing system principal does not stop the process booting; the seed
     # then fails closed on its own.
+    # The three startup seeds are one seed pass (`system_identity.seed_pass`): an operator's seed
+    # credential, when one was handed over, serves them all and is ended and deleted after.
+    from mantle.services.system_identity import seed_pass
+    _seeding = seed_pass()
+    _seeding.__enter__()
     try:
         from mantle.services.issuers import seed_platform_issuer_artifacts
         from mantle.services.system_identity import system_acting_context
@@ -382,6 +419,8 @@ async def lifespan(app: FastAPI):
             ensure_platform_operators(store_db)
     except Exception:
         logger.warning("Platform operator provisioning failed (non-fatal)", exc_info=True)
+    finally:
+        _seeding.__exit__(None, None, None)
 
     # Load trusted-issuer artifacts into the token verifier. The authority manifest
     # + AGIENCE_TRUSTED_ISSUERS env are the bootstrap seed; governable issuer
@@ -736,6 +775,9 @@ def oauth_protected_resource(request: Request):
     return JSONResponse(content=doc, headers={"Cache-Control": "public, max-age=300"})
 
 
+from mantle.services.acting_principal import AddSealPending  # noqa: E402
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_logger(request: Request, exc: HTTPException):
     logger.warning(
@@ -779,6 +821,15 @@ async def http_exception_logger(request: Request, exc: HTTPException):
 
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=headers)
 
+@app.exception_handler(AddSealPending)
+async def add_seal_pending(request: Request, exc: AddSealPending):
+    """An Add-only write that must wait for a reader's open (John, 2026-11-03): 503, try again
+    later."""
+    logger.info("HTTP 503 %s %s: %s", request.method, request.url.path, exc)
+    return JSONResponse(status_code=503, content={"detail": str(exc)},
+                        headers={"Retry-After": "300"})
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception_logger(request: Request, exc: Exception):
     logger.exception(
@@ -795,13 +846,22 @@ async def unhandled_exception_logger(request: Request, exc: Exception):
 # ----------------------------
 # CORS & Session
 # ----------------------------
-# allow_origins=["*"] is safe: all authenticated API calls use Bearer tokens,
-# not cookies, so cross-origin requests without credentials pose no CSRF risk.
-# The OAuth redirect flow uses session cookies but those are same-site
-# (browser navigations, not XHR), so CORS doesn't apply to them.
+# The web app calls Mantle's own host directly (my.agience.ai no longer proxies `/api`), so
+# Mantle answers cross-origin only to the origins `config.cors_origins` names: the web app's
+# address, or `MANTLE_CORS_ORIGINS`. Never `*` (review 7, F1).
+_CORS_ORIGINS = config.cors_origins()
+
+
+class _CorsFromSetting(CORSMiddleware):
+    """Reads the allowed origins at request time, so the list is the one place they live."""
+
+    def is_allowed_origin(self, origin: str) -> bool:  # noqa: D401
+        return origin.lower() in _CORS_ORIGINS
+
+
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
+    _CorsFromSetting,
+    allow_origins=_CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -982,6 +1042,24 @@ def _rl_admit(client: str) -> bool:
     return True
 
 
+#: The policy every page Mantle serves itself carries (review 12): the API console at /docs (Swagger
+#: UI, from its CDN, with its inline bootstrap) and the browser. No framing, no base tag, no plugin,
+#: forms only to this node, and scripts only from this node or the console's CDN.
+PAGE_CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+            "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+            "img-src 'self' data: https://fastapi.tiangolo.com; connect-src 'self' https:; "
+            "frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'")
+
+
+@app.middleware("http")
+async def _page_policy(request: Request, call_next):
+    response = await call_next(request)
+    if "text/html" in response.headers.get("content-type", ""):
+        response.headers.setdefault("Content-Security-Policy", PAGE_CSP)
+        response.headers.setdefault("X-Frame-Options", "DENY")
+    return response
+
+
 @app.middleware("http")
 async def _rate_limit(request: Request, call_next):
     if _RL_MAX <= 0 or request.url.path in _RL_EXEMPT:
@@ -1032,6 +1110,7 @@ app.add_middleware(_WebSocketRateLimit)
 app.include_router(artifacts_router)
 app.include_router(events_router)
 app.include_router(grants_router)
+app.include_router(held_reach_router)
 app.include_router(system_router)
 app.include_router(type_definitions_router)
 app.include_router(mcp_router)

@@ -877,9 +877,10 @@ def _sse_index_artifact(
 
 
 def _sse_remove_artifact(
-    principal_id: str, artifact_id: str, *, segment: str = "live",
+    principal_id: str, artifact_id: str, *, collection_id: str, segment: str = "live",
 ) -> None:
-    """Strip an artifact's references from the SSE index in one segment."""
+    """Strip an artifact's references from the SSE index in one segment. Postings are keyed per
+    collection, so the artifact's collection names the key they are under."""
     try:
         from mantle.services.dependencies import get_store_db
         from mantle.search.mantle.wiring import build_sse_indexer
@@ -889,6 +890,7 @@ def _sse_remove_artifact(
             return
         indexer.remove_artifact(
             principal_id, artifact_id, _ingest_key_request(principal_id),
+            collection_id=collection_id,
         )
     except Exception:
         logger.warning(
@@ -953,7 +955,7 @@ def move_artifact_segments(
         if seg not in _REMOVABLE_SEGMENTS:
             continue
         _mantle_remove_artifact(principal_id, collection_id, root, segment=seg)
-        _sse_remove_artifact(principal_id, root, segment=seg)
+        _sse_remove_artifact(principal_id, root, collection_id=collection_id, segment=seg)
 
 
 def get_artifact_embeddings(artifact: Artifact, collection_id: str) -> list[dict]:
@@ -1246,8 +1248,8 @@ def delete_artifact_from_index(
         for seg in _REMOVABLE_SEGMENTS:
             if principal_id and collection_id:
                 _mantle_remove_artifact(principal_id, collection_id, root, segment=seg)
-            if principal_id:
-                _sse_remove_artifact(principal_id, root, segment=seg)
+            if principal_id and collection_id:
+                _sse_remove_artifact(principal_id, root, collection_id=collection_id, segment=seg)
         if not (principal_id and collection_id):
             logger.warning(
                 "delete_artifact_from_index(%s): no principal_id/collection_id supplied, so NOTHING "

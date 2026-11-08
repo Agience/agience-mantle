@@ -70,8 +70,9 @@ from __future__ import annotations
 import logging
 import threading
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, Mapping
+from typing import Any, Dict, Iterator, Mapping, Optional
 
+from mantle.search.mantle.sse.keys import collection_sse_key
 from .blind_tokens import (
     FIELD_CONTENT,
     FIELD_DESCRIPTION,
@@ -233,7 +234,9 @@ class SseIndexer:
             stamp_analyzer_generation(self._postings, ANALYZER)
             self._stamped = True
 
-        owner_sse_key = self._oracle.derive_sse_key(principal_id, request)
+        # The collection's own SSE key: tokens, entries and the manifest are all keyed under it,
+        # so a query that does not reach this collection finds none of them.
+        owner_sse_key = collection_sse_key(self._oracle, principal_id, request, collection_id)
 
         # ---- 1. Analyze each field -----------------------------------
         # token → posting-entry-shape data. Three keys; see the module docstring for which BM25
@@ -289,9 +292,10 @@ class SseIndexer:
         # its posting updates names slots that do not carry the artifact; posting updates committed
         # without their manifest are unreachable by any later deletion. Either half alone is an
         # index that lies about itself, and on the file store there was no way to ask for both.
+        slot = self._manifest_slot(collection_id, artifact_id)
         with _atomic_slot_writes(self._postings, principal_id):
             # ---- 2. Read existing manifest (re-index detection) ----------
-            manifest_blob = self._postings.get_manifest(principal_id, artifact_id)
+            manifest_blob = self._postings.get_manifest(principal_id, slot)
             old_tokens: set[str] = set()
             if manifest_blob is not None:
                 old_tokens = set(unpack_manifest(
@@ -311,21 +315,36 @@ class SseIndexer:
             # ---- 4. Update manifest --------------------------------------
             if new_tokens:
                 self._postings.put_manifest(
-                    principal_id, artifact_id,
+                    principal_id, slot,
                     pack_manifest(new_tokens, manifest_key,
                                   aad=manifest_aad(principal_id, artifact_id)),
                 )
             else:
                 # Empty artifact (no analyzable fields) — drop any stale manifest.
-                self._postings.delete_manifest(principal_id, artifact_id)
+                self._postings.delete_manifest(principal_id, slot)
 
         return len(new_tokens)
+
+    def _manifest_slot(self, collection_id: Optional[str], artifact_id: str) -> str:
+        """Where an artifact's manifest is kept. Per collection when the provider keys postings
+        per collection, since each collection's index is its own; the artifact alone otherwise,
+        as before (and for postings written before collections had keys)."""
+        from mantle.search.mantle.sse.keys import _accepts_collection
+
+        if collection_id and _accepts_collection(self._oracle):
+            return f"{collection_id}~{artifact_id}"
+        return artifact_id
 
     def remove_artifact(
         self, principal_id: str, artifact_id: str,
         request: Any,          # the provider's policy object (oracle.KeyRequest in the platform)
+        *, collection_id: Optional[str] = None, sse_key: Optional[bytes] = None,
     ) -> int:
         """Strip every reference to ``artifact_id`` from the SSE index.
+
+        Postings are keyed per collection, so the artifact's collection names the key its
+        manifest is under. ``sse_key`` supplies a key directly: the cutover pass uses it to remove
+        postings written under the principal-wide key they had before collections had keys.
 
         Reads the artifact's manifest to find every blind token referencing
         it, evicts the entry from each posting list (deleting the list
@@ -338,14 +357,18 @@ class SseIndexer:
         if not principal_id or not artifact_id:
             raise ValueError("principal_id and artifact_id are required")
 
-        owner_sse_key = self._oracle.derive_sse_key(principal_id, request)
+        owner_sse_key = (sse_key if sse_key is not None else
+                         collection_sse_key(self._oracle, principal_id, request, collection_id)
+                         if collection_id else self._oracle.derive_sse_key(principal_id, request))
         manifest_key = derive_manifest_key(owner_sse_key, artifact_id)
 
         # One transaction, for the reason `index_artifact` states: a deletion that dropped the
         # manifest but not every posting entry leaves entries no later call can find, because the
         # manifest was the only record of where they were.
+        slot = (artifact_id if sse_key is not None and not collection_id
+                else self._manifest_slot(collection_id, artifact_id))
         with _atomic_slot_writes(self._postings, principal_id):
-            manifest_blob = self._postings.get_manifest(principal_id, artifact_id)
+            manifest_blob = self._postings.get_manifest(principal_id, slot)
             if manifest_blob is None:
                 return 0
 
@@ -362,7 +385,7 @@ class SseIndexer:
                     touched += 1
 
             # Drop the manifest itself.
-            self._postings.delete_manifest(principal_id, artifact_id)
+            self._postings.delete_manifest(principal_id, slot)
 
         return touched
 

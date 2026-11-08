@@ -457,7 +457,9 @@ try:
     try:
         found = n2.lookup_for("encryption", _read_as(INTRUDER))(ALL)
         ref["forged_context_hits"] = sorted(found)
-        ref["forged_context_refused"] = False
+        # Each collection's postings are under its own collection key: one the intruder cannot
+        # open contributes nothing, so the refusal is the empty answer, reached per collection.
+        ref["forged_context_refused"] = not found
     except GrantDenied as exc:
         ref["forged_context_refused"] = True
         ref["forged_context_refusal"] = str(exc)
@@ -465,8 +467,10 @@ try:
 
     # (c) the intruder's own key addresses nothing: a directory listing cannot become a search
     _act(OWNER)
-    owner_key = self_only.derive_sse_key(OWNER, KeyRequest(
-        requester_id=OWNER, purpose=KeyPurpose.SELF, requester_type="principal", action="read"))
+    # Postings are keyed per collection: the owner holds one SSE key per collection.
+    owner_keys = [self_only.derive_sse_key(OWNER, KeyRequest(
+        requester_id=OWNER, purpose=KeyPurpose.SELF, requester_type="principal", action="read"),
+        collection_id=c) for c in sorted({c for c, _a, _f in CORPUS})]
     _act(INTRUDER)
     intruder_key = self_only.derive_sse_key(INTRUDER, KeyRequest(
         requester_id=INTRUDER, purpose=KeyPurpose.SELF, requester_type="principal",
@@ -475,10 +479,10 @@ try:
     # Every term here must be in a title, because the tokens below are built for `FIELD_TITLE`.
     for term in ("encryption", "lattice", "silhouette"):
         stem = tokenize(term)[0]
-        owner_tok = bt.blind_token(owner_key, bt.FIELD_TITLE, stem)
         intruder_tok = bt.blind_token(intruder_key, bt.FIELD_TITLE, stem)
         addressed[term] = {
-            "owner_token_addresses_a_posting": bool(p2.get_entries(OWNER, owner_tok)),
+            "owner_token_addresses_a_posting": any(
+                p2.get_entries(OWNER, bt.blind_token(k, bt.FIELD_TITLE, stem)) for k in owner_keys),
             "intruder_token_under_owner": bool(p2.get_entries(OWNER, intruder_tok)),
             "intruder_token_under_intruder": bool(p2.get_entries(INTRUDER, intruder_tok)),
         }
@@ -490,6 +494,8 @@ try:
     # unchanged and so is the demonstration: the bytes are real ciphertext, they open under the
     # owner's derived key, and they do not open under the intruder's.
     stem = tokenize("lattice")[0]
+    owner_key = next(k for k in owner_keys
+                     if p2.get_entries(OWNER, bt.blind_token(k, bt.FIELD_TITLE, stem)))
     tok = bt.blind_token(owner_key, bt.FIELD_TITLE, stem)
     handed = p2.get_entries(OWNER, tok)
     entry_artifact, entry_collection, ct = handed[0]

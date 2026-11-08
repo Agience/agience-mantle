@@ -55,6 +55,7 @@ def content_handle():
 
     # The default comes from `lattice_api`, which takes it from `config` — spelling it again here
     # would let the content tier and the store it belongs to point at two different directories.
+    _impl.refuse_default_under_pytest(bool(os.getenv("MANTLE_LATTICE_PATH")))
     db_path = Path(os.path.abspath(os.path.expanduser(
         os.getenv("MANTLE_LATTICE_PATH", str(_impl.DEFAULT_LATTICE_PATH)))))
     root = db_path.parent

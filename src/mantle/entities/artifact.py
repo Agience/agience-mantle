@@ -90,6 +90,22 @@ class Artifact(BaseEntity):
         # path ever needs a lineage traversal — the field travels with the row, like
         # the lattice store's `(_origin, _seq)`.
         origin_root: Optional[str] = None,
+        # The collection this artifact's content is keyed under: its creation parent, fixed when
+        # it is created, as the reach walk follows the creation edge. A move is secondary
+        # containment and does not re-key. Modeled for the same reason as `origin_root`: it must
+        # survive the storage round trip, or the next save would key content to wherever the
+        # artifact is listed now.
+        content_key_scope: Optional[str] = None,
+        # Written by a caller holding Add or Create and not Read: sealed to the collection's drop
+        # key until a reader re-keys it (`content_crypto.encrypt_drop`).
+        content_dropped: Optional[bool] = None,
+        # A credential's secret, sealed when written to each persona that uses it
+        # (`services.credential_sealing`); handed to that persona at use, never opened here.
+        persona_sealed: Optional[dict] = None,
+        # The endpoints a credential's secret may be sent to, fixed when it is written by its
+        # writer (who holds Admin on it by creation) and sealed with the secret. Structure, not
+        # secret: `/use` returns it beside the sealed copy, and no later edit moves it.
+        credential_endpoints: Optional[list] = None,
         # The words a LEXICON entry goes by — `oxygen`, `O`, `atomic number 8` are one concept.
         #
         # Modeled here for the same reason as `content_ref` and `origin_root` above: it must
@@ -144,6 +160,10 @@ class Artifact(BaseEntity):
         # child is VISIBLE as unstamped instead of silently claiming to be a root —
         # which would give it its own key tree and orphan it from its collection.
         self.origin_root = origin_root or (self.id if not collection_id else None)
+        self.content_key_scope = content_key_scope
+        self.content_dropped = content_dropped
+        self.persona_sealed = persona_sealed
+        self.credential_endpoints = credential_endpoints
         self.lemmas = lemmas
         self.colimit_of = colimit_of
         self.trashed_by = trashed_by
@@ -180,6 +200,14 @@ class Artifact(BaseEntity):
             "origin_root": self.origin_root,
             "content_ref": self.content_ref,
         }
+        if self.content_key_scope:
+            d["content_key_scope"] = self.content_key_scope
+        if self.content_dropped:
+            d["content_dropped"] = True
+        if self.persona_sealed:
+            d["persona_sealed"] = self.persona_sealed
+        if self.credential_endpoints is not None:
+            d["credential_endpoints"] = list(self.credential_endpoints)
         if self.name is not None:
             d["name"] = self.name
         if self.description is not None:
@@ -225,6 +253,10 @@ class Artifact(BaseEntity):
             modified_by=data.get("modified_by"),
             modified_time=data.get("modified_time"),
             origin_root=data.get("origin_root"),
+            content_key_scope=data.get("content_key_scope"),
+            content_dropped=data.get("content_dropped"),
+            persona_sealed=data.get("persona_sealed"),
+            credential_endpoints=data.get("credential_endpoints"),
             # `name` is this entity's title slot — `_extract_artifact_fields` falls back to it for
             # the indexed title, and `field_filters._title` reads it too. A document may spell that
             # `name` or `title` depending on which path wrote it: the API files a title inside

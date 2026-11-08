@@ -68,6 +68,18 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 logger = logging.getLogger(__name__)
 
 _MAGIC = b"MEC1"                                   # Mantle Encrypted Content, v1
+#: Content keyed under its collection's own key (`oracle.get_or_create_collection_key`), not the
+#: principal's master key. Same layout as MEC1 and the same scoped AAD.
+_MAGIC_COLLECTION = b"MEC3"
+#: A drop: content written by a caller who holds Add (or Create) and not Read on the collection
+#: (architecture §51, CRUDEASIO: no action but Read releases a content key). Sealed to the
+#: collection's public drop key, `MED1 ‖ ephemeral X25519 public(32) ‖ nonce(12) ‖ ct`, with the
+#: principal, collection and artifact bound in the AAD. Only a holder of the collection key (whose
+#: derivation the drop key's private half is) opens it; a reader re-keys it under the collection
+#: key the first time it reads it.
+_MAGIC_DROP = b"MED1"
+_DROP_SALT = b"mantle-drop-key-v1"
+_HKDF_SALT_COLLECTION = b"agience-mantle-collection-content-key-v1"
 _NONCE_LEN = 12
 _HKDF_SALT = b"agience-mantle-content-key-v1"      # versioned, distinct from cell/sse salts
 _HKDF_INFO = b"content"
@@ -86,6 +98,8 @@ legacy_aad_reads: int = 0
 # principal_id -> 32-byte master key. Injectable so the crypto is unit-testable
 # without the oracle/DB, and so the content layer can pass a cached-oracle provider.
 MasterKeyProvider = Callable[[str], bytes]
+#: `(principal_id, collection_id) -> collection key`.
+CollectionKeyProvider = Callable[[str, str], bytes]
 
 
 #: The right a content key is demanded under. `read` everywhere but one place: a credential released
@@ -118,6 +132,17 @@ def content_key_action(action: str) -> Iterator[None]:
         yield
     finally:
         _KEY_ACTION.reset(token)
+
+
+def _refuse_ember(actor) -> None:
+    """A narrowed delegation opens no person's key (John, 2026-11-02, review 10; review 11 for the
+    personas): on one, no content key, master or collection, is asked for, whatever the person's
+    grants. An Ember write then goes to the collection's drop key (`encrypt_content`), and a read
+    is refused."""
+    if getattr(actor, "narrowed", None):
+        from mantle.services.acting_principal import KeyCustodyDenied
+        raise KeyCustodyDenied("an Ember delegation opens no key: Ember writes to a drop key and "
+                               "reads verdicts only")
 
 
 def _default_master_key(principal_id: str, collection_id: Optional[str] = None,
@@ -153,6 +178,7 @@ def _default_master_key(principal_id: str, collection_id: Optional[str] = None,
         raise RuntimeError("key oracle unavailable — cannot encrypt/decrypt content")
 
     actor = require_acting_principal()
+    _refuse_ember(actor)
     return oracle.get_or_create_master_key(
         principal_id,
         KeyRequest(
@@ -186,6 +212,34 @@ def _provider_for(collection_id: Optional[str], *, may_create: bool = False,
     return _provider
 
 
+def _default_collection_key(principal_id: str, collection_id: str, *, may_create: bool = False,
+                            creator_id: Optional[str] = None) -> bytes:
+    """The collection's own content key, checked against the grant ledger as the master key is.
+    Each collection has one (John, 2026-10-31); under threshold custody Origin releases its share
+    only to a caller whose walk reaches that collection."""
+    from mantle.search.mantle.oracle import KeyPurpose, KeyRequest
+    from mantle.search.mantle.wiring import _build_oracle
+    from mantle.services.acting_principal import require_acting_principal
+
+    oracle = _build_oracle()
+    if oracle is None:
+        raise RuntimeError("key oracle unavailable — cannot encrypt/decrypt content")
+    actor = require_acting_principal()
+    _refuse_ember(actor)
+    return oracle.get_or_create_collection_key(
+        principal_id, collection_id,
+        KeyRequest(requester_id=actor.principal_id, purpose=KeyPurpose.GRANT,
+                   requester_type=actor.principal_type, action=_KEY_ACTION.get(),
+                   may_create=may_create, creator_id=creator_id,
+                   artifact_id=None if may_create else _KEY_ARTIFACT.get()))
+
+
+def _collection_content_key(collection_key: bytes) -> bytes:
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=_HKDF_SALT_COLLECTION,
+                info=_HKDF_INFO)
+    return hkdf.derive(collection_key)
+
+
 def _content_key(principal_id: str, provider: MasterKeyProvider) -> bytes:
     master_key = provider(principal_id)
     hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=_HKDF_SALT, info=_HKDF_INFO)
@@ -210,8 +264,87 @@ def _scoped_aad(principal_id: str, collection_id: str) -> bytes:
 
 
 def is_encrypted(blob: bytes) -> bool:
-    """True if *blob* is Mantle-encrypted content (has the MEC1 magic)."""
-    return isinstance(blob, (bytes, bytearray)) and bytes(blob[:4]) == _MAGIC
+    """True if *blob* is Mantle-encrypted content (MEC1, MEC3 under a collection key, or a MED1
+    drop)."""
+    return isinstance(blob, (bytes, bytearray)) and bytes(blob[:4]) in (
+        _MAGIC, _MAGIC_COLLECTION, _MAGIC_DROP)
+
+
+def is_drop(blob: bytes) -> bool:
+    """True if *blob* is a drop, sealed to its collection's public drop key (MED1)."""
+    return isinstance(blob, (bytes, bytearray)) and bytes(blob[:4]) == _MAGIC_DROP
+
+
+def drop_private_key(collection_key: bytes):
+    """The collection's drop key pair, derived from its collection key: only a holder of the
+    collection key holds the private half."""
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+
+    raw = HKDF(algorithm=hashes.SHA256(), length=32, salt=_DROP_SALT,
+               info=b"collection drop key").derive(collection_key)
+    return X25519PrivateKey.from_private_bytes(raw)
+
+
+def drop_public_key(collection_key: bytes) -> bytes:
+    from cryptography.hazmat.primitives import serialization
+
+    return drop_private_key(collection_key).public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+
+
+def _drop_aad(principal_id: str, collection_id: str, artifact_id: str) -> bytes:
+    parts = [principal_id, collection_id, artifact_id]
+    return b"mantle-drop-v1|" + "|".join(f"{len(p.encode())}:{p}" for p in parts).encode()
+
+
+def _drop_key(shared: bytes, eph_pub: bytes, recipient_pub: bytes) -> bytes:
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=eph_pub + recipient_pub,
+                info=b"mantle drop content").derive(shared)
+
+
+def encrypt_drop(principal_id: str, plaintext: bytes, *, collection_id: str, artifact_id: str,
+                 public_key: bytes) -> bytes:
+    """Seal *plaintext* to a collection's public drop key: no collection key is needed or
+    obtained, so a writer holding Add (or Create) and not Read writes without one."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.x25519 import (
+        X25519PrivateKey, X25519PublicKey)
+
+    if not (principal_id and collection_id and artifact_id):
+        raise ValueError("a drop is bound to its principal, collection and artifact")
+    eph = X25519PrivateKey.generate()
+    eph_pub = eph.public_key().public_bytes(serialization.Encoding.Raw,
+                                            serialization.PublicFormat.Raw)
+    shared = eph.exchange(X25519PublicKey.from_public_bytes(public_key))
+    nonce = os.urandom(_NONCE_LEN)
+    ct = AESGCM(_drop_key(shared, eph_pub, public_key)).encrypt(
+        nonce, plaintext, _drop_aad(principal_id, collection_id, artifact_id))
+    return _MAGIC_DROP + eph_pub + nonce + ct
+
+
+def _decrypt_drop(principal_id: str, blob: bytes, collection_id: str, artifact_id: str,
+                  collection_key: bytes) -> bytes:
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
+
+    eph_pub = blob[4:36]
+    nonce, ct = blob[36:36 + _NONCE_LEN], blob[36 + _NONCE_LEN:]
+    priv = drop_private_key(collection_key)
+    shared = priv.exchange(X25519PublicKey.from_public_bytes(eph_pub))
+    return AESGCM(_drop_key(shared, eph_pub, drop_public_key(collection_key))).decrypt(
+        nonce, ct, _drop_aad(principal_id, collection_id, artifact_id))
+
+
+def _drop_public_for(collection_id: str) -> Optional[bytes]:
+    from mantle.search.mantle.wiring import _build_oracle
+
+    oracle = _build_oracle()
+    get = getattr(oracle, "add_seal_public", None) if oracle is not None else None
+    return get(collection_id) if get is not None else None
+
+
+def is_collection_keyed(blob: bytes) -> bool:
+    """True if *blob* is keyed under its collection's own key (MEC3)."""
+    return isinstance(blob, (bytes, bytearray)) and bytes(blob[:4]) == _MAGIC_COLLECTION
 
 
 def encrypt_content(
@@ -221,8 +354,13 @@ def encrypt_content(
     collection_id: Optional[str] = None,
     creator_id: Optional[str] = None,
     master_key_provider: Optional[MasterKeyProvider] = None,
+    collection_key_provider: Optional[CollectionKeyProvider] = None,
 ) -> bytes:
-    """Encrypt *plaintext* for *principal_id*. Returns ``MEC1‖nonce‖ct``.
+    """Encrypt *plaintext* for *principal_id*. Returns ``MEC3‖nonce‖ct`` under the collection's
+    own key when ``collection_id`` is known, else ``MEC1‖nonce‖ct`` under the master key.
+
+    An injected ``master_key_provider`` alone keeps the master-keyed form (callers that hold a
+    master key directly); ``collection_key_provider`` supplies the collection key.
 
     ``collection_id`` narrows the grant check to the artifact's own context; omitting
     it falls back to a principal-scoped check. Requires an acting principal in scope
@@ -236,6 +374,33 @@ def encrypt_content(
         raise ValueError("principal_id is required to encrypt content")
     if isinstance(plaintext, str):
         plaintext = plaintext.encode("utf-8")
+    if collection_id and (collection_key_provider is not None or master_key_provider is None):
+        # The collection's own key: every collection's content is keyed under its own. A writer
+        # who may not read the collection (Add or Create alone) is given no key: their content
+        # is sealed to the collection's public drop key instead.
+        if collection_key_provider is not None:
+            ck = collection_key_provider(principal_id, collection_id)
+        else:
+            from mantle.services.acting_principal import KeyCustodyDenied
+            try:
+                ck = _default_collection_key(principal_id, collection_id, may_create=True,
+                                             creator_id=creator_id)
+            except KeyCustodyDenied:
+                public = _drop_public_for(collection_id)
+                artifact = _KEY_ARTIFACT.get()
+                if not artifact:
+                    raise
+                if public is None:
+                    from mantle.services.acting_principal import AddSealPending
+                    raise AddSealPending(
+                        f"the collection {collection_id} has no Add seal yet, so nothing can be "
+                        f"added to it: try again later, once one of its readers has opened it")
+                return encrypt_drop(principal_id, plaintext, collection_id=collection_id,
+                                    artifact_id=artifact, public_key=public)
+        nonce = os.urandom(_NONCE_LEN)
+        ct = AESGCM(_collection_content_key(ck)).encrypt(
+            nonce, plaintext, _scoped_aad(principal_id, collection_id))
+        return _MAGIC_COLLECTION + nonce + ct
     key = _content_key(
         principal_id,
         master_key_provider or _provider_for(collection_id, may_create=True, creator_id=creator_id),
@@ -256,8 +421,12 @@ def decrypt_content(
     collection_id: Optional[str] = None,
     require_encrypted: bool = False,
     master_key_provider: Optional[MasterKeyProvider] = None,
+    collection_key_provider: Optional[CollectionKeyProvider] = None,
 ) -> bytes:
     """Decrypt a Mantle-encrypted *blob* for *principal_id*.
+
+    A MEC3 blob opens under its collection's own key, for its own collection only. A MEC1 blob
+    (written under the master key before collections had keys) opens as below.
 
     Legacy plaintext (no MEC1 magic) is returned unchanged (backward compatible) —
     unless ``require_encrypted=True``, which makes that path a hard error. Pass it
@@ -287,6 +456,20 @@ def decrypt_content(
         return bytes(blob)
     if not principal_id:
         raise ValueError("principal_id is required to decrypt content")
+    if is_drop(blob):
+        artifact = _KEY_ARTIFACT.get()
+        if not collection_id or not artifact:
+            raise ValueError("a drop opens only in its own collection, for its own artifact")
+        ck = (collection_key_provider(principal_id, collection_id) if collection_key_provider
+              else _default_collection_key(principal_id, collection_id))
+        return _decrypt_drop(principal_id, blob, collection_id, artifact, ck)
+    if is_collection_keyed(blob):
+        if not collection_id:
+            raise ValueError("a collection-keyed blob opens only in its own collection")
+        ck = (collection_key_provider(principal_id, collection_id) if collection_key_provider
+              else _default_collection_key(principal_id, collection_id))
+        return AESGCM(_collection_content_key(ck)).decrypt(
+            blob[4:4 + _NONCE_LEN], blob[4 + _NONCE_LEN:], _scoped_aad(principal_id, collection_id))
     key = _content_key(
         principal_id, master_key_provider or _provider_for(collection_id)
     )

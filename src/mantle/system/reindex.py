@@ -31,7 +31,12 @@ logger = logging.getLogger("reindex")
 #: The index generation this build writes.
 #:
 #:   1  hyphenated names indexed by their parts as well (0.1.6)
-GENERATION = 1
+#:   2  the same pass again, now naming each artifact it does not index (a tester's note was missed
+#:      by generation 1, which reported no failure and kept no record of which artifacts it skipped)
+GENERATION = 2
+
+#: The most artifacts a pass names as not indexed; the counts cover the rest.
+NOT_INDEXED_NAMED = 500
 
 #: The platform setting recording the generation the stored index was last rebuilt for.
 SETTING = "search.reindex.generation"
@@ -53,7 +58,12 @@ def reindex_as_owners(db) -> dict:
     An artifact whose body cannot be read here (held only in an object store this node cannot
     reach) is `unreadable`; one whose index write every candidate is refused is `denied` (on the
     release candidate, 69 of the platform's own artifacts: type definitions, operators, platform
-    collections). Neither is a failure: retrying cannot change either."""
+    collections). Neither is a failure: retrying cannot change either.
+
+    `not_indexed` names each artifact the pass did not index, with its reason (`skipped`,
+    `unreadable`, `denied`, `failed` or `ownerless`), up to :data:`NOT_INDEXED_NAMED`. 2026-10-31,
+    a tester: an old note was still found only by its whole hyphenated name after a pass that
+    reported no failure, and nothing said whether that pass had reached it."""
     from mantle.db.doc_boundary import ContentDecryptionError as SealError
     from mantle.db.lattice_api import from_lattice_doc
     from mantle.entities.artifact import Artifact
@@ -64,6 +74,11 @@ def reindex_as_owners(db) -> dict:
     from mantle.services.system_identity import system_acting_context
 
     counts = {"indexed": 0, "skipped": 0, "failed": 0, "unreadable": 0, "denied": 0, "ownerless": 0}
+    not_indexed: list[dict] = []
+
+    def missed(raw: dict, reason: str) -> None:
+        if len(not_indexed) < NOT_INDEXED_NAMED:
+            not_indexed.append({"id": str(raw.get("id")), "reason": reason})
     root_owners: dict[str, str | None] = {}
 
     def candidates(raw: dict) -> list[str]:
@@ -118,6 +133,7 @@ def reindex_as_owners(db) -> dict:
         owners = candidates(raw) if isinstance(raw, dict) else []
         if not owners:
             counts["ownerless"] += 1
+            missed(raw if isinstance(raw, dict) else {}, "ownerless")
             continue
         result = "failed"
         for owner in owners:
@@ -137,7 +153,9 @@ def reindex_as_owners(db) -> dict:
             logger.warning("  cannot index %s (%s) as %s", str(raw.get("id"))[:8], raw.get("content_type"),
                            " or ".join(o[:8] for o in owners))
         counts[result] += 1
-    return counts
+        if result != "indexed":
+            missed(raw, result)
+    return {**counts, "not_indexed": not_indexed}
 
 
 def reindex_once(db, settings, *, rebuild: Callable[[], dict] | None = None,
@@ -176,6 +194,10 @@ def main() -> int:
     db = next(get_store_db())
     settings.load_all(db)
     result = reindex_once(db, settings, check=args.check)
+    named = result.pop("not_indexed", [])
+    for entry in named:
+        logger.info("  not indexed: %s (%s)", entry["id"], entry["reason"])
+    # The last line is the summary; the release keeps it in the release record.
     logger.info("reindex: %s", result)
     return 1 if result.get("failed") else 0
 

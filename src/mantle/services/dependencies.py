@@ -13,6 +13,7 @@
 # _check_grant_permission — grant permission helper
 
 import logging
+import re
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Dict, List, Optional
@@ -26,7 +27,9 @@ from mantle.db.store import Database
 from typing import Generator
 
 from mantle import config
-from mantle.services.acting_principal import acting_from_auth, set_acting_principal
+from mantle.services.acting_principal import (
+    acting_from_auth, forwardable_credential, set_acting_principal,
+)
 from mantle.services.person_service import get_user_by_id  # expects Database
 from mantle.services.auth_service import verify_token
 from mantle.db import backend as db_store
@@ -185,6 +188,16 @@ class AuthContext:
     #: Recorded here; enforced by :func:`_enforce_token_scope`. Provenance alone would repeat the
     #: gap — the claim was always present, it was never consulted.
     scope: Optional[str] = None
+    #: A delegation's `aud`, as Origin issued it; None for anything that is not a delegation.
+    delegation_aud: Optional[str] = None
+    #: Origin's `narrowed` claim: this delegation, or the persona server delegation exchanged
+    #: from one, is narrowed (review 12, H5).
+    narrowed: bool = False
+
+    @property
+    def narrowed_audience(self) -> Optional[str]:
+        """The audience Origin narrowed this delegation to (`is_narrowed`), or None."""
+        return (narrowed_for(self) or "?") if is_narrowed(self) else None
 
     def __post_init__(self) -> None:
         """Nobody authenticates as the commons.
@@ -306,6 +319,14 @@ def _claim_aud_str(payload: dict) -> Optional[str]:
     return str(aud) if aud else None
 
 
+def _refuse_a_delegation_mantle_signed(payload: dict) -> None:
+    """Mantle mints no delegation (review 19, H2), so one its own key signed names a person nobody
+    handed it: refused, whatever else it carries."""
+    if str(payload.get("iss") or "") == "mantle":
+        raise HTTPException(status_code=401, detail="Mantle signs no delegation; this one is "
+                            "no one's")
+
+
 def _validate_aud_for_principal(payload: dict) -> None:
     """Post-decode audience validation for multi-type token paths."""
     principal_type = payload.get("principal_type", "user")
@@ -325,11 +346,27 @@ def _validate_aud_for_principal(payload: dict) -> None:
         # + act.sub=server_client_id.  Only require aud to be present.
         if not aud:
             raise HTTPException(status_code=401, detail="Missing aud in delegation token")
+        # A persona's own delegation (its actor proven by its own key, `act.iss`) is addressed to
+        # Mantle (review 22): one addressed to the persona is what the persona itself takes, and
+        # Mantle never holds it.
+        act = payload.get("act") if isinstance(payload.get("act"), dict) else {}
+        if (str(act.get("sub") or "").startswith(_SERVER_PREFIX) and act.get("iss")
+                and aud != "mantle"):
+            raise HTTPException(status_code=401,
+                                detail="a persona's delegation is addressed to Mantle")
     else:
         # External OIDC IdP tokens carry the IdP's own audience (already validated
         # by the OidcVerifier against the configured client id), not AUTHORITY_ISSUER
         # — so don't re-check it here.
         from mantle.services.oidc import get_oidc_verifier
+        # A person's Origin token is taken only addressed to Mantle (review 23, H1): the web app
+        # gets that one in the person's Origin session, and it mints nothing. One addressed to
+        # Origin is what Origin exchanges, and Mantle never holds it.
+        if payload.get("iss") == config.AUTHORITY_ISSUER:
+            if aud != "mantle":
+                raise HTTPException(status_code=401, detail="a person's token is taken here "
+                                    "only addressed to Mantle")
+            return
         if get_oidc_verifier().is_trusted(payload.get("iss", "")):
             return
         if aud != config.AUTHORITY_ISSUER:
@@ -421,6 +458,175 @@ def _enforce_token_scope(auth: "AuthContext", request: Optional[Request]) -> Non
     )
 
 
+#: The audience Origin narrows a delegation to for Ember (`aud` = `act.sub`). Review 8, R3.
+EMBER_ACTOR = "ember"
+EMBER_MEMORY_IDENTITY = "ember:memory"
+#: What a memory Ember writes may be: text, nothing typed (review 11).
+EMBER_MEMORY_CONTENT_TYPES = ("text/markdown", "text/plain")
+#: The narrow audiences Origin's token exchange issues (`NARROW_AUDIENCES` there): Ember and the
+#: persona servers (review 11, H3). `MANTLE_NARROW_AUDIENCES` (comma-separated, or a JSON list)
+#: names them here.
+DEFAULT_NARROW_AUDIENCES = ("ember", "iris", "lumen", "sage", "crystal")
+
+_ID = r"(?!visible$|trash$|platform-operators$|recall$|batch$)[^/]+"
+#: What each narrowed scope reaches, as explicit (method, route) allowlists (review 9, M7). A
+#: narrowed delegation reaches only the union of its scopes' routes, and a scope this table does
+#: not know reaches nothing. Ember shares nothing (John, 2026-11-02, review 11): sharing happens
+#: only in the person's own session. A persona's narrowed delegation reaches no Mantle route: a
+#: persona calls Mantle on its own server delegation, which it obtains from Origin for that
+#: narrowed delegation (`persona:<name>` scopes are listed here, empty, so the rule is explicit).
+NARROWED_SCOPE_ROUTES = {
+    "ember:memory": (("POST", re.compile(r"^/artifacts/?$")),),
+    # Ember's read check is a verdict, never content (review 10): Ember opens no person's key.
+    "ember:read": (("GET", re.compile(r"^/grants/my-access/?$")),),
+    "persona:iris": (),
+    "persona:lumen": (),
+    "persona:sage": (),
+    "persona:crystal": (),
+}
+
+_GET_ID = ("GET", re.compile(rf"^/artifacts/{_ID}/?$"))
+_GET_CHILDREN = ("GET", re.compile(rf"^/artifacts/{_ID}/children/?$"))
+_GET_CONTENT = ("GET", re.compile(rf"^/artifacts/{_ID}/content/?$"))
+_USE = ("POST", re.compile(rf"^/artifacts/{_ID}/use/?$"))
+_OP = ("POST", re.compile(rf"^/artifacts/{_ID}/op/[^/]+/?$"))
+_CREATE = ("POST", re.compile(r"^/artifacts/?$"))
+_VISIBLE = ("GET", re.compile(r"^/artifacts/visible/?$"))
+_OPERATORS = ("GET", re.compile(r"^/artifacts/platform-operators/?$"))
+_MY_ACCESS = ("GET", re.compile(r"^/grants/my-access/?$"))
+_RECALL = ("POST", re.compile(r"^/artifacts/recall/?$"))
+#: What a persona's own server delegation reaches when Origin exchanged it from a delegation
+#: narrowed to that persona (review 12, H5): the routes that persona's code calls on Mantle, and
+#: nothing else. No grant, no delete, no update, no platform route.
+NARROWED_SERVER_ROUTES = {
+    "iris": (_GET_ID, _MY_ACCESS, _CREATE, _USE, ("POST", re.compile(r"^/mcp/?$"))),
+    "lumen": (_GET_ID, _GET_CHILDREN, _VISIBLE, _OPERATORS, _MY_ACCESS, _CREATE, _USE, _OP,
+              ("POST", re.compile(r"^/artifacts/batch/?$"))),
+    "sage": (_GET_ID, _VISIBLE, _RECALL, _CREATE, _USE),
+    "crystal": (_GET_ID, _GET_CHILDREN, _GET_CONTENT, _VISIBLE, _OPERATORS, _MY_ACCESS, _CREATE,
+                _RECALL, _OP, ("GET", re.compile(r"^/type-definitions/[^/]+/?$")),
+                ("GET", re.compile(r"^/status/?$"))),
+}
+_SERVER_PREFIX = "agience-server-"
+
+
+def narrow_audiences() -> Optional[frozenset]:
+    """The narrow audiences, or None when `MANTLE_NARROW_AUDIENCES` does not parse: then every
+    delegation is treated as narrowed, and reaches nothing (fails closed)."""
+    import json as _json
+    import os as _os
+
+    raw = (_os.getenv("MANTLE_NARROW_AUDIENCES") or "").strip()
+    if not raw:
+        return frozenset(DEFAULT_NARROW_AUDIENCES)
+    if raw[:1] in "[{":
+        try:
+            parsed = _json.loads(raw)
+        except ValueError:
+            return None
+        names = list(parsed) if isinstance(parsed, (list, dict)) else None
+        if names is None or not all(isinstance(n, str) and n for n in names):
+            return None
+        return frozenset(names)
+    names = [n.strip() for n in raw.split(",")]
+    if not all(names):
+        return None
+    return frozenset(names)
+
+
+def is_narrowed(auth: "AuthContext") -> bool:
+    """A delegation Origin's token exchange narrowed, recognised from Origin's claims: a delegation
+    whose `aud` is its own actor (`act.sub`) and a narrow audience, or one carrying any scope that is
+    not a platform purpose. The actor's name alone decides nothing."""
+    aud = getattr(auth, "delegation_aud", None)
+    if not aud:
+        return False                          # not a delegation
+    if getattr(auth, "narrowed", False) is True:
+        return True                           # Origin says so (review 12, H5)
+    auds = narrow_audiences()
+    if auds is None:
+        return True
+    # Addressed to itself as a narrow audience, or to a page's own origin (a facet Origin narrowed
+    # a sign-in to): a persona server's own delegation is addressed to its client id, never these.
+    if aud == str(getattr(auth, "actor", None) or "") and (
+            aud in auds or aud.startswith(("https://", "http://"))):
+        return True
+    scopes = (getattr(auth, "scope", None) or "").split()
+    return any(not s.startswith(_PLATFORM_SCOPE_PREFIX) for s in scopes)
+
+
+def narrowed_for(auth) -> Optional[str]:
+    """Whom a narrowed delegation is narrowed to: its audience, or Ember for the one Origin
+    addresses to Mantle when Ember exchanges its own (`aud` `mantle`, actor `ember`, review 21,
+    F6). Ember never forwards the delegation addressed to itself."""
+    aud = getattr(auth, "delegation_aud", None)
+    actor = str(getattr(auth, "actor", "") or "")
+    if aud == "mantle" and getattr(auth, "narrowed", False) is True and (
+            actor == EMBER_ACTOR or actor.startswith(_SERVER_PREFIX)):
+        return actor          # Ember's, or a persona's server delegation (review 22)
+    return aud
+
+
+def is_ember(auth) -> bool:
+    """A delegation Origin narrowed to Ember: addressed to Ember, or Origin's exchange of it
+    addressed to Mantle."""
+    return is_narrowed(auth) and narrowed_for(auth) == EMBER_ACTOR
+
+
+def enforce_narrowed_bounds(auth: "AuthContext", request: Optional[Request]) -> None:
+    """A narrowed delegation reaches only what its declared scopes list; anything else is 403."""
+    if not is_narrowed(auth):
+        return
+    method = (request.method if request is not None else "") or ""
+    path = (request.url.path if request is not None else "") or ""
+    aud = narrowed_for(auth)
+    # A persona's own server delegation exchanged from one narrowed to it: that persona's routes.
+    if (getattr(auth, "narrowed", False) is True and (aud or "").startswith(_SERVER_PREFIX)
+            and aud == str(getattr(auth, "actor", "") or "")):
+        persona = aud[len(_SERVER_PREFIX):]
+        scopes = (getattr(auth, "scope", None) or "").split()
+        if (not scopes or f"persona:{persona}" in scopes) and any(
+                method == m and rx.match(path) for m, rx in NARROWED_SERVER_ROUTES.get(persona, ())):
+            return
+    for scope in (getattr(auth, "scope", None) or "").split():
+        # A scope counts only for its own audience: `ember:*` for Ember, `persona:<n>` for n.
+        owner = scope.split(":", 1)[0] if ":" in scope else ""
+        if owner == "persona":
+            owner = scope.split(":", 1)[1]
+        if owner != aud:
+            continue
+        if any(method == m and rx.match(path) for m, rx in NARROWED_SCOPE_ROUTES.get(scope, ())):
+            return
+    logger.warning("refused a narrowed delegation on %s %s (aud=%s scope=%r principal=%s)",
+                   method or "?", path or "?", aud, auth.scope, auth.principal_id)
+    raise HTTPException(status_code=403, detail="this delegation's scope does not reach this route")
+
+
+#: The name earlier callers use; the bound is now the scope's, whatever the audience.
+enforce_ember_bounds = enforce_narrowed_bounds
+
+
+def ember_create_allowed(auth: "AuthContext", body: dict) -> None:
+    """On an Ember delegation, a create is the caller's memory collection (`identity`
+    `ember:memory`, no container) or a memory inside that collection; nothing else."""
+    if not is_ember(auth):
+        return
+    from mantle.services.artifact_identity import derive_artifact_id
+    mine = derive_artifact_id(str(auth.user_id or auth.principal_id), EMBER_MEMORY_IDENTITY)
+    b = body or {}
+    if b.get("source_artifact_id"):
+        raise HTTPException(status_code=403, detail="an Ember delegation links nothing")
+    # The memory collection is the person's own, made by Mantle at their sign-in on their own
+    # token (review 10): Ember only writes into it, as a drop, and only a plain memory: never a
+    # collection, a credential or any other typed artifact (review 11).
+    ct = str(b.get("content_type") or "text/markdown")
+    if (not b.get("identity") and b.get("container_id") == mine
+            and ct in EMBER_MEMORY_CONTENT_TYPES):
+        return
+    raise HTTPException(status_code=403, detail="an Ember delegation creates only in the "
+                                                "caller's own memory collection")
+
+
 def enforce_token_bounds(auth: "AuthContext", request: Optional[Request], *,
                          nonce_source: Any = None) -> None:
     """Every bound a resolved credential carries beyond its grants: its scope and its key's nonce.
@@ -431,6 +637,7 @@ def enforce_token_bounds(auth: "AuthContext", request: Optional[Request], *,
     `request`: a WebSocket has headers but no method, and the scope check needs the method.
     """
     _enforce_token_scope(auth, request)
+    enforce_narrowed_bounds(auth, request)
     check_inbound_nonce(nonce_source if nonce_source is not None else request, auth)
 
 
@@ -471,6 +678,25 @@ async def get_end_user_claims(
 # ---------------------------------------------------------------------------
 # Core resolution
 # ---------------------------------------------------------------------------
+
+def _issued_before_its_bound(payload: dict) -> bool:
+    """Whether Origin's published sign-in bounds end a token with these claims
+    (`prism.trust.not_before`, polled from Origin and checked against its signature). Only a token
+    Origin issued is bounded: a person token or delegation whose `iss` is the authority issuer.
+    Such a token with no `iat` is refused (review 12, M8)."""
+    if str(payload.get("iss") or "") != str(getattr(config, "AUTHORITY_ISSUER", "") or "~"):
+        return False
+    try:
+        from prism.trust import not_before
+    except Exception:                                             # noqa: BLE001 — no prism here
+        return False
+    try:
+        from mantle.services import authority_ledger as _al
+        _al.listen_for_sign_in_bounds()
+    except Exception:                                             # noqa: BLE001
+        pass
+    return not_before.refused(payload)
+
 
 def resolve_auth(
     token: str,
@@ -546,6 +772,17 @@ def resolve_auth(
         except Exception:
             logger.debug("issuer refresh-on-miss failed", exc_info=True)
     if payload and "sub" in payload:
+        # Origin's sign-in bounds (review 11, M2): a token issued before its person signed out,
+        # or before a signing-key rollover, is no longer good here either.
+        if _issued_before_its_bound(payload):
+            raise HTTPException(status_code=401, detail="this token was issued before its person "
+                                "signed out; sign in again")
+        # A token with a purpose (Origin's refresh, email-verification and password-reset tokens,
+        # a use verdict) is no bearer (review 22, F6): it is signed with the same key as an access
+        # token and marked only by `token_type`.
+        if payload.get("token_type"):
+            raise HTTPException(status_code=401, detail=f"a {payload.get('token_type')!r} token "
+                                "is not an access token")
         jwt_principal_type = payload.get("principal_type", "user")
 
         # A `server` names nothing here. Mantle registers no servers, issues no server
@@ -624,6 +861,7 @@ def resolve_auth(
             )
 
         if jwt_principal_type == "delegation":
+            _refuse_a_delegation_mantle_signed(payload)
             # All four identity-chain entities are required:
             # User (sub), Server (act.sub), Authority (iss), Host (host_id)
             d_sub = payload.get("sub")
@@ -647,6 +885,8 @@ def resolve_auth(
                 # its purpose table; a token without one is an ordinary user delegation and is
                 # unaffected.
                 scope=(str(payload.get("scope")) if payload.get("scope") else None),
+                delegation_aud=_claim_aud_str(payload),
+                narrowed=payload.get("narrowed") is True,
             )
 
         # Default: user JWT.
@@ -731,8 +971,16 @@ async def get_auth(
     # leak into another request; it is deliberately not reset, because it must stay
     # readable for the whole handler including anything it awaits.
     if auth.principal_id or auth.user_id:
-        set_acting_principal(acting_from_auth(auth))
+        set_acting_principal(acting_from_auth(auth, forwarded_credential(token, auth)))
     return auth
+
+
+def forwarded_credential(token: Optional[str], auth: AuthContext):
+    """The caller's bearer to forward to Origin for a key-share release (threshold custody), when
+    it is an Origin-issued person token or delegation. See `acting_principal.forwardable_credential`."""
+    from mantle import config
+
+    return forwardable_credential(token, auth, getattr(config, "AUTHORITY_ISSUER", "") or "")
 
 
 async def get_person(
@@ -872,6 +1120,10 @@ def require_platform_admin(
     """
     if not auth.user_id:
         raise HTTPException(status_code=403, detail="Platform admin access required")
+    # A delegation (any actor acting for the person) is never a platform admin: administering
+    # the platform is the person's own act, on their own token (review 8, R3).
+    if getattr(auth, "actor", None):
+        raise HTTPException(status_code=403, detail="Platform admin access required")
     if is_platform_admin(store_db, auth.user_id):
         return auth.user_id
     raise HTTPException(status_code=403, detail="Platform admin access required")
@@ -929,8 +1181,13 @@ def check_access(
     store_db: Database,
     *,
     grant_memo: Optional[Dict[str, list]] = None,
+    consult_origin: bool = True,
 ) -> GrantEntity:
     """Verify *auth* has permission to perform *action* on *artifact_id*.
+
+    ``consult_origin=False`` decides by the store's co-signed grants alone, for a principal this
+    request holds no credential of (a persona whose own Read a credential's use needs); the store
+    is held to Origin's replica by the feed's digest check.
 
     CRUDEASIO lives in Mantle (the lattice grants collection). Light-cone
     traversal: direct grant first, then walk origin edges upward checking
@@ -1062,6 +1319,12 @@ def check_access(
                 root_id=doc.get("root_id") or artifact_id):
             held = _check_grants(resource)
             if held is not None:
+                # Under threshold custody Origin's own walk must agree, for every action: a store
+                # that drifted from what Origin co-signed decides nothing alone (§51).
+                from mantle.services.authority_ledger import origin_allows
+                if consult_origin and not origin_allows(doc.get("root_id") or artifact_id, action):
+                    _witness("denied", "origin_refused")
+                    raise HTTPException(status_code=404, detail="Not found")
                 _witness("allowed")
                 return held
     except db_store.OriginChainUnterminated:

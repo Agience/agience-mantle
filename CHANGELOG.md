@@ -5,6 +5,227 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-11-08
+
+### Fixed (local check, 2026-11-08)
+- Mantle no longer loads or deletes `KEYS_DIR/setup.token` at startup. The token is Origin's, and a single-host install shares one `KEYS_DIR`, so Origin keeps it until setup completes.
+
+### Changed (review 33)
+- Offline recovery (`MANTLE_MASTER_KEY_RECOVERY=escrow` with the offline escrow identity) combines this node's share with the escrow share and asks Origin nothing, so it runs when Origin is down, refuses, or has lost its shares. A running node still refuses to start with the identity configured, and a refusal from Origin on a running node never falls through to escrow.
+- `rekey_collections --rotate-again <root>` rotates a charged root onto a fresh key and kcv whatever its mark; it refuses a root the run does not rotate.
+- On the production plane the server does not start without its lock; elsewhere it logs. Step 21 holds the lock for the whole rotation.
+
+### Changed (review 32)
+- A re-run of step 21 leaves a rotated charged root `already`, with its key and kcv, while none of its removed part's rows opens under that key; a split root is reported `split`, not `left`.
+- `split_master_keys` refuses a root Mantle's own off-root test finds a removed part under and whose key carries no rotation mark, and counts a split whose activation Origin did not hear as failed (`activation_failed`), exiting non-zero.
+- The server holds `<lattice>.server.lock` while it runs (`services/server_lock.py`); step 21 rotates nothing while another process holds it.
+
+### Changed (review 31)
+- Step 21 (`rekey_collections`) rotates charged roots' keys only with `--mantle-stopped`, with the ledger feed at Origin's head, and with Origin's `principal-kinds` answer; it exits non-zero without any of them, or when any charged root is left. It rotates every root Mantle's own keep/shred test finds a removed part under, as well as those Origin charges.
+- The rotation re-checks each row's `_seq`/`_origin`, the rows under the old key and the key row inside its transaction, and leaves the root on any change; each root fails alone; the new key row carries the rotation mark (`rotated.kcv`), which the report gives for the operator to record at Origin.
+- `split_master_keys` refuses a charged root whose key carries no rotation mark for that key, and every master key when Origin does not say which roots are charged (`refused_unrotated`).
+- A drop (MED1) is under no master key: `rows_under_master_key` and the exposure counts leave it out.
+- The `agience-prism` floor is 0.1.9.
+
+### Changed (review 30)
+- Step 21 (`rekey_collections`) rotates each charged root's master key: its own leftovers move under a new key, the removed part's are shredded with the old key; a root with nothing left has its key removed. `OriginShareCustodian.charged_roots` reads the charged roots from Origin.
+
+### Changed (review 29)
+- The Origin client passes a release's `pending` on, reading a missing one as pending.
+- The owner-call re-key acts as the credential's own subject; an emptied key is removed only for Origin's `root` or `platform` answer, or with `rekey_collections --retire-member-keys`; the rekey report gives `left_per_root`.
+- `exposure_counts` reports `rows_keyed_off_their_root`; the seed planner zeroes its index folders; the mail outbox names messages in sending order.
+
+### Changed (review 28)
+- The owner-call re-key finds rows by their content key principal (index `ix_v_ckp`), writes its done record only when none is left, counts refusals toward the batch and remembers them for ten minutes.
+- A pending Origin share is replaced by a fresh split; only an activated one is completed.
+- Only whole non-person master keys are removed; the split pass's exit code is the non-person gate alone; the seed planner overwrites its copy of the store before removing it.
+
+### Changed (review 27)
+- Key principals are classified by Origin's replica, not by an id's shape; a root's master key is non-person, split on the call of a person Origin admits for it, and what is under it is re-keyed on that call; the rekey pass removes each non-person master key that keys nothing any more.
+- A split interrupted after Origin stored its share is finished with that share kept.
+- Origin is told a split key is active, and the store file settled, only after the replacing row commits (`LatticeConn.after_commit`).
+- The seed planner names its store and is isolated from Origin and the object stores before any `mantle` import and after the copy's settings load.
+- The owner-call re-key scans by key principal, counts refusals as left, and reads its done record by kind and origin; the mesh applies no inbound `custody:` row.
+
+### Changed (review 26)
+- A whole collection key is split on the call of any person whose own credential Origin admits for it; only a person's own access token or an unscoped person delegation splits a key, never a persona's or Ember's.
+- The split asks Origin's release rule first, stores Origin's share before writing the escrow share, and reads Origin's share back and recombines it before replacing the whole row; a refusal is a `ShareRefused`.
+- The store's connections set `secure_delete`, and a split checkpoints the WAL after replacing a whole key row, so the old row leaves no bytes in the store file; a blocked checkpoint is recorded and counted.
+- `split_master_keys.exposure_counts` counts by kind (whole person, non-person and collection keys, content under master keys, unsettled replacements); the pass exits non-zero while a non-person master key is still whole.
+- The platform mail secrets are members of a platform collection the system principal administers, and the operator holds Update on them.
+- Master-key and key-share rows never cross the mesh.
+- Under threshold custody a person's content still under their master key is re-keyed onto its collection keys in the background of their own call, bounded and resumable; `exposure_counts` reports what remains and for how many people.
+- A seed pass can be planned ahead: `python -m mantle.system.seed_plan` prints a pass's entries and digests, and a pass run with `MANTLE_SEED_PLAN_FILE` derives the same grant ids and submits only planned entries.
+
+### Changed (review 25)
+- A whole master key is split in place on its owner's own credential the first time they ask for it; `split_master_keys.exposure_counts` counts what remains whole.
+- Telling Origin a key is active carries the acting credential.
+
+### Changed (review 24)
+- Comments state the seal rule as Origin now applies it (current Update authority).
+
+### Changed (review 23)
+- Under pytest the store and its content tier refuse to open the default `.data` location unless a store is named.
+- A person's Origin token is taken only addressed to Mantle.
+- A new credential's seals go to Origin after its creation edge; an update that changes a credential's secret reseals it and records the new seals.
+
+### Changed (tester, 2026-10-31)
+- `mantle.system.reindex` names each artifact a pass does not index, with its reason (`skipped`, `unreadable`, `denied`, `failed` or `ownerless`), up to 500, and its result carries them as `not_indexed`. Its last line is the summary.
+- The index generation is 2, so the next release runs the pass once more. Generation 1 had recorded itself while an old note stayed findable only by its whole hyphenated name, and nothing named what that pass left out.
+
+### Changed (review 22)
+- A persona's delegation is taken only addressed to Mantle, and its narrowed bounds are the persona's.
+- A credential write records its sealed-copy and endpoint digests at Origin on the writer's credential (`credential_sealing.record_at_origin`).
+- `/use` requires the persona's `nonce` and forwards it to Origin.
+- A token carrying `token_type` is refused as a bearer.
+
+### Changed (review 21)
+- `/artifacts/{id}/use` returns Origin's signed verdict (`verdict`) beside the sealed copy, asked on the persona's own delegation (`OriginShareCustodian.use_verdict`); with no Origin, or a refusal, nothing is returned.
+- Invite mail and first-sign-in provisioning read a person record only on that person's own access token (`person_service.own_subject_token`), and ask Origin nothing without one.
+- Ember's delegation addressed to Mantle (`aud` `mantle`, actor `ember`) is bounded as an Ember delegation (`dependencies.narrowed_for`).
+- `EMBER_INVOKE_TOKEN` is noted as Ember's setting, read by the federation client in Ember's process.
+
+### Changed (review 19)
+- `/use` releases a sealed credential only on a delegation Origin signed. A delegation with `iss` `mantle` is refused at authentication.
+- The reach digest is `prism.trust.ledger.canonical_reach` (expiry, invite target, claim limit). An applied invite keeps its target digest. A deny on a node deleted at Origin (noted when this store removes its creation edge) is left out, as at Origin.
+- The catch-up reads to the head and writes each touched row's latest change over the whole ledger, under `ledger:catchup-review19`. A failure in it never stalls the feed.
+- Custody checks the store folder too, reading each folder as itself, and offers `custody_refusal`.
+- Every answer from Origin is capped at 4 MiB.
+
+### Changed (review 18)
+- The catch-up reads every page of Origin's feed, verified in one chain, before it works out the latest change to each row. It writes that latest change for every row a session touched, and runs again under a new marker for stores the one-page run marked. A short page leaves it undone.
+- An expiry that does not parse is past.
+
+### Changed (review 17)
+- The feed applies `origin_session` entries, so changes people make in Facet reach this store. The kinds applied are `prism.trust.ledger.MANTLE_APPLIES`. A store whose cursor had moved past such entries catches up once (`catch_up_skipped`), applying each only while it is still the latest change to its row. The operator's `root.retire` drops the id's Add seal.
+- The Add seal is `add-seal:<collection>`, bound to the collection key by a MAC. An Add-only write seals only to a seal it verifies against the collection key this node holds; otherwise it is refused with 503 "try again later" (`AddSealPending`) until a reader opens the collection. A legacy `drop-key:` row is never trusted.
+- The deny walk follows the whole creation chain, as Origin's does, and a cached cell asks the store's verdict before it is served.
+- The mesh plane must be Mantle's own content bucket.
+
+### Changed (review 16)
+- The Add seal is Mantle's own key material. It is cached when a reader opens the collection key and re-checked on every Read open, with an ALARM and a repair on a mismatch. Nothing is submitted to or read from Origin, and `drop_key_check` and the Origin comparison are removed.
+- `DELETE /artifacts/{container}/children/{member}` resolves both ids to root ids before checking for a creation edge.
+
+### Changed (review 15)
+- `DELETE /artifacts/{container}/children/{member}` removing the member's creation edge needs Delete on the member, or Admin on the container, as Origin requires: it deletes the member at Origin. Evict still removes a secondary edge.
+
+### Changed (review 14)
+
+### Changed (round 13)
+- `GET /grants/invite-context` and `GET /grants/invite-details` are removed: an invite is described and claimed at Origin, and no Mantle route takes an invite's raw token in its query.
+
+### Changed (review 12)
+- Issuer trust roots in configuration: the authority manifest's anchors always win, and Origin's own issuer and every pinned name are taken from the manifest alone; an issuer artifact never adds an issuer or a key, and only keeps a configured external issuer (`AGIENCE_TRUSTED_ISSUERS`) live until it is revoked. `POST /system/issuers` is removed, and no copy of the manifest's anchors is seeded into the store. A JWKS or discovery document is fetched only over https from an origin a configured issuer names or `MANTLE_JWKS_FETCH_ALLOWLIST` lists.
+- With Origin's ledger installed, the grant routes (`POST /grants`, claims, accepts, revocations, grant keys and their members) answer 409: authority changes are made at Origin, in the person's Origin session. Every change made there (`origin_page`) is applied here from Origin's feed: grants, denies and invites, and containment edges with their masks.
+- Every feed entry is checked before it is applied: its hash recomputed from its body, Origin's co-signature by the kid's key from the authority manifest's Origin anchor, and the chain from the last entry applied. One that fails is not applied and stops the pass, with an alarm.
+- A persona's own server delegation exchanged from one narrowed to it (`narrowed` claim) is narrowed: it reaches only the routes that persona calls (`NARROWED_SERVER_ROUTES`), never a grant, an update or a delete.
+- A cached key is served only on its requester's own verdict, the double-check under the oracle's lock included. Key-release verdicts are remembered per credential, and forgetting a person's verdicts also forgets the key-release verdicts and the key cache.
+- Mantle's pages (/docs, the browser) carry a CSP forbidding framing, base tags and plugins, and `X-Frame-Options: DENY`.
+- A credential's `allowed_endpoints` are stored decoded until stable; a path that decodes to a traversal, a backslash or a control character is refused.
+
+### Changed (review 11)
+- Ember makes no grant: an Ember delegation, whatever its scope, is refused at `POST /grants`, and `ember:share` reaches no route. Sharing happens only in the person's own session (John, 2026-11-02).
+- A narrowed delegation is recognised from Origin's claims, not from its actor's name: a delegation addressed to itself as a narrow audience (`MANTLE_NARROW_AUDIENCES`, default Ember and the personas `iris`, `lumen`, `sage`, `crystal`) or to a page's own origin, or one carrying any scope that is not a platform purpose. A scope counts only for its own audience; an audience or scope Mantle does not know reaches nothing; a malformed `MANTLE_NARROW_AUDIENCES` treats every delegation as narrowed (fails closed). A persona's narrowed delegation reaches no Mantle route, and no narrowed delegation opens a key.
+- An Ember delegation creates only plain memories (`text/markdown`, `text/plain`) in the caller's own memory collection: never a collection, a credential or another typed artifact.
+- Tokens issued before Origin's published sign-in bound for their person, or everyone's, are refused (`prism.trust.not_before`), and that person's Origin verdicts are forgotten when the bound moves.
+- A person's memory collection is made at any sign-in that finds it missing, not only the first, and never on a narrowed delegation.
+- A deny on a collection, or above it, holds against every path to its key, a member's Read included (`OracleService._authorize`), matching Origin's release rule.
+
+### Changed (review 10)
+- Ember opens no person's key: on an Ember delegation no content key, master or collection, is asked for (`content_crypto`), whatever the person's grants. A memory Ember writes is sealed to its collection's drop key, written without Read, and indexed by no one until the person reads it.
+- A person's memory collection for Ember is made at their sign-in, on their own token (`user_provisioning._ensure_ember_memory`), which gives it its key and its drop key; an Ember delegation never creates it, and writes only into it.
+- An Ember delegation's read check is a verdict (`GET /grants/my-access`), never content; its share is one Read grant on one artifact (never a container or collection) to one named person (never the commons), expiring within 7 days (`grants_router.EMBER_SHARE_MAX_DAYS`). A persona page's narrowed delegation reaches no Mantle route; none needs one.
+- A credential names the endpoints its secret may be sent to (`allowed_endpoints`, https URLs, fixed when it is written by its writer, who holds Admin on it by creation): they are sealed to each persona with the secret, stored beside it (`credential_endpoints`) and returned by `POST /artifacts/{id}/use`; no later edit moves them. `/use` no longer carries the unused per-card readers of secret names.
+- The acting principal carries a delegation's scope.
+
+### Added (review 10)
+- `python -m mantle.system.rewrap_kek --new-kek-file PATH [--dry-run]`: re-wraps every stored key (whole master and collection keys, this node's share of each split key), re-seals every node-sealed field, every link name with its keyed tokens and every secret platform setting under a new KEK, verifies each by opening it again, and scrubs the old wraps from the store file.
+
+### Changed (review 8)
+- A delegation for Ember (`act.sub` `ember`) reaches only Ember's routes: the caller's memory collection and memories in it (`POST /artifacts`), `GET /artifacts/{id}` and Read grants (`POST /grants`); anything else is 403.
+- No delegation is a platform admin.
+- Threshold custody is claimed only by isolated production (`services.custody_plane`): Mantle refuses to start, and builds no threshold store, unless `AGIENCE_PLANE=production` and the process shows isolation (not root, `NoNewPrivs` set, its keys folder its own and 0700).
+
+### Added
+- Under threshold custody every action, not only Read, needs Origin's verdict as well as the store's grants (`authority_ledger.origin_allows`, through `GET /internal/authority/reach` on the caller's credential); an allow is remembered 30 seconds per requester, resource and action, a refusal not at all.
+- Every 300 seconds the feed compares a digest of the store's active grants and containment edges with Origin's replica (`POST /internal/authority/verify`); a divergence is an ERROR alarm.
+- Search is keyed per collection.
+  - A search cell key is derived from its collection's key, with the owner bound in (`OracleService.derive_cell_key`).
+  - Each collection has its own SSE key, derived from its collection key (`derive_sse_key(..., collection_id=)`). An artifact's blind tokens, posting entries and manifest (kept per collection) are under it.
+  - A query spanning several collections opens each collection's key on its own (`TokenNarrower`). A collection whose key the caller cannot open (not written, not granted, or refused by Origin) contributes nothing. The master key is not used to search.
+  - A key provider without `collection_id` (an embedding consumer's, one key per principal) is used as before (`sse.keys.collection_sse_key`).
+  - `SseIndexer.remove_artifact` takes the artifact's `collection_id`, which the ingest pipeline passes.
+- A collection's key is minted as it is created, after its creator's grant (`collection_service.ensure_collection_key`, for collections and workspaces). With no key oracle or no acting principal it is minted on the first write instead; under threshold custody that is refused.
+- `mantle.system.rekey_collections` also moves the search index (`rekey_index`). Each cell is re-encrypted in place, after reading it back, from its master-derived key to its collection's. Each artifact's postings are written again under its collection's SSE key, then removed from under the principal-wide key, and a rerun finishes an interrupted move.
+- An artifact's content is keyed under its creation parent's collection key, stamped on the row when it is created (`content_key_scope`, carried by the entity), as reach follows the creation edge. A move is secondary containment and does not re-key. A row written before the stamp keys to `collection_id`.
+- Every collection's content is keyed under its own random collection key (`oracle.get_or_create_collection_key`), minted as the collection is created (below) and held in the key store as `ck:<collection>`. Under threshold custody it is split two-of-three like a master key. Content keyed under a collection is `MEC3` (`content_crypto`), its key derived from the collection key under the same scoped AAD. A `MEC1` blob under the master key still opens. Each collection key is cached under its own id for at most 300 seconds.
+- `mantle.system.rekey_collections`, run at the cutover, moves each existing row onto its collection's key: the inline body, the sealed fields, and a content-tier copy. Prior versions are rows of their own and move the same way. The rewrite is in place (`put_artifact(..., snapshot=False)`), so the pass adds no version, and an old content-tier copy is removed once no row names it. The collection key is stored before anything is written under it. Each new blob is read back before the row is written, and the row is replaced in one write only if it is still the row the pass read. What is already collection-keyed is skipped, so the pass is resumable and a second run writes nothing. It reports progress (`--every`), counts (`--dry-run`), and every row it leaves under the master key with the reason (`left`).
+- A seed scope (`*-seed`) runs on the operator's seed credential from `MANTLE_SEED_CREDENTIAL_FILE`, minted at Origin for that pass. Without one, a seed pass is background work, which can only narrow reach. One credential serves one pass (`system_identity.seed_pass`; startup's three seeds are one pass): when the pass ends, done or failed, Origin is told (`seed-done`) and the file is deleted.
+- Under threshold custody, a `contains` edge or grant from a peer (mesh consume) that widens reach is held in `held_reach_change`, unwritten. A narrowing from a peer is written and journaled. `GET /held-reach` lists the held changes on resources the caller manages; `POST /held-reach/{id}/accept` writes one on the caller's own credential, and that write is the co-signed change (a refused acceptance stays held); `POST /held-reach/{id}/reject` drops it.
+- Every change that affects reach is journaled at the store layer every writer goes through (`db.reach_journal`, stdlib only): a grant document written or deleted (`vertex._write_row`, `vertex.delete_artifact`), and a `contains` edge added, changed or retired (`edge._add_one`, `edge._retire_edge_row`). That covers the creation edge the vertex store writes for an artifact placed in a collection, mesh consume, the CLI passes, and the edges a delete takes with it. A new master key's principal and origin root are submitted by the oracle before it stores the key. Entries hold structure only: ids, the CRUDEASIO actions set, effect (`allow`, or `deny` for anything else, as the reach rules read it), state, expiry, an invite's target as a kind and digest (`target_digest`, taken before the address is sealed) and its claim limit, and the edge's decoded mask. They never hold a name, note, label, address or content.
+- Recorded changes are submitted to Origin (`services.authority_ledger`, `POST /internal/authority/entries`) on the acting person's own credential, just before the write transaction commits (`seq.LatticeConn.write`). A refusal rolls the whole transaction back (`ReachChangeRefused`). An entry co-signed for a transaction that then fails is withdrawn by a compensating entry. Origin's receipt (`seq`, `entry_hash`, `signature`, `kid`) is kept in the store's `authority_receipt` table in the same transaction.
+- A withdrawal Origin does not take is recorded (`authority_compensation_due`), retried before the next change to reach and at startup as the system principal's narrowing, and under threshold custody no change to reach is written while one is outstanding.
+- Each receipt's ledger head (`head_seq`) is kept (`authority_receipt`, `ledger:head`, and in memory); a receipt naming a lower head is refused, since Origin's ledger then went backwards.
+- A new master key's `root` entry carries the creation the store records for it (who made it, and when), which Origin requires for an id it has not seen.
+- A grant's expiry is compared as time when deciding whether a change widens reach, and shortening a deny's expiry counts as widening.
+- An entry Origin appended whose receipt is then refused (its head went backwards) is withdrawn.
+- Changes to reach are co-signed outside the write lock (`seq.cosigned` on `put_artifact`, `put_many`, `delete_artifact` and the edge writes). The call runs once to learn its changes and is rolled back, Origin is asked with no lock held, and the call runs again and commits only if it makes the same changes against the same co-signed rows. Otherwise the entries are withdrawn and it runs again; after five tries it raises `ReachChangeConflict` with nothing written. Any other write block that changes reach is recorded and replayed only if no other connection committed meanwhile. Ordinary writes no longer wait for Origin.
+- A retried withdrawal names the entry it withdraws, so Origin takes it only while that entry is the latest change to its row; a 409 means it was superseded, and it is cleared.
+- A creator who does not already hold the owner's rights on the container gets no creator grant on what they add, and none is asked of Origin: the item is the collection's owner's. An inbox sender's add succeeds without reading the inbox.
+- An invite is no principal's grant until claimed: `get_active_grants_for_principal_resource`, and so `check_access`, no longer counts an invite whose grantee id equals a principal's id.
+- The cutover pass leaves a row to do when the content tier takes no copy, and removes the new copy it made for a row changed underfoot.
+- Each co-signed entry is confirmed to Origin once its write commits, outside the write lock; one Origin does not hear is recorded (`authority_confirm_due`) and told again.
+- A withdrawal answered 409 is cleared only when the row's latest entry at Origin is one this store committed; otherwise it stays due.
+- A replayed write block is checked against the store's write mark, which writes on this connection move too, and no transaction is open while Origin is asked.
+- A first key share is stored only on a credential Origin accepts for it; without one the store refuses before writing anything.
+- CRUDEASIO (architecture §51): no action but Read releases a content key. The oracle checks Read for every content key, the create base case holds only while no grant names the collection, and the use route no longer widens the key demand to Invoke.
+- Writing without reading is an Add grant. Each collection has a public Add seal (X25519, its private half derived from the collection key, cached as `drop-key:<collection>`). A writer holding Add or Create and not Read seals what they write to it (`MED1`, principal, collection and artifact bound); the first reader re-keys it under the collection key and indexes it as themselves.
+- `create_workspace_artifact` accepts Add (intake) as well as Create.
+- Each operation's changes to reach go to Origin as one batch (`reach_journal.batch`), and a container's root is registered in the batch with its creation grant; a seeded platform collection likewise.
+- An `unchanged` receipt is never withdrawn or confirmed, and a withdrawal Origin answers 410 (resolved by the operator) clears.
+- The combined-key cache holds a key at most 30 seconds, the canon's verdict memo TTL.
+- The cutover pass gives each rewrite its own object-store key, removes object-store copies no version names, and re-files postings for heads only.
+- `add_artifact_to_collection` never makes a second creation edge nor demotes one; target-collection links are secondary containment; an identity upsert into another container is refused.
+- The held-reach listing asks once per resource (`held_reach_change.resource_id`).
+- A person's card is their own root: first sign-in creates it as the person, on their own credential, with their own creation grant, in one Origin-issued batch (`workspace_service.create_container`), placed in no collection and granted to no one else. The People directory is no longer created or written by provisioning, a card is no longer moved into it, and no owner grant on an old card is widened. A member whose old card holds `person_artifact_id` gets their own card at an id of its own (`own_card_id`). A sign-in no longer creates the Authorities collection.
+- `GET /system/users` lists Origin's own person records (`OriginShareCustodian.platform_users`, on the caller's own credential), each with this node's admin verdict; Origin decides who may list. A node with no Origin configured answers 503. The People directory is not read.
+- `mantle.system.people_to_signups [--dry-run]` makes the old People directory the platform's sign-up collection: it renames it and revokes each member's grants on their old card, as the platform's system principal. It deletes nothing and is resumable and idempotent.
+- A container's root and a key's root, submitted to Origin outside a store transaction, are confirmed once their write has landed (`reach_journal.confirm_submitted`).
+- `split_master_keys` activates each key's share at Origin once the split key reads back, so it is no longer replaceable.
+- The root `conftest.py` keeps every test off the checkout's `.data/`: an open there is refused where it happens (so it fails under xdist too), compared case-insensitively.
+- Batches are Origin's: the first receipt of an operation names the batch the rest of it carries.
+- A shared credential is sealed to its personas when written (`persona_sealed`); the use route hands the persona its sealed copy and reads the card as the persona, so no key is opened as the caller.
+- Under threshold custody a cached key is used for a requester only after Origin's verdict for them, memoized 30 seconds.
+- The ledger feed is read every 15 seconds and the operator's revocations and edge removals are applied here.
+- Removing a member from a container takes Evict or Admin.
+- The cutover pass counts object-store references from parsed contexts and re-files postings for archived heads.
+- Origin's share of a key is told when this node activates it.
+- Under threshold custody the ledger is enforced. A change Origin refuses, or cannot be asked about, is not written. A change to reach with no ledger installed is refused at the store, whatever wrote it. A ledger that cannot be installed is fatal at startup. Under lattice custody the ledger is recorded: the change is written either way and a refusal is logged. `MANTLE_AUTHORITY_LEDGER=off` sends nothing, and is refused under threshold custody. `manage_seed`, `manage_bootstrap` and `seal_titles` install the ledger for their pass.
+- An invite claim sends its claim token to Origin as proof (`reach_journal.proof`), which Origin checks and does not store.
+- `mantle.system.cosign_authority` co-signs the authority this node already holds at Origin, once, on the operator's bootstrap credential (`--bootstrap-token-file`), and ends that credential at Origin when the batch finishes or fails: every containment edge, then every key principal's root, then every grant, as bootstrap entries, keeping each receipt. A member with more than one creation edge is submitted with the one `get_origin_parent` reads, and the others as secondary containment; the pass reports how many. A re-run appends nothing, and `--dry-run` counts and sends nothing. It runs before threshold custody is turned on and before `mantle.system.split_master_keys`.
+- Under threshold custody each share request to Origin carries the acting caller's own credential (`X-Acting-Credential`) and names the collection, and the artifact's root, the key is wanted for (`ThresholdMasterKeyStore.get_scoped`, which the oracle calls). Origin releases the share only when that credential's subject reaches the key by its own replica. A share is replaced only with such a credential.
+- The request boundary (`get_auth`, the events socket) carries the caller's bearer in the acting principal when it is an Origin-issued person token or delegation (`acting_principal.ForwardedCredential`, shown only as a hash in any repr). A block run as the principal already acting keeps that credential (`acting_as`), so provisioning at a person's first sign-in acts on the person's own credential.
+- Background work, and work acting as the platform system principal, shows a delegation Origin mints for the one principal being opened (`OriginShareCustodian.background_delegation`, reused until a minute before it expires). Origin mints one only while the operator's background authority is in force. Nothing long-lived is kept on this node.
+- Under threshold custody a key is refused, warm or cold, to a caller with no credential Origin issued. That covers a grant key (`GrantKeyCannotOpenShare`), an external sign-in, an mcp_client or server token, and background work when Origin mints no delegation. Each refusal names why. A refusal from Origin never falls through to escrow recovery (`ShareRefused`); only an Origin that cannot answer does.
+- A combined master key stays in the oracle's cache for at most five minutes (`MANTLE_MASTER_KEY_CACHE_TTL`, 300 seconds by default and at most), after which the store, and under threshold custody Origin, is asked again.
+
+### Changed
+- A shared credential's use (`POST /artifacts/{id}/use`) takes two ordinary grants: the caller's Invoke on the credential (and on the card), and the persona's own Read on its credential, granted by the collection's Admin when the credential is shared with it. Mantle checks both by grant, reads the card and the credential as stored for their type and id only, acts as no persona, mints no delegation for one and opens no key; it hands the persona the copy sealed to its key, which the persona opens itself. There is no `persona.use` job.
+- A narrowed delegation (Origin's token exchange: Ember, or a persona page) reaches on every route only what its scopes list: `ember:memory` `POST /artifacts`, `ember:read` `GET /artifacts/{id}`, `ember:share` `POST /grants`, `persona` reads (`GET /artifacts/{id}`, its children and content, `POST /artifacts/recall`). A narrowed delegation with no or an unknown scope reaches nothing.
+- A container's root is co-signed before its row is written, so a root Origin refuses leaves no row; Origin's verdict on a read is remembered per credential, so a narrowed delegation never rides on a verdict its subject's own token earned.
+- Every background delegation names its job (the acting block's scope), and a block naming none is refused under threshold custody: the ledger's retries run as `ledger.retry`, the rekey pass as `platform.rekey`, the content-tier tool as `platform.content-tier`.
+- Mantle answers cross-origin requests only from the origins `MANTLE_CORS_ORIGINS` names (comma-separated), defaulting to the web app's address `FACET_URI`; never `*`.
+- Under threshold custody the server refuses to start while `MANTLE_ESCROW_IDENTITY_FILE` is set; recovery runs offline (`split_master_keys --combine` with `MANTLE_MASTER_KEY_RECOVERY=escrow`).
+- `split_master_keys` and `rekey_collections` leave no replaced bytes in the store file: once they have rewritten anything they turn on `secure_delete`, `VACUUM` the file and truncate the WAL (`db.scrub`).
+- The BLAS negative control runs its child with every thread cap removed, so it passes in a suite run under `OMP_NUM_THREADS=1`.
+- The feed's cursor stops before an entry it fails to apply.
+- A failed confirmation of an entry submitted outside a store transaction is recorded in `authority_confirm_due`.
+- `people_to_signups` names the member by the card's derived id, and also revokes the grants the member issued on their old card and closes its invites.
+- The rekey pass checks an artifact's own versions before it removes an object-store copy a stale count says no row names.
+- The test guard also refuses sqlite `file:` URIs, paths through junctions and symlinks, subprocesses aimed at the store, and opens in child Python processes.
+- The vertex store writes one creation edge per member, ever. An artifact first placed in a collection gets `is_origin`. An existing artifact that names a new collection (a move) is placed there as secondary containment, so a move never re-roots it. An existing membership is left as it is, so a later put no longer resets its `propagate` mask to unrestricted.
+- `lattice_api` wrappers that read a failed write as `False` raise `ReachChangeRefused` instead of absorbing it.
+
 ## [0.1.10] - 2026-10-31
 
 ### Added
@@ -13,6 +234,7 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 - Each call to Origin for a share signs its own token: 30 seconds of life, a fresh `jti`, and claims naming the method, the route path and the principal.
 - Calls made while holding the custody lock are bounded inside its 30-second wait: Origin at 3 seconds to connect and 8 to read, the durable store at 3 and 8 with one attempt (`content_service._make_s3_client` takes optional timeouts and attempts). A hung peer refuses the put.
 - `mantle.system.split_master_keys` splits every whole master key into shares, sealing the escrow shares into one export file (`--escrow-out`) before any row is replaced, and replaces a row only after its shares, including Origin's stored copy, recombine to the key. Each row is re-read under the custody lock and left alone if it changed since the pass read it. `--dry-run` counts, `--combine` writes split keys back whole under the KEK for a rollback (dropping a pending row only if it is still pending), and `--export-escrow` copies every sealed escrow share from the durable store into one file for the operator's offline copy. A re-run splits only what is still whole. The keys do not change, so nothing they encrypt is rewritten.
+
 
 ### Changed
 - `LatticeMasterKeyStore` refuses a row that holds a share of a split key instead of reading it as absent, so a node returned to whole-key custody without `--combine` cannot mint a replacement over a split key.

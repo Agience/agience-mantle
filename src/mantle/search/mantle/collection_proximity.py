@@ -110,6 +110,7 @@ from typing import (
     Tuple,
 )
 
+from mantle.search.mantle.sse.keys import collection_sse_key
 from mantle.search.ingest.collection_frame import (
     CollectionDigest,
     dumps_digest,
@@ -181,7 +182,7 @@ class DigestSlot:
         self, principal_id: str, digest: CollectionDigest, request: Any,
     ) -> None:
         """Seal and store one collection's digest. Overwrites in place."""
-        key = self._oracle.derive_sse_key(principal_id, request)
+        key = collection_sse_key(self._oracle, principal_id, request, digest.collection_id)
         token = digest_slot_token(key, digest.collection_id)
         self._postings.put_posting(
             principal_id, token,
@@ -205,7 +206,7 @@ class DigestSlot:
         ``TokenNarrower._entries`` takes for an unreadable posting list.
         """
         try:
-            key = self._oracle.derive_sse_key(principal_id, request)
+            key = collection_sse_key(self._oracle, principal_id, request, collection_id)
         except MasterKeyMissing:
             return None
         token = digest_slot_token(key, collection_id)

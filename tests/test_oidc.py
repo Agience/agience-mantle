@@ -99,7 +99,9 @@ def test_platform_role_issuer_verifies_without_audience():
     not here. Internal service auth must keep working under the confused-deputy guard
     above."""
     priv, jwk = _keypair_and_jwk("k1")
-    iss = "mantle"  # platform-service anchor-style issuer
+    # A platform-role issuer named in configuration. Not a name the authority manifest pins: those
+    # come from the manifest alone (review 12, H2).
+    iss = "svc-internal"
     v = OidcVerifier([{"issuer": iss, "role": "platform", "jwks": {"keys": [jwk]}}])
     assert not v.is_trusted(iss)
     claims = v.verify(_token(priv, iss, "anything", "k1"))

@@ -19,6 +19,9 @@ def test_collect_usage_metrics_returns_stable_metric_set(tmp_path, monkeypatch):
         # Mirrors the real signature, `may_create` included — see the note on the same stub in
         # `db/test_lattice_api.py`.
         lambda principal_id, collection_id=None, *, may_create=False, creator_id=None: b"" * 32)
+    monkeypatch.setattr(
+        "mantle.services.content_crypto._default_collection_key",
+        lambda principal_id, collection_id, *, may_create=False, creator_id=None: bytes([2]) * 32)
 
     api.create_collection(db, Artifact(id="ws-1", collection_id="", content="",
                                        content_type=WORKSPACE_CONTENT_TYPE,

@@ -14,10 +14,15 @@ That is the shape of Origin's delegation JWT — ``sub`` / ``act.sub`` / ``host_
 unpacks into ``AuthContext`` (``services/dependencies.py:311-318``). Nothing new is
 invented; the existing chain is carried the rest of the way down.
 
-Fail closed: this is deliberately not a token — contrast a contextvar that carries a
-raw bearer, as an application tier typically does. It holds an already-verified chain, so
-nothing below the router re-parses or re-trusts a credential. Verification stays at
-the boundary; this is only the result of it.
+Fail closed: the identity here is an already-verified chain, so nothing below the router
+re-parses or re-trusts a credential to decide who is asking. Verification stays at the boundary;
+this is only the result of it.
+
+It may also carry the caller's own credential (:class:`ForwardedCredential`), unread, for one
+consumer: under threshold custody Origin releases a key share only on the acting caller's own
+credential, which Origin verifies itself, so Mantle forwards the bearer it was presented. Only an
+Origin-issued person token or delegation is carried (`forwardable_credential`); a grant key never
+is. It never appears in a repr, a log line or an equality.
 
 Usage: on the request path, the auth dependency sets it — nothing else to do.
 
@@ -35,12 +40,15 @@ on the thread or task that runs next.
 from __future__ import annotations
 
 import contextvars
+import hashlib
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterator, Optional
 
 __all__ = [
     "ActingPrincipal",
+    "ForwardedCredential",
+    "forwardable_credential",
     "KeyCustodyDenied",
     "NoActingPrincipal",
     "SystemPrincipalUnavailable",
@@ -75,6 +83,13 @@ class KeyCustodyDenied(PermissionError):
     """
 
 
+class AddSealPending(KeyCustodyDenied):
+    """An Add-only write into a collection with no Add seal bound to its collection key yet: no
+    reader has opened it since this node started (or since the seal was changed). Refused, and
+    the sender is told to try again later (John, 2026-11-03); the API answers 503 with a
+    `Retry-After`."""
+
+
 class NoActingPrincipal(KeyCustodyDenied):
     """No authenticated caller is in scope, so no key may be issued.
 
@@ -92,6 +107,64 @@ class SystemPrincipalUnavailable(NoActingPrincipal):
     would acquire whatever grants happened to match it, which is the failure mode
     ``issuers.py`` already fails closed against.
     """
+
+
+class ForwardedCredential:
+    """The caller's own bearer, held only to be forwarded to Origin for a key-share release.
+
+    Nothing in Mantle reads it for a decision. `repr` and `str` show a short hash, so an acting
+    principal logged or put in an exception message does not carry the token."""
+
+    __slots__ = ("_token",)
+
+    def __init__(self, token: str) -> None:
+        if not token:
+            raise ValueError("an empty credential")
+        self._token = token
+
+    @property
+    def token(self) -> str:
+        return self._token
+
+    @property
+    def ref(self) -> str:
+        return "sha256:" + hashlib.sha256(self._token.encode("utf-8")).hexdigest()[:12]
+
+    def __repr__(self) -> str:
+        return f"ForwardedCredential({self.ref})"
+
+    __str__ = __repr__
+
+
+def forwardable_credential(token: Optional[str], auth, authority_issuer: str
+                           ) -> Optional[ForwardedCredential]:
+    """The bearer to carry for a share release, or None.
+
+    Only a JWT whose (unverified) `iss` is this platform's authority, presented by a person or a
+    delegation for one. The signature was verified by `resolve_auth`; Origin verifies it again
+    before it releases anything. A grant key, an external sign-in (another issuer would only be
+    refused, and Origin need not see it), a platform service or an mcp_client token is not
+    carried."""
+    import base64
+    import json
+
+    raw = (token or "").strip()
+    if raw[:7].lower() == "bearer ":
+        raw = raw[7:].strip()
+    if not raw or raw.count(".") != 2 or not authority_issuer:
+        return None
+    if (getattr(auth, "principal_type", "") or "") != "user":
+        return None
+    try:
+        seg = raw.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(claims, dict) or claims.get("iss") != authority_issuer:
+        return None
+    if claims.get("principal_type", "user") not in ("user", "delegation"):
+        return None
+    return ForwardedCredential(raw)
 
 
 @dataclass(frozen=True)
@@ -122,6 +195,9 @@ class ActingPrincipal:
 
     #: ``iss`` — the authority that vouched for the chain.
     authority: Optional[str] = None
+    #: The audience Origin narrowed this delegation to (`dependencies.is_narrowed`): Ember or a
+    #: persona. A narrowed delegation is never an acting credential for a key.
+    narrowed: Optional[str] = None
     #: The delegation's ``scope`` claim, when present. Recorded for audit.
 
     scope: Optional[str] = None
@@ -131,6 +207,10 @@ class ActingPrincipal:
     #: identity that granted itself more authority by claiming a source would be the
     #: same self-asserted-operand defect this module exists to remove.
     source: str = "request"
+
+    #: The caller's own credential, forwarded to Origin for a key-share release and never read
+    #: here. See :class:`ForwardedCredential`. Excluded from repr and equality.
+    credential: Optional[ForwardedCredential] = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not self.principal_id:
@@ -183,7 +263,7 @@ def require_acting_principal() -> ActingPrincipal:
     return principal
 
 
-def acting_from_auth(auth) -> ActingPrincipal:
+def acting_from_auth(auth, credential: Optional[ForwardedCredential] = None) -> ActingPrincipal:
     """Build an :class:`ActingPrincipal` from an ``AuthContext``.
 
     Reads the delegation chain ``resolve_auth`` already unpacked. Kept here rather
@@ -214,7 +294,10 @@ def acting_from_auth(auth) -> ActingPrincipal:
         actor=actor,
         host_id=getattr(auth, "host_id", None),
         authority=getattr(auth, "authority", None),
+        scope=getattr(auth, "scope", None),
+        narrowed=getattr(auth, "narrowed_audience", None),
         source="request",
+        credential=credential,
     )
 
 
@@ -228,12 +311,22 @@ def acting_as(
     authority: Optional[str] = None,
     scope: Optional[str] = None,
     source: str = "system",
+    credential: Optional[ForwardedCredential] = None,
+    narrowed: Optional[str] = None,
 ) -> Iterator[ActingPrincipal]:
     """Run a block as ``principal_id``, restoring the previous identity on exit.
 
     Restores in a ``finally``, so an exception inside the block cannot strand the
     identity for whatever runs next on this thread or task.
+
+    A block run as the principal already acting, who presented their own credential (a person
+    provisioned at their first sign-in), keeps that credential: what it does is done on the
+    person's authority, not the platform's.
     """
+    if credential is None:
+        outer = _acting.get()
+        if outer is not None and outer.principal_id == principal_id and outer.credential:
+            credential = outer.credential
     principal = ActingPrincipal(
         principal_id=principal_id,
         principal_type=principal_type,
@@ -241,7 +334,9 @@ def acting_as(
         host_id=host_id,
         authority=authority,
         scope=scope,
+        narrowed=narrowed,
         source=source,
+        credential=credential,
     )
     token = _acting.set(principal)
     try:

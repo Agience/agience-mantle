@@ -1058,8 +1058,15 @@ class CredentialUseResponse(BaseModel):
     """A credential's secret, sealed to the persona making the one call it is used in."""
     id: str
     sealed: Dict[str, str] = Field(description=(
-        "The secret sealed to the persona's enrolled key (RSA-OAEP-256 + A256GCM), bound to this "
-        "secret and the card it was released for. Only that persona can open it."))
+        "The secret sealed to the persona's enrolled key (RSA-OAEP-256 + A256GCM), bound to the "
+        "persona's key id and this credential's id. Only that persona can open it."))
+    endpoints: List[str] = Field(default_factory=list, description=(
+        "Where the secret may be sent: the endpoints the credential names, fixed when it was "
+        "written and sealed with it. The persona sends it nowhere else."))
+    verdict: str = Field(description=(
+        "Origin's signed verdict that this persona may use this credential for this card, for "
+        "this subject on this delegation (`prism.trust.use_verdict`). The persona opens nothing "
+        "without it."))
 
 
 class DeleteArtifactResponse(BaseModel):
@@ -1520,6 +1527,16 @@ async def list_visible(
             logger.warning(
                 "First-login provisioning failed for user %s (non-fatal)", auth.user_id, exc_info=True
             )
+    elif auth.user_id and not truncated_cone:
+        # A person who held grants before Ember's memory collection existed gets it at a later
+        # sign-in, on their own token (review 11).
+        try:
+            from mantle.services.seed_provisioning.user_provisioning import ensure_ember_memory_for
+            if await offload_sync(ensure_ember_memory_for, store_db, auth, read_authorized):
+                read_authorized = await offload_sync(resolver.resolve, auth.user_id, "read")
+        except Exception:
+            logger.warning("Ember's memory collection not made for %s (non-fatal)",
+                           auth.user_id, exc_info=True)
 
     if action == "read":
         authorized: Set[str] = set(read_authorized)
@@ -1704,6 +1721,9 @@ async def create_artifact(
 
     if not auth.user_id and _key_issuer(auth, body.container_id) is None:
         raise HTTPException(status_code=401, detail="User identification required")
+    # A delegation for Ember creates only in the caller's own memory collection (review 8, R3).
+    from mantle.services.dependencies import ember_create_allowed
+    ember_create_allowed(auth, body.model_dump(exclude_none=True))
 
     # Mantle is the database layer — `create` is a plain insert; no operation
     # dispatch, no type resolution. content_type is an opaque label.
@@ -1720,7 +1740,6 @@ async def create_artifact(
     #: declared key from the document, `null` where there is none, and drops nothing else the
     #: document carries — `created_by`, `modified_by`, `content_ref`, and on a task artifact
     #: seventeen store-level fields.
-    doc = _artifact_body(result)
     return _artifact_body(result)
 
 
@@ -2141,10 +2160,9 @@ def _mint_context(
 # ---------- GET /artifacts/{artifact_id} — Read ----------
 
 def _decrypted_for_use(db: Database, artifact_id: str) -> Optional[dict]:
-    """A document with its content decrypted under an `invoke` key demand."""
-    from mantle.services.content_crypto import content_key_action
-    with content_key_action("invoke"):
-        return _find_artifact(db, artifact_id)
+    """A document with its content decrypted for use. The key goes by Read alone (architecture
+    §51): Invoke gates the use, and opens no content key."""
+    return _find_artifact(db, artifact_id)
 
 
 def _context_of(doc: dict) -> dict:
@@ -2158,39 +2176,36 @@ def _context_of(doc: dict) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _llm_connection_secrets(card: dict) -> Set[str]:
-    ref = _context_of(card).get("credentials_ref") or {}
-    return {str(ref["secret_id"])} if isinstance(ref, dict) and ref.get("secret_id") else set()
-
-
-def _authorizer_secrets(card: dict) -> Set[str]:
-    raw = card.get("content") or "{}"
-    try:
-        cfg = json.loads(raw) if isinstance(raw, str) else raw
-    except (TypeError, ValueError):
-        return set()
-    if not isinstance(cfg, dict):
-        return set()
-    return {str(cfg[k]) for k in ("client_secret_artifact_id", "refresh_token_artifact_id") if cfg.get(k)}
-
-
-def _mcp_server_secrets(card: dict) -> Set[str]:
-    t = _context_of(card).get("transport") or {}
-    return {str(t["secret_id"])} if isinstance(t, dict) and t.get("secret_id") else set()
-
-
-#: What a secret may be released FOR: the card type that points at it, the one persona that serves
-#: that type and may receive it, and where the card names its secrets. A secret is released only to
-#: that persona, only for a card that names it.
-_SECRET_USES: Dict[str, Tuple[str, Any]] = {
-    "application/vnd.agience.llm-connection+json": ("lumen", _llm_connection_secrets),
-    "application/vnd.agience.authorizer+json": ("iris", _authorizer_secrets),
-    "application/vnd.agience.mcp-server+json": ("iris", _mcp_server_secrets),
+#: What a secret may be used FOR: the card type, and the one persona that serves it and may
+#: receive the secret. Which secret a card names is the persona's own reading of the card (its
+#: context is sealed, and Mantle opens no key here); where the secret may go is the credential's
+#: own (`credential_endpoints`).
+_SECRET_USES: Dict[str, str] = {
+    "application/vnd.agience.llm-connection+json": "lumen",
+    "application/vnd.agience.authorizer+json": "iris",
+    "application/vnd.agience.mcp-server+json": "iris",
 }
+
+
+def _use_verdict_custodian():
+    """The Origin client that answers for a secret's use: the ledger's own when it is installed,
+    else one on `ORIGIN_URI`, else None (no Origin, so no secret is used)."""
+    from mantle.db import reach_journal
+    held = getattr(getattr(reach_journal, "_authority", None), "custodian", None)
+    if held is not None and hasattr(held, "use_verdict"):
+        return held
+    from mantle.clients.origin_key_share_client import OriginShareCustodian
+    try:
+        return OriginShareCustodian()
+    except ValueError:
+        return None
 
 
 class CredentialUseRequest(CountsUnknownFields):
     for_: str = Field(alias="for", description="The card the secret is used for (an LLM connection, an authorizer).")
+    nonce: str = Field(min_length=16, max_length=128, description=(
+        "The persona's fresh nonce for this one use, which Origin signs into its verdict "
+        "(review 22)."))
     model_config = ConfigDict(populate_by_name=True)
 
 
@@ -2203,56 +2218,92 @@ async def use_credential(
     auth: AuthContext = Depends(get_auth),
     store_db: Database = Depends(get_store_db),
 ):
-    """A credential's secret, released for one use, sealed to the persona that will use it.
+    """A credential's secret, handed to the persona that will use it, sealed to that persona's key.
 
-    A key and an authorizer's secret are one thing: a credential artifact whose content is the
-    secret. Shared — a platform model connection granted to everyone, a person's connection granted
-    to a team — it must be usable by those it is granted to without being readable by them, and in
-    clear only at the point of use. So:
+    Use is Invoke (John, 2026-11-02), and it takes two ordinary grants:
 
-    - **Only a proven persona.** The caller is a delegation whose actor is a persona that signed for
-      it with its own enrolled key (`act.iss` names it). A person's own token, a grant key, an MCP
-      client, or a delegation the shared `chorus` identity asked for is refused.
-    - **Only for a card that names it, served by that persona.** `for` is the card (an LLM connection
-      for Lumen, an authorizer for Iris). The subject needs `invoke` on the card and on the secret,
-      not `read`; the card must name this secret; the persona must be the one that serves the card.
-    - **Sealed to the persona's key** from the authority manifest, bound to this secret and card
-      (`prism.trust.sealing`). The answer, the edge and any log carry ciphertext; the plaintext
-      exists only inside the persona.
+    - **The caller holds Invoke** on the credential (and on the card it is used for). Invoke
+      releases no key.
+    - **The persona's own principal holds Read** on its credential, granted by the collection's
+      Admin when the credential is shared with the persona.
 
-    Each release is witnessed in the access log of the card and of the secret as an `invoke` by
-    that persona.
+    The secret was sealed to the persona's enrolled key when it was written (`persona_sealed`),
+    bound to the credential's id. Mantle hands that sealed copy over without opening anything: it
+    checks both grants by grant alone, reads the card and the credential as stored for their type
+    and id only, acts as no persona, mints no delegation for one, and opens no key. The persona
+    opens it with its own key; which card it serves, and that the card names this credential, is
+    the persona's own reading of the card.
+
+    The request is the persona's own: a delegation it obtained signing with its own enrolled key
+    (`act.iss`), whose subject is the caller. A person's own token, a grant key, an MCP client, or
+    a delegation the shared `chorus` identity asked for is refused.
+
+    Mantle's checks are its own word, and a persona opens nothing on that alone (review 21, F1):
+    the answer also carries Origin's signed verdict (`verdict`), which Origin gives after its own
+    walk of its replica, on the persona's delegation as the acting credential. It binds the persona,
+    the subject, the delegation's `jti`, the credential, the card and the grants that decided it
+    (`prism.trust.use_verdict`). No Origin, or Origin's refusal, and no sealed copy is returned.
     """
     actor, signer = auth.actor or "", auth.actor_signer or ""
     if auth.principal_type != "user" or not signer or actor != f"agience-server-{signer}":
         raise HTTPException(status_code=403,
                             detail="a secret is released only to a persona that proved who it is")
+    # On a delegation Origin signed, and no other (review 19, H2): Mantle mints none, and a
+    # delegation any other key signed names a person nobody handed it.
+    from mantle import config as _config
+    if not auth.authority or auth.authority != _config.AUTHORITY_ISSUER:
+        raise HTTPException(status_code=403,
+                            detail="a secret is released only on a delegation Origin signed")
     card_id = body.for_
+    # 1. The caller's Invoke, on the card and the credential: no key is released by it.
     await offload_sync(check_access, auth, card_id, "invoke", store_db)
     await offload_sync(check_access, auth, artifact_id, "invoke", store_db)
-    card = await offload_sync(_decrypted_for_use, store_db, card_id)
-    use = _SECRET_USES.get((card or {}).get("content_type") or "")
-    if not card or use is None:
+    from mantle.db import backend as _backend
+    from mantle.services.bootstrap_types import CREDENTIAL_CONTENT_TYPE
+    card = await offload_sync(_backend.get_raw_artifact, store_db, card_id)
+    persona = _SECRET_USES.get((card or {}).get("content_type") or "")
+    if not card or persona is None:
         raise HTTPException(status_code=404, detail="Not found")
-    persona, names = use
     if persona != signer:
         raise HTTPException(status_code=403, detail=f"this card's secrets are used by {persona} only")
-    doc = await offload_sync(_decrypted_for_use, store_db, artifact_id)
-    from mantle.services.bootstrap_types import CREDENTIAL_CONTENT_TYPE
-    if (not doc or doc.get("content_type") != CREDENTIAL_CONTENT_TYPE
-            or {str(doc.get("id")), str(doc.get("root_id") or ""), artifact_id}.isdisjoint(names(card))):
+    doc = await offload_sync(_backend.get_raw_artifact, store_db, artifact_id)
+    if not doc or doc.get("content_type") != CREDENTIAL_CONTENT_TYPE:
         raise HTTPException(status_code=404, detail="Not found")
-
-    from prism.trust import sealing
-    from prism.trust.authority_trust import get_authority_manifest
+    # 2. The persona's own Read on its credential, by grant: decided on the store's co-signed
+    #    grants (this request holds no credential of the persona's to show Origin), opening nothing.
+    persona_auth = AuthContext(principal_id=actor, principal_type="user", user_id=actor)
     try:
-        jwk = (get_authority_manifest().get_jwks(signer).get("keys") or [])[0]
-    except (KeyError, IndexError):
-        raise HTTPException(status_code=403, detail=f"no enrolled key for {signer}; nothing to seal to") from None
-    kid = str(jwk.get("kid") or f"{signer}-1")
-    sealed = sealing.seal(str(doc.get("content") or "").encode("utf-8"), sealing.public_key_from_jwk(jwk),
-                          kid=kid, context=f"{artifact_id}|{card_id}")
-    return {"id": doc.get("id") or artifact_id, "sealed": sealed}
+        await offload_sync(check_access, persona_auth, artifact_id, "read", store_db,
+                           consult_origin=False)
+    except HTTPException:
+        raise HTTPException(status_code=403, detail=f"{signer} holds no Read on this credential: "
+                            "the collection's Admin grants it when sharing the credential")
+    sealed = (doc.get("persona_sealed") or {}).get(signer)
+    if not sealed:
+        raise HTTPException(status_code=403, detail=f"this credential is not sealed for {signer}; "
+                            "write it again with the persona enrolled")
+    # Origin's verdict, on the persona's own delegation (review 21, F1).
+    from mantle.clients.origin_key_share_client import AuthorityRefused, CustodianUnavailable
+    from mantle.services.acting_principal import current_acting_principal
+    acting = current_acting_principal()
+    held = getattr(getattr(acting, "credential", None), "token", "") if acting else ""
+    custodian = _use_verdict_custodian()
+    if custodian is None:
+        raise HTTPException(status_code=503, detail="a secret is used only on Origin's verdict, "
+                            "and no Origin is configured (ORIGIN_URI)")
+    try:
+        verdict = await offload_sync(custodian.use_verdict, artifact_id, card_id, body.nonce,
+                                     credential=held)
+    except AuthorityRefused as exc:
+        # Any refusal by Origin is a refusal here; anything else is Origin failing to answer.
+        raise HTTPException(status_code=403 if 400 <= exc.status < 500 else 502,
+                            detail=f"Origin gave no verdict for this use: {exc.detail}")
+    except CustodianUnavailable as exc:
+        raise HTTPException(status_code=503, detail=f"Origin gave no verdict: {exc}")
+    # Where the secret may go is the credential's own, fixed when it was written and sealed with
+    # it; the persona refuses this list if it differs from the sealed one (review 10, R1).
+    return {"id": doc.get("id") or artifact_id, "sealed": sealed,
+            "endpoints": list(doc.get("credential_endpoints") or []), "verdict": verdict}
 
 
 @router.get("/{artifact_id}",
@@ -2823,6 +2874,18 @@ async def delete_artifact(
             "detached": detached, "destroyed": destroyed, "refused": refused}
 
 
+def _root_id(store_db: Database, any_id: str) -> str:
+    """The root id of an artifact named by its root id or any of its version ids, read from the
+    raw row (no decryption, no re-key); an id with no row is its own."""
+    try:
+        raw = store_db.artifacts.get_artifact(any_id)
+    except Exception:  # noqa: BLE001 — unreadable: the id as given
+        return any_id
+    if not isinstance(raw, dict):
+        return any_id
+    return str(raw.get("root_id") or raw.get("id") or any_id)
+
+
 @router.delete("/{artifact_id}/children/{child_id}", status_code=status.HTTP_200_OK,
     summary="Remove a member from a container",
     responses=_errors(401, 500, ok=RemoveItemResponse) | {
@@ -2851,14 +2914,34 @@ async def remove_child_from_container(
     `DELETE` body no defined semantics and intermediaries are permitted to drop it, so naming the
     container in the body would put a required field on a carrier that may not arrive.
 
-    Authorizes `evict` on the container rather than `delete` on the member: detaching is a
-    container operation and the member survives it. A cascade delete asks the other question,
-    because it destroys.
+    Authorizes `evict` on the container rather than `delete` on the member for a secondary edge:
+    detaching is a container operation and the member survives it. Detaching a member from the
+    container it was created in removes its creation edge, which deletes it at Origin (review 15),
+    so that asks `delete` on the member (or Admin on the container), as a cascade delete does.
     """
     if not auth.user_id:
         raise HTTPException(status_code=401, detail="User identification required")
 
-    await offload_sync(check_access, auth, artifact_id, "evict", store_db)
+    # Evict removes a secondary edge (architecture §51), or Admin on the container. Removing the
+    # member's creation edge deletes it at Origin (review 15), so that one needs Delete reaching
+    # the member, or Admin on the container: the authority's rule.
+    from mantle.db import lattice_api as _la
+    from mantle.services import grant_service
+
+    # Both ids as root ids first (review 16, L2): a member named by one of its version ids, or a
+    # container by one of its, is the same edge, and the same removal of a creation edge.
+    container_root = await offload_sync(_root_id, store_db, artifact_id)
+    member_root = await offload_sync(_root_id, store_db, child_id)
+    parent = await offload_sync(_la.get_origin_parent, store_db, member_root)
+    creation = bool(parent) and parent[0] == container_root
+    try:
+        if creation:
+            await offload_sync(check_access, auth, child_id, "delete", store_db)
+        else:
+            await offload_sync(check_access, auth, artifact_id, "evict", store_db)
+    except HTTPException:
+        if not await offload_sync(grant_service.can_admin, store_db, auth.user_id, artifact_id):
+            raise
 
     from mantle.services import workspace_service
 
@@ -3774,6 +3857,7 @@ async def get_artifact_content(
             return _Resp(status_code=304, headers={"ETag": etag})
 
     owner_id = doc.get("created_by")
+    from mantle.db.doc_boundary import content_key_scope as _content_key_scope
     from mantle.services.content_service import ContentStoreUnavailable, get_bytes_decrypted
     from fastapi import Response
     try:
@@ -3781,7 +3865,7 @@ async def get_artifact_content(
         # call in the router, and the one whose duration scales with the artifact's size.
         data = await offload_sync(
             get_bytes_decrypted, content_key, owner_id,
-            cas_ref=cas_ref, collection_id=doc.get("collection_id"),
+            cas_ref=cas_ref, collection_id=_content_key_scope(doc),
         )
     except ContentStoreUnavailable as exc:
         # Not a server fault and not a lost object: this node holds no copy and has no object

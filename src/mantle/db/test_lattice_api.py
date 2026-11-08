@@ -42,6 +42,11 @@ def _test_master_key(monkeypatch):
         content_crypto, "_default_master_key",
         lambda principal_id, collection_id=None, *, may_create=False, creator_id=None: b"\x01" * 32,
     )
+    # Collection-scoped content is keyed under the collection's own key; stubbed the same way.
+    monkeypatch.setattr(
+        content_crypto, "_default_collection_key",
+        lambda principal_id, collection_id, *, may_create=False, creator_id=None: b"\x02" * 32,
+    )
 
 
 @pytest.fixture()
@@ -612,7 +617,7 @@ def test_content_is_ciphertext_at_rest_plaintext_on_read(db):
     api.create_artifact(db, _entity())
     raw = db.artifacts.get_artifact("art-lattice-1")          # the STORED doc
     assert raw["content_encrypted"] is True
-    assert base64.b64decode(raw["content"])[:4] == b"MEC1"    # envelope, not plaintext
+    assert base64.b64decode(raw["content"])[:4] == b"MEC3"    # envelope, under the collection key
     assert "hello lattice" not in raw["content"]
     assert raw["content_key_principal"] == "col-1"    # keyed on the COLLECTION's origin root
     got = api.get_artifact(db, "art-lattice-1")               # the read chokepoint decrypts

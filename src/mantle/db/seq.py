@@ -37,11 +37,134 @@ import time
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional, Tuple
 
+from . import reach_journal as _journal
 from . import schema as _schema
 
 _BUSY_TIMEOUT_MS = 30_000
 _BEGIN_RETRIES = 60
 _BEGIN_BACKOFF_S = 0.05
+
+
+class _RecordingCursor(sqlite3.Cursor):
+    """A cursor that, while its connection records, keeps every statement it runs and its
+    parameters exactly as given (`LatticeConn.write`'s co-sign path replays them)."""
+
+    def execute(self, sql, parameters=()):
+        log = self.connection.recording
+        if log is not None:
+            log.append(("one", sql, parameters))
+        return super().execute(sql, parameters)
+
+    def executemany(self, sql, seq_of_parameters):
+        log = self.connection.recording
+        if log is not None:
+            seq_of_parameters = [tuple(p) if not isinstance(p, dict) else dict(p)
+                                 for p in seq_of_parameters]
+            log.append(("many", sql, seq_of_parameters))
+        return super().executemany(sql, seq_of_parameters)
+
+    def executescript(self, sql_script):
+        if self.connection.recording is not None:
+            raise sqlite3.ProgrammingError("executescript inside a recorded write transaction")
+        return super().executescript(sql_script)
+
+
+class _RecordingConnection(sqlite3.Connection):
+    recording = None                     # a list while a write transaction records
+
+    def cursor(self, factory=_RecordingCursor):
+        return super().cursor(factory)
+
+    def execute(self, sql, parameters=()):
+        return self.cursor().execute(sql, parameters)
+
+    def executemany(self, sql, seq_of_parameters):
+        return self.cursor().executemany(sql, seq_of_parameters)
+
+
+def _replay(c: sqlite3.Connection, log: list) -> None:
+    for kind, sql, params in log:
+        if kind == "one":
+            c.execute(sql, params)
+        else:
+            c.executemany(sql, params)
+
+
+class ReachChangeConflict(_journal.ReachChangeRefused):
+    """Something the transaction depended on changed while Origin was asked; the co-signed
+    entries were withdrawn and nothing was written. Safe to run the change again."""
+
+
+def _receipt_seq(c, key: str):
+    r = c.execute("SELECT seq FROM authority_receipt WHERE subject = ?", (key,)).fetchone()
+    return r[0] if r is not None else None
+
+
+class _Reserved(BaseException):
+    """Ends the first run of a `cosigned` store call once it has recorded its changes."""
+
+
+#: How many times a `cosigned` store call is run again when what it depends on changed while
+#: Origin was asked.
+COSIGN_ATTEMPTS = 5
+
+
+def cosigned(conn_of):
+    """For a store method that may change reach, when it is the outermost write: run it once to
+    learn its changes and roll that back (holding the write lock only for the run), have Origin
+    co-sign them with no lock held, then run it again under the lock and commit only if it makes
+    exactly the changes Origin co-signed. Otherwise those are withdrawn and it is tried again, up
+    to `COSIGN_ATTEMPTS`; then `ReachChangeConflict`. A call that changes no reach commits on its
+    first run, as it always did. `conn_of(args)` gives the `LatticeConn`."""
+    import functools
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            conn = conn_of(args)
+            if conn._depth() > 0 or not _journal.installed() or _journal.is_suspended():
+                return fn(*args, **kwargs)
+            for attempt in range(COSIGN_ATTEMPTS):
+                conn._local.cosign_mode = "reserve"
+                try:
+                    return fn(*args, **kwargs)            # changed no reach: committed
+                except _Reserved:
+                    pending = conn._local.cosign_reserved
+                    basis = conn._local.cosign_basis
+                finally:
+                    conn._local.cosign_mode = None
+                    conn._local.cosign_reserved = None
+                    conn._local.cosign_basis = None
+                c = conn.conn()
+                if _journal.due(c):                       # retried first, no lock held
+                    _journal.retry_due(c)
+                    if _journal.required() and _journal.due(c):
+                        raise _journal.ReachChangeRefused(
+                            "a withdrawal the authority has not taken is outstanding; under "
+                            "threshold custody no change to reach is written until it clears")
+                done = _journal.cosign(pending, c)        # no lock held
+                conn._local.cosign_mode, conn._local.cosign_expect = "expect", done
+                conn._local.cosign_basis = basis
+                try:
+                    return fn(*args, **kwargs)
+                except ReachChangeConflict:
+                    if attempt == COSIGN_ATTEMPTS - 1:
+                        raise
+                finally:
+                    conn._local.cosign_mode = None
+                    conn._local.cosign_expect = None
+                    conn._local.cosign_basis = None
+        return wrapper
+    return deco
+
+
+def _run_after_commit(fns) -> None:
+    import logging
+    for fn in fns:
+        try:
+            fn()
+        except Exception:  # noqa: BLE001 — the write landed; what follows it is logged
+            logging.getLogger(__name__).warning("an after-commit step failed", exc_info=True)
 
 
 class LatticeConn:
@@ -75,7 +198,7 @@ class LatticeConn:
         c = getattr(self._local, "c", None)
         if c is None:
             c = sqlite3.connect(self.path, timeout=_BUSY_TIMEOUT_MS / 1000.0,
-                                isolation_level=None)
+                                isolation_level=None, factory=_RecordingConnection)
             c.row_factory = sqlite3.Row
             _schema.apply_pragmas(c)
             c.execute("PRAGMA busy_timeout=%d" % _BUSY_TIMEOUT_MS)
@@ -85,6 +208,16 @@ class LatticeConn:
 
     def _depth(self) -> int:
         return getattr(self._local, "depth", 0)
+
+    def after_commit(self, fn) -> None:
+        """Run `fn` once the write transaction open on this thread commits, or now when none is
+        open (review 27, L3). A transaction that rolls back drops it: what `fn` tells another
+        party (Origin that a key is active) is told only of a write that landed. `fn` never fails
+        the write; an error is logged."""
+        if self._depth() > 0 and getattr(self._local, "after_commit", None) is not None:
+            self._local.after_commit.append(fn)
+            return
+        _run_after_commit([fn])
 
     def read(self) -> sqlite3.Cursor:
         """A cursor for read-only work. No transaction is opened."""
@@ -106,34 +239,143 @@ class LatticeConn:
                 self._local.depth -= 1
             return
 
-        with self._wlock:
+        # Changes to reach this transaction makes are recorded as it makes them
+        # (`reach_journal`). With an authority installed they are co-signed OUTSIDE the write
+        # lock, so ordinary writers never queue behind Origin:
+        #   1. reserve: run the transaction under the lock, keep every statement it ran, note the
+        #      store's write mark (`write_mark`: every origin's last `_seq`, and the vertex and
+        #      edge totals, which any write to the store moves, on this connection or another),
+        #      and roll it back;
+        #   2. ask: submit the recorded changes with no lock held;
+        #   3. commit: under the lock, only if no other connection committed since the
+        #      reservation, replay the statements and the receipts and commit. Otherwise nothing
+        #      is written, the co-signed entries are withdrawn, and `ReachChangeConflict` says so.
+        # A refusal at 2 writes nothing; a failure at 3 withdraws what 2 co-signed.
+        allocs = self.allocators()
+        self._wlock.acquire()
+        held = True
+        committed = False
+        self._local.after_commit = []
+        _journal.begin()
+        try:
             self._begin_immediate(c)
             self._local.depth = 1
             # Every allocator on this connection is driven together, not just one.
             # Driving a single allocator's lifecycle would leave any other store's
             # allocator un-begun and un-flushed, so its cache would persist across
             # transactions while its counter never reaches disk.
-            allocs = self.allocators()
             for a in allocs:
                 a.begin()
+            c.recording = [] if _journal.installed() else None
             try:
                 cur = c.cursor()
                 yield cur
                 for a in allocs:
                     a.flush(cur)
-                c.execute("COMMIT")
+                pending = _journal.take_pending() if c.recording is not None else []
+                mode = getattr(self._local, "cosign_mode", None)
+                self._local.cosign_mode = None            # one transaction's worth
+                if mode == "expect":
+                    # The second run of a `cosigned` store call: written only if it makes exactly
+                    # the changes Origin co-signed for the first.
+                    expected = self._local.cosign_expect
+                    c.recording = None
+                    self._local.cosign_withdraw = expected    # withdrawn if not committed
+                    basis = getattr(self._local, "cosign_basis", None) or {}
+                    if [(e, k) for e, _r, k in expected] != pending or any(
+                            _receipt_seq(c, k) != seq_ for k, seq_ in basis.items()):
+                        raise ReachChangeConflict(
+                            "what this change depends on changed while Origin was asked")
+                    _journal.write_receipts(cur, expected)
+                    c.execute("COMMIT")
+                    committed = True
+                    self._local.to_confirm = expected
+                    self._local.cosign_withdraw = None
+                    return
+                if not pending:
+                    c.recording = None
+                    _journal.flush(cur)
+                    c.execute("COMMIT")
+                    committed = True
+                    return
+                if mode == "reserve":
+                    # The first run of a `cosigned` store call: hand back what it would change.
+                    c.recording = None
+                    self._local.cosign_reserved = pending
+                    # What the change is made against: the co-signed change each row had then.
+                    self._local.cosign_basis = {k: _receipt_seq(c, k) for _e, k in pending}
+                    raise _Reserved()
+                log, c.recording = c.recording, None
+                outstanding = bool(_journal.due(cur))
+                c.execute("ROLLBACK")
+                version = write_mark(self)       # the store as it was, still under the lock
             except BaseException:
+                c.recording = None
                 try:
                     c.execute("ROLLBACK")
                 except Exception:
                     pass
                 for a in allocs:                  # a rolled-back write consumes no proper time
                     a.discard()
+                _journal.abort(c)
+                withdraw = getattr(self._local, "cosign_withdraw", None)
+                if withdraw:
+                    self._local.cosign_withdraw = None
+                    _journal.compensate([(e, r) for e, r, _k in withdraw], c)
                 raise
-            finally:
-                self._local.depth = 0
-                for a in allocs:
-                    a.end()
+            for a in allocs:
+                a.discard()
+            self._local.depth = 0               # no transaction is open while Origin is asked
+            self._wlock.release()
+            held = False
+
+            if outstanding:                       # retried first, still with no lock held
+                _journal.retry_due(c)
+                if _journal.required() and _journal.due(c):
+                    raise _journal.ReachChangeRefused(
+                        "a withdrawal the authority has not taken is outstanding; under "
+                        "threshold custody no change to reach is written until it clears")
+            done = _journal.cosign(pending, c)    # no lock held
+
+            self._wlock.acquire()
+            held = True
+            try:
+                self._begin_immediate(c)
+                self._local.depth = 1
+                if write_mark(self) != version:
+                    raise ReachChangeConflict(
+                        "the store changed while Origin was asked; the change was withdrawn "
+                        "and nothing was written; run it again")
+                _replay(c, log)
+                cur = c.cursor()
+                _journal.write_receipts(cur, done)
+                c.execute("COMMIT")
+                committed = True
+                self._local.to_confirm = done
+            except BaseException:
+                try:
+                    c.execute("ROLLBACK")
+                except Exception:
+                    pass
+                _journal.compensate([(e, r) for e, r, _k in done], c)
+                raise
+        finally:
+            c.recording = None
+            _journal.end()
+            self._local.depth = 0
+            for a in allocs:
+                a.end()
+            if held:
+                self._wlock.release()
+            # Committed: tell the authority, with no lock held, so the entries can no longer be
+            # withdrawn. One it does not hear is recorded and told again (`confirm`).
+            confirmed = getattr(self._local, "to_confirm", None)
+            if confirmed:
+                self._local.to_confirm = None
+                _journal.confirm(confirmed, c)
+            after, self._local.after_commit = getattr(self._local, "after_commit", None), None
+            if committed and after:
+                _run_after_commit(after)
 
     def allocators(self) -> "list[SeqAllocator]":
         with self._alloc_lock:

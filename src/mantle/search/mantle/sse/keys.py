@@ -33,6 +33,7 @@ from typing import Any, Protocol, runtime_checkable
 
 __all__ = [
     "SseKeyProvider",
+    "collection_sse_key",
 ]
 
 
@@ -50,4 +51,28 @@ class SseKeyProvider(Protocol):
     """
 
     def derive_sse_key(self, principal_id: str, request: Any) -> bytes:
+        """A provider may also accept ``collection_id=`` (keyword), and then returns that
+        collection's own SSE key: `OracleService` does, deriving it from the collection key, so
+        postings are keyed per collection. A provider without it keeps one key per principal."""
         ...
+
+
+def _accepts_collection(provider: Any) -> bool:
+    import inspect
+
+    try:
+        params = inspect.signature(provider.derive_sse_key).parameters
+    except (TypeError, ValueError):
+        return False
+    return "collection_id" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def collection_sse_key(provider: Any, principal_id: str, request: Any,
+                       collection_id: str) -> bytes:
+    """The SSE key for one collection: the provider's per-collection key when it offers one
+    (the platform's `OracleService`), else its per-principal key, under which entries are still
+    filtered to the collection they name."""
+    if _accepts_collection(provider):
+        return provider.derive_sse_key(principal_id, request, collection_id=collection_id)
+    return provider.derive_sse_key(principal_id, request)

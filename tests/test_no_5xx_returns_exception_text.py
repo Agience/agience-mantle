@@ -133,22 +133,10 @@ def test_no_5xx_body_interpolates_a_caught_exception(path: pathlib.Path) -> None
         "a broad one." % "\n  ".join(bad))
 
 
-def test_the_issuer_handler_catches_the_specific_type() -> None:
-    """The regression test for the one site this file was written for.
-
-    Asserted on the handler rather than the outcome: a broad `except RuntimeError` here would
-    still pass every functional test, because the only RuntimeError raised TODAY is the curated one.
-    The defect is what happens when something else raises, which no test can provoke."""
+def test_no_route_creates_an_issuer_any_more() -> None:
+    """The site this file was written for (`create_issuer`) is gone: issuers come from
+    configuration and the authority manifest alone (review 12, H1). Asserted on the source, so
+    the handler cannot come back without this test noticing."""
     src = (_ROUTERS / "system_router.py").read_text(encoding="utf-8", errors="replace")
-    # Comments stripped first: the note explaining the narrowing itself says `except RuntimeError`,
-    # so asserting against the raw source would match that comment rather than real code — the
-    # same trap as prose about a removal reintroducing the forbidden string.
     code = chr(10).join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
-    i = code.index("async def create_issuer")
-    body = code[i:i + 3000]
-    assert "except SystemPrincipalUnavailable" in body, (
-        "create_issuer no longer catches the specific exception; a broad handler returns any "
-        "internal RuntimeError's text as a 503")
-    assert "except RuntimeError" not in body, (
-        "the broad `except RuntimeError` is back — it returns internal error text for every "
-        "RuntimeError the call stack can raise")
+    assert "async def create_issuer" not in code

@@ -51,8 +51,12 @@ def test_an_invitation_names_the_inviter_and_resource_and_escapes_them(outbox):
 
 def test_the_invite_path_mails_the_claim_link_to_the_hosted_app(outbox, monkeypatch):
     from types import SimpleNamespace
+    # The inviter's own token, from the request the invite is made in (review 21).
+    monkeypatch.setattr("mantle.services.person_service.own_subject_token",
+                        lambda pid: "the-inviter-s-own-token")
     monkeypatch.setattr("mantle.services.person_service.get_user_by_id",
-                        lambda db, id: SimpleNamespace(name="Ann"))
+                        lambda db, id, subject_token=None: SimpleNamespace(name="Ann")
+                        if subject_token == "the-inviter-s-own-token" else None)
     monkeypatch.setattr(grant_service, "_resource_name", lambda db, rid: "Shared Plans")
     monkeypatch.setattr("mantle.config.FACET_URI", "https://my.agience.ai")
 

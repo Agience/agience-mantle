@@ -326,14 +326,13 @@ def send_invite_email(db, user_id, resource_id, target_email, raw_token, message
     configured or the send failed; the invite stands either way, and its claim link is in the
     response."""
     from mantle.services import email_service
-    from mantle.services.person_service import get_user_by_id
+    from mantle.services.person_service import get_user_by_id, own_subject_token
     try:
-        # No subject token here: this runs several frames below the route, off the
-        # invite-creation path, and is handed a `user_id` rather than a request — so the call is
-        # the unscoped one. It reads a display name for an email salutation, which is the
-        # weakest use of this lookup in the tree and the easiest to drop if Origin ever requires
-        # the subject token outright. Nothing is manufactured to stand in for it.
-        person = get_user_by_id(db=db, id=user_id)
+        # The inviter's display name for the salutation, on the inviter's own access token, the
+        # request this runs in (review 21, F4). Without one Origin is asked nothing, and the mail
+        # says "Someone".
+        token = own_subject_token(user_id)
+        person = get_user_by_id(db=db, id=user_id, subject_token=token) if token else None
         from_name = (getattr(person, "name", None) or "").strip() or "Someone"
     except Exception:
         from_name = "Someone"
@@ -439,15 +438,21 @@ def claim_invite(db: Database, user_id: str, raw_token: str,
         created_time=now,
         modified_time=now,
     )
-    created = create_grant(db, new_grant)
+    # The claim token goes to the authority ledger as proof (`reach_journal.proof`): Origin
+    # checks it against the hash the invite entry carries, and the target against the claimant's
+    # own verified identity, and counts the claims itself. It is not stored there.
+    from mantle.db import reach_journal
 
-    invite.claims_count += 1
-    invite.modified_time = now
-    if invite.max_claims == 1:
-        invite.state = GrantEntity.STATE_REVOKED
-        invite.revoked_at = now
-        invite.revoked_by = user_id
-    update_grant(db, invite)
+    with reach_journal.proof(invite_id=invite.id, token=raw_token):
+        created = create_grant(db, new_grant)
+
+        invite.claims_count += 1
+        invite.modified_time = now
+        if invite.max_claims == 1:
+            invite.state = GrantEntity.STATE_REVOKED
+            invite.revoked_at = now
+            invite.revoked_by = user_id
+        update_grant(db, invite)
 
     logger.info("invite claimed: invite=%s resource=%s user=%s", invite.id, invite.resource_id, user_id)
     _emit_invite_event(

@@ -66,7 +66,7 @@ from pydantic import BaseModel, Field
 
 from mantle.db import backend as db_store
 from mantle.services import issuers as issuers_svc
-from mantle.services.bootstrap_types import AUTHORITY_COLLECTION_SLUG, PEOPLE_COLLECTION_SLUG
+from mantle.services.bootstrap_types import AUTHORITY_COLLECTION_SLUG
 
 
 from mantle.services.dependencies import (
@@ -157,7 +157,7 @@ class IssuerRevokedResponse(BaseModel):
 
 
 class PlatformUserResponse(BaseModel):
-    """A person card, plus whether this node treats them as a platform admin."""
+    """A person Origin knows, plus whether this node treats them as a platform admin."""
     id: str
     email: str = ""
     name: str = ""
@@ -168,7 +168,7 @@ class PlatformUserResponse(BaseModel):
 
 class PlatformUserListResponse(BaseModel):
     users: List[PlatformUserResponse]
-    #: Total person cards found, before the page was taken — so a caller knows
+    #: Every person Origin knows, before the page was taken — so a caller knows
     #: whether another page exists without asking for it.
     total: int
     limit: int
@@ -190,51 +190,8 @@ class AdminChangeResponse(BaseModel):
 # Issuers
 # =============================================================================
 
-@router.post(
-    "/issuers",
-    responses=_errors(400, 401, 403, 500, 503),
-    status_code=status.HTTP_201_CREATED,
-    response_model=IssuerCreatedResponse,
-    summary="Add a trusted issuer",
-    description=(
-        "Mint a system-owned trusted-issuer artifact. Takes effect immediately — the "
-        "create fires the db chokepoint event, so the verifier's trust set updates without "
-        "a restart. Admin-only."
-    ),
-)
-async def create_issuer(
-    body: IssuerCreateRequest,
-    auth: AuthContext = Depends(get_auth),
-    store_db: Database = Depends(get_store_db),
-) -> IssuerCreatedResponse:
-    admin_id = await offload_sync(require_platform_admin, auth, store_db)
-    try:
-        art = await offload_sync(
-            issuers_svc.create_issuer_artifact,
-            store_db, issuer=body.issuer, authorized_by=admin_id,
-            jwks=body.jwks, jwks_uri=body.jwks_uri, audience=body.audience,
-            namespace=body.namespace, role=body.role,
-        )
-    except ValueError as exc:
-        # Deliberately raised, with a curated message naming what the caller must change —
-        # "role must be 'external' or 'platform'", "an external issuer must bind an 'audience'".
-        # Returning that text IS the point of a 400.
-        raise HTTPException(status_code=400, detail=str(exc))
-    except SystemPrincipalUnavailable as exc:
-        # NARROWED FROM `except RuntimeError` [P-9, 2026-08-26]. The broad handler returned
-        # `str(exc)` for ANY RuntimeError the call stack could raise — a library's, sqlite's,
-        # anything — straight into the response body. It was right about the one raise it was
-        # written for and wrong about every other one, which is exactly the shape P-9 names:
-        # *"an unhandled exception's text is internal detail, and it is being returned to the
-        # caller."*
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception:
-        # Anything else is unhandled by definition: logged in full, and the caller is told only
-        # that it failed. The same pattern `artifacts_router` already uses for its 500s — one of
-        # which says so outright: *"The server log carries the underlying error."*
-        logger.error("issuer creation failed for %s", body.issuer, exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to create the issuer")
-    return IssuerCreatedResponse(id=art.id, issuer=body.issuer, role=body.role)
+# Issuers come from configuration alone: the authority manifest pins the platform's own, and
+# `AGIENCE_TRUSTED_ISSUERS` names the external ones. No route adds one (review 12, H1).
 
 
 @router.get(
@@ -334,27 +291,15 @@ def _grant_admin_flags(db, *, user_id: str, authority_id: str, granted_by: str, 
         logger.warning("grant cache invalidation failed after admin flag change", exc_info=True)
 
 
-def _card_context(card: dict) -> dict:
-    raw = card.get("context")
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str) and raw:
-        try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return {}
-    return {}
-
-
 @router.get(
     "/users",
     responses=_errors(401, 403),
     response_model=PlatformUserListResponse,
     summary="List platform users",
     description=(
-        "The person cards in the People collection, each with its platform-admin status. "
-        "Paginated — the People collection grows without bound, so a page is taken rather "
-        "than the whole set. Admin-only."
+        "Origin's person records, each with its platform-admin status on this node. "
+        "Paginated at Origin. Origin lists them only for a platform admin, decided on its own "
+        "replica from the caller's own credential; 503 when no Origin is configured."
     ),
 )
 async def list_users(
@@ -364,61 +309,65 @@ async def list_users(
     store_db: Database = Depends(get_store_db),
 ) -> PlatformUserListResponse:
     await offload_sync(require_platform_admin, auth, store_db)
-    # One hop for the whole listing rather than one per store call: this handler scans the
-    # People collection and then evaluates the admin predicate once per user on the page, so
-    # awaiting each separately would spend more time crossing threads than reading.
-    users, total = await offload_sync(_platform_user_page, store_db, limit, offset)
+    from mantle.services.acting_principal import current_acting_principal
+    acting = current_acting_principal()
+    credential = acting.credential.token if acting and acting.credential else ""
+    # One hop for the whole listing: one call to Origin, then the admin predicate once per user
+    # on the page.
+    users, total = await offload_sync(_platform_user_page, store_db, limit, offset,
+                                      credential=credential)
     return PlatformUserListResponse(users=users, total=total, limit=limit, offset=offset)
 
 
 def _platform_user_page(
-    store_db: Database, limit: int, offset: int
+    store_db: Database, limit: int, offset: int, *, credential: str, custodian=None,
 ) -> tuple[List[PlatformUserResponse], int]:
-    """The person cards on one page, each with its admin verdict, plus the pre-page total."""
+    """One page of Origin's person records, each with this node's admin verdict, plus Origin's
+    total. Origin already knows every sign-up (John, 2026-11-02), so nothing here reads a card.
+
+    Origin pages them, and lists them only for a platform admin by its own replica (an Admin
+    grant on the Authorities collection it has pinned, or the operator while no one holds one),
+    on the caller's own credential: Mantle's check above is not the one that decides."""
+    from mantle.clients.origin_key_share_client import (
+        AuthorityRefused, CustodianUnavailable, OriginShareCustodian,
+    )
+    if custodian is None:
+        try:
+            custodian = OriginShareCustodian()
+        except ValueError:
+            raise HTTPException(status_code=503, detail="the user list is Origin's, and no "
+                                "Origin is configured (ORIGIN_URI)")
+    try:
+        page = custodian.platform_users(credential=credential, limit=limit, offset=offset)
+    except AuthorityRefused as exc:
+        raise HTTPException(status_code=403 if exc.status in (401, 403) else 502,
+                            detail=f"Origin refused the user list: {exc.detail}")
+    except CustodianUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
     authority_id = _authority_id(store_db)
     operator_id = resolve_operator_id(store_db)
-    # Resolved once and reused across the loop below: the predicate would otherwise
-    # re-scan the authority collection's whole grant set for every user listed.
+    # Resolved once and reused across the page: the predicate would otherwise re-scan the
+    # authority collection's whole grant set for every user listed.
     bootstrap_open = not _authority_bootstrap_complete(store_db)
-
-    people_id = get_id_optional(PEOPLE_COLLECTION_SLUG)
-
-    # Deduplicate first, page second. A page taken over the raw card list would shift
-    # under itself whenever a person holds two cards, so the identity set is settled
-    # before any slicing happens.
-    ordered_ids: List[str] = []
-    cards_by_id: Dict[str, tuple[dict, dict]] = {}
-    if people_id:
-        for card in db_store.list_collection_artifacts(store_db, people_id) or []:
-            ctxd = _card_context(card)
-            identity = ctxd.get("identity") if isinstance(ctxd.get("identity"), dict) else {}
-            uid = str(card.get("created_by") or identity.get("agience_root_id") or "")
-            if not uid or uid in cards_by_id:
-                continue
-            ordered_ids.append(uid)
-            cards_by_id[uid] = (card, ctxd)
-
-    total = len(ordered_ids)
-    page = ordered_ids[offset:offset + limit]
-
     users: List[PlatformUserResponse] = []
-    for uid in page:
-        card, ctxd = cards_by_id[uid]
+    for person in page.get("users") or []:
+        uid = str(person.get("id") or "")
+        if not uid:
+            continue
         users.append(PlatformUserResponse(
             id=uid,
-            email=ctxd.get("email") or "",
-            name=card.get("name") or ctxd.get("display_name") or "",
-            picture=ctxd.get("picture"),
-            # The SAME predicate the write endpoints gate on — a second
-            # implementation here would risk this list reporting an admin the
-            # API then refuses, or vice versa.
+            email=person.get("email") or "",
+            name=person.get("name") or "",
+            picture=person.get("picture"),
+            # The SAME predicate the write endpoints gate on.
             is_platform_admin=is_platform_admin(
                 store_db, uid, operator_id=operator_id,
                 authority_id=authority_id, bootstrap_open=bootstrap_open,
             ),
-            created_time=card.get("created_time"),
+            created_time=person.get("created_time"),
         ))
-    return users, total
+    return users, int(page.get("total") or 0)
 
 
 @router.post(

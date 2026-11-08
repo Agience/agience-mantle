@@ -221,6 +221,11 @@ class Grant(BaseEntity):
         created_time: Optional[str] = None,
         modified_time: Optional[str] = None,
     ):
+        if id is None:
+            # Inside a seed pass's plan a new grant's id is derived, so the pass's entries are
+            # known before its credential is minted (`services/seed_plan.py`, review 26).
+            from mantle.services.seed_plan import grant_id as _planned_id
+            id = _planned_id(resource_id, grantee_type, grantee_id)
         super().__init__(id=id, created_time=created_time, modified_time=modified_time)
         self.resource_id = resource_id
         self.grantee_type = grantee_type

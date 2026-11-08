@@ -2,10 +2,9 @@
 key, a member's profile as its member, and the platform's collections as the platform's system
 principal, which is granted them.
 
-2026-10-30, on the release candidate: of 414 rows the pass left in plain text, 371 were grants
-(sealed with a content key no actor holds, rather than the node's), 41 were member profiles in the
-People directory (keyed to the directory, which members hold no grant on), and 2 were the People
-and Authorities collections, created by the platform's id, which nothing acts as.
+A grant is sealed under the node's key. A member's profile is the member's own root, keyed to
+itself, and opens for its member. The Authorities collection is created by the platform's id, which
+nothing acts as, so the platform's system principal is granted it.
 
 Keys are decided as in production: the light-cone verifier over the store's own grants.
 """
@@ -46,7 +45,7 @@ def db(tmp_path, monkeypatch):
 
 
 def _member(db):
-    """A member's profile, as first login writes it, in the People directory."""
+    """A member's profile, as first login writes it: the member's own root."""
     from mantle.services.acting_principal import acting_as
     ctx = up.UserContext(id=USER, email=f"{WORD}@example.invalid", name=f"Ada {WORD}")
     with acting_as(USER, principal_type="user"):
@@ -58,9 +57,9 @@ def _raw(db, artifact_id):
     return db.artifacts.get_artifact(artifact_id)
 
 
-def test_a_member_profile_and_the_directory_survive_the_rollback_round_trip(db):
+def test_a_member_profile_and_a_platform_collection_survive_the_rollback_round_trip(db):
     pid = _member(db)
-    people = _raw(db, pid)["collection_id"]
+    platform = up.ensure_authority_collection(db)
     assert WORD not in json.dumps(_raw(db, pid)), "the control: written sealed"
 
     back = unseal_stored_titles(db)
@@ -70,8 +69,8 @@ def test_a_member_profile_and_the_directory_survive_the_rollback_round_trip(db):
     counts = seal_stored_titles(db)
     assert counts["left_plain"] == 0, counts
     assert WORD not in json.dumps(_raw(db, pid))
-    ctx = json.loads(_raw(db, people)["context"] or "{}")
-    assert doc_boundary.SEALED in ctx and "name" not in _raw(db, people), "the directory's own name"
+    ctx = json.loads(_raw(db, platform)["context"] or "{}")
+    assert doc_boundary.SEALED in ctx and "name" not in _raw(db, platform), "the collection's own name"
 
 
 def test_a_grant_stored_plain_is_sealed_under_the_nodes_key_and_back(db):
@@ -97,25 +96,24 @@ def test_a_grant_stored_plain_is_sealed_under_the_nodes_key_and_back(db):
 
 
 def test_the_platform_principal_holds_read_and_update_on_the_platforms_collections(db):
-    pid = _member(db)
-    people = _raw(db, pid)["collection_id"]
-    grants = la.get_active_grants_for_principal_resource(db, grantee_id=SYSTEM, resource_id=people)
+    platform = up.ensure_authority_collection(db)
+    grants = la.get_active_grants_for_principal_resource(db, grantee_id=SYSTEM, resource_id=platform)
     assert [(g.grantee_type, g.can_read, g.can_update, g.can_admin) for g in grants] == \
         [("user", True, True, False)]
-    assert not up.ensure_platform_principal_grant(db, people), "idempotent"
+    assert not up.ensure_platform_principal_grant(db, platform), "idempotent"
 
 
-def test_a_directory_made_before_the_grant_is_granted_by_the_pass(db):
-    """Production's People directory predates the grant: the pass makes it before it seals."""
-    pid = _member(db)
-    people = _raw(db, pid)["collection_id"]
-    for g in la.get_active_grants_for_principal_resource(db, grantee_id=SYSTEM, resource_id=people):
+def test_a_platform_collection_made_before_the_grant_is_granted_by_the_pass(db):
+    """A platform collection made before the grant: the pass makes it before it seals."""
+    _member(db)
+    platform = up.ensure_authority_collection(db)
+    for g in la.get_active_grants_for_principal_resource(db, grantee_id=SYSTEM, resource_id=platform):
         db.artifacts.delete_artifact(g.id)
-    assert not la.get_active_grants_for_principal_resource(db, grantee_id=SYSTEM, resource_id=people)
+    assert not la.get_active_grants_for_principal_resource(db, grantee_id=SYSTEM, resource_id=platform)
 
     counts = seal_stored_titles(db)
     assert counts["platform_grants"] >= 1, counts
-    assert unseal_stored_titles(db)["denied"] == 0, "the directory opens for the platform again"
+    assert unseal_stored_titles(db)["denied"] == 0, "the collection opens for the platform again"
 
 
 def test_a_link_named_before_sealing_is_tokenized_by_the_pass_and_back(db):

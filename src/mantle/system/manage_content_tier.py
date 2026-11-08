@@ -84,7 +84,7 @@ def main() -> int:
 
     db = next(get_store_db())
     context = (acting_as(args.as_principal, principal_type="user")
-               if args.as_principal else system_acting_context())
+               if args.as_principal else system_acting_context(scope="platform.content-tier"))
 
     with context:
         # The handle's own enumerator — `db.artifacts.list_artifacts` — because the module-level

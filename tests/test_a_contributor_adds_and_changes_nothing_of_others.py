@@ -53,31 +53,65 @@ def test_a_contributor_reads_and_adds_and_cannot_change_anothers_card(db):
             check_access(_auth(OTHER), ideas, "evict", db)
 
 
-async def test_the_maker_edits_and_deletes_their_own_card_and_no_one_elses(db):
-    """2026-10-22 (John): the maker of a card in someone else's collection edits and deletes it. Its
-    owner's grant was minted at creation, but the update path asked for `update` on the container."""
-    from fastapi.responses import Response
+def _req():
     from starlette.requests import Request
+    return Request({"type": "http", "method": "PATCH", "headers": [], "path": "/", "query_string": b""})
+
+
+async def _add(db, who, container, text):
+    from fastapi.responses import Response
     from mantle.routers import artifacts_router as artifacts
 
-    def req():
-        return Request({"type": "http", "method": "PATCH", "headers": [], "path": "/", "query_string": b""})
+    with acting_as(who, principal_type="user"):
+        return (await artifacts.create_artifact(
+            request=_req(), response=Response(), auth=_auth(who), store_db=db,
+            body=artifacts.CreateArtifactRequest(container_id=container, content=text,
+                                                 context=json.dumps({"title": text}))))["id"]
+
+
+async def test_what_a_contributor_adds_belongs_to_the_collection_s_owner(db):
+    """John, 2026-11-01: a creator who does not already hold the owner's rights on the collection
+    gets no creator grant on what they add. A `contributor` reads it, through the collection, and
+    cannot change or delete it; the collection's owner can."""
 
     with acting_as(USER, principal_type="user"):
         ideas = ws.create_container(db, USER, content_type="application/vnd.agience.collection+json", name="Ideas").id
-        hosts = ws.create_workspace_artifact(db, USER, ideas, context=json.dumps({"title": "Host's"}), content="h").id
         invite, token = grant_service.create_invite(db, user_id=USER, resource_id=ideas, role="contributor")
     grant_service.claim_invite(db, ANA, token, "")
+    mine = await _add(db, ANA, ideas, "Ana's idea")
+    from mantle.db import lattice_api as la
+    assert la.get_active_grants_for_principal_resource(db, grantee_id=ANA, resource_id=mine) == []
     with acting_as(ANA, principal_type="user"):
-        mine = (await artifacts.create_artifact(
-            request=req(), response=Response(), auth=_auth(ANA), store_db=db,
-            body=artifacts.CreateArtifactRequest(container_id=ideas, content="Ana's idea",
-                                                 context=json.dumps({"title": "Idea A"}))))["id"]
-        patched = await artifacts.update_artifact(
-            artifact_id=mine, auth=_auth(ANA), store_db=db,
-            body=artifacts.UpdateArtifactRequest(content="Ana's idea, refined"))
-        assert (patched.get("content") if isinstance(patched, dict) else patched.content) == "Ana's idea, refined"
-        with pytest.raises(HTTPException):
-            await artifacts.update_artifact(artifact_id=hosts, auth=_auth(ANA), store_db=db,
-                                            body=artifacts.UpdateArtifactRequest(content="Ana's now"))
-        check_access(_auth(ANA), mine, "delete", db)
+        check_access(_auth(ANA), mine, "read", db)
+        for action in ("update", "delete"):
+            with pytest.raises(HTTPException):
+                check_access(_auth(ANA), mine, action, db)
+    with acting_as(USER, principal_type="user"):
+        check_access(_auth(USER), mine, "update", db)
+        check_access(_auth(USER), mine, "delete", db)
+
+
+async def test_an_inbox_sender_adds_asks_for_no_grant_and_reads_nothing(db):
+    """A create-only sender's add succeeds; no grant is asked of the authority; afterwards they
+    can read neither the item nor the inbox."""
+    from mantle.attenuation import ACTIONS
+    from mantle.db import lattice_api as la
+    from mantle.db import reach_journal
+
+    with acting_as(USER, principal_type="user"):
+        inbox = ws.create_container(db, USER, content_type="application/vnd.agience.collection+json", name="Inbox").id
+        la.create_grant(db, Grant(id="g-inbox-ana", resource_id=inbox, grantee_type="user",
+                                  grantee_id=ANA, granted_by=USER,
+                                  **{f"can_{a}": a == "create" for a in ACTIONS}))
+    seen = []
+    prior = reach_journal._authority
+    reach_journal.install(lambda entry, **kw: seen.append(entry) or None)
+    try:
+        item = await _add(db, ANA, inbox, "a note for the host")
+    finally:
+        reach_journal._authority = prior
+    assert item and not [e for e in seen if e["kind"] == "grant"]
+    with acting_as(ANA, principal_type="user"):
+        for target in (item, inbox):
+            with pytest.raises(HTTPException):
+                check_access(_auth(ANA), target, "read", db)

@@ -52,6 +52,45 @@ def _read_authority_manifest() -> Optional[dict]:
     except (OSError, ValueError):
         return None
 
+def _manifest_pinned_names() -> set:
+    """The issuers the authority manifest pins: every anchor's name, and Origin's own issuer."""
+    manifest = _read_authority_manifest() or {}
+    names = set((manifest.get("trust_anchors") or {}).keys())
+    auth_issuer = getattr(config, "AUTHORITY_ISSUER", None)
+    if auth_issuer:
+        names.add(auth_issuer)
+    return names
+
+
+def jwks_fetch_allowed(url: Optional[str], configured: Optional[list] = None) -> bool:
+    """Is `url` an address Mantle may fetch a JWKS (or discovery document) from? Only an origin
+    `MANTLE_JWKS_FETCH_ALLOWLIST` names (comma-separated `scheme://host[:port]`), over https,
+    or one a configured issuer names (review 12, H1). Anything else, a link-local or internal
+    address included, is never fetched."""
+    from urllib.parse import urlsplit
+
+    if not url:
+        return False
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
+        return False
+    origin = f"{parts.scheme}://{parts.netloc.lower()}"
+    allowed = {o.strip().rstrip("/").lower()
+               for o in (os.getenv("MANTLE_JWKS_FETCH_ALLOWLIST") or "").split(",") if o.strip()}
+    for d in list(getattr(config, "TRUSTED_ISSUERS", []) or []) + list(configured or []):
+        if not isinstance(d, dict):
+            continue
+        for key in ("issuer", "jwks_uri"):
+            v = d.get(key)
+            if isinstance(v, str) and v.startswith("https://"):
+                p = urlsplit(v)
+                allowed.add(f"{p.scheme}://{p.netloc.lower()}")
+    return origin in allowed
+
+
 # Fixed namespace for deriving a stable Agience user id from an external
 # (issuer/tenant, subject) pair. Never change this — it would re-key every
 # external user. See `OidcVerifier.external_user_id`.
@@ -79,22 +118,30 @@ class OidcVerifier:
         # Build the trust maps from the env seed + manifest anchors (no DB yet).
         self._rebuild([])
 
-    def _rebuild(self, artifact_issuers: list) -> None:
-        """Rebuild the trust maps from (env + artifact) issuers + manifest anchors.
+    def _rebuild(self, artifact_issuers: list, *, from_store: bool = False) -> None:
+        """Rebuild the trust maps from configuration: the configured external issuers
+        (`AGIENCE_TRUSTED_ISSUERS`) and the authority manifest's anchors (review 12, H1, H2).
 
-        Idempotent — called at construction (artifacts=[]) and on every refresh.
-        ``_external`` holds verify-only IdPs (role != platform): tenant-namespacing
-        + the dependencies aud-skip key off it. ``_by_iss`` holds everything
-        verifiable. Artifact issuers override env issuers on key collision (later
-        wins), and explicit issuers override manifest anchors (setdefault)."""
+        An issuer artifact never adds an issuer, a key or an audience: trust roots in
+        configuration, never in who wrote a row (§51). Once the store has been read
+        (`from_store`), a configured external issuer stays trusted only while a live
+        artifact names it, so revoking the artifact narrows trust. The manifest always
+        wins: its anchors, and Origin's own issuer, are taken from the manifest alone, and
+        nothing configured or stored can name them."""
+        pinned = _manifest_pinned_names()
+        live = {d.get("issuer") for d in (artifact_issuers or [])
+                if isinstance(d, dict) and d.get("issuer")}
         external: Dict[str, dict] = {}
         by_iss: Dict[str, dict] = {}
-        for d in (self._env_issuers + list(artifact_issuers or [])):
-            iss = d.get("issuer") if isinstance(d, dict) else None
-            if not iss:
+        for d in self._env_issuers:
+            iss = d.get("issuer")
+            if not iss or iss in pinned:
+                continue
+            platform = d.get("role", "external") == "platform"
+            if from_store and not platform and iss not in live:
                 continue
             by_iss[iss] = d
-            if d.get("role", "external") != "platform":
+            if not platform:
                 external[iss] = d
         self._external = external
         self._by_iss = by_iss
@@ -112,7 +159,7 @@ class OidcVerifier:
             arts = []
         with self._lock:
             self._last_refresh = time.time()
-            self._rebuild(arts)
+            self._rebuild(arts, from_store=True)
 
     def refresh_if_unknown_iss(self, db: Any, token: str) -> bool:
         """If ``token``'s issuer is unknown, refresh from the store (throttled) and
@@ -142,14 +189,20 @@ class OidcVerifier:
         for name, anchor in anchors.items():
             jwks = anchor.get("jwks") if isinstance(anchor, dict) else None
             if isinstance(jwks, dict):
-                # platform-service JWTs carry iss = the service NAME.
-                self._by_iss.setdefault(name, {"issuer": name, "jwks": jwks, "audience": None})
+                # platform-service JWTs carry iss = the service NAME. The manifest wins.
+                self._by_iss[name] = {"issuer": name, "jwks": jwks, "audience": None}
+                self._external.pop(name, None)
         # Origin-signed user tokens + delegations carry iss = AUTHORITY_ISSUER (a URL),
-        # signed by the origin key — verify against the origin anchor's JWKS.
+        # signed by the origin key — verify against the origin anchor's JWKS, and nothing else.
         origin_jwks = (anchors.get("origin") or {}).get("jwks")
         auth_issuer = getattr(config, "AUTHORITY_ISSUER", None)
-        if isinstance(origin_jwks, dict) and auth_issuer:
-            self._by_iss.setdefault(auth_issuer, {"issuer": auth_issuer, "jwks": origin_jwks, "audience": None})
+        if auth_issuer:
+            self._external.pop(auth_issuer, None)
+            if isinstance(origin_jwks, dict):
+                self._by_iss[auth_issuer] = {"issuer": auth_issuer, "jwks": origin_jwks,
+                                             "audience": None}
+            else:
+                self._by_iss.pop(auth_issuer, None)
 
     def is_trusted(self, iss: Optional[str]) -> bool:
         """True only for configured EXTERNAL OIDC IdPs — not the platform's own
@@ -275,8 +328,11 @@ class OidcVerifier:
                 cached = self._jwks_cache.get(iss)
             return cached[0] if cached else []
         try:
-            jwks_uri = cfg.get("jwks_uri") or self._discover_jwks_uri(iss)
-            if not jwks_uri:
+            jwks_uri = cfg.get("jwks_uri") or self._discover_jwks_uri(iss, self._env_issuers)
+            if not jwks_uri or not jwks_fetch_allowed(jwks_uri, self._env_issuers):
+                if jwks_uri:
+                    logger.warning("oidc: JWKS for %s not fetched: %s is not an allowlisted "
+                                   "address", iss, jwks_uri)
                 return cached[0] if cached else []
             try:
                 r = httpx.get(jwks_uri, timeout=_FETCH_TIMEOUT_S)
@@ -292,8 +348,10 @@ class OidcVerifier:
             fetch_lock.release()
 
     @staticmethod
-    def _discover_jwks_uri(iss: str) -> Optional[str]:
+    def _discover_jwks_uri(iss: str, configured: Optional[list] = None) -> Optional[str]:
         url = iss.rstrip("/") + "/.well-known/openid-configuration"
+        if not jwks_fetch_allowed(url, configured):
+            return None
         try:
             r = httpx.get(url, timeout=_FETCH_TIMEOUT_S)
             r.raise_for_status()

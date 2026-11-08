@@ -61,7 +61,7 @@ from mantle.search.mantle.oracle import (
     OracleService,
 )
 from mantle.search.mantle.sse.indexer import SseIndexer
-from mantle.search.mantle.sse.narrowing import Coverage, TokenNarrower, phrase_stems
+from mantle.search.mantle.sse.narrowing import TokenNarrower, phrase_stems
 from mantle.search.mantle.sse.posting import InMemoryPostingStore
 from mantle.search.query_parser import parse_query
 
@@ -521,13 +521,12 @@ class TestTheLookupReadsOnlyWhatItIsGiven:
             stems, [("user-nobody", "col-nobody")], self_request) == {}
 
     def test_a_refused_key_narrows_to_nothing_at_the_resolver(self, stack):
-        """A key the custodian refuses is not caught here — `sse/query` does not catch it
-        either, and a second opinion about custody is exactly what this arm must not hold. It
-        reaches `resolve_authorized_scope`, whose catch-all narrows to nothing, so a refusal
-        costs recall and is still not distinguishable from a token matching nothing."""
+        """Postings are keyed per collection. A collection whose key the custodian refuses
+        contributes nothing, and is still not distinguishable from a token matching nothing; a
+        query spanning it and a collection the caller reaches answers from the one it reaches.
+        The custodian decides; this arm only does not ask past a refusal."""
         lookup = stack["narrower"].lookup_for(TERM, _read_request())
-        with pytest.raises(Exception):
-            lookup([("user-nobody", "col-nobody")])
+        assert lookup([("user-nobody", "col-nobody")]) == {}
         assert _scope(stack, lookup=lambda pairs: lookup(
             [("user-nobody", "col-nobody")])).artifact_ids == frozenset()
 

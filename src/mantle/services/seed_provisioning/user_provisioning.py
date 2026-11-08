@@ -31,7 +31,6 @@ from mantle.db.store import Database
 
 from mantle.db.backend import (
     add_artifact_to_collection as db_add_artifact_to_collection,
-    create_artifact as db_create_artifact,
     create_collection as db_create_collection,
     create_grant as db_create_grant,
     get_active_grants_for_principal_resource as db_get_grants_for_principal_resource,
@@ -39,11 +38,8 @@ from mantle.db.backend import (
     get_collection_by_id as db_get_collection_by_id,
     get_edge as db_get_edge,
     list_collection_artifacts as db_list_collection_artifacts,
-    remove_artifact_from_collection as db_remove_artifact_from_collection,
     update_artifact as db_update_artifact,
-    upsert_user_collection_grant as db_upsert_user_collection_grant,
 )
-from mantle.entities.artifact import Artifact as ArtifactEntity
 from mantle.entities.collection import Collection as CollectionEntity, COLLECTION_CONTENT_TYPE
 from mantle.entities.grant import Grant as GrantEntity
 from mantle.config import AGIENCE_PLATFORM_USER_ID
@@ -51,7 +47,6 @@ from mantle.services import mint_context as _mc
 from mantle.services.bootstrap_types import (
     AUTHORITY_COLLECTION_SLUG,
     INBOX_MATERIALIZATION_SLUGS,
-    PEOPLE_COLLECTION_SLUG,
 )
 from mantle.services.platform_topology import get_id_optional, register_id
 from .loader import (
@@ -111,7 +106,7 @@ def _seeds_base() -> Optional[Path]:
     Mantle bundles no seed content: it is a bare encrypted data plane. A seed corpus is an
     install-package artifact supplied by the deployment rather than shipped in the Mantle image,
     provided at deploy time by pointing ``AGIENCE_SEEDS_ROOT`` at the mounted seeds. Unset means no
-    seed application: the runtime provisioners (People/Authorities collections, Person cards,
+    seed application: the runtime provisioners (the Authorities collection, Person cards,
     issuers) still run, and only the declarative grant seeds are skipped."""
     env = os.getenv("AGIENCE_SEEDS_ROOT")
     return Path(env) if env else None
@@ -122,6 +117,28 @@ def _is_platform_admin(store_db: Database, user_id: str) -> bool:
     from mantle.services.platform_settings_service import settings
 
     return bool(user_id) and settings.get("platform.operator_id") == user_id
+
+
+def _resolve_profile(user_id: str, email: Optional[str], name: Optional[str]):
+    """`(email, name)`, filled from Origin's person record when either is missing, on the
+    person's own access token only (review 21, F4): the first sign-in request carries it. A
+    script, a delegation or a grant key carries none, and then Origin is asked nothing and the
+    profile has no address."""
+    if email is not None and name is not None:
+        return email, name
+    try:
+        from mantle.services import person_service
+        token = person_service.own_subject_token(user_id)
+        if token is None:
+            return email, name
+        person = person_service.get_user_by_id(None, user_id, subject_token=token)
+        if person is not None:
+            email = email or getattr(person, "email", None)
+            name = name or getattr(person, "name", None)
+    except Exception:
+        logger.debug("provision_user (%s): could not resolve person email/name", user_id,
+                     exc_info=True)
+    return email, name
 
 
 def provision_user(
@@ -166,26 +183,13 @@ def _provision_user(
 
     base = seeds_base or _seeds_base()
 
-    # Resolve the user's email/name from the identity record when callers don't
-    # supply them (most do not) — needed to mint the Person profile and to match
-    # pre-signup leads by email. Non-fatal: degrades to no email.
-    if email is None or name is None:
-        try:
-            from mantle.services import person_service
-            # No subject token: provisioning is a bootstrap path, run under no user's request —
-            # it is often what runs BEFORE that user has ever presented a token here. So this
-            # stays the unscoped call, and nothing is minted to make it look otherwise. It is
-            # already non-fatal: an Origin that refuses degrades to "no email", which the code
-            # below is written to survive.
-            person = person_service.get_user_by_id(store_db, user_id)
-            if person is not None:
-                email = email or getattr(person, "email", None)
-                name = name or getattr(person, "name", None)
-        except Exception:
-            logger.debug("provision_user (%s): could not resolve person email/name", user_id, exc_info=True)
+    # The user's email and name from Origin's record when the caller did not supply them, needed
+    # to mint the Person profile and to match pre-signup leads by email. Non-fatal.
+    email, name = _resolve_profile(user_id, email, name)
 
     inbox_id = _ensure_inbox_workspace(store_db, user_id)
     _ensure_observations_container(store_db, user_id)
+    _ensure_ember_memory(store_db, user_id)
     ctx = UserContext(id=user_id, email=email, name=name, inbox_id=inbox_id, tenant=tenant)
 
     # Declarative grant seeds are applied ONLY when the install package supplies a
@@ -212,71 +216,24 @@ def _provision_user(
     try:
         _ensure_person_artifact(store_db, ctx)
     except Exception:
-        logger.warning("provision_user (%s): Person artifact creation failed", user_id, exc_info=True)
+        # Under threshold custody a refusal here leaves a member without a linked card: it is
+        # not swallowed there, so the sign-in says so.
+        from mantle.db import reach_journal as _rj
+        logger.error("provision_user (%s): Person artifact creation failed", user_id,
+                     exc_info=True)
+        if _rj.required():
+            raise
     try:
         _convert_leads_for_person(store_db, user_id, email)
     except Exception:
         logger.warning("provision_user (%s): lead conversion failed", user_id, exc_info=True)
 
 
-def _ensure_people_collection(store_db: Database) -> str:
-    """Idempotently ensure the platform **People** collection exists, creating it
-    at RUNTIME. Returns its deterministic id.
-
-    People is deliberately NOT a user-readable platform-registry seed (it's absent
-    from ``ALL_PLATFORM_COLLECTION_SLUGS`` / the seed tree). It's created here the
-    same way an app provisions its bound data collection — deterministic id, then
-    create-if-missing + persist the slug→id mapping. Access model: the platform/
-    admin manages the directory (the operator gets a management grant); members
-    never get a grant on the collection itself — each reaches only their OWN card
-    via that card's owner grant ([[feedback_authority_roots_to_person]]).
-    """
-    people_id = derive_uuid(get_instance_namespace(), "agience", PEOPLE_COLLECTION_SLUG)
-    # Register for this session so get_id(<slug>) / ref lookups resolve it.
-    register_id(PEOPLE_COLLECTION_SLUG, people_id)
-    register_id(f"agience/{PEOPLE_COLLECTION_SLUG}", people_id)
-
-    if db_get_collection_by_id(store_db, people_id) is None:
-        now = datetime.now(timezone.utc).isoformat()
-        with _as_the_platform():
-            db_create_collection(store_db, CollectionEntity(
-                id=people_id,
-                name="People",
-                description=(
-                    "Platform people directory — each member's profile lives here. "
-                    "Members manage only their own card; the platform/admin manages all."
-                ),
-                created_by=AGIENCE_PLATFORM_USER_ID,
-                content_type=COLLECTION_CONTENT_TYPE,
-                state=CollectionEntity.STATE_LIVE,
-                created_time=now, modified_time=now,
-            ))
-        _persist_seed_ids(store_db, {PEOPLE_COLLECTION_SLUG: people_id})
-        logger.info("Created People collection %s at runtime", people_id)
-
-    # Platform/admin manageability (idempotent): the operator manages the directory.
-    from mantle.services.platform_settings_service import settings
-    operator_id = settings.get("platform.operator_id")
-    if operator_id:
-        try:
-            db_upsert_user_collection_grant(
-                store_db, user_id=operator_id, collection_id=people_id,
-                granted_by=AGIENCE_PLATFORM_USER_ID, name="People (admin management)",
-                can_read=True, can_create=True, can_update=True, can_delete=True,
-                can_evict=True, can_add=True, can_invoke=True, can_admin=True,
-            )
-        except Exception:
-            logger.debug("People: operator grant upsert failed", exc_info=True)
-    ensure_platform_principal_grant(store_db, people_id)
-    return people_id
-
-
 @contextlib.contextmanager
 def _as_the_platform():
     """Write one of the platform's own collections as the platform's id, its `created_by`, so the
     key oracle's creator rule mints its key. Provisioning runs as the member signing in, who holds
-    no key to a platform row: on a fresh node the first login was refused the key for the People
-    directory's name (2026-10-30). The platform system principal is granted the collection once it
+    no key to a platform row. The platform system principal is granted the collection once it
     exists (`ensure_platform_principal_grant`), and reads it from then on."""
     from mantle.services.acting_principal import acting_as
     with acting_as(AGIENCE_PLATFORM_USER_ID, principal_type="service", scope="platform.provision",
@@ -305,8 +262,7 @@ def ensure_platform_principal_grant(store_db: Database, collection_id: str) -> b
     The platform's collections are created by `AGIENCE_PLATFORM_USER_ID`, a name no request ever
     acts as, so nothing held their key: work the platform does on its own rows (sealing them, the
     rollback's unsealing) runs as the system principal (`system_acting_context`) and was refused.
-    2026-10-30, on the release candidate: the People directory, its 41 member profiles and the
-    Authorities collection could be sealed by no actor and were left in plain text."""
+    Without it the platform's own rows can be sealed by no actor and stay in plain text."""
     from mantle.services.peer_signing import get_system_principal_id
     system = get_system_principal_id()
     if not system or not collection_id:
@@ -329,7 +285,7 @@ def ensure_authority_collection(store_db: Database) -> str:
     active ``can_admin``/``can_update`` grant on it IS a platform admin (see
     ``services.dependencies.require_platform_admin``). It MUST exist unconditionally
     (not only when a seed corpus is loaded) so multi-admin management works on any
-    node — created here the same deterministic-id, create-if-missing way as People.
+    node — created here by deterministic id, if missing.
     """
     authority_id = derive_uuid(get_instance_namespace(), "agience", AUTHORITY_COLLECTION_SLUG)
     register_id(AUTHORITY_COLLECTION_SLUG, authority_id)
@@ -353,70 +309,36 @@ def ensure_authority_collection(store_db: Database) -> str:
     return authority_id
 
 
-def _ensure_person_owner_grant(store_db: Database, person_id: str, user_id: str) -> None:
-    """Grant the user read+update+delete on their OWN Person card (idempotent).
-
-    People is a platform collection — members get only ``read`` on it, so the
-    owner needs an explicit grant to EDIT their own profile. Authority roots to
-    the person whose card it is (granted_by == the user). See
-    ``feedback_authority_roots_to_person``.
-
-    ``can_delete`` is part of owning it. This card is the artifact that holds a
-    member's plaintext email and display name, and ``DELETE /artifacts/{id}``
-    resolves through the same grant flags as every other artifact — without the
-    flag the one person the data is about is the one principal who cannot remove
-    it. The idempotence check therefore tests for delete too, so a card issued
-    with the narrower pair is widened on the owner's next login rather than
-    staying undeletable for the life of the account.
-    """
-    existing = db_get_grants_for_principal_resource(store_db, user_id, person_id)
-    if any(getattr(g, "can_update", False) and getattr(g, "can_delete", False)
-           for g in existing):
-        return
-    db_create_grant(store_db, GrantEntity(
-        resource_id=person_id, grantee_type="user", grantee_id=user_id,
-        granted_by=user_id, can_read=True, can_update=True, can_delete=True,
-        name="Own profile (read + edit + delete)",
-    ))
-
-
-def _migrate_person_home(
-    store_db: Database, ctx: UserContext, person_id: str, people_id: Optional[str]
-) -> None:
-    """One-time self-heal: move an existing Person card out of the Inbox
-    home into the People collection. No-op once migrated. Safe to run every login.
-    """
-    if not people_id:
-        return
-    if not db_get_edge(store_db, people_id, person_id):
-        db_add_artifact_to_collection(store_db, people_id, person_id, origin=True)
-    if ctx.inbox_id and db_get_edge(store_db, ctx.inbox_id, person_id):
-        db_remove_artifact_from_collection(store_db, ctx.inbox_id, person_id)
-        entity = db_get_artifact(store_db, person_id)
-        if entity is not None and getattr(entity, "collection_id", None) != people_id:
-            entity.collection_id = people_id
-            db_update_artifact(store_db, entity)
-        logger.info("Migrated Person %s out of inbox into People", person_id)
+def own_card_id(store_db: Database, user_id: str) -> str:
+    """The id of the person's own card. `person_artifact_id`, unless a card written in the People
+    directory before 2026-11-01 holds that id: that card is the platform's now
+    (`mantle.system.people_to_signups`), and the person's own card has an id of its own."""
+    pid = person_artifact_id(user_id)
+    old = db_get_artifact(store_db, pid)
+    if old is not None and getattr(old, "collection_id", None) not in (None, "", pid):
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"agience://person/{user_id}/own"))
+    return pid
 
 
 def _ensure_person_artifact(store_db: Database, ctx: UserContext) -> bool:
-    """Create the user's Person artifact on first login (idempotent).
+    """Create the person's own card on first sign-in (idempotent). True only when it creates it.
 
-    The card is homed in the platform **People** collection (the directory /
-    data home for the People app) — NOT the user's Inbox. It carries the stable
-    user id in ``context.identity.agience_root_id`` and gets an owner grant so
-    the user can view + edit their own profile. Pre-existing cards are migrated
-    off the Inbox. Returns True only when it creates the card this call.
+    The card belongs to the person (John, 2026-11-01): it is its own root, created as the person
+    on their own credential, with their own creation grant, in one batch Origin issues
+    (`workspace_service.create_container`). It is placed in no collection and no one else is
+    granted anything on it. Sharing it is the person's own act: they place it, as a link, in a
+    collection where they hold Add. It carries the stable user id in
+    ``context.identity.agience_root_id``.
+
+    A card written in the People directory before 2026-11-01 is the platform's
+    (`mantle.system.people_to_signups`): it is left alone, nothing is granted on it, and the
+    person's own card is made beside it at an id of its own (`own_card_id`).
+
+    It ensures no platform collection: a member's sign-in holds no credential that may create one
+    (the Authorities collection is the bootstrap's, `manage_bootstrap`).
     """
-    pid = person_artifact_id(ctx.id)
-    # People + Authorities are created at runtime (not seeded) — ensure both.
-    people_id = _ensure_people_collection(store_db)
-    ensure_authority_collection(store_db)
-
+    pid = own_card_id(store_db, ctx.id)
     if db_get_artifact(store_db, pid):
-        # Already exists — self-heal its home + owner grant, then report no-create.
-        _migrate_person_home(store_db, ctx, pid, people_id)
-        _ensure_person_owner_grant(store_db, pid, ctx.id)
         return False
 
     display_name = (ctx.name or "").strip()
@@ -432,22 +354,14 @@ def _ensure_person_artifact(store_db: Database, ctx: UserContext) -> bool:
         "display_name": display_name,
         "email": ctx.email or "",
     }
-    now = datetime.now(timezone.utc).isoformat()
-    db_create_artifact(store_db, ArtifactEntity(
-        id=pid, root_id=pid, collection_id=people_id,
-        state=ArtifactEntity.STATE_LIVE,
+    # Provisioning acts as the person (`provision_user`), on the credential their sign-in carries.
+    from mantle.services import workspace_service
+    workspace_service.create_container(
+        store_db, ctx.id, content_type=PERSON_CONTENT_TYPE, name=display_name,
         context=json.dumps(context, separators=(",", ":")),
-        content="", content_type=PERSON_CONTENT_TYPE,
-        name=display_name, description="Platform member profile.",
-        created_by=ctx.id, created_time=now,
-    ))
-    if not db_get_edge(store_db, people_id, pid):
-        # origin edge: the operator's People grant propagates to cards (admin sees
-        # all); members have no People grant, so nothing propagates to them — they
-        # reach only their own card via its owner grant.
-        db_add_artifact_to_collection(store_db, people_id, pid, origin=True)
-    _ensure_person_owner_grant(store_db, pid, ctx.id)
-    logger.info("Created Person artifact %s for user %s (People)", pid, ctx.id)
+        description="Platform member profile.", artifact_id=pid,
+    )
+    logger.info("Created Person artifact %s for user %s (own root)", pid, ctx.id)
     return True
 
 
@@ -507,6 +421,65 @@ def _apply_grant_set(
     report = seed_from_artifacts(store_db, root, user=ctx)
     for err in report.errors:
         logger.warning("provision_user (%s): %s", user_id, err)
+
+
+#: The natural key Ember's memory collection is derived from, per person (`ember.mantle_api`).
+EMBER_MEMORY_IDENTITY = "ember:memory"
+
+
+def _ensure_ember_memory(store_db: Database, user_id: str) -> Optional[str]:
+    """The person's own memory collection for Ember, made at their sign-in on their own token.
+
+    Ember opens no person's key (John, 2026-11-02, review 10), so it can neither make this
+    collection nor read it: it only writes memories into it, sealed to the collection's drop key.
+    Made here, as the person, the collection gets its key and its drop key from their own open, and
+    is theirs by their creation grant. Idempotent; non-fatal (Ember then says the collection comes
+    at the next sign-in)."""
+    from mantle.db.constants import COLLECTION_CONTENT_TYPE as _COLLECTION
+    from mantle.services import workspace_service
+    from mantle.services.artifact_identity import derive_artifact_id
+
+    mem_id = derive_artifact_id(str(user_id), EMBER_MEMORY_IDENTITY)
+    # Made only on the person's own token: never on a narrowed delegation (Ember's, a persona's),
+    # which Origin refuses to make it anyway (review 11).
+    from mantle.services.acting_principal import current_acting_principal
+    acting = current_acting_principal()
+    if acting is not None and getattr(acting, "narrowed", None):
+        return None
+    try:
+        if db_get_artifact(store_db, mem_id) is not None:
+            return mem_id
+        workspace_service.create_container(
+            store_db, str(user_id), content_type=_COLLECTION, name="Memory",
+            description="What you asked Ember to remember. Yours alone until you share it.",
+            artifact_id=mem_id)
+        return mem_id
+    except Exception:  # noqa: BLE001 — a missing memory collection must not fail a sign-in
+        logger.warning("provision_user (%s): Ember's memory collection not made", user_id,
+                       exc_info=True)
+        return None
+
+
+def ensure_ember_memory_for(store_db: Database, auth, known: set) -> Optional[str]:
+    """Make the person's memory collection at a sign-in that is not their first (review 11):
+    first-login provisioning makes it for a new person, and a person who already held grants
+    before it existed gets it here. Only on their own token, and only when their reach does not
+    already hold it."""
+    from mantle.services.artifact_identity import derive_artifact_id
+    from mantle.services.dependencies import is_narrowed
+
+    user_id = getattr(auth, "user_id", None)
+    if not user_id or is_narrowed(auth) or getattr(auth, "principal_type", "user") != "user":
+        return None
+    mem_id = derive_artifact_id(str(user_id), EMBER_MEMORY_IDENTITY)
+    if mem_id in (known or set()):
+        return None
+    try:
+        if db_get_artifact(store_db, mem_id) is not None:
+            return None                       # there already; nothing new to resolve
+    except Exception:                         # noqa: BLE001 — fall through to the ensure
+        pass
+    return _ensure_ember_memory(store_db, str(user_id))
 
 
 def _ensure_observations_container(store_db: Database, user_id: str) -> Optional[str]:

@@ -61,11 +61,6 @@ PUBLIC = {
     ("GET", "/auth/callback"):                      "the OAuth redirect target: pre-auth by definition",
     ("GET", "/mcp"):                                "405 with `Allow: POST`; serves no data",
     ("GET", "/mcp/"):                               "as above, trailing-slash form",
-    ("GET", "/grants/invite-context"):
-        "an invite link is followed BEFORE the recipient has an account. Safe because it "
-        "discloses no identity: it returns `has_target=bool(...)`, a boolean over the "
-        "target and never the target, while `resource_id`/`granted_by`/`name` are returned "
-        "only by `/grants/invite-details`, which is authenticated",
 }
 
 

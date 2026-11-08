@@ -1,7 +1,7 @@
 """Step 3 identity linkage: Person artifact at first-login + lead conversion.
 
-Covers `_ensure_person_artifact` (deterministic id, agience_root_id in context,
-idempotent) and `_convert_leads_for_person` (email match, skips non-matching and
+Covers `_ensure_person_artifact` (deterministic id, the person's own root, agience_root_id in
+context, idempotent) and `_convert_leads_for_person` (email match, skips non-matching and
 already-converted leads).
 """
 
@@ -26,146 +26,54 @@ from mantle.services.seed_provisioning.loader import UserContext  # noqa: E402
 # Person artifact
 # ---------------------------------------------------------------------------
 
+def _containers(monkeypatch):
+    made: list = []
+    from mantle.services import workspace_service
+    monkeypatch.setattr(workspace_service, "create_container",
+                        lambda db, user_id, **kw: made.append((user_id, kw)))
+    return made
+
+
 def test_ensure_person_artifact_creates(monkeypatch):
-    created: list = []
-    edges: list = []
-    grants: list = []
-    # People collection is ensured at runtime; the card is homed there, NOT the inbox.
-    monkeypatch.setattr(up, "_ensure_people_collection", lambda db: "people-col")
-    monkeypatch.setattr(up, "ensure_authority_collection", lambda db: "authority-col")
+    """The card is the person's own root, created as them (`create_container`, which issues their
+    creation grant): no collection home, no grant to anyone else."""
+    made = _containers(monkeypatch)
     monkeypatch.setattr(up, "db_get_artifact", lambda db, pid: None)
-    monkeypatch.setattr(up, "db_create_artifact", lambda db, e: created.append(e))
-    monkeypatch.setattr(up, "db_get_edge", lambda db, c, ch: None)
     monkeypatch.setattr(up, "db_add_artifact_to_collection",
-                        lambda db, c, ch, **kw: edges.append((c, ch)))
-    monkeypatch.setattr(up, "db_get_grants_for_principal_resource", lambda db, g, r: [])
-    monkeypatch.setattr(up, "db_create_grant", lambda db, g: grants.append(g))
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("placed nowhere")))
+    monkeypatch.setattr(up, "db_create_grant",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no other grant")))
 
     ctx = UserContext(id="u-1", email="jane@example.com", name="Jane", inbox_id="inbox-1")
-    up._ensure_person_artifact(MagicMock(), ctx)
+    assert up._ensure_person_artifact(MagicMock(), ctx) is True
 
-    assert len(created) == 1
-    e = created[0]
-    assert e.content_type == up.PERSON_CONTENT_TYPE
-    assert e.id == up.person_artifact_id("u-1")
-    assert e.id != "u-1"  # not == user_id (avoids personal-collection collision)
-    ctxd = json.loads(e.context)
+    assert len(made) == 1
+    user_id, kw = made[0]
+    assert user_id == "u-1"
+    assert kw["content_type"] == up.PERSON_CONTENT_TYPE
+    assert kw["artifact_id"] == up.person_artifact_id("u-1")
+    assert kw["artifact_id"] != "u-1"  # not == user_id (avoids personal-collection collision)
+    ctxd = json.loads(kw["context"])
     assert ctxd["identity"]["agience_root_id"] == "u-1"
     assert ctxd["display_name"] == "Jane"
     assert ctxd["email"] == "jane@example.com"
-    # Homed in People, not the inbox.
-    assert edges == [("people-col", e.id)]
-    assert e.collection_id == "people-col"
-    # Owner gets read + update + DELETE on their own card. Delete is the one that makes the
-    # card erasable by its subject — it holds their plaintext email and display name, and
-    # `DELETE /artifacts/{id}` resolves through this grant like any other artifact's.
-    assert len(grants) == 1
-    assert grants[0].resource_id == e.id
-    assert grants[0].grantee_id == "u-1"
-    assert grants[0].can_read is True
-    assert grants[0].can_update is True
-    assert grants[0].can_delete is True
 
 
 def test_ensure_person_artifact_idempotent(monkeypatch):
-    created: list = []
-    monkeypatch.setattr(up, "_ensure_people_collection", lambda db: "people-col")
-    monkeypatch.setattr(up, "ensure_authority_collection", lambda db: "authority-col")
-    monkeypatch.setattr(up, "db_get_artifact", lambda db, pid: object())  # already exists
-    monkeypatch.setattr(up, "db_create_artifact", lambda db, e: created.append(e))
-    # Already homed in People, no legacy inbox edge → migrate is a no-op.
-    monkeypatch.setattr(up, "db_get_edge",
-                        lambda db, c, ch: object() if c == "people-col" else None)
-    monkeypatch.setattr(up, "db_add_artifact_to_collection", lambda db, c, ch, **kw: None)
-    # Owner grant already present → no duplicate.
-    monkeypatch.setattr(up, "db_get_grants_for_principal_resource",
-                        lambda db, g, r: [SimpleNamespace(can_update=True, can_delete=True)])
+    made = _containers(monkeypatch)
+    # Already exists, as the person's own root → nothing made, nothing granted.
+    monkeypatch.setattr(up, "db_get_artifact", lambda db, pid: SimpleNamespace(collection_id=None))
     monkeypatch.setattr(up, "db_create_grant",
                         lambda db, g: (_ for _ in ()).throw(AssertionError("should not create")))
-    up._ensure_person_artifact(MagicMock(), UserContext(id="u-1", inbox_id="inbox-1"))
-    assert created == []
-
-
-def test_owner_grant_widens_a_card_that_cannot_be_deleted(monkeypatch):
-    """A card carrying only read+update is widened on the owner's next login.
-
-    Idempotence is measured against the grant the owner should hold, not against "some grant
-    exists" — otherwise a card issued under the narrower pair stays undeletable by its subject
-    for the life of the account, and the fix reaches new members only.
-    """
-    grants: list = []
-    monkeypatch.setattr(up, "db_get_grants_for_principal_resource",
-                        lambda db, g, r: [SimpleNamespace(can_update=True, can_delete=False)])
-    monkeypatch.setattr(up, "db_create_grant", lambda db, g: grants.append(g))
-
-    up._ensure_person_owner_grant(MagicMock(), "person-1", "u-1")
-
-    assert len(grants) == 1
-    assert grants[0].can_delete is True
+    assert up._ensure_person_artifact(MagicMock(), UserContext(id="u-1", inbox_id="inbox-1"))         is False
+    assert made == []
 
 
 def test_person_display_name_falls_back_to_email_local_part(monkeypatch):
-    created: list = []
-    monkeypatch.setattr(up, "_ensure_people_collection", lambda db: "people-col")
-    monkeypatch.setattr(up, "ensure_authority_collection", lambda db: "authority-col")
+    made = _containers(monkeypatch)
     monkeypatch.setattr(up, "db_get_artifact", lambda db, pid: None)
-    monkeypatch.setattr(up, "db_create_artifact", lambda db, e: created.append(e))
-    monkeypatch.setattr(up, "db_get_edge", lambda db, c, ch: None)
-    monkeypatch.setattr(up, "db_add_artifact_to_collection", lambda db, c, ch, **kw: None)
-    monkeypatch.setattr(up, "db_get_grants_for_principal_resource", lambda db, g, r: [])
-    monkeypatch.setattr(up, "db_create_grant", lambda db, g: None)
     up._ensure_person_artifact(MagicMock(), UserContext(id="u-2", email="bob@acme.example", inbox_id="i"))
-    assert json.loads(created[0].context)["display_name"] == "bob"
-
-
-# ---------------------------------------------------------------------------
-# People collection (created at runtime, NOT seeded; admin-managed, user-private)
-# ---------------------------------------------------------------------------
-
-def _zero_ns():
-    import uuid as _uuid
-    return _uuid.UUID(int=0)
-
-
-def test_ensure_people_collection_creates_and_grants_operator(monkeypatch):
-    created: list = []
-    grants: list = []
-    monkeypatch.setattr(up, "get_instance_namespace", _zero_ns)
-    monkeypatch.setattr(up, "derive_uuid", lambda ns, n, s: "people-col")
-    monkeypatch.setattr(up, "register_id", lambda *a, **k: None)
-    monkeypatch.setattr(up, "db_get_collection_by_id", lambda db, cid: None)  # missing
-    monkeypatch.setattr(up, "db_create_collection", lambda db, c: created.append(c))
-    monkeypatch.setattr(up, "_persist_seed_ids", lambda db, m: None)
-    monkeypatch.setattr("mantle.services.platform_settings_service.settings.get",
-                        lambda key, *a, **k: "op-1" if key == "platform.operator_id" else None)
-    monkeypatch.setattr(up, "db_upsert_user_collection_grant",
-                        lambda db, **kw: (grants.append(kw), (None, True))[1])
-
-    pid = up._ensure_people_collection(MagicMock())
-
-    assert pid == "people-col"
-    assert len(created) == 1
-    assert created[0].id == "people-col"
-    assert created[0].content_type == up.COLLECTION_CONTENT_TYPE
-    # The operator (not regular users) gets management of the directory.
-    assert len(grants) == 1
-    assert grants[0]["user_id"] == "op-1"
-    assert grants[0]["can_admin"] is True
-
-
-def test_ensure_people_collection_idempotent(monkeypatch):
-    created: list = []
-    monkeypatch.setattr(up, "get_instance_namespace", _zero_ns)
-    monkeypatch.setattr(up, "derive_uuid", lambda ns, n, s: "people-col")
-    monkeypatch.setattr(up, "register_id", lambda *a, **k: None)
-    monkeypatch.setattr(up, "db_get_collection_by_id", lambda db, cid: object())  # exists
-    monkeypatch.setattr(up, "db_create_collection", lambda db, c: created.append(c))
-    monkeypatch.setattr(up, "_persist_seed_ids", lambda db, m: None)
-    monkeypatch.setattr("mantle.services.platform_settings_service.settings.get", lambda key, *a, **k: None)
-
-    pid = up._ensure_people_collection(MagicMock())
-    assert pid == "people-col"
-    assert created == []  # not re-created
+    assert json.loads(made[0][1]["context"])["display_name"] == "bob"
 
 
 # ---------------------------------------------------------------------------

@@ -144,6 +144,8 @@ def bootstrap(db, principal: str, *, name: str, dry_run: bool) -> int:
 
 
 def main() -> int:
+    from mantle.services.authority_ledger import install_for_cli
+    install_for_cli()             # its grants and edges are journaled like the server's
     parser = argparse.ArgumentParser(
         description="Bootstrap a new, empty mantle store. Not seeding — see the module docstring.",
         formatter_class=argparse.RawDescriptionHelpFormatter,

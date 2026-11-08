@@ -22,7 +22,6 @@ from types import SimpleNamespace
 import pytest
 from unittest.mock import MagicMock, patch
 from mantle.services.acting_principal import acting_as
-from .helpers import self_request
 
 
 def _archived_artifact():
@@ -90,7 +89,7 @@ class _FakeSseIndex:
         self.postings[(principal_id, artifact_id)] = dict(fields)
         return len(fields)
 
-    def remove_artifact(self, principal_id, artifact_id, request=None):
+    def remove_artifact(self, principal_id, artifact_id, request=None, *, collection_id=None):
         self.postings.pop((principal_id, artifact_id), None)
 
 
@@ -310,7 +309,7 @@ class TestMoveArtifactSegments:
         ):
             pipeline_unified.move_artifact_segments(artifact, "ws-1", remove_from=["draft"])
         vec_rm.assert_called_once_with("prin-1", "ws-1", "art-1", segment="draft")
-        sse_rm.assert_called_once_with("prin-1", "art-1", segment="draft")
+        sse_rm.assert_called_once_with("prin-1", "art-1", collection_id="ws-1", segment="draft")
 
     def test_noop_when_index_backend_unavailable(self):
         from mantle.search.ingest import pipeline_unified

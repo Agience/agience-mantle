@@ -68,6 +68,7 @@ Stdlib + ``cryptography`` only, like the rest of the lexical core — see
 from __future__ import annotations
 
 
+from mantle.search.mantle.sse.keys import collection_sse_key
 import logging
 from typing import (
     Any,
@@ -320,16 +321,48 @@ class TokenNarrower:
         is_phrase: bool,
         request: Any,
     ) -> Dict[str, Coverage]:
-        try:
-            owner_sse_key = self._oracle.derive_sse_key(principal_id, request)
-        except MasterKeyMissing:
-            # Never written to, so no key and no index. Nothing to narrow to — the same
-            # answer an empty posting list gives, reached one step earlier.
-            logger.debug(
-                "SSE narrowing: principal %s has no master key (never indexed); skipping",
-                principal_id,
-            )
-            return {}
+        # Postings are keyed per collection, so each authorized collection is opened under its own
+        # key and searched on its own. A collection whose key this caller cannot open, or that
+        # has none (never written), contributes nothing; no other collection's key is asked for.
+        from mantle.services.acting_principal import KeyCustodyDenied
+
+        from mantle.search.mantle.sse.keys import _accepts_collection
+        from mantle.search.mantle.threshold_custody import ShareRefused
+
+        found: Dict[str, Coverage] = {}
+        # A provider with one key per principal (an embedding consumer's) is probed once, over all
+        # the collections, exactly as before; entries are filtered to the authorized set.
+        groups = ([{c} for c in sorted(authorized_collections)]
+                  if _accepts_collection(self._oracle) else [set(authorized_collections)])
+        for group in groups:
+            collection_id = sorted(group)[0]
+            try:
+                key = collection_sse_key(self._oracle, principal_id, request, collection_id)
+            except (MasterKeyMissing, KeyCustodyDenied, ShareRefused):
+                # Not written, not granted, or refused by Origin: the same answer, this
+                # collection contributes nothing and the others are still searched.
+                logger.debug("SSE narrowing: collection %s of %s opens no key here; skipping",
+                             collection_id, principal_id)
+                continue
+            for artifact_id, cover in self._collection_ids(
+                    principal_id, key, group, stems, is_phrase=is_phrase).items():
+                held = found.get(artifact_id)
+                found[artifact_id] = cover if held is None else Coverage(
+                    max(held.stems, cover.stems), max(held.bigrams, cover.bigrams),
+                    tuple(dict.fromkeys(held.matched + cover.matched)),
+                )
+        return found
+
+    def _collection_ids(
+        self,
+        principal_id: str,
+        owner_sse_key: bytes,
+        authorized_collections: set[str],
+        stems: Sequence[str],
+        *,
+        is_phrase: bool,
+    ) -> Dict[str, Coverage]:
+        """Membership within one collection's index, under its key."""
 
         # No owner-index accelerator. It earns its risk only when every probe below is an `open()`
         # on a file store — 4,520 of them for a ten-term query over 194 owners, mostly misses — so

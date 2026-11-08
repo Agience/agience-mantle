@@ -18,6 +18,7 @@ import sqlite3
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from . import constants as K
+from . import reach_journal as _journal
 from . import schema as _schema
 from . import seq as _seq
 from .seq import LatticeConn, SeqAllocator
@@ -162,6 +163,7 @@ class LatticeGraphStore(_GraphStoreABC):  # type: ignore[misc,valid-type]
             handled += self._add_chunk(chunk, stamp_rev)
         return handled
 
+    @_seq.cosigned(lambda a: a[0].db)
     def _add_chunk(self, chunk: List[Any], stamp_rev: bool) -> int:
         handled = 0
         with self.db.write() as cur:
@@ -212,6 +214,18 @@ class LatticeGraphStore(_GraphStoreABC):  # type: ignore[misc,valid-type]
                 if k not in _PROMOTED and not k.startswith("_")}
         is_origin = props.get("is_origin")
         norm_io = None if is_origin is None else int(bool(is_origin))
+
+        # A peer's widening of reach is held, not written, under threshold custody: a person here
+        # accepts it, and that acceptance is what Origin co-signs (`services.held_reach`).
+        if (not stamp_rev and label == _journal.CONTAINS and _journal.required()
+                and _journal.edge_widens(
+                    None if old is None else (bool(old["is_origin"]), old["propagate"]),
+                    bool(norm_io), props.get("propagate"))):
+            _journal.hold(cur, "edge", f"edge:{src} {dst}",
+                          {"src": src, "dst": dst, "label": label,
+                           "props": {k: v for k, v in props.items() if not k.startswith("_")}},
+                          origin)
+            return 1
         cur.execute(
             "INSERT INTO edge(edge_key, src, dst, label, force, propagate, is_origin,"
             " order_key, _origin, _seq, _leaf, props) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
@@ -221,6 +235,15 @@ class LatticeGraphStore(_GraphStoreABC):  # type: ignore[misc,valid-type]
             " _seq=excluded._seq, _leaf=excluded._leaf, props=excluded.props",
             (key, src, dst, label, props.get("force"), props.get("propagate"),
              norm_io, props.get("order_key"), origin, seq_val, leaf, json.dumps(blob)))
+
+        # ── the authority ledger: a containment edge added, or its origin flag or mask changed ──
+        if label == _journal.CONTAINS and (
+                old is None or bool(old["is_origin"]) != bool(norm_io)
+                or _journal.propagate_of(old["propagate"])
+                != _journal.propagate_of(props.get("propagate"))):
+            _journal.record(_journal.edge_entry(src, dst, origin=bool(norm_io),
+                                                propagate=props.get("propagate")),
+                            f"edge:{src} {dst}")
 
         # ── incremental merkle: the same leaf_digest vertices use, so one tree covers both ──
         # An edge is an identity fact, so its contribution is edge_hash(edge_key, content) —
@@ -271,16 +294,18 @@ class LatticeGraphStore(_GraphStoreABC):  # type: ignore[misc,valid-type]
             raise ValueError("edge requires non-empty (src, dst, label); got %r" % (e,))
         return str(src), str(dst), str(label), props
 
+    @_seq.cosigned(lambda a: a[0].db)
     def delete_edge(self, from_id: str, to_id: str, label: str) -> bool:
         key = K.edge_key(from_id, to_id, label)
         with self.db.write() as cur:
             prev = cur.execute(
-                "SELECT _origin, force, propagate, is_origin, order_key, props "
+                "SELECT src, dst, _origin, force, propagate, is_origin, order_key, props "
                 "FROM edge WHERE edge_key = ?", (key,)).fetchone()
             if prev is None:
                 return False
             return _retire_edge_row(cur, key, label, prev, leaves=self.leaves)
 
+    @_seq.cosigned(lambda a: a[0].db)
     def delete_edges_touching(self, node_id: str) -> int:
         """Delete every edge with `node_id` on either side. Returns how many rows went.
 
@@ -758,6 +783,14 @@ def _retire_edge_row(cur: Any, key: bytes, label: str, prev: Any, *, leaves: int
     cur.execute("DELETE FROM edge WHERE edge_key = ?", (key,))
     if cur.rowcount < 1:
         return False
+    if label == _journal.CONTAINS:
+        _journal.record(_journal.unedge_entry(prev["src"], prev["dst"]),
+                        f"edge:{prev['src']} {prev['dst']}")
+        if prev["is_origin"]:
+            # A creation edge removed deletes the member at Origin (review 15). Noted here, as
+            # Origin notes it, so this store's digest of reach reads a deleted node the same way.
+            cur.execute("INSERT OR REPLACE INTO authority_receipt(subject, kind, seq) "
+                        "VALUES(?, 'gone', 0)", (f"gone:{prev['dst']}",))
     _seq.xor_leaf(cur, K.leaf_of(key.hex(), leaves),
                   K.edge_hash(key, _edge_row_content(prev)))
     _seq.bump(cur, _schema.c_edge_total(), -1)
@@ -781,8 +814,8 @@ def _retire_edges_touching(cur: Any, node_id: str, *, leaves: int) -> int:
     authorization edges the deletion exists to remove.
     """
     rows = cur.execute(
-        "SELECT edge_key, label, _origin, force, propagate, is_origin, order_key, props "
-        "FROM edge WHERE src = ? OR dst = ?", (node_id, node_id)).fetchall()
+        "SELECT edge_key, src, dst, label, _origin, force, propagate, is_origin, order_key, "
+        "props FROM edge WHERE src = ? OR dst = ?", (node_id, node_id)).fetchall()
     seen: set = set()
     gone = 0
     for r in rows:
@@ -795,6 +828,7 @@ def _retire_edges_touching(cur: Any, node_id: str, *, leaves: int) -> int:
     return gone
 
 
+@_seq.cosigned(lambda a: a[0])
 def retire_edges_touching(db: LatticeConn, node_id: str, *, leaves: int) -> int:
     """Retire every edge on either side of `node_id`. Module-level for the same reason
     :func:`edge_mark` is: the artifact store shares this `LatticeConn`, and its delete path must

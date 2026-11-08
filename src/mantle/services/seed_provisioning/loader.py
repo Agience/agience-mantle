@@ -375,7 +375,7 @@ def _apply_artifact_card(
                 created_time=now,
                 modified_time=now,
             )
-            db_create_collection(store_db, collection)
+            _create_platform_collection(store_db, collection)
             report.artifacts_added += 1
             logger.info("Seeded collection %s/%s (id=%s)", namespace, slug, artifact_uuid)
         except Exception as exc:
@@ -507,6 +507,29 @@ def _resolve_grant_card(
             continue
         out.append((principal, res, flags, name))
     return out
+
+
+def _create_platform_collection(store_db: Database, collection) -> None:
+    """A platform collection comes into being at the authority by its root, made by the acting
+    principal (the platform's system principal on a seed pass), with that principal's creation
+    grant in the same batch (architecture §51: all access is by explicit grant issued at
+    creation; `created_by` grants nothing). The seed's grants to others then rest on it."""
+    from mantle.attenuation import ACTIONS
+    from mantle.db import reach_journal as rj
+    from mantle.services.acting_principal import current_acting_principal
+
+    actor = current_acting_principal()
+    with rj.batch():
+        if actor is not None and rj.installed():
+            with rj.proof(created_by=str(actor.principal_id),
+                          created_at=datetime.now(timezone.utc).isoformat()):
+                rj.submit(rj.root_entry(collection.id))
+        db_create_collection(store_db, collection)
+        if actor is not None and rj.installed():
+            db_upsert_user_collection_grant(
+                store_db, user_id=str(actor.principal_id), collection_id=collection.id,
+                granted_by=str(actor.principal_id), name="Creation grant",
+                **{f"can_{a}": True for a in ACTIONS})
 
 
 def _apply_accumulated_grants(

@@ -101,19 +101,21 @@ def test_skips_when_no_operator(gmail_env, wired, monkeypatch):
 def test_happy_path_provisions_graph(gmail_env, wired):
     pe.ensure_platform_email_sender(db=MagicMock())
 
-    # Four artifacts: operator + authorizer + 2 credentials.
+    # Five artifacts: operator + authorizer + 2 credentials + the credentials' collection
+    # (review 26, M1).
     cts = {c.args[1].content_type for c in wired.create_artifact.call_args_list}
-    assert cts == {pe._OPERATOR_CT, pe._AUTHORIZER_CT, pe._CREDENTIAL_CT}
-    assert wired.create_artifact.call_count == 4
+    assert cts == {pe._OPERATOR_CT, pe._AUTHORIZER_CT, pe._CREDENTIAL_CT, pe.COLLECTION_CT}
+    assert wired.create_artifact.call_count == 5
     for c in wired.create_artifact.call_args_list:
         assert c.args[1].created_by == _OPERATOR
 
-    # Operator→authorizer typed edge.
-    wired.add_edge.assert_called_once()
-    assert wired.add_edge.call_args.kwargs["relationship"] == "authorizer"
+    # Operator→authorizer typed edge, and each credential's membership of its collection.
+    typed = [c for c in wired.add_edge.call_args_list if c.kwargs.get("relationship")]
+    assert len(typed) == 1 and typed[0].kwargs["relationship"] == "authorizer"
+    assert wired.add_edge.call_count == 3
 
-    # Grants: the operator (a person, the graph's administrator) reads and invokes all four.
-    assert wired.upsert_grant.call_count == 4
+    # Grants: the operator (a person, the graph's administrator) reads and invokes all five.
+    assert wired.upsert_grant.call_count == 5
     assert all(c.kwargs["can_read"] and c.kwargs["can_invoke"] for c in wired.upsert_grant.call_args_list)
 
 
@@ -179,8 +181,9 @@ def test_idempotent_when_graph_exists(gmail_env, wired):
     wired.get_artifact.side_effect = lambda db, artifact_id: SimpleNamespace(_key=artifact_id)
     pe.ensure_platform_email_sender(db=MagicMock())
     wired.create_artifact.assert_not_called()      # no re-create
-    wired.add_edge.assert_not_called()             # edge not re-added
-    assert wired.update_artifact.call_count == 4   # values re-written, so rotation self-heals
+    # The typed edge is not re-added; the memberships are stated again (idempotent at the store).
+    assert not [c for c in wired.add_edge.call_args_list if c.kwargs.get("relationship")]
+    assert wired.update_artifact.call_count == 5   # values re-written, so rotation self-heals
     contents = [c.args[1].content for c in wired.update_artifact.call_args_list]
     assert {"csecret", "rtoken"} <= {
         json.loads(c).get("value") for c in contents if c.startswith('{"value"')
@@ -194,8 +197,8 @@ def test_grants_system_principal_when_available(gmail_env, wired, monkeypatch):
     monkeypatch.setattr("mantle.services.peer_signing.get_system_principal_id", lambda: "sys-principal-1")
     pe.ensure_platform_email_sender(db=MagicMock())
 
-    # 8 grants: 4 (operator) + 4 (system principal).
-    assert wired.upsert_grant.call_count == 8
+    # 10 grants: 5 (operator) + 5 (system principal).
+    assert wired.upsert_grant.call_count == 10
     grantees = {c.kwargs["user_id"] for c in wired.upsert_grant.call_args_list}
     assert grantees == {_OPERATOR, "sys-principal-1"}
     # Every grant is issued BY the operator — that's the rooting to a person.
@@ -208,7 +211,9 @@ def test_grants_system_principal_when_available(gmail_env, wired, monkeypatch):
     assert sys_grants == {"id-platform-email-sender": (True, True),
                           "id-platform-email-authorizer": (True, True),
                           "id-platform-email-client-secret": (False, True),
-                          "id-platform-email-refresh-token": (False, True)}
+                          "id-platform-email-refresh-token": (False, True),
+                          # Admin on the credentials' collection, and no read (review 26, M1).
+                          "id-platform-email-credentials": (False, False)}
 
 
 # ---------------------------------------------------------------------------

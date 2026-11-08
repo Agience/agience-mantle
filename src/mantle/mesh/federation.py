@@ -10,6 +10,10 @@ on the same peer list.
 Peers are configured out-of-band, never hardcoded:
     EMBER_PEERS = "http://<peer-host>:8091,http://…"   # comma-separated peer base URLs
     EMBER_INVOKE_TOKEN = "<shared secret>"              # sent to peers' /v1/invoke as X-Ember-Token
+
+This module runs in Ember's process (`ember.genesis`), and both are Ember's settings: the Mantle
+service holds no Ember token. A peer takes the shared token for its node's own operators only and
+never lets it choose a principal (review 21).
 """
 from __future__ import annotations
 

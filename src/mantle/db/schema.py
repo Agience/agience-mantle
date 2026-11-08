@@ -181,6 +181,13 @@ VERTEX_DDL: List[str] = [
     "CREATE INDEX IF NOT EXISTS ix_v_collection ON vertex("
     "  json_extract(doc, '$.collection_id')"
     ")",
+    #
+    # The principal a row's content key roots at, when the row carries one: how the owner-call
+    # re-key finds a person's rows wherever their root is (`services/owner_rekey._rows_of`, review
+    # 28). Partial, so rows that name none (most) cost nothing.
+    "CREATE INDEX IF NOT EXISTS ix_v_ckp ON vertex("
+    "  json_extract(doc, '$.content_key_principal')"
+    ") WHERE json_extract(doc, '$.content_key_principal') IS NOT NULL",
 ]
 
 #
@@ -254,6 +261,45 @@ SUPPORT_DDL: List[str] = [
     # the counter-drift audit. `merkle.leaves` lives here: the store's operating
     # Merkle resolution (the derived `natural_leaves(corpus)`), recorded so every
     # `open_lattice` resolves the same value and `reshard()` can move it in one place.
+    # The authority's co-signature for each grant and containment edge it co-signed
+    # (`reach_journal`), keyed by the row: `grant:<id>`, `edge:<src> <dst>`. Local, never
+    # replicated, and not part of the merkle: it is evidence about a row, not a row.
+    """CREATE TABLE IF NOT EXISTS authority_receipt (
+         subject    TEXT PRIMARY KEY,
+         kind       TEXT NOT NULL,
+         seq        INTEGER,
+         entry_hash TEXT,
+         signature  TEXT,
+         kid        TEXT
+       )""",
+
+    # A widening of reach that arrived from a peer under threshold custody, held unwritten until a
+    # person here accepts it (`services.held_reach`). Local, never replicated.
+    # A withdrawal of a co-signed entry the authority did not take (`reach_journal.compensate`),
+    # retried before the next change to reach and at startup. Local, never replicated.
+    """CREATE TABLE IF NOT EXISTS authority_compensation_due (
+         seq       INTEGER PRIMARY KEY,
+         entry     TEXT NOT NULL,
+         failed_at TEXT DEFAULT CURRENT_TIMESTAMP
+       )""",
+
+    # Co-signed entries whose writes committed and that the authority has not yet heard so
+    # (`reach_journal.confirm`). Local, never replicated.
+    """CREATE TABLE IF NOT EXISTS authority_confirm_due (
+         seq INTEGER PRIMARY KEY
+       )""",
+
+    """CREATE TABLE IF NOT EXISTS held_reach_change (
+         id            INTEGER PRIMARY KEY AUTOINCREMENT,
+         kind          TEXT NOT NULL,
+         subject       TEXT NOT NULL,
+         payload       TEXT NOT NULL,
+         received_from TEXT,
+         held_at       TEXT DEFAULT CURRENT_TIMESTAMP,
+         resource_id   TEXT
+       )""",
+    "CREATE INDEX IF NOT EXISTS ix_held_reach_resource ON held_reach_change(resource_id)",
+
     """CREATE TABLE IF NOT EXISTS meta (
          k TEXT PRIMARY KEY,
          v TEXT
@@ -385,6 +431,14 @@ PRAGMAS: List[str] = [
     # ceiling, not a target — nothing shrinks to it on a store that never exceeds it.
     "PRAGMA journal_size_limit=67108864",
     #
+    # A replaced or deleted row's bytes are zeroed in the page SQLite writes next, rather than
+    # left in the page's free space until reused (review 26, H2). The store holds key rows that a
+    # split or a rollback replaces in place, and a whole KEK-wrapped key left in free space opens
+    # with the KEK alone. Every connection sets it, so every replace or delete is covered without a
+    # call site having to remember; `db/scrub.py::settle_replaced` then checkpoints the WAL so the
+    # old page image leaves the main file and the log too.
+    "PRAGMA secure_delete=ON",
+    #
     # The reason it cannot help: these stages do a single-pass sequential scan. Each page is
     # read once and evicted, so a larger cache has nothing to re-serve, while `mmap` adds
     # per-page mapping overhead to every one of them. A page cache pays for repeated access,
@@ -442,6 +496,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     """Idempotent. Safe to call on every open, from every thread and process."""
     _migrate_vertex_columns(conn)
     _migrate_edge_columns(conn)
+    _migrate_held_reach(conn)
     for stmt in ALL_DDL:
         conn.execute(stmt)
     _migrate_next_seq(conn)
@@ -465,6 +520,20 @@ _VERTEX_ADDED_COLUMNS = (
     ("origin_root", "TEXT"),
     ("root_id", "TEXT"),
 )
+
+
+def _migrate_held_reach(conn: sqlite3.Connection) -> None:
+    """`held_reach_change.resource_id` (the resource a held change would widen, indexed so the
+    listing asks who manages each resource once) on a store made before it."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(held_reach_change)")}
+    if cols and "resource_id" not in cols:
+        conn.execute("ALTER TABLE held_reach_change ADD COLUMN resource_id TEXT")
+        for rid, kind, payload in conn.execute(
+                "SELECT id, kind, payload FROM held_reach_change").fetchall():
+            import json as _json
+            p = _json.loads(payload)
+            res = p.get("resource_id") if kind == "grant" else p.get("src")
+            conn.execute("UPDATE held_reach_change SET resource_id = ? WHERE id = ?", (res, rid))
 
 
 def _migrate_vertex_columns(conn: sqlite3.Connection) -> None:

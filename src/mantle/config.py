@@ -299,6 +299,28 @@ AGIENCE_PLATFORM_USER_ID = str(_uuid.uuid5(_uuid.NAMESPACE_URL, "agience://platf
 # them from the settings store, and that store's `DEFAULTS` mirrors these values rather
 # than declaring its own. See the note on `_SETTING_MAP`.
 FACET_URI: str = os.getenv("FACET_URI", "http://localhost:5173")
+
+
+def cors_origins() -> list:
+    """The browser origins Mantle answers cross-origin: `MANTLE_CORS_ORIGINS` (comma-separated),
+    else the web app's address, `FACET_URI`. Each is reduced to its exact origin (scheme, host,
+    port); a wildcard is never one. The web app calls Mantle's own host directly, so this is who
+    may (review 7, F1)."""
+    from urllib.parse import urlsplit
+
+    raw = os.getenv("MANTLE_CORS_ORIGINS") or ""
+    values = [v.strip() for v in raw.split(",") if v.strip()] or [FACET_URI]
+    out = []
+    for v in values:
+        parts = urlsplit(v)
+        if parts.scheme in ("http", "https") and parts.netloc and "*" not in parts.netloc:
+            origin = f"{parts.scheme}://{parts.netloc}".lower()
+            if origin not in out:
+                out.append(origin)
+    if not out:
+        parts = urlsplit(FACET_URI)
+        out.append(f"{parts.scheme}://{parts.netloc}".lower())
+    return out
 #: Named, so `authorization_servers()` below can tell this value from one an operator DECLARED.
 #: Every other consumer of `ORIGIN_URI` wants a usable URL and this is the usable one; only the
 #: question "is there actually an authorization server there" needs the provenance.

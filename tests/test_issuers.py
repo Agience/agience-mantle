@@ -59,25 +59,26 @@ class TestLoadIssuerConfigs:
 
 
 class TestVerifierRefresh:
-    def test_refresh_merges_external_issuer(self):
-        v = OidcVerifier(trusted_issuers=[])
-        assert "https://idp.test" not in v._by_iss
+    def test_refresh_keeps_a_configured_external_issuer_live(self):
+        """A stored artifact keeps a configured issuer live; it never adds one (review 12)."""
+        cfg = {"issuer": "https://idp.test", "audience": "a", "jwks": {"keys": []}}
+        v = OidcVerifier(trusted_issuers=[cfg])
         with patch("mantle.services.issuers.load_issuer_configs",
-                   return_value=[{"issuer": "https://idp.test", "role": "external",
-                                  "jwks": {"keys": []}}]):
+                   return_value=[{"issuer": "https://idp.test", "role": "external"}]):
             v.refresh_from_db(object())
-        # External issuer is verifiable AND tenant-namespaced.
-        assert "https://idp.test" in v._by_iss
-        assert v.is_trusted("https://idp.test")
+        assert "https://idp.test" in v._by_iss and v.is_trusted("https://idp.test")
+        with patch("mantle.services.issuers.load_issuer_configs", return_value=[]):
+            v.refresh_from_db(object())
+        assert not v.is_trusted("https://idp.test")        # revoked: no live artifact
 
-    def test_platform_role_not_namespaced(self):
+    def test_an_artifact_alone_adds_no_issuer(self):
         v = OidcVerifier(trusted_issuers=[])
         with patch("mantle.services.issuers.load_issuer_configs",
-                   return_value=[{"issuer": "svc", "role": "platform",
+                   return_value=[{"issuer": "svc", "role": "platform", "jwks": {"keys": []}},
+                                 {"issuer": "https://idp.test", "role": "external",
                                   "jwks": {"keys": []}}]):
             v.refresh_from_db(object())
-        assert "svc" in v._by_iss          # verifiable
-        assert not v.is_trusted("svc")     # but native tenant, not external
+        assert "svc" not in v._by_iss and "https://idp.test" not in v._by_iss
 
     def test_handle_issuer_event_refreshes(self):
         from mantle.services import issuers
@@ -215,29 +216,15 @@ class TestAdminCreateRevoke:
 
 
 class TestIssuerRouter:
-    async def test_create_requires_admin(self, client):
-        with patch("mantle.routers.system_router.require_platform_admin",
-                   side_effect=HTTPException(status_code=403, detail="nope")):
-            r = await client.post("/system/issuers", json={"issuer": "https://idp.test",
-                                                    "jwks": {"keys": []}})
-        assert r.status_code == 403
-
-    async def test_create_dispatches_to_service_as_admin(self, client):
-        with (
-            patch("mantle.routers.system_router.require_platform_admin", return_value="admin-1"),
-            patch("mantle.services.issuers.create_issuer_artifact",
-                  return_value=SimpleNamespace(id="new-id")) as svc,
-        ):
-            r = await client.post("/system/issuers", json={"issuer": "https://idp.test",
-                                                    "audience": "aud", "jwks": {"keys": []}})
-        assert r.status_code == 201
-        assert r.json()["id"] == "new-id"
-        # The artifact is authorized by the admin (provenance), owned by system.
-        assert svc.call_args.kwargs["authorized_by"] == "admin-1"
+    async def test_no_route_adds_an_issuer(self, client):
+        r = await client.post("/system/issuers", json={"issuer": "https://idp.test",
+                                                      "jwks": {"keys": []}})
+        assert r.status_code in (404, 405)
 
 
 class TestSeedPlatformIssuers:
-    def test_seeds_manifest_anchors_and_env(self):
+    def test_seeds_only_configured_external_issuers(self):
+        """The manifest's anchors are never copied into the store (review 12, H2)."""
         from mantle.services import issuers
         manifest = {"trust_anchors": {
             "origin": {"jwks": {"keys": [{"kid": "o"}]}},
@@ -249,43 +236,31 @@ class TestSeedPlatformIssuers:
             patch("mantle.services.issuers.list_issuer_artifacts", return_value=[]),
             patch("mantle.services.oidc._read_authority_manifest", return_value=manifest),
             patch("mantle.config.AUTHORITY_ISSUER", "https://auth.test"),
-            # No `create=True`: `TRUSTED_ISSUERS` exists, and production reads it as
-            # `getattr(config, "TRUSTED_ISSUERS", [])`. If the symbol were ever removed, that
-            # getattr would silently fall back to `[]` while `create=True` kept manufacturing a
-            # phantom trust list here — the test would keep proving external issuers are seeded
-            # from a name nothing reads.
             patch("mantle.config.TRUSTED_ISSUERS",
                   [{"issuer": "https://ext.test", "jwks": {"keys": []}}]),
             patch("mantle.services.issuers.create_issuer_artifact",
                   side_effect=lambda db, **kw: created.append(kw)),
         ):
             n = issuers.seed_platform_issuer_artifacts(object())
-        seeded = {c["issuer"]: c for c in created}
-        assert n == 4
-        assert seeded["origin"]["role"] == "platform"
-        assert seeded["mantle"]["role"] == "platform"
-        # AUTHORITY_ISSUER seeded as platform, against ORIGIN's jwks (user tokens).
-        assert seeded["https://auth.test"]["role"] == "platform"
-        assert seeded["https://auth.test"]["jwks"] == {"keys": [{"kid": "o"}]}
-        assert seeded["https://ext.test"]["role"] == "external"
+        assert n == 1 and [c["issuer"] for c in created] == ["https://ext.test"]
+        assert created[0]["role"] == "external"
 
     def test_seed_is_idempotent(self):
         from mantle.services import issuers
         existing = SimpleNamespace(context=json.dumps(
-            {"content_type": ISSUER_CONTENT_TYPE, "issuer": "origin"}))
-        manifest = {"trust_anchors": {"origin": {"jwks": {"keys": [{"kid": "o"}]}}}}
+            {"content_type": ISSUER_CONTENT_TYPE, "issuer": "https://ext.test"}))
         created = []
         with (
             patch("mantle.services.peer_signing.get_system_principal_id", return_value="SYS"),
             patch("mantle.services.issuers.list_issuer_artifacts", return_value=[existing]),
-            patch("mantle.services.oidc._read_authority_manifest", return_value=manifest),
             patch("mantle.config.AUTHORITY_ISSUER", None),
-            patch("mantle.config.TRUSTED_ISSUERS", []),   # see above: no `create=True`
+            patch("mantle.config.TRUSTED_ISSUERS",
+                  [{"issuer": "https://ext.test", "jwks": {"keys": []}}]),
             patch("mantle.services.issuers.create_issuer_artifact",
                   side_effect=lambda db, **kw: created.append(kw)),
         ):
             n = issuers.seed_platform_issuer_artifacts(object())
-        assert n == 0 and created == []   # 'origin' already present -> skipped
+        assert n == 0 and created == []   # already present -> skipped
 
     def test_seed_fail_closed_without_system_principal(self):
         from mantle.services import issuers
@@ -306,36 +281,37 @@ class TestContainerEmitsChangeEvent:
         emit.assert_called_once_with(entity, "artifact.created")
 
 
-class TestArtifactsAuthoritative:
-    def test_artifact_issuer_overrides_manifest_anchor(self):
-        # conftest writes a manifest with origin/mantle/peer anchors; the verifier
-        # loads them. A platform issuer artifact for the same iss must win (artifacts
-        # authoritative), while the manifest still fills the gaps (fallback).
+class TestTheManifestWins:
+    def test_an_artifact_never_replaces_a_manifest_anchor(self):
+        # conftest writes a manifest with origin/mantle/peer anchors; the verifier loads them, and
+        # an artifact naming one of them changes nothing (review 12, H2).
         v = OidcVerifier(trusted_issuers=[])
-        assert "origin" in v._by_iss          # seeded from the test manifest
-        rotated = {"keys": [{"kid": "rotated"}]}
+        before = v._by_iss["origin"]["jwks"]
         with patch("mantle.services.issuers.load_issuer_configs",
-                   return_value=[{"issuer": "origin", "role": "platform", "jwks": rotated}]):
+                   return_value=[{"issuer": "origin", "role": "platform",
+                                  "jwks": {"keys": [{"kid": "rotated"}]}}]):
             v.refresh_from_db(object())
-        assert v._by_iss["origin"]["jwks"] == rotated   # artifact wins
-        assert "mantle" in v._by_iss                      # manifest still fills the gap
+        assert v._by_iss["origin"]["jwks"] == before
+        assert "mantle" in v._by_iss
 
 
 class TestVerifierRefreshUnknownIss:
     def test_refresh_if_unknown_iss_throttled(self):
-        v = OidcVerifier(trusted_issuers=[])
+        cfg = {"issuer": "https://new.test", "audience": "a", "jwks": {"keys": []}}
+        v = OidcVerifier(trusted_issuers=[cfg])
+        with patch("mantle.services.issuers.load_issuer_configs", return_value=[]):
+            v.refresh_from_db(object())             # configured, not yet live
+        v._last_refresh = 0.0
         with (
             patch("mantle.services.oidc.jwt.get_unverified_claims",
                   return_value={"iss": "https://new.test"}),
             patch("mantle.services.issuers.load_issuer_configs",
-                  return_value=[{"issuer": "https://new.test", "jwks": {"keys": []}}]) as load,
+                  return_value=[{"issuer": "https://new.test"}]) as load,
         ):
             assert v.refresh_if_unknown_iss(object(), "tok") is True
             assert "https://new.test" in v._by_iss
-            # Second call within the throttle window does NOT re-hit the store.
             load.reset_mock()
             assert v.refresh_if_unknown_iss(object(), "tok") is False  # now known anyway
-            # A different unknown iss is throttled (no reload until interval passes).
             with patch("mantle.services.oidc.jwt.get_unverified_claims",
                        return_value={"iss": "https://other.test"}):
                 assert v.refresh_if_unknown_iss(object(), "tok2") is False

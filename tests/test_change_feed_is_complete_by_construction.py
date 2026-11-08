@@ -141,9 +141,25 @@ WRITE_SITES: dict[tuple[str, str], tuple[str, str]] = {
                   "to anyone holding a wildcard subscription."),
     ("db/lattice_identity.py", "update"): (OFF_FEED, "identity planes — see put."),
     ("db/lattice_identity.py", "delete"): (OFF_FEED, "identity planes — see put."),
+    ("services/authority_ledger.py", "_retire_add_seal"): (
+        OFF_FEED, "key material: drops a retired id's Add seal (review 17); not an artifact "
+                  "change."),
+    ("search/mantle/oracle.py", "_check_drop_key"): (
+        OFF_FEED, "key material: caches or repairs a collection's public Add seal; not an "
+                  "artifact change."),
+    ("services/authority_ledger.py", "_apply_one"): (
+        OFF_FEED, "the grant and containment planes: applies the operator's revocations and "
+                  "edge removals from Origin's ledger, which grant_service's vocabulary does not "
+                  "announce either."),
+    ("services/authority_ledger.py", "_apply_session"): (
+        OFF_FEED, "the grant and containment planes: applies the authority changes people made in "
+                  "their Origin sessions, from Origin's ledger (review 12)."),
     ("search/mantle/oracle.py", "put"): (
         OFF_FEED, "encrypted-search cell writes. Derived from artifacts already on the feed; "
                   "announcing the derivation as well would double every indexed change."),
+    ("search/mantle/threshold_custody.py", "_split_whole"): (
+        OFF_FEED, "replaces a whole master-key row with this node's share of it, on its owner's "
+                  "call (review 25). Key material, never content: the feed names no key row."),
     ("search/anchors/repo.py", "clear"): (
         OFF_FEED, "removes the anchors of a superseded AnchorSet. Anchors are the COORDINATE "
                   "SYSTEM, not content — an anchor's id is a cluster id naming a cell path, an "
@@ -209,14 +225,40 @@ WRITE_SITES: dict[tuple[str, str], tuple[str, str]] = {
                   "are superseded versions of that root, as `vertex._snapshot_prior` writes them, "
                   "and the bulk relabel of `committed` to `live` changes no value any reader "
                   "returns."),
+    ("services/held_reach.py", "accept"): (
+        OFF_FEED, "writes a grant a peer sent, held until a person here accepted it. A grant is "
+                  "not an artifact a subscriber follows; the write is journaled to Origin like any "
+                  "other grant."),
+    ("system/rekey_collections.py", "rekey_one"): (
+        OFF_FEED, "the cutover re-encryption: it rewrites only the stored form of a row's content "
+                  "(under the master key to under its collection's key), and only the row it read. "
+                  "Every reader sees the same artifact, so there is nothing to announce."),
     ("system/split_master_keys.py", "split_master_keys"): (
         OFF_FEED, "master-key custody, a release migration: it replaces a key row's stored form "
                   "(whole under the KEK) with shares of the same key. Key rows are not artifacts "
                   "any reader sees, and the key does not change, so nothing is announced."),
+    ("db/scrub.py", "_mark_due"): (
+        OFF_FEED, "a per-box record that a replaced key row's checkpoint is still due (review "
+                  "26). Operational, never replicated, and no artifact any reader sees."),
+    ("db/scrub.py", "_clear_due"): (OFF_FEED, "clears that record — see _mark_due."),
+    ("services/owner_rekey.py", "rekey_owner"): (
+        OFF_FEED, "a per-box record that a person's content is re-keyed (review 26). The rows "
+                  "themselves are re-keyed by `rekey_one`, classified with the pass."),
+    ("system/rekey_collections.py", "_rotate_one"): (
+        OFF_FEED, "master-key custody (reviews 30 and 31): a charged root's key replaced by a fresh one and "
+                  "its own leftover rows re-encrypted under it, in place. The same content under a "
+                  "new key is not a new version, and key rows are not artifacts any reader sees."),
+    ("system/split_master_keys.py", "retire_empty_master_keys"): (
+        OFF_FEED, "master-key custody (review 27): it removes a non-person key row that keys no "
+                  "content any more. Key rows are not artifacts any reader sees."),
     ("system/split_master_keys.py", "combine_master_keys"): (
         OFF_FEED, "the reverse of the master-key split, run before a rollback: it writes the same "
                   "key back whole, or drops a pending key row that was never served. Key rows "
                   "are not artifacts any reader sees."),
+    ("system/rewrap_kek.py", "rewrap_kek"): (
+        OFF_FEED, "KEK rotation, a cutover migration: it rewrites only the stored form of key rows, "
+                  "node-sealed fields and secret settings (wrapped under the old KEK to the new). "
+                  "No reader sees a different artifact, so there is nothing to announce."),
     ("system/seal_titles.py", "seal_stored_titles"): (
         OFF_FEED, "title sealing, a release migration: it rewrites only the stored form of a title "
                   "(plain to sealed) on rows as they are. No reader sees a different artifact, and "
@@ -617,6 +659,11 @@ def content_key(monkeypatch):
     monkeypatch.setattr(
         content_crypto, "_default_master_key",
         lambda principal_id, collection_id=None, *, may_create=False, creator_id=None: b"\x01" * 32,
+    )
+    # Collection-scoped content is keyed under the collection's own key; stubbed the same way.
+    monkeypatch.setattr(
+        content_crypto, "_default_collection_key",
+        lambda principal_id, collection_id, *, may_create=False, creator_id=None: b"\x02" * 32,
     )
 
 

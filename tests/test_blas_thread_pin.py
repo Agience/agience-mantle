@@ -54,7 +54,14 @@ BLAS_MODULES = [
 ]
 
 
-def _run(body: str, env_pin: str | None) -> dict:
+#: Every variable that caps a BLAS or OpenMP pool. The negative control removes all of them from
+#: its child: a suite run under a cap (`OMP_NUM_THREADS=1`, which OpenBLAS also honours) would
+#: otherwise size the unpinned pool at 1 and the control would measure the cap, not the pin.
+THREAD_CAPS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+               "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS")
+
+
+def _run(body: str, env_pin: str | None, *, uncapped: bool = False) -> dict:
     """Run `body` in a clean interpreter and return its JSON verdict.
 
     `env_pin=None` removes the variable from the child's environment — the unset case the pin
@@ -64,6 +71,9 @@ def _run(body: str, env_pin: str | None) -> dict:
     prelude = f"import sys, os, json\nsys.path[:0] = {json.dumps(sys.path)}\n"
     env = dict(os.environ)
     env.pop(PIN, None)
+    if uncapped:
+        for cap in THREAD_CAPS:
+            env.pop(cap, None)
     if env_pin is not None:
         env[PIN] = env_pin
     proc = subprocess.run(
@@ -147,7 +157,7 @@ def test_late_pin_is_inert_negative_control() -> None:
         "import numpy\n"
         f"os.environ[{PIN!r}] = '1'\n"
         "numpy.linalg.eigh(numpy.eye(64))\n" + _POOL_READER + "print(json.dumps({'pools': pools}))",
-        None,
+        None, uncapped=True,
     )
     assert v["pools"], "no OpenBLAS pool reported; the control cannot run"
     assert all(p > 1 for p in v["pools"]), (

@@ -131,3 +131,6 @@ def test_a_refused_index_write_is_denied_and_any_other_fault_fails(monkeypatch, 
     monkeypatch.setattr(pu, "index_artifact", index_artifact)
     counts = reindex.reindex_as_owners(Db)
     assert counts[counted] == 1 and counts["indexed"] == 0, counts
+    # 2026-10-31, a tester's old note was missed by a pass that reported no failure, and nothing
+    # said which artifacts it had not indexed. The pass names each one with its reason.
+    assert counts["not_indexed"] == [{"id": "a1", "reason": counted}], counts

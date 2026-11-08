@@ -24,6 +24,16 @@ from .test_a_split_master_key_needs_two_custodians import make_env
 KEYS = {"alice": bytes(range(32)), "bob": bytes(range(1, 33)), "carol": bytes(range(2, 34))}
 
 
+@pytest.fixture(autouse=True)
+def _as_the_platform():
+    """Both passes run as the platform system principal and show Origin a delegation it mints for
+    each key's principal (`FakeOrigin.background_delegation`)."""
+    from mantle.services.acting_principal import acting_as
+
+    with acting_as("system", source="system", scope="platform.custody"):
+        yield
+
+
 @pytest.fixture()
 def node(tmp_path):
     e = make_env(tmp_path)
@@ -60,7 +70,8 @@ def test_dry_run_changes_nothing(node):
 
 def test_every_key_is_split_and_reads_back_unchanged(node):
     counts, exported = _split(node)
-    assert counts == {"whole": 3, "already_split": 0, "split": 3, "changed": 0, "failed": 0}
+    assert counts == {"whole": 3, "already_split": 0, "split": 3, "changed": 0, "failed": 0,
+                      "refused_unrotated": 0, "activation_failed": 0}
     for pid, key in KEYS.items():
         row = node.db.artifacts.docs["master-key:" + pid]
         assert row["content_type"] == SHARE_CONTENT_TYPE and "token" not in row
@@ -75,10 +86,38 @@ def test_every_key_is_split_and_reads_back_unchanged(node):
                                (o["x"], base64.b64decode(o["y"]))]) == KEYS[e["principal_id"]]
 
 
+def test_every_split_key_s_origin_share_is_activated(node):
+    """A split key is active at once, so Origin's share of it stops being replaceable: left
+    pending, it could be replaced with a share of another key on the principal's or an Admin's
+    credential for as long as it stayed so."""
+    _split(node)
+    assert set(node.origin.shares) == set(KEYS)
+    assert node.origin.pending == set()
+
+
+def test_a_rerun_after_a_failed_read_back_replaces_a_share_still_replaceable(node,
+                                                                            monkeypatch):
+    """The split never needs `/rekey-pending`: a key left whole after its share reached Origin was
+    never activated, so its first share is still replaceable, and the re-run's new split of the
+    same key replaces it on the principal's own credential."""
+    with monkeypatch.context() as m:
+        m.setattr(tc.ThresholdMasterKeyStore, "get",
+                  lambda self, pid: (_ for _ in ()).throw(RuntimeError("read-back fails")))
+        counts, _ = _split(node)
+    assert counts["failed"] == 3 and set(node.origin.shares) == set(KEYS)
+    assert _whole_keys(node) == KEYS
+    assert node.origin.pending == set(KEYS)     # never activated: still replaceable
+    counts, _ = _split(node)
+    assert counts["split"] == 3
+    for pid, key in KEYS.items():
+        assert node.store.get(pid) == key
+
+
 def test_a_second_run_splits_nothing(node):
     _split(node)
     counts, exported = _split(node)
-    assert counts == {"whole": 0, "already_split": 3, "split": 0, "changed": 0, "failed": 0}
+    assert counts == {"whole": 0, "already_split": 3, "split": 0, "changed": 0, "failed": 0,
+                      "refused_unrotated": 0, "activation_failed": 0}
     assert exported == []
 
 
@@ -153,7 +192,13 @@ def test_combine_writes_every_key_back_whole(node):
     counts = _combine(node)
     assert counts["combined"] == 3 and counts["failed"] == 0
     assert _whole_keys(node) == KEYS
-    counts, _ = _split(node)                                    # and splits again over Origin's
+    # Splitting again writes a new share over each one Origin holds, activated: refused until the
+    # operator's seed credential lists them for re-key (`/rekey-pending`), and then taken.
+    counts, _ = _split(node)
+    assert counts["split"] == 0 and counts["failed"] == 3
+    assert _whole_keys(node) == KEYS                             # left whole, nothing lost
+    node.origin.pending.update(KEYS)                             # the operator marks them
+    counts, _ = _split(node)
     assert counts["split"] == 3
 
 
@@ -213,3 +258,24 @@ def test_a_real_split_needs_an_export_path_and_refuses_to_replace_one(tmp_path, 
     monkeypatch.delenv("MANTLE_ESCROW_RECIPIENT_FILE", raising=False)
     with pytest.raises(SystemExit):
         smk.main(["--escrow-out", str(tmp_path / "new.age"), "--recipient-file", ""])
+
+
+def test_a_split_key_leaves_no_trace_of_its_whole_form_in_the_store_file(tmp_path):
+    """Review 7: SQLite keeps a replaced row's old bytes in its file (`secure_delete` is off by
+    default). After the split, the whole KEK-wrapped key must be gone from the file, the WAL
+    included, or a copy of the file still opens with the KEK alone."""
+    from mantle.db.lattice_api import LatticeDatabase
+
+    e = make_env(tmp_path)
+    db = LatticeDatabase(str(tmp_path / "store.db"), origin="t")
+    whole = LatticeMasterKeyStore(e.kek, lambda: db)
+    whole.put("alice", KEYS["alice"])
+    for i in range(30):                                  # unrelated traffic around it
+        db.artifacts.put_artifact({"id": f"x{i}", "content_type": "text/plain",
+                                   "content": "y" * 200})
+    token = db.artifacts.get_artifact("master-key:alice")["token"]
+    counts = smk.split_master_keys(db, e.kek, e.origin, e.recipient, e.escrow, e.lock,
+                                   write_escrow=lambda _x: None)
+    assert counts["split"] == 1
+    raw = b"".join(p.read_bytes() for p in tmp_path.glob("store.db*") if p.is_file())
+    assert token.encode() not in raw

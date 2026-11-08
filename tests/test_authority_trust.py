@@ -238,56 +238,52 @@ def test_verify_service_jwt_rejects_when_anchor_missing(trust_setup):
 # ---------------------------------------------------------------------------
 
 
-def test_verify_delegation_jwt_accepts_valid_token(trust_setup):
+def test_verify_delegation_jwt_refuses_one_mantle_signed(trust_setup):
+    """Review 19, H2: Mantle mints no delegation, so one its key signed is refused, whatever it
+    carries."""
     service_identity.init_service_identity("mantle")
-    token = service_identity.sign_delegation_jwt(
-        audience="crystal", user_sub="user-123"
-    )
+    token = service_identity.sign_delegation_jwt(audience="crystal", user_sub="user-123")
+    with pytest.raises(JWTError, match="Origin"):
+        authority_trust.verify_delegation_jwt(
+            token, expected_issuer="mantle", expected_audience="crystal",
+            expected_actor="mantle")
 
+
+def test_verify_delegation_jwt_accepts_valid_token(trust_setup):
+    service_identity.init_service_identity("origin")
+    token = service_identity.sign_delegation_jwt(audience="crystal", user_sub="user-123")
     claims = authority_trust.verify_delegation_jwt(
-        token,
-        expected_issuer="mantle",
-        expected_audience="crystal",
-        expected_actor="mantle",
-    )
+        token, expected_issuer="origin", expected_audience="crystal", expected_actor="origin")
     assert claims["sub"] == "user-123"
     assert claims["principal_type"] == "delegation"
-    assert claims["act"]["sub"] == "mantle"
+    assert claims["act"]["sub"] == "origin"
 
 
 def test_verify_delegation_jwt_rejects_service_token(trust_setup):
     """A `principal_type=service` token must NOT pass delegation verification."""
-    service_identity.init_service_identity("mantle")
+    service_identity.init_service_identity("origin")
     token = service_identity.sign_service_jwt(audience="crystal")
-
     with pytest.raises(JWTError, match="principal_type"):
         authority_trust.verify_delegation_jwt(
-            token, expected_issuer="mantle", expected_audience="crystal"
-        )
+            token, expected_issuer="origin", expected_audience="crystal")
 
 
 def test_verify_delegation_jwt_rejects_wrong_actor(trust_setup):
     """If the verifier expects a specific actor, a different one is rejected."""
-    service_identity.init_service_identity("mantle")
+    service_identity.init_service_identity("origin")
     token = service_identity.sign_delegation_jwt(audience="crystal", user_sub="u1")
-
     with pytest.raises(JWTError, match="act.sub"):
         authority_trust.verify_delegation_jwt(
-            token,
-            expected_issuer="mantle",
-            expected_audience="crystal",
-            expected_actor="origin",
-        )
+            token, expected_issuer="origin", expected_audience="crystal",
+            expected_actor="mantle")
 
 
 def test_verify_delegation_jwt_actor_check_optional(trust_setup):
     """Omitting expected_actor skips the actor check (still validates type/sig/aud/iss)."""
-    service_identity.init_service_identity("mantle")
+    service_identity.init_service_identity("origin")
     token = service_identity.sign_delegation_jwt(audience="crystal", user_sub="u1")
-
     claims = authority_trust.verify_delegation_jwt(
-        token, expected_issuer="mantle", expected_audience="crystal"
-    )
+        token, expected_issuer="origin", expected_audience="crystal")
     assert claims["sub"] == "u1"
 
 

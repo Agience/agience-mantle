@@ -38,9 +38,8 @@ anchor from the platform installer; a standalone node names an external IdP thro
 `AGIENCE_TRUSTED_ISSUERS` instead and needs no peer anchor at all.
 
 `setup.token`, `minio.pass` and the `origin.*` / `licensing_*` keys are deliberately absent, and
-nothing here needs them. Mantle has no setup flow of its own — `key_manager.init_setup_token`
-only *loads* a token file if one is already there, and boot deletes it either way, so an absent
-`setup.token` is the completed state rather than a missing file. `content_service` treats an
+nothing here needs them. Mantle has no setup flow of its own and never reads or removes
+`setup.token`, which is Origin's. `content_service` treats an
 uninitialized MinIO password as "no S3 edge configured" and carries on. Writing key files nothing
 here reads would suggest they matter.
 

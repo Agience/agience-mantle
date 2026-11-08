@@ -6,6 +6,10 @@ import os as _os
 import time as _time
 
 _os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+# The authority ledger sends every change to reach to Origin, and `ORIGIN_URI` always has a value,
+# so an app started by a test would otherwise send them to whatever answers there. A test that is
+# about the ledger installs it itself (`tests/test_reach_changes_go_to_origin.py`).
+_os.environ.setdefault("MANTLE_AUTHORITY_LEDGER", "off")
 del _os
 
 import itertools
@@ -558,3 +562,12 @@ def content_keys(monkeypatch):
                         lambda pid, pt, **kw: real_encrypt(pid, pt, master_key_provider=_provider, **kw))
     monkeypatch.setattr(content_crypto, "decrypt_content",
                         lambda pid, blob, **kw: real_decrypt(pid, blob, master_key_provider=_provider, **kw))
+
+
+@pytest.fixture(autouse=True)
+def _no_authority_ledger_leaks():
+    """The journal's authority is process state; one a test installs ends with that test."""
+    from mantle.db import reach_journal
+
+    yield
+    reach_journal.uninstall()

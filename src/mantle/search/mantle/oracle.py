@@ -78,6 +78,9 @@ _HKDF_SALT_V1 = b"agience-mantle-cell-key-v1"
 # cryptographically independent — same master, different info, different key.
 _HKDF_SSE_INFO = b"sse"
 
+# A collection's SSE key, from its collection key: a salt of its own.
+_HKDF_SALT_COLLECTION_SSE = b"agience-mantle-collection-sse-key-v1"
+
 
 # ---------------------------------------------------------------------------
 # Master key storage
@@ -510,6 +513,14 @@ class LightConeGrantVerifier:
             return self._ttl_s
         return ttl
 
+    def has_grants(self, resource_id: str) -> bool:
+        """Does any grant (any kind, any state) name `resource_id`?"""
+        try:
+            from mantle.db import lattice_api as _la
+            return bool(_la._grant_docs_by(self._db, "resource_id", str(resource_id)))
+        except Exception:  # noqa: BLE001 — cannot tell: say yes, the safe answer
+            return True
+
     def authorized(
         self,
         *,
@@ -727,6 +738,50 @@ class LightConeGrantVerifier:
             return False   # which is the fail-closed direction
         return False
 
+    def _denied(self, requester_id: str, requester_type: str, collection_id: str,
+                action: str) -> bool:
+        """Does a live deny this requester holds sit on `collection_id` or anywhere up its creation
+        chain, whatever each edge on the way conducts (review 17, M2: Origin's `Reach.denies`)? A
+        malformed chain counts as denied (fail closed)."""
+        from mantle.entities.grant import mask_of
+
+        deny = set()
+        for g in self._grants(requester_id, requester_type):
+            rid = getattr(g, "resource_id", None)
+            m = mask_of(g)
+            if rid and m.is_deny and m.carries(action):
+                deny.add(str(rid))
+        if not deny:
+            return False
+        try:
+            return any(r in deny for r in self._creation_chain(str(collection_id)))
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _creation_chain(self, node_id: str):
+        """`node_id`, its root, and every node up its creation edges to the top, whatever each
+        edge conducts: where a deny holds against it."""
+        from mantle.db import lattice_api as la
+
+        seen = set()
+        first = str(node_id)
+        yield first
+        seen.add(first)
+        doc = self._db.artifacts.get_artifact(first) if hasattr(self._db, "artifacts") else None
+        cur = str((doc or {}).get("root_id") or first)
+        if cur not in seen:
+            yield cur
+            seen.add(cur)
+        while True:
+            if len(seen) > la.ORIGIN_WALK_CEILING:
+                raise RuntimeError(f"the creation chain from {node_id!r} does not end")
+            parent = la.get_origin_parent(self._db, cur)
+            if not parent or not parent[0] or str(parent[0]) in seen:
+                return
+            cur = str(parent[0])
+            seen.add(cur)
+            yield cur
+
     def _chain(self, collection_id: str, action: str):
         """Where a grant could sit to reach `collection_id` under `action`, nearest first.
 
@@ -785,6 +840,40 @@ class LightConeGrantVerifier:
 # OracleService
 # ---------------------------------------------------------------------------
 
+#: A collection key's id in the key store and at Origin: `ck:<collection id>`.
+from prism.trust.ledger import COLLECTION_KEY_PREFIX  # noqa: E402  (shared, review 17)
+
+
+def _owner_bound(principal_id: str, collection_id: str) -> str:
+    """The derivation label binding a collection's cell keys to its owner, length-prefixed so
+    the two cannot be re-partitioned."""
+    return f"{len(principal_id.encode('utf-8'))}:{principal_id}:{collection_id}"
+
+
+def collection_key_id(collection_id: str) -> str:
+    return COLLECTION_KEY_PREFIX + str(collection_id)
+
+
+#: The longest a combined key is held in the process cache before the store (under threshold
+#: custody, Origin) is asked again. Revocation reaches a warm key within this time, so it is the
+#: canon's verdict memo TTL (architecture §51: thirty seconds bounds post-revocation validity):
+#: a cache of key material is key-equivalent and holds no longer than the verdict that gates it.
+MASTER_KEY_CACHE_TTL_MAX = 30.0
+
+#: Operator setting for the cache lifetime, in seconds, clamped to `[0, MASTER_KEY_CACHE_TTL_MAX]`.
+MASTER_KEY_CACHE_TTL_SETTING = "MANTLE_MASTER_KEY_CACHE_TTL"
+
+
+def master_key_cache_ttl() -> float:
+    raw = (os.getenv(MASTER_KEY_CACHE_TTL_SETTING) or "").strip()
+    try:
+        ttl = float(raw) if raw else MASTER_KEY_CACHE_TTL_MAX
+    except ValueError:
+        raise ValueError(f"{MASTER_KEY_CACHE_TTL_SETTING} must be a number of seconds, "
+                         f"got {raw!r}") from None
+    return max(0.0, min(ttl, MASTER_KEY_CACHE_TTL_MAX))
+
+
 class OracleService:
     """Single-node, in-process key custodian. MVP implementation.
 
@@ -798,18 +887,184 @@ class OracleService:
         store: MasterKeyStore,
         *,
         grant_verifier: Optional[GrantVerifier] = None,
+        cache_ttl_s: Optional[float] = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._store = store
         self._verifier = grant_verifier
         self._lock = threading.RLock()
-        # Cache unwrapped master keys for the process lifetime. Trade-off:
-        # crypto round-trip cost vs. RAM. 32 bytes per principal is cheap.
-        #
-        self._cache: dict[str, bytes] = {}
+        # Unwrapped master keys, each held for at most `cache_ttl_s` seconds
+        # (`MASTER_KEY_CACHE_TTL_MAX` at most) and then read from the store again: under threshold
+        # custody that read asks Origin, which applies its replica's grants at that moment, so a
+        # revoked grant stops opening a warm key within the TTL. `principal -> (deadline, key)`.
+        ttl = master_key_cache_ttl() if cache_ttl_s is None else float(cache_ttl_s)
+        self._cache_ttl = max(0.0, min(ttl, MASTER_KEY_CACHE_TTL_MAX))
+        self._clock = clock
+        self._cache: dict[str, tuple[float, bytes]] = {}
+
+    def _cached(self, principal_id: str) -> Optional[bytes]:
+        hit = self._cache.get(principal_id)
+        if hit is None:
+            return None
+        if hit[0] <= self._clock():
+            self._cache.pop(principal_id, None)
+            return None
+        return hit[1]
+
+    def forget_cache(self) -> None:
+        """Drop every cached key: the next use asks the store, and its requester's verdict, again
+        (a person's sign-in bound moved, review 12, M7)."""
+        self._cache.clear()
+
+    def _remember(self, principal_id: str, key: bytes) -> None:
+        if self._cache_ttl > 0:
+            self._cache[principal_id] = (self._clock() + self._cache_ttl, key)
 
     # ------------------------------------------------------------------
     # Authorization
     # ------------------------------------------------------------------
+
+    def _no_grant_yet(self, collection_id: str) -> bool:
+        """No grant of any kind names `collection_id` yet. A verifier that cannot say answers
+        no, so the create base case then does not apply (fail closed)."""
+        check = getattr(self._verifier, "has_grants", None)
+        if check is None:
+            return False
+        try:
+            return not check(collection_id)
+        except Exception:  # noqa: BLE001 — cannot tell: no base case
+            return False
+
+    # ------------------------------------------------------------------
+    # The Add seal: the public half a writer holding Add (and not Read) seals to
+    # ------------------------------------------------------------------
+    #
+    # Not an authority object (John, 2026-11-03: "It's not a drop key. It's a grant with Add
+    # rights and nothing else."). What lets a sender write without reading is their Add grant at
+    # Origin. The public half they seal to is this store's own key material: derived from the
+    # collection key when a reader opens the collection, cached here, and re-checked on every
+    # Read open. Origin never stores, co-signs or serves it. The content type and the row id keep
+    # their old crypto name, which the stored rows carry.
+
+    ADD_SEAL_CONTENT_TYPE = "application/vnd.agience.add-seal+json"
+    #: The row an earlier Mantle wrote: never trusted (it carries no binding), dropped when a
+    #: reader's open writes the bound one.
+    _LEGACY_SEAL_ROW = "drop-key:"
+
+    def _drop_db(self):
+        factory = getattr(self._store, "_db_factory", None)
+        return factory() if factory is not None else None
+
+    @staticmethod
+    def _seal_mac(collection_key: bytes, collection_id: str, public: bytes) -> str:
+        """The Add seal's binding (review 17, M1): a MAC over the collection and its public half,
+        under a key derived from the collection key, so a row only a holder of that key could
+        have written."""
+        import base64 as _b64
+        import hashlib as _hashlib
+        import hmac as _hmac
+
+        k = _hmac.new(collection_key, b"mantle-add-seal-mac-v1", _hashlib.sha256).digest()
+        tag = _hmac.new(k, b"add-seal\0" + str(collection_id).encode("utf-8") + b"\0" + public,
+                        _hashlib.sha256).digest()
+        return _b64.b64encode(tag).decode("ascii")
+
+    def _seal_row(self, collection_id: str) -> Optional[dict]:
+        db = self._drop_db()
+        if db is None:
+            return None
+        doc = db.artifacts.get_artifact(f"add-seal:{collection_id}")
+        ctx = (doc or {}).get("context") or {}
+        if isinstance(ctx, str):
+            import json as _json
+            try:
+                ctx = _json.loads(ctx)
+            except ValueError:
+                ctx = {}
+        return ctx if isinstance(ctx, dict) and ctx.get("public") else None
+
+    def _key_for_seal(self, collection_id: str) -> Optional[bytes]:
+        """The collection key this node holds without anyone's credential: in its key cache after
+        a reader's open, or in a store that keeps keys locally. None under threshold custody when
+        no reader has opened the collection since this process started."""
+        kid = collection_key_id(collection_id)
+        ck = self._cached(kid)
+        if ck is None and not hasattr(self._store, "verdict"):
+            try:
+                ck = self._store.get(kid)
+            except Exception:  # noqa: BLE001 — none to check against
+                ck = None
+        return ck
+
+    def add_seal_public(self, collection_id: str) -> Optional[bytes]:
+        """The public half an Add-only write seals to, or None: no seal yet, or one this node
+        cannot verify as bound to the collection key (review 17). Either way the write is refused
+        until a reader opens the collection (John, 2026-11-03)."""
+        import base64 as _b64
+        import hmac as _hmac
+
+        row = self._seal_row(collection_id)
+        if row is None:
+            return None
+        ck = self._key_for_seal(collection_id)
+        if ck is None:
+            return None
+        try:
+            public = _b64.b64decode(row["public"])
+        except (ValueError, TypeError):
+            return None
+        from mantle.services.content_crypto import drop_public_key
+        bound = (public == drop_public_key(ck) and _hmac.compare_digest(
+            str(row.get("mac") or ""), self._seal_mac(ck, collection_id, public)))
+        if not bound:
+            logger.error("ALARM: the Add seal of collection %s is not bound to its collection key; "
+                         "no write is sealed to it until a reader opens the collection",
+                         collection_id)
+            return None
+        return public
+
+    def verdict(self, principal_id: str, collection_id: Optional[str],
+                request: "KeyRequest") -> None:
+        """The store's verdict for this requester on this collection's key (or the principal's),
+        as a key open asks it: Origin's under threshold custody, memoized 30 s; nothing locally.
+        A cached cell is served only after it (review 17, M2)."""
+        key_id = collection_key_id(collection_id) if collection_id else principal_id
+        self._requester_verdict(key_id, collection_id, request)
+
+    def _requester_verdict(self, key_id: str, collection_id: Optional[str],
+                           request: "KeyRequest") -> None:
+        """A cached key is shared; a verdict is not. The store says whether this requester may
+        have it (under threshold custody Origin decides, memoized at most 30 s per requester)."""
+        verdict = getattr(self._store, "verdict", None)
+        if verdict is not None:
+            verdict(key_id, collection_id=collection_id, artifact_id=request.artifact_id)
+
+    def _check_drop_key(self, collection_id: str, collection_key: bytes) -> None:
+        """On every Read open of a collection key: this store's cached Add seal is the one the key
+        derives. Missing, it is cached now; a mismatch is an ALARM and is repaired, since a writer
+        would otherwise seal to someone else."""
+        import base64 as _b64
+
+        from mantle.services.content_crypto import drop_public_key
+
+        derived = drop_public_key(collection_key)
+        mac = self._seal_mac(collection_key, collection_id, derived)
+        row = self._seal_row(collection_id) or {}
+        if row.get("public") == _b64.b64encode(derived).decode("ascii") and row.get("mac") == mac:
+            return
+        if row:
+            logger.error("ALARM: the Add seal of collection %s is not the one its key derives, "
+                         "bound to it; it is repaired here, and anything sealed to it since cannot "
+                         "be opened by the collection's readers", collection_id)
+        db = self._drop_db()
+        if db is not None:
+            db.artifacts.put_artifact({
+                "id": f"add-seal:{collection_id}", "state": "live",
+                "content_type": self.ADD_SEAL_CONTENT_TYPE,
+                "context": {"public": _b64.b64encode(derived).decode("ascii"), "mac": mac,
+                            "collection_id": collection_id}})
+            if db.artifacts.get_artifact(self._LEGACY_SEAL_ROW + collection_id) is not None:
+                db.artifacts.delete_artifact(self._LEGACY_SEAL_ROW + collection_id)
 
     def _authorize(
         self, principal_id: str, collection_id: Optional[str], request: KeyRequest
@@ -873,28 +1128,45 @@ class OracleService:
         # It widens nothing that a grant would not: one statement later the creator receives an
         # owner grant on this same artifact; this authorizes the instant between, which is the only
         # instant in which no grant can exist yet.
+        # And only while no grant on the collection exists yet: that instant is the whole of the
+        # case. Once any grant does, the key goes by Read like every other (architecture §51:
+        # no action but Read releases a content key), so a writer who holds Add or Create on an
+        # existing collection is never given its key, here or at Origin; they write a drop.
         if (
             request.may_create
             and request.creator_id
             and request.requester_id == request.creator_id
             and collection_id
             and collection_id == principal_id
+            and self._no_grant_yet(collection_id)
         ):
             return
 
         # `artifact_id` only when named, so a verifier that has no artifact-scoped answer is asked
         # exactly the question it was always asked.
         scoped = {"artifact_id": request.artifact_id} if request.artifact_id else {}
+        # Key material goes by Read alone (architecture §51, CRUDEASIO): holding any other
+        # action, Create, Update, Delete, Evict, Invoke, Add, Share or Admin, releases no key,
+        # whatever action the request names. `request.action` still says whether a request may
+        # mint (`_WRITE_ACTIONS`); it never widens who is given the key.
+        # A deny on the collection, or above it, holds against every path to its key, a member's
+        # Read included (review 11, M3): Origin's `may_release` holds the same.
+        denied = getattr(self._verifier, "_denied", None)
+        if (collection_id and principal_id != request.requester_id and denied is not None
+                and denied(request.requester_id, request.requester_type, collection_id, "read")):
+            raise GrantDenied(
+                f"{request.requester_id!r} is denied 'read' on collection {collection_id!r}, "
+                f"which holds against every path to its key")
         if not self._verifier.authorized(
             requester_id=request.requester_id,
             requester_type=request.requester_type,
             principal_id=principal_id,
             collection_id=collection_id,
-            action=request.action,
+            action="read",
             **scoped,
         ):
             raise GrantDenied(
-                f"{request.requester_id!r} holds no {request.action!r} grant reaching "
+                f"{request.requester_id!r} holds no 'read' grant reaching "
                 f"principal {principal_id!r} / collection {collection_id!r}"
             )
 
@@ -962,25 +1234,42 @@ class OracleService:
 
         self._authorize(principal_id, collection_id, request)
 
-        # Fast path: already cached.
-        cached = self._cache.get(principal_id)
+        # A store that needs the caller's own credential to open a key (threshold custody) says
+        # whether this caller has one, before a cached key is served to it.
+        check_caller = getattr(self._store, "check_caller", None)
+        if check_caller is not None:
+            check_caller()
+
+        # Fast path: already cached, and not past its time-to-live, for this requester only once
+        # their own verdict holds (under threshold custody, Origin's decision, memoized 30 s).
+        cached = self._cached(principal_id)
         if cached is not None:
+            self._requester_verdict(principal_id, collection_id, request)
             return cached
 
         with self._lock:
-            # Double-check after acquiring the lock.
-            cached = self._cache.get(principal_id)
+            # Double-check after acquiring the lock: still only on this requester's own verdict
+            # (review 12, M6).
+            cached = self._cached(principal_id)
             if cached is not None:
+                self._requester_verdict(principal_id, collection_id, request)
                 return cached
 
-            existing = self._store.get(principal_id)
+            # A store that asks a custodian to release the key (threshold custody) is told what it
+            # is wanted for, so the custodian's own reach check is asked the same question.
+            get_scoped = getattr(self._store, "get_scoped", None)
+            if get_scoped is not None:
+                existing = get_scoped(principal_id, collection_id=collection_id,
+                                      artifact_id=request.artifact_id)
+            else:
+                existing = self._store.get(principal_id)
             if existing is not None:
                 if len(existing) != _MASTER_KEY_BYTES:
                     raise RuntimeError(
                         f"Master key for {principal_id} is {len(existing)} bytes, "
                         f"expected {_MASTER_KEY_BYTES}"
                     )
-                self._cache[principal_id] = existing
+                self._remember(principal_id, existing)
                 return existing
 
             # No key exists. Only a write — or a caller that explicitly says it is entitled to
@@ -995,12 +1284,78 @@ class OracleService:
                     f"'no results' instead of surfacing a missing key)"
                 )
 
-            # First write by this principal — generate.
+            # First write by this principal — generate. The key principal and its origin root are
+            # journaled first (`db.reach_journal`): an authority that refuses it refuses the key.
+            from datetime import datetime, timezone
+
+            from mantle.db import reach_journal
+
+            # The creation the store is recording for this new id: who made it, and when. Origin
+            # registers a root for an id it has not seen only with it.
+            with reach_journal.proof(created_by=str(request.creator_id or request.requester_id),
+                                     created_at=datetime.now(timezone.utc).isoformat()):
+                root = reach_journal.root_entry(principal_id)
+                receipt = reach_journal.submit(root)
             master_key = os.urandom(_MASTER_KEY_BYTES)
             self._store.put(principal_id, master_key)
-            self._cache[principal_id] = master_key
+            reach_journal.confirm_submitted(root, receipt, self._drop_db())  # its key is stored
+            self._remember(principal_id, master_key)
             logger.info("Generated new MANTLE master key for principal=%s", principal_id)
             return master_key
+
+    # ------------------------------------------------------------------
+    # Collection keys
+    # ------------------------------------------------------------------
+
+    def get_or_create_collection_key(self, principal_id: str, collection_id: str,
+                                     request: KeyRequest) -> bytes:
+        """The collection's own random content key, minted on its first write.
+
+        Checked exactly as a master key for that collection is (`_authorize`, collection-scoped),
+        held in the same store under its own id (`collection_key_id`), split two-of-three under
+        threshold custody like a master key, and cached under its own id for the same
+        `MASTER_KEY_CACHE_TTL_MAX`. Under threshold custody Origin releases its share only to a
+        caller whose own walk reaches this collection for `read`; the master key it no longer
+        opens content for is released to the principal alone.
+        """
+        if not principal_id or not collection_id:
+            raise ValueError("principal_id and collection_id are required")
+        self._authorize(principal_id, collection_id, request)
+        check_caller = getattr(self._store, "check_caller", None)
+        if check_caller is not None:
+            check_caller()
+        key_id = collection_key_id(collection_id)
+        cached = self._cached(key_id)
+        if cached is not None:
+            self._requester_verdict(key_id, collection_id, request)
+            self._check_drop_key(collection_id, cached)
+            return cached
+        with self._lock:
+            cached = self._cached(key_id)
+            if cached is not None:
+                self._requester_verdict(key_id, collection_id, request)       # review 12, M6
+                return cached
+            get_scoped = getattr(self._store, "get_scoped", None)
+            existing = (get_scoped(key_id, collection_id=collection_id,
+                                   artifact_id=request.artifact_id)
+                        if get_scoped is not None else self._store.get(key_id))
+            if existing is not None:
+                if len(existing) != _MASTER_KEY_BYTES:
+                    raise RuntimeError(f"collection key {key_id} is {len(existing)} bytes")
+                self._remember(key_id, existing)
+                self._check_drop_key(collection_id, existing)
+                return existing
+            if request.action not in _WRITE_ACTIONS and not request.may_create:
+                raise MasterKeyMissing(
+                    f"no key exists for collection {collection_id!r} and a read does not mint "
+                    f"one")
+            key = os.urandom(_MASTER_KEY_BYTES)
+            self._store.put(key_id, key)
+            self._remember(key_id, key)
+            self._check_drop_key(collection_id, key)
+            logger.info("Generated a collection key for collection=%s (principal=%s)",
+                        collection_id, principal_id)
+            return key
 
     # ------------------------------------------------------------------
     # Cell key derivation
@@ -1009,55 +1364,61 @@ class OracleService:
     def derive_cell_key(
         self, principal_id: str, collection_id: str, cluster_id: str, request: KeyRequest
     ) -> bytes:
-        """HKDF(master_key, info=collection_id ‖ 0x00 ‖ cluster_id) → 256-bit AES key.
+        """HKDF(collection_key, info=collection_id ‖ 0x00 ‖ cluster_id) → 256-bit AES key.
 
-        ``request`` is required; the grant check runs against the specific
-        ``(principal_id, collection_id)`` context and raises :class:`GrantDenied`
-        when the requester cannot reach it.
+        Keyed under the collection's own key (`get_or_create_collection_key`), not the master
+        key: a caller who reaches the collection for read opens its cells and no sibling's, and
+        under threshold custody Origin releases the collection key's share on exactly that
+        reach. ``request`` is checked against ``(principal_id, collection_id)``.
 
-        ``cluster_id`` is the routing anchor of the cell (canonical plan §5.1:
-        the AnchorSet is the partition; one cell per ``(principal, collection,
-        anchor)``) and is required — routing has no flat fallback, so there is no
-        anchor-less key. Deterministic; cell keys are never persisted — callers
-        re-derive on demand.
+        ``cluster_id`` is the routing anchor of the cell (one cell per ``(principal, collection,
+        anchor)``). Deterministic; cell keys are never persisted.
         """
         if not principal_id or not collection_id:
             raise ValueError("principal_id and collection_id are required")
+        ck = self.get_or_create_collection_key(principal_id, collection_id, request)
+        # The owner is bound in too: one collection id under two principals (which ids make
+        # impossible in practice) still derives two keys.
+        return self._derive(ck, _owner_bound(principal_id, collection_id), cluster_id)
 
-        master_key = self.get_or_create_master_key(
-            principal_id, request, collection_id=collection_id
-        )
+    def derive_legacy_cell_key(self, principal_id: str, collection_id: str, cluster_id: str,
+                               request: KeyRequest) -> bytes:
+        """The cell key as it was derived before collections had keys, from the master key.
+        Read by the cutover pass alone, which re-encrypts each cell under `derive_cell_key`."""
+        master_key = self.get_or_create_master_key(principal_id, request,
+                                                   collection_id=collection_id)
         return self._derive(master_key, collection_id, cluster_id)
 
     # ------------------------------------------------------------------
     # SSE key derivation (MANTLE-SSE encrypted lexical)
     # ------------------------------------------------------------------
 
-    def derive_sse_key(self, principal_id: str, request: KeyRequest) -> bytes:
-        """HKDF(master_key, info='sse') → 256-bit principal SSE key.
+    def derive_sse_key(self, principal_id: str, request: KeyRequest, *,
+                       collection_id: Optional[str] = None) -> bytes:
+        """HKDF(collection_key, info='sse') → 256-bit SSE key for one collection.
 
-        ``request`` is required. The SSE key is per-principal, so the grant check
-        is principal-scoped: the requester must reach at least one collection under
-        ``principal_id``. Raises :class:`GrantDenied` otherwise.
-
-        The SSE key is derived per-principal (not per-collection) because SSE
-        posting lists span a principal's entire corpus. Per-blind-token
-        encryption keys are subsequently derived from the SSE key inside
-        the posting list manager (:mod:`mantle.search.mantle.sse.posting`).
-
-        Deterministic — re-derivation yields the same key.
+        Postings are keyed per collection: an artifact's blind tokens, posting entries and
+        manifest are all derived from its collection's SSE key, so a query opens only the
+        collections whose keys the caller reaches and finds nothing in the others (their tokens
+        are different). ``request`` is checked against ``(principal_id, collection_id)``.
         """
         if not principal_id:
             raise ValueError("principal_id is required")
+        if not collection_id:
+            # The principal-wide key postings had before collections had keys. Every index path
+            # names its collection; this form is for reading what predates that.
+            return self.derive_legacy_sse_key(principal_id, request)
+        ck = self.get_or_create_collection_key(principal_id, collection_id, request)
+        return HKDF(algorithm=hashes.SHA256(), length=_SSE_KEY_BYTES,
+                    salt=_HKDF_SALT_COLLECTION_SSE,
+                    info=_HKDF_SSE_INFO + b"\x00" + principal_id.encode("utf-8")).derive(ck)
 
+    def derive_legacy_sse_key(self, principal_id: str, request: KeyRequest) -> bytes:
+        """The principal-wide SSE key postings were written under before collections had keys,
+        from the master key. Read by the cutover pass alone, to remove those postings."""
         master_key = self.get_or_create_master_key(principal_id, request)
-        hkdf = HKDF(
-            algorithm=hashes.SHA256(),
-            length=_SSE_KEY_BYTES,
-            salt=_HKDF_SALT_V1,
-            info=_HKDF_SSE_INFO,
-        )
-        return hkdf.derive(master_key)
+        return HKDF(algorithm=hashes.SHA256(), length=_SSE_KEY_BYTES, salt=_HKDF_SALT_V1,
+                    info=_HKDF_SSE_INFO).derive(master_key)
 
     # ------------------------------------------------------------------
     # Internal helpers

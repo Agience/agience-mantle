@@ -719,6 +719,45 @@ class TestRemoveArtifactFromWorkspace:
             r = await client.delete("/artifacts/ws-1/children/missing")
         assert r.status_code == 404
 
+    @pytest.mark.asyncio
+    async def test_evict_alone_does_not_remove_a_creation_edge(self, client: AsyncClient):
+        """Review 15: removing a member's creation edge deletes it at Origin, so it needs Delete
+        reaching the member, or Admin on the container; Evict alone removes a secondary edge."""
+        from fastapi import HTTPException
+
+        def evict_only(_auth, _rid, action, _db):
+            if action != "evict":
+                raise HTTPException(status_code=404, detail="Not Found")
+            return MagicMock()
+
+        with patch("mantle.routers.artifacts_router.check_access", side_effect=evict_only),              patch("mantle.services.grant_service.can_admin", return_value=False),              patch("mantle.db.lattice_api.get_origin_parent", return_value=("ws-1", None)),              patch("mantle.services.workspace_service.remove_artifact_from_container") as svc:
+            r = await client.delete("/artifacts/ws-1/children/art-1")
+        assert r.status_code == 404 and not svc.called
+        with patch("mantle.routers.artifacts_router.check_access", side_effect=evict_only),              patch("mantle.services.grant_service.can_admin", return_value=False),              patch("mantle.db.lattice_api.get_origin_parent", return_value=("elsewhere", None)),              patch("mantle.services.workspace_service.remove_artifact_from_container") as svc:
+            svc.return_value = MagicMock(id="art-1", state="live")
+            r = await client.delete("/artifacts/ws-1/children/art-1")
+        assert r.status_code == 200 and svc.called          # a secondary edge: Evict suffices
+
+    @pytest.mark.asyncio
+    async def test_a_version_id_does_not_slip_past_the_creation_edge_check(self,
+                                                                           client: AsyncClient):
+        """Review 16, L2: both ids resolve to root ids first, so naming the member by one of its
+        version ids is the same removal of its creation edge."""
+        from fastapi import HTTPException
+
+        def evict_only(_auth, _rid, action, _db):
+            if action != "evict":
+                raise HTTPException(status_code=404, detail="Not Found")
+            return MagicMock()
+
+        roots = {"ver-7": "art-1", "ws-v": "ws-1"}
+        parents = {"art-1": ("ws-1", None)}
+        with patch("mantle.routers.artifacts_router.check_access", side_effect=evict_only),              patch("mantle.services.grant_service.can_admin", return_value=False),              patch("mantle.routers.artifacts_router._root_id",
+                   side_effect=lambda _db, i: roots.get(i, i)),              patch("mantle.db.lattice_api.get_origin_parent",
+                   side_effect=lambda _db, i: parents.get(i)),              patch("mantle.services.workspace_service.remove_artifact_from_container") as svc:
+            r = await client.delete("/artifacts/ws-v/children/ver-7")
+        assert r.status_code == 404 and not svc.called
+
 
 # ---------------------------------------------------------------------------
 # POST /artifacts/{id}/op/invoke
