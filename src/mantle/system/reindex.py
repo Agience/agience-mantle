@@ -70,7 +70,12 @@ def reindex_as_owners(db) -> dict:
     from mantle.search.ingest.pipeline_unified import index_artifact, is_indexable
     from mantle.search.mantle.oracle import KeyCustodyDenied
     from mantle.services.acting_principal import acting_as
-    from mantle.services.content_service import ContentDecryptionError, ContentStoreUnavailable
+    from mantle.services.content_service import (ContentDecryptionError, ContentStoreUnavailable,
+                                                 ContentUrlSigningError)
+
+    #: A body this node cannot read: sealed under keys it does not hold, or held only in an object
+    #: store it cannot reach or sign a URL for (the release candidate has none, by design).
+    unreadable = (SealError, ContentDecryptionError, ContentStoreUnavailable, ContentUrlSigningError)
     from mantle.services.system_identity import system_acting_context
 
     counts = {"indexed": 0, "skipped": 0, "failed": 0, "unreadable": 0, "denied": 0, "ownerless": 0}
@@ -94,7 +99,8 @@ def reindex_as_owners(db) -> dict:
         that exception's type, so a key refusal, and a body this node cannot read, are told from a
         fault. 2026-11-09, the release candidate (no object store, by design): three type
         definitions failed its reindex because the indexer logged `ContentStoreUnavailable`, which
-        raised directly is already `unreadable`."""
+        raised directly is already `unreadable`, and three notes because a body only the object store
+        holds could not be signed for there (`ContentUrlSigningError`)."""
         def __init__(self):
             super().__init__(logging.WARNING)
             self.refused = self.unreadable = self.other = False
@@ -103,7 +109,7 @@ def reindex_as_owners(db) -> dict:
             exc = record.exc_info[1] if record.exc_info else None
             if isinstance(exc, KeyCustodyDenied):
                 self.refused = True
-            elif isinstance(exc, (SealError, ContentDecryptionError, ContentStoreUnavailable)):
+            elif isinstance(exc, unreadable):
                 self.unreadable = True
             elif exc is not None:
                 self.other = True
@@ -122,7 +128,7 @@ def reindex_as_owners(db) -> dict:
                 outcome = index_artifact(artifact, artifact.collection_id or artifact.id, is_head=True)
         except KeyCustodyDenied:
             return "denied"
-        except (SealError, ContentDecryptionError, ContentStoreUnavailable):
+        except unreadable:
             return "unreadable"
         except Exception as exc:  # noqa: BLE001 — per artifact; the rest of the corpus still indexes
             logger.warning("  cannot index %s as %s (%s: %s)", str(raw.get("id"))[:8], owner[:8],

@@ -144,16 +144,18 @@ def test_a_refused_index_write_is_denied_and_any_other_fault_fails(monkeypatch, 
     (("store",), "unreadable"),
     (("grant", "fault"), "failed"),
     (("store", "fault"), "failed"),
+    (("signing",), "unreadable"),
 ])
 def test_a_logged_unreadable_body_is_not_a_failure(monkeypatch, logged, counted):
     import logging
     from mantle.db import lattice_api
     from mantle.search.ingest import pipeline_unified as pu
     from mantle.search.mantle.oracle import GrantDenied
-    from mantle.services.content_service import ContentStoreUnavailable
+    from mantle.services.content_service import ContentStoreUnavailable, ContentUrlSigningError
 
     made = {"grant": lambda: GrantDenied("no read grant"),
             "store": lambda: ContentStoreUnavailable("not in this node's local content tier"),
+            "signing": lambda: ContentUrlSigningError("could not generate a signed content URL"),
             "fault": lambda: RuntimeError("disk")}
 
     class Db:
