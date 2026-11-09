@@ -7,6 +7,9 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [0.1.11] - 2026-11-09
 
+### Fixed (release candidate)
+- `platform_operators` on the release candidate (`AGIENCE_PLANE=rc`) leaves, and counts, an account whose operator grant cannot be sealed there under a collection key production wrapped; on any other plane that still fails the migration.
+
 ### Security
 - An invite mail carries one link, its claim link. The personal message, the inviter's display name and the resource's name are defanged in the subject, text and HTML (`services/defang.py`, the same rules as Origin's and the website's lead mail): URLs, markdown links, HTML anchors, bare domains, Unicode and punycode hosts and IPv4 addresses arrive as readable text no mail client links, and the HTML escapes everything. On 2026-11-09 an account sent a real Agience invite with phishing text in its message.
 - An invite's personal message is at most 500 characters; a longer one is refused 400 naming the limit, before anything is recorded or mailed.

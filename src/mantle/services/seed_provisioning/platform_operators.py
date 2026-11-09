@@ -20,6 +20,7 @@ grants every existing account (a release migration).
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from typing import Any, Dict, List
 
@@ -173,8 +174,38 @@ def grant_to_every_account(db: Database) -> Dict[str, int]:
         if doc.get("grantee_type") == "user" and doc.get("grantee_id"):
             accounts.add(str(doc["grantee_id"]))
     accounts -= not_accounts
-    granted = sum(1 for a in sorted(accounts) if grant_to_account(db, a))
-    return {"accounts": len(accounts), "granted": granted}
+    granted = left = 0
+    on_rc = (os.getenv("AGIENCE_PLANE") or "").strip().lower() == "rc"
+    for a in sorted(accounts):
+        try:
+            granted += 1 if grant_to_account(db, a) else 0
+        except Exception as exc:
+            # The release candidate runs on a copy of production's store with a key encryption key
+            # of its own: a grant written under a collection key production wrapped cannot be
+            # sealed there (2026-11-09, release 2026.11.2: the accounts made since 2026.11.0's
+            # promote). It is left, and counted; on any other plane it is a fault.
+            if on_rc and _is_unsealable_here(exc):
+                left += 1
+                continue
+            raise
+    out = {"accounts": len(accounts), "granted": granted}
+    if left:
+        out["left_on_rc"] = left
+    return out
+
+
+def _is_unsealable_here(exc: BaseException) -> bool:
+    """A write refused because a key production wrapped will not unwrap here: the master key, or
+    the content encryption that needs it, anywhere in the exception's chain."""
+    from mantle.db.doc_boundary import ContentEncryptionError
+    from mantle.search.mantle.custody import MasterKeyUnavailable
+
+    seen = exc
+    while seen is not None:
+        if isinstance(seen, (ContentEncryptionError, MasterKeyUnavailable)):
+            return True
+        seen = seen.__cause__ or seen.__context__
+    return False
 
 
 def main() -> int:
