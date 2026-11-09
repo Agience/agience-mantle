@@ -1397,14 +1397,20 @@ def upsert_user_collection_grant(db: LatticeDatabase, *, user_id: str, collectio
         can_add=can_add, can_share=can_share, can_admin=can_admin,
     )
     if user_grant is not None:
+        # A grant whose name is sealed under another node's key (a copied or restored store, such
+        # as the release candidate's copy of production) reads with no name here, so a difference
+        # cannot be told: its name stays sealed as it is, and only the rights converge. Setting it
+        # would be refused (`to_lattice_doc`), and every converging migration failed on the copy
+        # (2026-11-09: `platform_operators` stopped the release candidate).
+        settable = name is not None and getattr(user_grant, "_node_sealed", None) is None
         changed = any(getattr(user_grant, k) != v for k, v in new_flags.items())
-        if name is not None:
+        if settable:
             changed = changed or (user_grant.name != name)
         if not changed:
             return user_grant, False
         for k, v in new_flags.items():
             setattr(user_grant, k, v)
-        if name is not None:
+        if settable:
             user_grant.name = name
         #: NO `or user_grant` FALLBACK. `update_grant` has one
         #: `return entity` and `GrantEntity` defines neither `__bool__` nor `__len__`, so the
