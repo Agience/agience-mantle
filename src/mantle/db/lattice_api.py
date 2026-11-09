@@ -1397,12 +1397,15 @@ def upsert_user_collection_grant(db: LatticeDatabase, *, user_id: str, collectio
         can_add=can_add, can_share=can_share, can_admin=can_admin,
     )
     if user_grant is not None:
-        # A grant whose name is sealed under another node's key (a copied or restored store, such
-        # as the release candidate's copy of production) reads with no name here, so a difference
-        # cannot be told: its name stays sealed as it is, and only the rights converge. Setting it
-        # would be refused (`to_lattice_doc`), and every converging migration failed on the copy
-        # (2026-11-09: `platform_operators` stopped the release candidate).
-        settable = name is not None and getattr(user_grant, "_node_sealed", None) is None
+        # The release candidate (`AGIENCE_PLANE=rc`) runs on a copy of production's store under a
+        # key of its own, so every name production sealed reads as none there and a difference
+        # cannot be told: on that plane alone the name stays sealed as it is and only the rights
+        # converge (2026-11-09: `platform_operators` stopped the release candidate). Anywhere else
+        # a seal that will not open is a fault (a corrupt row, a rotation gone wrong), and the
+        # write still fails on it (`to_lattice_doc` refuses to overwrite what it cannot open).
+        unopened = getattr(user_grant, "_node_sealed", None) is not None
+        on_copy = (os.getenv("AGIENCE_PLANE") or "").strip().lower() == "rc"
+        settable = name is not None and not (unopened and on_copy)
         changed = any(getattr(user_grant, k) != v for k, v in new_flags.items())
         if settable:
             changed = changed or (user_grant.name != name)

@@ -8,7 +8,7 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 ## [0.1.11] - 2026-11-08
 
 ### Fixed
-- `upsert_user_collection_grant` leaves a name sealed under another node's key as it is and converges only the rights. On a copied or restored store such a name reads as none, so the upsert saw a difference that was not there, set the name, and the write was refused: the `platform_operators` migration failed on the release candidate's copy of production.
+- On the release candidate (`AGIENCE_PLANE=rc`), `upsert_user_collection_grant` leaves a grant name that will not open as it is and converges only the rights. The candidate runs on a copy of production's store under a key of its own, so every name production sealed reads as none there: the upsert saw a difference that was not there, set the name, and the write was refused, failing the `platform_operators` migration. On any other plane a seal that will not open is a fault, and the write still fails on it.
 - The test guard over the install-root store installs one audit hook per process; a later install adds its recorder to it. Under pytest-xdist, each worker's `sitecustomize` installed the guard before `conftest.py`, and the first hook refused before the second could record, so the detector test failed under `-n 4`.
 - The detector test probes the store at its exact path everywhere, and spelled in another case only where the filesystem folds case. On Linux the upper-cased path names a different file, which the guard rightly lets through, so the test failed there.
 
