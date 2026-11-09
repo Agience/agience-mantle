@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 
 logger = logging.getLogger("seal_titles")
@@ -331,7 +332,22 @@ def main() -> int:
         counts = seal_stored_titles(db, dry_run=args.dry_run)
         counts.update(seal_stored_labels(db, dry_run=args.dry_run))
         logger.info("%s: %s", "would seal" if args.dry_run else "sealed", counts)
-    return 1 if counts.get("denied") else 0
+    return exit_code(counts)
+
+
+def exit_code(counts: dict) -> int:
+    """1 when a title could not be opened, which on a node that holds its own keys is a fault. The
+    release candidate (`AGIENCE_PLANE=rc`) runs on a copy of production's store with keys of its
+    own and no custody, so it can open none of production's sealed titles: there the pass reports
+    what it could not open and succeeds (2026-11-09: the RC's rehearsal of `--unseal` failed on 612
+    titles it was never meant to read)."""
+    if not counts.get("denied"):
+        return 0
+    if (os.getenv("AGIENCE_PLANE") or "").strip().lower() == "rc":
+        logger.info("release candidate: %d sealed under keys it does not hold, left as they are",
+                    counts["denied"])
+        return 0
+    return 1
 
 
 if __name__ == "__main__":
