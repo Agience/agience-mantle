@@ -17,16 +17,22 @@ def test_the_defaults_resolve_under_the_test_base():
 
 def test_the_detector_sees_an_open_under_the_install_root_store():
     """An audit event for a path under `.data/` is recorded (raised here without opening
-    anything), and one under the test base is not."""
+    anything), and one under the test base is not. Where the filesystem folds case (Windows),
+    the store spelled in another case is the store and is refused too; on a case-sensitive
+    filesystem that spelling names a different path, so only the exact spelling is the store."""
     data, base, touched = sys._mantle_install_data
     before = len(touched)
     sys.audit("open", os.path.join(base, ".data", "x.db"), "r", 0)
     assert len(touched) == before
     import pytest
-    with pytest.raises(PermissionError):      # refused in place, in any process
-        sys.audit("open", os.path.join(data.upper(), "mantle-lattice.db"), "r", 0)
+    spellings = [data]
+    if os.path.normcase(data.upper()) == os.path.normcase(data):
+        spellings.append(data.upper())
     try:
-        assert len(touched) == before + 1     # and recorded, compared case-insensitively
+        for spelling in spellings:
+            with pytest.raises(PermissionError):      # refused in place, in any process
+                sys.audit("open", os.path.join(spelling, "mantle-lattice.db"), "r", 0)
+        assert len(touched) == before + len(spellings)   # and each one recorded
     finally:
         del touched[before:]                  # the probe itself is no violation
 

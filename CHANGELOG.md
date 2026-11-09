@@ -9,6 +9,7 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ### Fixed
 - The test guard over the install-root store installs one audit hook per process; a later install adds its recorder to it. Under pytest-xdist, each worker's `sitecustomize` installed the guard before `conftest.py`, and the first hook refused before the second could record, so the detector test failed under `-n 4`.
+- The detector test probes the store at its exact path everywhere, and spelled in another case only where the filesystem folds case. On Linux the upper-cased path names a different file, which the guard rightly lets through, so the test failed there.
 
 ### Fixed (local check, 2026-11-08)
 - Mantle no longer loads or deletes `KEYS_DIR/setup.token` at startup. The token is Origin's, and a single-host install shares one `KEYS_DIR`, so Origin keeps it until setup completes.
