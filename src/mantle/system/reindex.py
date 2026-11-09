@@ -91,15 +91,20 @@ def reindex_as_owners(db) -> dict:
 
     class _Refusals(logging.Handler):
         """The indexer reports a refused write as a failed arm and logs the exception; this reads
-        that exception's type, so a key refusal is told from a fault."""
+        that exception's type, so a key refusal, and a body this node cannot read, are told from a
+        fault. 2026-11-09, the release candidate (no object store, by design): three type
+        definitions failed its reindex because the indexer logged `ContentStoreUnavailable`, which
+        raised directly is already `unreadable`."""
         def __init__(self):
             super().__init__(logging.WARNING)
-            self.refused = self.other = False
+            self.refused = self.unreadable = self.other = False
 
         def emit(self, record):
             exc = record.exc_info[1] if record.exc_info else None
             if isinstance(exc, KeyCustodyDenied):
                 self.refused = True
+            elif isinstance(exc, (SealError, ContentDecryptionError, ContentStoreUnavailable)):
+                self.unreadable = True
             elif exc is not None:
                 self.other = True
 
@@ -126,7 +131,11 @@ def reindex_as_owners(db) -> dict:
         finally:
             pipeline_log.removeHandler(watch)
         if outcome.failed:
-            return "denied" if watch.refused and not watch.other else "failed"
+            if watch.other:
+                return "failed"
+            if watch.refused:
+                return "denied"
+            return "unreadable" if watch.unreadable else "failed"
         return "skipped" if outcome.wrote_nothing else "indexed"
 
     for raw in db.artifacts.list_artifacts():

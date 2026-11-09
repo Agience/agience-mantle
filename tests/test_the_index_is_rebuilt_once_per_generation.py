@@ -134,3 +134,49 @@ def test_a_refused_index_write_is_denied_and_any_other_fault_fails(monkeypatch, 
     # 2026-10-31, a tester's old note was missed by a pass that reported no failure, and nothing
     # said which artifacts it had not indexed. The pass names each one with its reason.
     assert counts["not_indexed"] == [{"id": "a1", "reason": counted}], counts
+
+
+# 2026-11-09, the release candidate (no object store, by design): three type definitions failed
+# its reindex because the indexer logged `ContentStoreUnavailable` beside a grant refusal. A body
+# this node cannot read is `unreadable` whether raised or logged; any other fault still fails.
+@pytest.mark.parametrize("logged, counted", [
+    (("grant", "store"), "denied"),
+    (("store",), "unreadable"),
+    (("grant", "fault"), "failed"),
+    (("store", "fault"), "failed"),
+])
+def test_a_logged_unreadable_body_is_not_a_failure(monkeypatch, logged, counted):
+    import logging
+    from mantle.db import lattice_api
+    from mantle.search.ingest import pipeline_unified as pu
+    from mantle.search.mantle.oracle import GrantDenied
+    from mantle.services.content_service import ContentStoreUnavailable
+
+    made = {"grant": lambda: GrantDenied("no read grant"),
+            "store": lambda: ContentStoreUnavailable("not in this node's local content tier"),
+            "fault": lambda: RuntimeError("disk")}
+
+    class Db:
+        class artifacts:
+            @staticmethod
+            def list_artifacts():
+                return iter([{"id": "t1", "created_by": "s1", "origin_root": None}])
+
+            @staticmethod
+            def get_artifact(_id):
+                return None
+
+    def index_artifact(artifact, collection_id, is_head=True):
+        for kind in logged:
+            try:
+                raise made[kind]()
+            except Exception:
+                logging.getLogger("mantle.search.ingest.pipeline_unified").warning(
+                    "SSE indexing failed", exc_info=True)
+        return pu.IndexOutcome(sse=pu.ARM_FAILED, vector="skipped")
+
+    monkeypatch.setattr(lattice_api, "from_lattice_doc", lambda raw, cls: type("A", (), {"collection_id": "c", "id": "t1"})())
+    monkeypatch.setattr(pu, "is_indexable", lambda a: True)
+    monkeypatch.setattr(pu, "index_artifact", index_artifact)
+    counts = reindex.reindex_as_owners(Db)
+    assert counts[counted] == 1 and counts["indexed"] == 0, counts
