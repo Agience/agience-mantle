@@ -229,7 +229,19 @@ def main() -> int:
     config.set_settings_provider(platform_settings.get)
     config.load_settings_from_db()
     with system_acting_context(scope="platform.operators-seed"):
-        if not ensure_platform_operators(db):
+        try:
+            provisioned = ensure_platform_operators(db)
+        except Exception as exc:
+            # The release candidate cannot seal under a collection key production wrapped
+            # (2026-11-09, release 2026.11.2: the operators' collection itself); there the
+            # convergence is left as production has it. On any other plane it is a fault.
+            if (os.getenv("AGIENCE_PLANE") or "").strip().lower() == "rc" and _is_unsealable_here(exc):
+                logger.info("release candidate: the operators' collection is sealed under a key it "
+                            "does not hold; left as production has it")
+                provisioned = True
+            else:
+                raise
+        if not provisioned:
             logger.error("platform operators could not be provisioned")
             return 1
         counts = grant_to_every_account(db)
