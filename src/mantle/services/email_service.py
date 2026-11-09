@@ -119,18 +119,36 @@ async def send_email(to: str, subject: str, html_body: str, text: str) -> bool:
         return False
 
 
+#: The longest personal message an invite carries, in characters. The route refuses a longer one.
+MESSAGE_LIMIT = 500
+
+
 def invite_message(from_name: str, resource_name: str, claim_url: str,
-                   message: Optional[str] = None) -> tuple[str, str, str]:
-    """`(subject, html, text)` of an invitation. Every caller-supplied value is escaped."""
-    subject = f"{from_name} invited you to {resource_name} on Agience"
-    note = (message or "").strip()
-    text = (f"{from_name} invited you to {resource_name} on Agience.\n"
+                   message: Optional[str] = None, *, from_email: str) -> tuple[str, str, str]:
+    """`(subject, html, text)` of an invitation from `from_name` at `from_email`, their verified
+    address.
+
+    The personal message, the sender's name and the resource's name are text the inviter chose, so
+    each is defanged (`services/defang`) in every part, subject included, and the HTML escapes
+    everything: the one link the mail carries is `claim_url`, and its one anchor is the claim
+    link's. The sender's address is defanged too, so the invitee reads it and no client links it.
+    """
+    from mantle.services.defang import defang
+
+    def one_line(value: Optional[str], fallback: str) -> str:
+        return defang(" ".join(str(value or "").split()) or fallback)
+
+    sender = f"{one_line(from_name, 'Someone')} ({defang(from_email)})"
+    what = one_line(resource_name, "a workspace")
+    note = defang((message or "").strip())
+    subject = f"{sender} invited you to {what} on Agience"
+    text = (f"{sender} invited you to {what} on Agience.\n"
             + (f'\n"{note}"\n' if note else "")
             + f"\nOpen this link to accept:\n{claim_url}\n\n"
             "If you do not have an account yet, you can create one when you open the link. "
             "If you were not expecting this, you can ignore it.\n")
     e = html.escape
-    body = (f"<p>{e(from_name)} invited you to <strong>{e(resource_name)}</strong> on Agience.</p>"
+    body = (f"<p>{e(sender)} invited you to <strong>{e(what)}</strong> on Agience.</p>"
             + (f"<blockquote>{e(note)}</blockquote>" if note else "")
             + f'<p><a href="{e(claim_url, quote=True)}">Accept the invitation</a></p>'
             + f"<p>Or open this link: {e(claim_url)}</p>"
@@ -139,6 +157,7 @@ def invite_message(from_name: str, resource_name: str, claim_url: str,
 
 
 async def send_invite(to: str, from_name: str, resource_name: str, claim_url: str,
-                      message: Optional[str] = None) -> bool:
-    subject, html_body, text = invite_message(from_name, resource_name, claim_url, message)
+                      message: Optional[str] = None, *, from_email: str) -> bool:
+    subject, html_body, text = invite_message(from_name, resource_name, claim_url, message,
+                                              from_email=from_email)
     return await send_email(to, subject, html_body, text)

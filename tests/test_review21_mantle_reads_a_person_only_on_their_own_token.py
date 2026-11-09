@@ -65,14 +65,16 @@ def test_the_invite_mail_asks_origin_nothing_without_the_inviter_s_token(origin,
 
     sent = []
 
-    async def _send(target, from_name, resource, url, message):
+    async def _send(target, from_name, resource, url, message, *, from_email):
         sent.append(from_name)
         return True
 
     monkeypatch.setattr(email_service, "send_invite", _send)
-    assert grant_service.send_invite_email(None, SUBJECT, "res-1", "t@x.test", "tok", None)
+    assert grant_service.send_invite_email(None, SUBJECT, "res-1", "t@x.test", "tok", None,
+                                           from_email="a@x.test")
     assert origin.seen == [] and sent == ["Someone"]
     with acting_as(SUBJECT, principal_type="user", credential=ForwardedCredential(OWN)):
-        grant_service.send_invite_email(None, SUBJECT, "res-1", "t@x.test", "tok", None)
+        grant_service.send_invite_email(None, SUBJECT, "res-1", "t@x.test", "tok", None,
+                                        from_email="a@x.test")
     assert sent[-1] == "A Person"
     assert origin.seen[-1]["headers"][SUBJECT_TOKEN_HEADER] == OWN

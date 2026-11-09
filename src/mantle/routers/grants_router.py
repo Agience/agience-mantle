@@ -136,12 +136,37 @@ class CreateGrantRequest(CountsUnknownFields):
     expires_at: Optional[str] = None
     state: str = "active"
     role: Optional[str] = None
-    message: Optional[str] = None
+    #: No `max_length` here: a model limit answers 422 before the handler runs, and the limit is
+    #: refused 400 naming it (`_require_message_within_limit`).
+    message: Optional[str] = Field(None, description=(
+        "A personal note for the invite mail, at most 500 characters. It arrives as plain text: "
+        "anything in it shaped like a link is rewritten so no mail client links it."))
 
 
 # =============================================================================
 # Helpers
 # =============================================================================
+
+def _verified_sender(auth: AuthContext) -> str:
+    """The address an invite mail names its sender by: the caller's, if their issuer verified it.
+
+    An invite reaches a stranger's inbox, and the invitee decides whether to trust it by who sent
+    it; an address the sender merely typed would let anyone sign as anyone. Refused 403 before
+    anything is recorded or mailed."""
+    email = (auth.email or "").strip()
+    if not (email and auth.email_verified):
+        raise HTTPException(status_code=403, detail="verify your email address first: an invite "
+                            "names its sender by their verified address")
+    return email
+
+
+def _require_message_within_limit(message: Optional[str]) -> None:
+    """Refuse 400 an invite's personal message longer than `email_service.MESSAGE_LIMIT`."""
+    from mantle.services.email_service import MESSAGE_LIMIT
+    if message is not None and len(message) > MESSAGE_LIMIT:
+        raise HTTPException(status_code=400, detail=f"an invite's message is at most "
+                            f"{MESSAGE_LIMIT} characters; this one has {len(message)}")
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -523,7 +548,7 @@ async def my_access_endpoint(
 
 @router.post("", status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(authority_changes_are_made_at_origin)],
-    responses=_errors(400, 401, ok=GrantWithClaimResponse, ok_code=201),
+    responses=_errors(400, 401, 403, ok=GrantWithClaimResponse, ok_code=201),
 )
 async def create_grant_endpoint(
     body: CreateGrantRequest,
@@ -546,6 +571,8 @@ async def create_grant_endpoint(
 
     if body.grantee_type == GrantEntity.GRANTEE_INVITE:
         await offload_sync(_require_share_or_admin, auth, body.resource_id, store_db)
+        from_email = _verified_sender(auth)
+        _require_message_within_limit(body.message)
         from mantle.services import grant_service
 
         target_email = None
@@ -571,7 +598,7 @@ async def create_grant_endpoint(
 
         email_sent = bool(target_email) and await offload_sync(
             grant_service.send_invite_email, store_db, auth.user_id, body.resource_id,
-            target_email, raw_token, body.message)
+            target_email, raw_token, body.message, from_email=from_email)
         response = _grant_response(created)
         response["claim_token"] = raw_token
         response["claim_url"] = grant_service.build_claim_url(raw_token)
@@ -967,7 +994,7 @@ async def revoke_grant(
 
 
 @router.post("/{grant_id}/resend",
-    responses=_errors(401, 404, 410, ok=GrantWithClaimResponse),
+    responses=_errors(401, 403, 404, 410, ok=GrantWithClaimResponse),
 )
 async def resend_invite(
     grant_id: Annotated[str, Path(description=_GRANT_PARAM)],
@@ -992,6 +1019,7 @@ async def resend_invite(
             await offload_sync(_require_admin, auth, grant.resource_id, store_db)
         except HTTPException:
             raise HTTPException(status_code=404, detail="Invite not found")
+    from_email = _verified_sender(auth)
     try:
         raw_token = await offload_sync(grant_service.reissue_invite, store_db, grant)
     except InviteExhausted as exc:
@@ -999,7 +1027,7 @@ async def resend_invite(
     target = grant.target_entity if (grant.target_entity_type or "").lower() == "email" else None
     email_sent = bool(target) and await offload_sync(
         grant_service.send_invite_email, store_db, auth.user_id, grant.resource_id,
-        target, raw_token, None)
+        target, raw_token, None, from_email=from_email)
     response = _grant_response(grant)
     response["claim_token"] = raw_token
     response["claim_url"] = grant_service.build_claim_url(raw_token)

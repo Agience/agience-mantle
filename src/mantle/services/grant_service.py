@@ -321,10 +321,11 @@ def build_claim_url(raw_token: str) -> str:
     return f"{str(_BASE).rstrip('/')}/invite/{raw_token}"
 
 
-def send_invite_email(db, user_id, resource_id, target_email, raw_token, message) -> bool:
-    """Mail the invitation (`services/email_service`), from *user_id*. False when mail is not
-    configured or the send failed; the invite stands either way, and its claim link is in the
-    response."""
+def send_invite_email(db, user_id, resource_id, target_email, raw_token, message, *,
+                      from_email: str) -> bool:
+    """Mail the invitation (`services/email_service`), from *user_id* at *from_email*, the
+    address their issuer verified, which the mail names. False when mail is not configured or the
+    send failed; the invite stands either way, and its claim link is in the response."""
     from mantle.services import email_service
     from mantle.services.person_service import get_user_by_id, own_subject_token
     try:
@@ -339,7 +340,8 @@ def send_invite_email(db, user_id, resource_id, target_email, raw_token, message
     claim_url = build_claim_url(raw_token)
     try:
         return _run_async(email_service.send_invite(target_email, from_name,
-                                                    _resource_name(db, resource_id), claim_url, message))
+                                                    _resource_name(db, resource_id), claim_url,
+                                                    message, from_email=from_email))
     except Exception as exc:
         logger.warning("send_invite email delivery failed: %s", exc)
         return False

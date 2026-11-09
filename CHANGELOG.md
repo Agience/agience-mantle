@@ -5,6 +5,13 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-11-09
+
+### Security
+- An invite mail carries one link, its claim link. The personal message, the inviter's display name and the resource's name are defanged in the subject, text and HTML (`services/defang.py`, the same rules as Origin's and the website's lead mail): URLs, markdown links, HTML anchors, bare domains, Unicode and punycode hosts and IPv4 addresses arrive as readable text no mail client links, and the HTML escapes everything. On 2026-11-09 an account sent a real Agience invite with phishing text in its message.
+- An invite's personal message is at most 500 characters; a longer one is refused 400 naming the limit, before anything is recorded or mailed.
+- The mail names its sender and their verified address ("Name (address) invited you to …"). Creating or resending an invite without an address the issuer verified (`email_verified`) is refused 403 before anything is recorded or mailed.
+
 ## [0.1.11] - 2026-11-08
 
 ### Fixed

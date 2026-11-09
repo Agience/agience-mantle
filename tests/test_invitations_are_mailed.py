@@ -40,11 +40,12 @@ def test_mail_is_configured_only_with_a_provider_and_its_settings(monkeypatch):
 
 def test_an_invitation_names_the_inviter_and_resource_and_escapes_them(outbox):
     ok = asyncio.run(email_service.send_invite(
-        "invitee@example.invalid", "Ann <b>", "Q4 <plans>", "https://my.agience.ai/invite/tok", "see <you>"))
+        "invitee@example.invalid", "Ann <b>", "Q4 <plans>", "https://my.agience.ai/invite/tok", "see <you>",
+        from_email="ann@example.invalid"))
     assert ok
     (mail,) = _mails(outbox)
     assert mail["to"] == "invitee@example.invalid"
-    assert mail["subject"] == "Ann <b> invited you to Q4 <plans> on Agience"
+    assert mail["subject"] == "Ann <b> (ann@example[.]invalid) invited you to Q4 <plans> on Agience"
     assert "https://my.agience.ai/invite/tok" in mail["text"]
     assert "<b>" not in mail["html"] and "&lt;plans&gt;" in mail["html"] and "&lt;you&gt;" in mail["html"]
 
@@ -60,9 +61,10 @@ def test_the_invite_path_mails_the_claim_link_to_the_hosted_app(outbox, monkeypa
     monkeypatch.setattr(grant_service, "_resource_name", lambda db, rid: "Shared Plans")
     monkeypatch.setattr("mantle.config.FACET_URI", "https://my.agience.ai")
 
-    sent = grant_service.send_invite_email(None, "u-1", "ws-9", "invitee@example.invalid", "tok123", None)
+    sent = grant_service.send_invite_email(None, "u-1", "ws-9", "invitee@example.invalid", "tok123", None,
+                                           from_email="ann@example.invalid")
 
     assert sent is True
     (mail,) = _mails(outbox)
-    assert mail["subject"] == "Ann invited you to Shared Plans on Agience"
+    assert mail["subject"] == "Ann (ann@example[.]invalid) invited you to Shared Plans on Agience"
     assert "https://my.agience.ai/invite/tok123" in mail["text"]

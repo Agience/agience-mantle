@@ -41,7 +41,9 @@ def _mails(folder):
 
 
 def _auth(user):
-    return AuthContext(principal_id=user, principal_type="user", user_id=user)
+    # An invite names its sender by their verified address, so the inviter has one.
+    return AuthContext(principal_id=user, principal_type="user", user_id=user,
+                       email=f"{user}@example.invalid", email_verified=True)
 
 
 async def _invite(db, home):
