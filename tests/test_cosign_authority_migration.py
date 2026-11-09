@@ -119,3 +119,29 @@ def test_a_member_with_two_creation_edges_goes_with_one(db):
 def test_the_cli_needs_the_bootstrap_credential_unless_it_is_a_dry_run():
     with pytest.raises(SystemExit):
         ca.main([])
+
+
+def test_a_malformed_row_is_counted_by_reason_and_the_run_goes_on(db):
+    """2026-11-09, the RC's seed rehearsal: production holds a grant with no grantee, which Origin
+    refuses as malformed (400). It reaches no one; the run counts it and states the rest. Any other
+    refusal still stops the run."""
+    from mantle.clients.origin_key_share_client import AuthorityRefused
+
+    class Picky(FakeOrigin):
+        def submit_entry(self, entry, **kw):
+            if entry.get("grant_id") == "g1":
+                raise AuthorityRefused(400, "grantee_id must be a non-empty string of at most 128")
+            return super().submit_entry(entry, **kw)
+
+    origin = Picky()
+    counts = ca.cosign(db, origin, "b")
+    assert counts["malformed"] == 1 and counts["malformed_by_kind"]["grants"] == 1
+    assert counts["malformed_by_reason"] == {"grantee_id must be a non-empty string of at most 128": 1}
+    assert counts["appended"] == 4
+
+    class Refusing(FakeOrigin):
+        def submit_entry(self, entry, **kw):
+            raise AuthorityRefused(403, "an id the ledger already holds")
+
+    with pytest.raises(AuthorityRefused):
+        ca.cosign(db, Refusing(), "b")

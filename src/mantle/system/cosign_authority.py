@@ -30,6 +30,9 @@ only for ids the operator listed when opening the window, so a run is told which
 ids the pending entries touch, for Origin to filter and list (`origin.scripts.authority_bootstrap
 --unseen`, then `--ids-stdin`).
 
+A row Origin refuses as malformed (400: a grant with no grantee, an id longer than Origin keeps)
+reaches no one; it is counted by reason and the run goes on. Any other refusal stops the run.
+
 Idempotent: Origin answers an entry already in its replica `unchanged`, with that entry's receipt,
 and appends nothing. Run it again after any interruption.
 
@@ -153,18 +156,32 @@ def cosign(db, custodian, bootstrap_credential: str, only: Optional[set] = None)
     """Submit the pending entries as bootstrap entries and keep the receipts; with `only`, just
     the entries whose ids are all in it. Returns the counts. Stops at the first refusal, naming
     it: a partial replica is safe to extend by running again."""
+    from mantle.clients.origin_key_share_client import AuthorityRefused
     from mantle.services.authority_ledger import receipt_of
 
     p = pending(db)
     counts = {"edges": 0, "roots": 0, "grants": 0, "appended": 0, "unchanged": 0,
-              "secondary": p["secondary"], "held": p["held"], "left_out": 0}
+              "secondary": p["secondary"], "held": p["held"], "left_out": 0, "malformed": 0,
+              "malformed_by_reason": {}, "malformed_by_kind": {"edges": 0, "roots": 0, "grants": 0}}
     for group in ("edges", "roots", "grants"):
         for entry in p[group]:
             if only is not None and not set(entry_ids(entry)) <= only:
                 counts["left_out"] += 1
                 continue
-            answer = custodian.submit_entry(entry, credential=bootstrap_credential,
-                                            bootstrap=True)
+            try:
+                answer = custodian.submit_entry(entry, credential=bootstrap_credential,
+                                                bootstrap=True)
+            except AuthorityRefused as exc:
+                # A malformed row (a grant with no grantee, an id past Origin's length) is refused
+                # as a 400 and reaches no one: it is counted by reason and the run goes on. Any
+                # other refusal is Origin's authority speaking, and stops the run.
+                if exc.status != 400:
+                    raise
+                counts["malformed"] += 1
+                reason = str(exc.detail)[:120]
+                counts["malformed_by_reason"][reason] = counts["malformed_by_reason"].get(reason, 0) + 1
+                counts["malformed_by_kind"][group] += 1
+                continue
             outcome = answer.get("outcome") or "appended"
             counts[outcome] = counts.get(outcome, 0) + 1
             counts[group] += 1
@@ -245,7 +262,11 @@ def main(argv=None) -> int:
     print(f"co-signed {counts['edges']} edge(s), {counts['roots']} root(s), {counts['grants']} "
           f"grant(s): {counts['appended']} appended, {counts['unchanged']} already held; "
           f"{counts['secondary']} extra creation edge(s) as secondary containment; "
-          f"{counts['held']} co-signed before, {counts['left_out']} touching ids Origin has seen")
+          f"{counts['held']} co-signed before, {counts['left_out']} touching ids Origin has seen; "
+          f"malformed, refused: {counts['malformed_by_kind']['edges']} edge(s), "
+          f"{counts['malformed_by_kind']['roots']} root(s), {counts['malformed_by_kind']['grants']} grant(s)")
+    for reason, n in sorted(counts["malformed_by_reason"].items()):
+        print(f"malformed: {n} x {reason}")
     return 0
 
 
