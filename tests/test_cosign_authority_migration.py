@@ -81,11 +81,26 @@ def test_receipts_are_kept_beside_the_rows(db):
     assert la._prop_mask(edge) == ["read"]                         # the row is untouched
 
 
-def test_a_second_run_appends_nothing(db):
+def test_a_second_run_sends_nothing_origin_co_signed(db):
+    """Each receipt kept says Origin co-signed that row: an edge or grant with one is not stated
+    again. A key root keeps no receipt; Origin answers it `unchanged`."""
     origin = FakeOrigin()
     ca.cosign(db, origin, "bootstrap-token")
+    origin.calls.clear()
     counts = ca.cosign(db, origin, "bootstrap-token")
-    assert counts["appended"] == 0 and counts["unchanged"] == 5
+    assert [k for k, _, _ in origin.calls] == ["root"]
+    assert counts["held"] == 4 and counts["appended"] == 0 and counts["unchanged"] == 1
+
+
+def test_the_pending_ids_are_what_origin_filters_and_only_those_are_stated(db):
+    """Once Origin has ordinary entries it accepts a bootstrap only for ids it has not seen and
+    the window lists: the run states only entries all of whose ids it was given."""
+    assert ca.pending_ids(db) == ["C", "W", "card", "g1", "g2"]
+    origin = FakeOrigin()
+    counts = ca.cosign(db, origin, "b", only={"W", "C", "g1"})
+    sent = sorted(k for k, _, _ in origin.calls)
+    assert sent == ["edge.add", "grant", "root"]             # W->C, g1 on W, W's root
+    assert counts["left_out"] == 2                           # C->card (card is not given), g2
 
 
 def test_a_member_with_two_creation_edges_goes_with_one(db):

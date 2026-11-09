@@ -22,11 +22,20 @@ A member with more than one creation edge (written by a move before the store ke
 edge per member) is submitted with the one `get_origin_parent` reads as its creation edge, and the
 others as secondary containment, which conducts nothing upward. The pass reports how many.
 
+Only what Origin has not co-signed goes: an edge or grant whose receipt the store already keeps
+(written when the change was journaled, or by an earlier run) is left out (`pending`). Once
+changes are journaled as they happen, Origin accepts a bootstrap only for ids it has not seen, and
+only for ids the operator listed when opening the window, so a run is told which ids it may state
+(`--ids-stdin`, one id per line): an entry touching any other id is left out. `--ids` prints the
+ids the pending entries touch, for Origin to filter and list (`origin.scripts.authority_bootstrap
+--unseen`, then `--ids-stdin`).
+
 Idempotent: Origin answers an entry already in its replica `unchanged`, with that entry's receipt,
 and appends nothing. Run it again after any interruption.
 
     python -m mantle.system.cosign_authority --dry-run
-    python -m mantle.system.cosign_authority --bootstrap-token-file /path/bootstrap.token
+    python -m mantle.system.cosign_authority --ids                 # the pending entries' ids
+    python -m mantle.system.cosign_authority --bootstrap-token-file /path/bootstrap.token [--ids-stdin]
 
 The bootstrap credential is read from the file (or `MANTLE_BOOTSTRAP_CREDENTIAL_FILE`), used for
 this run only, and never written anywhere. `--dry-run` counts what would be submitted and sends
@@ -103,6 +112,35 @@ def plan(db) -> dict:
     return {"edges": edges, "roots": roots, "grants": grants, "secondary": extra}
 
 
+def entry_ids(entry: dict) -> list:
+    """The ids an entry states, as Origin reads them (`authority_ledger._entry_ids`)."""
+    if entry["kind"] == "grant":
+        return [entry["grant_id"], entry["resource_id"]]
+    if entry["kind"] in ("edge.add", "edge.remove"):
+        return [entry["src"], entry["dst"]]
+    return [entry["principal_id"]]
+
+
+def pending(db, p: Optional[dict] = None) -> dict:
+    """The plan without the edges and grants whose receipt the store keeps: Origin co-signed
+    those already. A key root keeps no receipt, so every root stays; Origin's filter of the ids
+    it has seen decides those."""
+    from mantle.db import reach_journal
+
+    p = p or plan(db)
+    conn = db.graph.db.read()
+    held = {g: [e for e in p[g] if reach_journal.receipt_of_row(conn, _key(e))] for g in ("edges", "grants")}
+    out = {g: [e for e in p[g] if e not in held.get(g, [])] for g in ("edges", "roots", "grants")}
+    out["secondary"] = p["secondary"]
+    out["held"] = sum(len(v) for v in held.values())
+    return out
+
+
+def pending_ids(db) -> list:
+    p = pending(db)
+    return sorted({i for g in ("edges", "roots", "grants") for e in p[g] for i in entry_ids(e)})
+
+
 def _key(entry: dict) -> str:
     if entry["kind"] == "grant":
         return f"grant:{entry['grant_id']}"
@@ -111,16 +149,20 @@ def _key(entry: dict) -> str:
     return f"edge:{entry['src']} {entry['dst']}"
 
 
-def cosign(db, custodian, bootstrap_credential: str) -> dict:
-    """Submit the plan as bootstrap entries and keep the receipts. Returns the counts. Stops at
-    the first refusal, naming it: a partial replica is safe to extend by running again."""
+def cosign(db, custodian, bootstrap_credential: str, only: Optional[set] = None) -> dict:
+    """Submit the pending entries as bootstrap entries and keep the receipts; with `only`, just
+    the entries whose ids are all in it. Returns the counts. Stops at the first refusal, naming
+    it: a partial replica is safe to extend by running again."""
     from mantle.services.authority_ledger import receipt_of
 
-    p = plan(db)
+    p = pending(db)
     counts = {"edges": 0, "roots": 0, "grants": 0, "appended": 0, "unchanged": 0,
-              "secondary": p["secondary"]}
+              "secondary": p["secondary"], "held": p["held"], "left_out": 0}
     for group in ("edges", "roots", "grants"):
         for entry in p[group]:
+            if only is not None and not set(entry_ids(entry)) <= only:
+                counts["left_out"] += 1
+                continue
             answer = custodian.submit_entry(entry, credential=bootstrap_credential,
                                             bootstrap=True)
             outcome = answer.get("outcome") or "appended"
@@ -142,6 +184,9 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--ids", action="store_true", help="print the ids the pending entries touch")
+    ap.add_argument("--ids-stdin", action="store_true",
+                    help="state only entries whose ids are all among those on stdin, one per line")
     ap.add_argument("--bootstrap-token-file",
                     default=os.getenv("MANTLE_BOOTSTRAP_CREDENTIAL_FILE", ""),
                     help="the bootstrap credential the operator obtained at Origin")
@@ -150,7 +195,7 @@ def main(argv=None) -> int:
                         datefmt="%H:%M:%S")
 
     credential = ""
-    if not args.dry_run:
+    if not args.dry_run and not args.ids:
         if not args.bootstrap_token_file:
             ap.error("the bootstrap credential is required: --bootstrap-token-file or "
                      "MANTLE_BOOTSTRAP_CREDENTIAL_FILE (POST /oracle/authority-ledger/bootstrap "
@@ -168,18 +213,24 @@ def main(argv=None) -> int:
     from mantle.services.dependencies import get_store_db
 
     db = next(get_store_db())
+    if args.ids:
+        for i in pending_ids(db):
+            print(i)
+        return 0
     if args.dry_run:
         p = plan(db)
+        left = pending(db, p)
         print(f"would co-sign {len(p['edges'])} containment edge(s), {len(p['roots'])} key "
               f"root(s) and {len(p['grants'])} grant(s) at Origin; {p['secondary']} extra "
-              f"creation edge(s) go as secondary containment")
+              f"creation edge(s) go as secondary containment; {left['held']} already co-signed")
         return 0
+    only = {ln.strip() for ln in sys.stdin if ln.strip()} if args.ids_stdin else None
 
     from mantle.clients.origin_key_share_client import OriginShareCustodian
 
     custodian = OriginShareCustodian()
     try:
-        counts = cosign(db, custodian, credential)
+        counts = cosign(db, custodian, credential, only)
     except Exception as exc:  # noqa: BLE001 — reported by name; a rerun resumes
         logger.error("co-signing stopped: %s. Nothing already co-signed is lost; run again "
                      "with a new bootstrap credential.", exc)
@@ -193,7 +244,8 @@ def main(argv=None) -> int:
                            "lapses at its expiry", exc_info=True)
     print(f"co-signed {counts['edges']} edge(s), {counts['roots']} root(s), {counts['grants']} "
           f"grant(s): {counts['appended']} appended, {counts['unchanged']} already held; "
-          f"{counts['secondary']} extra creation edge(s) as secondary containment")
+          f"{counts['secondary']} extra creation edge(s) as secondary containment; "
+          f"{counts['held']} co-signed before, {counts['left_out']} touching ids Origin has seen")
     return 0
 
 
