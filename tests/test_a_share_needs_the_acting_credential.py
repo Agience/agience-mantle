@@ -325,3 +325,21 @@ def test_an_answer_over_the_cap_is_refused_on_every_call(monkeypatch):
         transport=httpx.MockTransport(lambda r: httpx.Response(
             200, json={"x": 2, "y": "AA==", "kcv": "k"}))))
     assert small.get_share("p", credential="tok")["x"] == 2
+
+
+def test_an_answer_the_edge_compressed_is_read_once_decoded(monkeypatch):
+    """2026-11-09: production reaches Origin through the edge, which gzips its answers; the bounded
+    read decoded the body and kept `Content-Encoding: gzip`, so every compressed answer was decoded
+    twice and failed as `DecodingError` (the ledger seed, and live journaling). The RC, on
+    loopback and uncompressed, never showed it."""
+    import gzip
+
+    from mantle.clients import origin_key_share_client as oc
+
+    monkeypatch.setattr(oc.peer_signing, "sign_service_jwt", lambda **_k: "svc")
+    answer = json.dumps({"x": 2, "y": "AA==", "kcv": "k", "pad": "a" * 2000}).encode()
+    c = oc.OriginShareCustodian("http://origin.test", client=httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(
+            200, content=gzip.compress(answer),
+            headers={"Content-Encoding": "gzip", "Content-Type": "application/json"}))))
+    assert c.get_share("p", credential="tok")["x"] == 2

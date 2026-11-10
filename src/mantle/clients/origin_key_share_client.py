@@ -106,11 +106,17 @@ class _Bounded:
             if declared and declared.isdigit() and int(declared) > MAX_ANSWER_BYTES:
                 raise CustodianUnavailable(f"Origin's answer is too large ({declared} bytes)")
             body = bytearray()
-            for chunk in resp.iter_bytes():
+            for chunk in resp.iter_bytes():       # decoded: the bound is on what is parsed
                 body.extend(chunk)
                 if len(body) > MAX_ANSWER_BYTES:
                     raise CustodianUnavailable("Origin's answer is too large")
-            return httpx.Response(resp.status_code, headers=resp.headers, content=bytes(body),
+            # The body is already decoded, so the answer carries no encoding of its own: kept, a
+            # gzip `Content-Encoding` had it decoded twice (2026-11-09: every answer the edge
+            # compressed failed as `DecodingError`, the ledger seed included; loopback, uncompressed,
+            # never showed it).
+            headers = [(k, v) for k, v in resp.headers.multi_items()
+                       if k.lower() not in ("content-encoding", "content-length", "transfer-encoding")]
+            return httpx.Response(resp.status_code, headers=headers, content=bytes(body),
                                   request=resp.request)
 
     def get(self, url: str, **kwargs) -> httpx.Response:

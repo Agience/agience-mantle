@@ -7,6 +7,11 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [0.1.11] - 2026-11-09
 
+### Fixed
+- Every call to Origin reads its answer once decoded. The bounded read (`origin_key_share_client._Bounded`) decoded the body and kept the answer's `Content-Encoding`, so an answer the edge had gzipped was decoded a second time and failed as `DecodingError`. Production reaches Origin through the edge: the authority-ledger seed of release 2026.11.4 stopped at its first entry, and live journaling lost entries the same way. On loopback, uncompressed, it never showed.
+
+## [0.1.11] - 2026-11-09
+
 ### Changed
 - `python -m mantle.system.cosign_authority` states only what Origin has not co-signed: an edge or grant whose receipt the store keeps is left out. `--ids` prints the ids the pending entries touch, and `--ids-stdin` states only entries whose ids are all on stdin. Accounts made since their authority is journaled put ids in Origin's replica, and Origin refuses a bootstrap that restates one; the seed now asks Origin which ids it has not seen and states those. The dry run also counts what is already co-signed.
 - `cosign_authority` counts a row Origin refuses as malformed (400: a grant with no grantee, an id longer than Origin keeps) by kind and by reason, and goes on; such a row reaches no one. Any other refusal still stops the run.
