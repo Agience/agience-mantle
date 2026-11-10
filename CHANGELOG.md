@@ -10,6 +10,7 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 ### Changed
 - `python -m mantle.system.cosign_authority` states only what Origin has not co-signed: an edge or grant whose receipt the store keeps is left out. `--ids` prints the ids the pending entries touch, and `--ids-stdin` states only entries whose ids are all on stdin. Accounts made since their authority is journaled put ids in Origin's replica, and Origin refuses a bootstrap that restates one; the seed now asks Origin which ids it has not seen and states those. The dry run also counts what is already co-signed.
 - `cosign_authority` counts a row Origin refuses as malformed (400: a grant with no grantee, an id longer than Origin keeps) by kind and by reason, and goes on; such a row reaches no one. Any other refusal still stops the run.
+- `cosign_authority` names by kind what it left out as touching ids Origin has seen (`left out, touching ids Origin has seen: <e> edge(s), <r> root(s), <g> grant(s)`).
 
 ## [0.1.11] - 2026-11-09
 

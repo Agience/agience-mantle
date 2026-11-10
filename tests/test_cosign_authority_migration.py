@@ -101,6 +101,7 @@ def test_the_pending_ids_are_what_origin_filters_and_only_those_are_stated(db):
     sent = sorted(k for k, _, _ in origin.calls)
     assert sent == ["edge.add", "grant", "root"]             # W->C, g1 on W, W's root
     assert counts["left_out"] == 2                           # C->card (card is not given), g2
+    assert counts["left_out_by_kind"] == {"edges": 1, "roots": 0, "grants": 1}
 
 
 def test_a_member_with_two_creation_edges_goes_with_one(db):

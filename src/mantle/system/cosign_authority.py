@@ -162,11 +162,12 @@ def cosign(db, custodian, bootstrap_credential: str, only: Optional[set] = None)
     p = pending(db)
     counts = {"edges": 0, "roots": 0, "grants": 0, "appended": 0, "unchanged": 0,
               "secondary": p["secondary"], "held": p["held"], "left_out": 0, "malformed": 0,
-              "malformed_by_reason": {}, "malformed_by_kind": {"edges": 0, "roots": 0, "grants": 0}}
+              "left_out_by_kind": {"edges": 0, "roots": 0, "grants": 0}, "malformed_by_reason": {}, "malformed_by_kind": {"edges": 0, "roots": 0, "grants": 0}}
     for group in ("edges", "roots", "grants"):
         for entry in p[group]:
             if only is not None and not set(entry_ids(entry)) <= only:
                 counts["left_out"] += 1
+                counts["left_out_by_kind"][group] += 1
                 continue
             try:
                 answer = custodian.submit_entry(entry, credential=bootstrap_credential,
@@ -262,7 +263,9 @@ def main(argv=None) -> int:
     print(f"co-signed {counts['edges']} edge(s), {counts['roots']} root(s), {counts['grants']} "
           f"grant(s): {counts['appended']} appended, {counts['unchanged']} already held; "
           f"{counts['secondary']} extra creation edge(s) as secondary containment; "
-          f"{counts['held']} co-signed before, {counts['left_out']} touching ids Origin has seen; "
+          f"{counts['held']} co-signed before; "
+          f"left out, touching ids Origin has seen: {counts['left_out_by_kind']['edges']} edge(s), "
+          f"{counts['left_out_by_kind']['roots']} root(s), {counts['left_out_by_kind']['grants']} grant(s); "
           f"malformed, refused: {counts['malformed_by_kind']['edges']} edge(s), "
           f"{counts['malformed_by_kind']['roots']} root(s), {counts['malformed_by_kind']['grants']} grant(s)")
     for reason, n in sorted(counts["malformed_by_reason"].items()):
