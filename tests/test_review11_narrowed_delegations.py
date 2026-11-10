@@ -60,7 +60,7 @@ def test_a_persona_narrowed_delegation_reaches_only_the_operators_verdict():
     """It reaches no content and no write. It does reach the platform operators' verdict, which
     Crystal's operator gate asks with it before every persona tool call: refused, every persona
     tool call answered 503 on production (2026-11-10)."""
-    for name in ("iris", "lumen", "sage", "crystal"):
+    for name in ("aria", "astra", "iris", "lumen", "ophan", "sage", "seraph", "crystal"):
         a = _auth(name, f"persona:{name}")
         assert D.is_narrowed(a)
         assert _reach(a, "GET", "/artifacts/platform-operators"), name
@@ -181,3 +181,13 @@ def test_the_memory_collection_is_never_made_on_a_narrowed_delegation(monkeypatc
     with acting_as("alice", principal_type="user"):
         up._ensure_ember_memory(object(), "alice")
     assert made == [derive_artifact_id("alice", "ember:memory")]
+
+
+def test_seraph_s_own_delegation_reads_and_writes_nothing():
+    """FR-006 (John, 2026-11-10): Seraph's archive goes through the person, not its own delegation."""
+    server = _auth("agience-server-seraph", None, act="agience-server-seraph")
+    server.narrowed = True
+    assert _reach(server, "GET", "/artifacts/abc") and _reach(server, "GET", "/artifacts/abc/children")
+    for m, p in [("PATCH", "/artifacts/abc"), ("POST", "/artifacts"), ("DELETE", "/artifacts/abc"),
+                 ("POST", "/artifacts/abc/op/archive")]:
+        assert not _reach(server, m, p), (m, p)

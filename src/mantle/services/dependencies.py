@@ -466,7 +466,7 @@ EMBER_MEMORY_CONTENT_TYPES = ("text/markdown", "text/plain")
 #: The narrow audiences Origin's token exchange issues (`NARROW_AUDIENCES` there): Ember and the
 #: persona servers (review 11, H3). `MANTLE_NARROW_AUDIENCES` (comma-separated, or a JSON list)
 #: names them here.
-DEFAULT_NARROW_AUDIENCES = ("ember", "iris", "lumen", "sage", "crystal")
+DEFAULT_NARROW_AUDIENCES = ("ember", "aria", "astra", "iris", "lumen", "ophan", "sage", "seraph", "crystal")
 
 _ID = r"(?!visible$|trash$|platform-operators$|recall$|batch$)[^/]+"
 #: What each narrowed scope reaches, as explicit (method, route) allowlists (review 9, M7). A
@@ -484,9 +484,13 @@ NARROWED_SCOPE_ROUTES = {
     "ember:memory": (("POST", re.compile(r"^/artifacts/?$")),),
     # Ember's read check is a verdict, never content (review 10): Ember opens no person's key.
     "ember:read": (("GET", re.compile(r"^/grants/my-access/?$")),),
+    "persona:aria": (_PLATFORM_OPERATORS,),
+    "persona:astra": (_PLATFORM_OPERATORS,),
     "persona:iris": (_PLATFORM_OPERATORS,),
     "persona:lumen": (_PLATFORM_OPERATORS,),
+    "persona:ophan": (_PLATFORM_OPERATORS,),
     "persona:sage": (_PLATFORM_OPERATORS,),
+    "persona:seraph": (_PLATFORM_OPERATORS,),
     "persona:crystal": (_PLATFORM_OPERATORS,),
 }
 
@@ -508,6 +512,14 @@ NARROWED_SERVER_ROUTES = {
     "lumen": (_GET_ID, _GET_CHILDREN, _VISIBLE, _OPERATORS, _MY_ACCESS, _CREATE, _USE, _OP,
               ("POST", re.compile(r"^/artifacts/batch/?$"))),
     "sage": (_GET_ID, _VISIBLE, _RECALL, _CREATE, _USE),
+    # FR-006 (John, 2026-11-10): the app calls these directly. Aria and Ophan call nothing on Mantle
+    # of their own and Astra none on a person's behalf: the operators' verdict alone. Seraph reads
+    # (an artifact, a container's children); its archive goes through the person, never its own
+    # delegation: no write.
+    "aria": (_OPERATORS,),
+    "astra": (_OPERATORS,),
+    "ophan": (_OPERATORS,),
+    "seraph": (_GET_ID, _GET_CHILDREN, _OPERATORS),
     "crystal": (_GET_ID, _GET_CHILDREN, _GET_CONTENT, _VISIBLE, _OPERATORS, _MY_ACCESS, _CREATE,
                 _RECALL, _OP, ("GET", re.compile(r"^/type-definitions/[^/]+/?$")),
                 ("GET", re.compile(r"^/status/?$"))),

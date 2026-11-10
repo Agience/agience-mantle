@@ -5,6 +5,11 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-11-10
+
+### Changed
+- The personas the app now calls directly (FR-006) are narrow audiences here too (`DEFAULT_NARROW_AUDIENCES`): each `persona:<name>` scope reaches the platform operators' verdict alone. A persona's own server delegation reaches what its code calls: Aria, Astra and Ophan the operators' verdict, Seraph an artifact and a container's children. Seraph's archive is the person's, never its own delegation's: no write (John, 2026-11-10).
+
 ## [0.1.14] - 2026-11-10
 
 ### Added
