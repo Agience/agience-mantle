@@ -5,6 +5,11 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-11-10
+
+### Changed
+- Beacon's head count (`derive_heads`) is capped by the geometry, `n_features // 2`, as context's is, in place of a stated ceiling of 64. A narrower head block has a cosine carrying only a sign. The `lo` and `hi` arguments are gone. No caller passed them.
+
 ## [0.1.17] - 2026-11-10
 
 ### Changed

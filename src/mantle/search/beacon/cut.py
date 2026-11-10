@@ -10,7 +10,7 @@
 # white-label pilot, a different tree and a different arrangement. This module
 # holds the screen math; the consumer's glue (the embeddings, the RAG pipeline,
 # the retrieval policy) stays on its own side. `tests/test_beacon_cut.py` verifies
-# the two agree function by function.
+# the two agree function by function, apart from the repairs recorded there.
 # ---------------------------------------------------------------------------
 
 """The cut — beacon's silhouette: which of a candidate pool belong together, and where the set
@@ -23,8 +23,9 @@ stops.
     the aperture (AGPL)             prediction — lag, delay embedding, the fitted propagator.
 
 The cut is held bit-equal to the implementation it reproduces, over a shared corpus of inputs
-(`tests/test_beacon_cut.py`), against an oracle kept verbatim and never allowed to call this
-module.
+(`tests/test_beacon_cut.py`), against an oracle that never calls this module. The oracle is the
+source verbatim except for the repairs recorded beside it (`gap_split`, `top_break` and the
+`derive_heads` ceiling), each with what it moves.
 
 Public surface
 --------------
@@ -63,10 +64,8 @@ geometry it comes from, and the ones that are still typed say so in those words.
     `lo = _MIN_HEADS`     floor on the head count       derived — the engine's own readability
                           (`derive_heads`)              gate, seen from the head axis. Lands on
                                                         2. See `_smallest_readable_head_count`.
-    `hi = 64`             ceiling on the head count     stated, not derived, and it binds. See
-                                                        `derive_heads` — measured, and the
-                                                        derivation that would replace it does not
-                                                        reproduce, so it is not applied.
+    `n_features // 2`     ceiling on the head count     derived — the geometry: a narrower head
+                          (`derive_heads`)              block has a cosine carrying only a sign.
     `_UNIT_NORM_FLOOR`    1e-9, added to every norm     stated, not derived. A typed guard
                           before dividing               against dividing by a zero-length vector.
     `_RATIO_FLOOR`        1e-12, clip on the gap        stated, not derived. A typed guard on
@@ -369,12 +368,9 @@ def head_screen(item_embs, query_emb, heads: int) -> np.ndarray:
     item — the last by `argsort` — so the adaptive cut collapses to keeping one arbitrary candidate
     rather than reporting that it has nothing to read.
 
-    This is reachable through `derive_heads` whenever `n_features < lo … hi`, i.e. for any embedding
-    narrower than the derived head count. Every embedding model in the live pilot is 384–1536 wide,
-    so it is not reachable there today. It is stated here, and asserted in
-    `tests/test_beacon_cut.py`, because the arithmetic is reproduced exactly from the implementation
-    this module came from, and a defect reproduced exactly is still a defect: repairing it would
-    change what a live pilot produces and is its own deliberate act.
+    It is not reachable through `derive_heads`, whose ceiling is `n_features // 2`. A caller who
+    passes `heads` directly can still reach it, and `tests/test_beacon_cut.py` asserts the
+    all-zero screen.
     """
     E = np.asarray(item_embs, dtype=np.float64)
     q = np.asarray(query_emb, dtype=np.float64)
@@ -405,7 +401,7 @@ def signal_power(W) -> np.ndarray:
     return ((U[:, sig] * S[sig]) ** 2).sum(1)
 
 
-def derive_heads(item_embs, lo: int = _MIN_HEADS, hi: int = 64) -> int:
+def derive_heads(item_embs) -> int:
     """The head count, derived from the candidate set's own effective rank: `H = round(occupancy·N)`.
 
     `engine.occupancy_fraction` is `2^{H_sv} / N` — the active-mode count of the singular spectrum
@@ -413,46 +409,31 @@ def derive_heads(item_embs, lo: int = _MIN_HEADS, hi: int = 64) -> int:
     modes the set actually occupies. The screen is then cut into that many blocks: as many heads as
     the data has independent things to say. Nothing is picked.
 
-    `lo` and `hi` are not the same kind of number, and only one of them is still typed. Both
-    produce exactly the values the implementation this reproduces shipped with, and both are
-    measured here rather than defended:
+    Both bounds are derived, and both match `entroptics_context.cut.derive_heads` exactly
+    (`tests/test_conformance_mantle.py` in that repo pins it).
 
-    `lo = _MIN_HEADS` is a floor, and it is derived: `_smallest_readable_head_count()`, the fewest
-    heads at which `signal_power`'s own read can be taken at all, recovered by asking the engine's
-    readability gate rather than restating it. It lands on 2. It binds on small pools — over 280
-    draws (d ∈ 64…1536, n ∈ 2…400) the raw count falls below it in 77 of them, every one at
-    `n <= 5` and never at `n >= 8`. What it buys is the screen's own premise: at `H = 1` there is
-    one block, `head_screen` collapses to a single global cosine column, and the engine gives no
-    reading while `signal_power` still returns a number.
+    The floor is `_MIN_HEADS`: `_smallest_readable_head_count()`, the fewest heads at which
+    `signal_power`'s own read can be taken at all, recovered by asking the engine's readability
+    gate rather than restating it. It lands on 2. It binds on small pools — over 280 draws
+    (d ∈ 64…1536, n ∈ 2…400) the raw count falls below it in 77 of them, every one at `n <= 5` and
+    never at `n >= 8`. At `H = 1` there is one block, `head_screen` collapses to a single global
+    cosine column, and the engine gives no reading while `signal_power` still returns a number.
 
-    `hi = 64` is a ceiling, and it binds, and where it binds it decides. On near-isotropic candidate
-    sets (no coherent structure) the raw count is ~0.93·N, so the ceiling bites from `n ≈ 70`
-    upward — 12/12 draws at n=80, 12/12 at n=100, for every width from 64 to 1536. On structured
-    retrieval-shaped sets it does not bind at all: the raw count at the pilot's default horizon of
-    80 is 17–19, nowhere near 64. So it binds exactly in the regime where the set has no structure
-    for the screen to read — but it is still a typed number changing a derived one, and calling
-    that a "search bound" would be wrong.
-
-    The derivation that would replace `hi`: the only ceiling the arithmetic itself requires is
-    `H <= n_features`, below which `head_screen`'s block width goes to zero and the screen is all
-    zeros (see `head_screen`). That bound is derived — it is the geometry, not a preference — and
-    it is looser than 64 for every embedding width in use, so it would move the head count on
-    exactly the isotropic sets where 64 binds today. It does not reproduce the values the
-    implementation this module came from shipped with, so it is reported here rather than applied.
+    The ceiling is `n_features // 2`, the geometry: a head block narrower than two coordinates has
+    a "cosine" carrying only a sign, and past `n_features` the block width is zero and the screen
+    all zeros (see `head_screen`). On structured retrieval-shaped sets at the pilot's horizon of 80
+    the raw count is 17–19 and the ceiling does not bind. On near-isotropic sets the raw count is
+    about 0.93·N and the ceiling binds only past `N ≈ n_features / 2`. F1 is flat across ceilings
+    from 16 to 192 on the same pools, so no stated ceiling is needed to hold the answer.
     """
+    lo = _MIN_HEADS
     E = np.asarray(item_embs, dtype=np.float64)
     if E.ndim != 2 or min(E.shape) < 2:
         return lo
+    ceiling = max(lo, int(E.shape[1]) // 2)
     En = E / (np.linalg.norm(E, axis=1, keepdims=True) + _UNIT_NORM_FLOOR)
     heads = round(float(occupancy_fraction(En)) * E.shape[0])     # occupancy · N = 2^{H_sv}
-    # A tighter cap of `min(hi, n_features)` produces the identical head count at every embedding
-    # width the pilot uses (384/768/1024/1536, N = 8…400), because `hi` already exceeds
-    # `n_features` down to width 64 (see `head_screen`'s degeneracy note). It is not applied here
-    # because `test_every_moved_function_is_bit_identical_to_the_body_it_came_from` checks this
-    # function against the consumer's un-capped body and disagrees at narrow widths — 176 of 7100
-    # comparisons. That bit-equality is the provenance guarantee for a function moved rather than
-    # rewritten, so the tighter cap belongs in the consumer's body first.
-    return int(max(lo, min(hi, heads)))
+    return int(max(lo, min(ceiling, heads)))
 
 
 def select(item_embs, query_emb, heads: Optional[int] = None) -> np.ndarray:

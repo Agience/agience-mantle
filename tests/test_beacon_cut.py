@@ -5,7 +5,7 @@
 where it is Apache-2.0 and public, rather than in the downstream consumer's trade-secret
 `adaptive_beacon.py` (a third-party white-label pilot). The giveaway holds only if what is given
 away answers identically to what the pilot runs, so every moved function is held bit-equal to an
-oracle kept verbatim in this file.
+oracle in this file: the source body, apart from three recorded repairs.
 
 The sections, in order:
 
@@ -18,13 +18,14 @@ The sections, in order:
   3. Absence stays absence. An empty or single-candidate input produces a computed null, never a
      plausible number in its place.
   4. The measured degeneracy. Pins `heads > n_features`, a real defect reproduced deliberately
-     rather than repaired, because repairing it would move a live pilot's answers. Two other
-     defects in the same file carry repairs — see the oracle header — and section 4a pins the
-     delta between the pre-repair bodies, kept in this file, and the ones in use.
+     rather than repaired at `head_screen`, which a caller can still reach by passing `heads`.
+     Three bodies carry repairs (`gap_split`, `top_break`, and the `derive_heads` ceiling) —
+     see the oracle header — and section 4a pins the delta between the pre-repair bodies, kept
+     in this file, and the ones in use.
   5. The dependency floor. beacon acquires no edge to `beam` or `prism` through `cut`.
 
-What these checks cannot show: the oracle is a verbatim copy of the source implementation, so
-agreement proves the move was faithful. It does not prove either is correct on a real corpus — a
+What these checks cannot show: the oracle is the source implementation with its recorded repairs,
+so agreement proves the move was faithful to it. It does not prove either is correct on a real corpus — a
 copy and its original can be wrong together. Ground-truth checks are section 2's job, and they are
 weaker than the parity sweep.
 
@@ -50,9 +51,9 @@ from mantle.search.beacon.engine import _tw1_core, occupancy_fraction, signal_ra
 # 0 · The oracle — the source bodies, verbatim, never calling the module they check
 # ═════════════════════════════════════════════════════════════════════════════════════════════
 # These are not refactored and do not call `cut` — an oracle that calls the thing it checks proves
-# only that a function equals itself. They are `backend/semantic/adaptive_beacon.py`, with exactly
-# two mechanical substitutions, both renames that happened inside mantle and neither of which
-# touches arithmetic:
+# only that a function equals itself. They are `backend/semantic/adaptive_beacon.py`, with the
+# repairs recorded below (`gap_split`, `top_break`, `derive_heads`) and two mechanical
+# substitutions, both renames that happened inside mantle and neither of which touches arithmetic:
 #
 #     _engine.resolved_rank(M)  ->  int(signal_rank(M))        (same body, same value)
 #     _engine.fill_fraction(M)  ->  occupancy_fraction(M)      (same body, same value)
@@ -191,6 +192,15 @@ def _pre_repair_top_break(scores):
     return keep, rel_gap
 
 
+def _pre_repair_derive_heads(item_embs) -> int:
+    E = np.asarray(item_embs, dtype=np.float64)
+    if E.ndim != 2 or min(E.shape) < 2:
+        return 2
+    En = E / (np.linalg.norm(E, axis=1, keepdims=True) + _ORACLE_NORM_FLOOR)
+    heads = round(float(occupancy_fraction(En)) * E.shape[0])
+    return int(max(2, min(64, heads)))
+
+
 def _o_head_screen(item_embs, query_emb, heads):
     E = np.asarray(item_embs, dtype=np.float64)
     q = np.asarray(query_emb, dtype=np.float64)
@@ -211,13 +221,35 @@ def _o_signal_power(W):
     return ((U[:, sig] * S[sig]) ** 2).sum(1)
 
 
-def _o_derive_heads(item_embs, lo: int = 2, hi: int = 64) -> int:
+# ── `derive_heads` ───────────────────────────────────────────────────────────────────────────
+#
+# This oracle body is maintained here, under the same arrangement as `gap_split` and `top_break`.
+# The source caps the head count at a stated 64. The maintained body caps it at `n_features // 2`,
+# the geometry: a head block narrower than two coordinates has a cosine carrying only a sign. This
+# is the bound `entroptics_context.cut.derive_heads` uses, and that repo's conformance test holds
+# the two equal.
+#
+# What the repair moves, and it is a live pilot's behaviour on these shapes (10 draws per cell):
+#
+#       pool                                   n          heads differ   selection differs
+#       isotropic, d = 384 or 768              50              0/10            0/10
+#       isotropic, d = 384 or 768              80, 120, 200   10/10          9-10/10
+#       four topics, d = 384 or 768            50 to 200       0/10            0/10
+#       12 on-topic + 28 off-topic, d = 32     40             (40 seeds)  on-topic kept 5.0 -> 8.3,
+#                                                                         off-topic kept 1.1 -> 1.6
+#
+# So on structured pools at pilot widths nothing moves. On a pool with no structure the count
+# rises past 64 toward the set's own effective rank, from the pilot's default horizon of 80 up; at
+# a width narrower than twice the raw count the ceiling now holds a block to two coordinates.
+
+def _o_derive_heads(item_embs) -> int:
+    lo = 2
     E = np.asarray(item_embs, dtype=np.float64)
     if E.ndim != 2 or min(E.shape) < 2:
         return lo
     En = E / (np.linalg.norm(E, axis=1, keepdims=True) + _ORACLE_NORM_FLOOR)
     heads = round(float(occupancy_fraction(En)) * E.shape[0])
-    return int(max(lo, min(hi, heads)))
+    return int(max(lo, min(max(lo, E.shape[1] // 2), heads)))
 
 
 def _o_select(item_embs, query_emb, heads=None):
@@ -427,41 +459,32 @@ def test_derive_heads_tracks_the_spectrum_and_is_not_a_constant_in_disguise() ->
     assert cut.derive_heads(np.ones((1, 8))) == 2, "a degenerate shape must fall to `lo`"
 
 
-def test_the_head_count_bounds_are_stated_not_derived_and_the_ceiling_BINDS() -> None:
-    """The two numbers in `derive_heads` that are not derived, pinned with their measurement so
-    neither is mistaken for a compute bound: `lo=2, hi=64` might look like a search bound that
-    does not change the answer inside its range, but one of them does.
+def test_both_head_count_bounds_are_derived_and_the_width_ceiling_binds() -> None:
+    """The floor is the engine's readability gate and the ceiling is `n_features // 2`; neither is
+    typed. Each is pinned where it binds, so a stated number put back in either place shows.
 
-      `lo`      is derived (`_smallest_readable_head_count`) and recovers exactly the `2` the
-                source shipped with. It binds only at `n <= 5` (77 of 280 draws, d ∈ 64…1536),
-                never at `n >= 8`. See the dedicated test below for the pinned oracle.
-      `hi = 64` binds and decides. On near-isotropic sets the raw count is ~0.93·N, so it bites
-                from n ≈ 70 upward (12/12 draws at n = 80). On structured retrieval sets at the
-                pilot's default horizon of 80 the raw count is 17–19 and it never binds. The
-                derivation that would replace it is `H <= n_features` (below which the screen is
-                all-zero); that does not reproduce, so it is reported here rather than landed."""
+      floor     `_MIN_HEADS`, recovered from the gate; binds where the raw count rounds below 2.
+      ceiling   `n_features // 2`; binds on an isotropic set whose raw count is about 0.93·N,
+                once N passes half the width. At n = 80, d = 512 the raw count is ~74 and below
+                the ceiling of 256; at n = 80, d = 64 it is clamped to 32."""
     rng = np.random.default_rng(20260805)
-    # `lo` binds where the raw count falls below it — a set whose energy is one direction, so
-    # `occupancy · N` rounds to 1 — and it clamps upward.
     one_direction = np.repeat(rng.normal(size=(1, 64)), 5, axis=0) + 1e-9 * rng.normal(size=(5, 64))
     En_one = one_direction / (np.linalg.norm(one_direction, axis=1, keepdims=True)
                               + cut._UNIT_NORM_FLOOR)
     assert round(float(occupancy_fraction(En_one)) * 5) < 2, (
         "the fixture stopped being one-directional; this test can only pin the floor on a set "
         "whose raw count falls below it")
-    assert cut.derive_heads(one_direction) == 2
-    assert cut.derive_heads(one_direction, lo=5) == 5, "the floor is not the floor; `lo` was ignored"
-    # `hi` binds on an isotropic set at n = 80, and it is the ceiling that decides.
+    assert cut.derive_heads(one_direction) == cut._MIN_HEADS
+
     iso = rng.normal(size=(80, 512))
     En = iso / (np.linalg.norm(iso, axis=1, keepdims=True) + cut._UNIT_NORM_FLOOR)
     raw = round(float(occupancy_fraction(En)) * 80)
-    assert raw > 64, (
-        f"the fixture stopped being isotropic (raw={raw}); this test can only pin the ceiling on a "
-        "set whose raw count exceeds it")
-    assert cut.derive_heads(iso) == 64, "the ceiling did not bind where it was measured to bind"
-    assert cut.derive_heads(iso, hi=128) == raw, (
-        "raising the ceiling did not release the derived count, so 64 is not merely clamping — "
-        "something else is deciding")
+    assert 64 < raw <= 256, f"the fixture stopped being isotropic (raw={raw})"
+    assert cut.derive_heads(iso) == raw, "a ceiling below the width's half clamped the count"
+
+    narrow = rng.normal(size=(80, 64))
+    assert cut.derive_heads(narrow) == 32, "the width ceiling did not bind where the geometry does"
+    assert cut.head_screen(narrow, rng.normal(size=64), cut.derive_heads(narrow)).any()
 
 
 #: The value the pilot shipped with, kept as a pinned oracle. `derive_heads`'s floor is recovered
@@ -497,9 +520,6 @@ def test_the_derived_head_floor_recovers_the_value_the_pilot_shipped_with() -> N
         "one head below the floor is still readable, so the floor is not ON the gate — it was "
         "typed, or the gate moved without it")
 
-    # And it is genuinely the default, not decoration.
-    import inspect
-    assert inspect.signature(cut.derive_heads).parameters["lo"].default == cut._MIN_HEADS
 
 
 def test_the_two_typed_floors_are_named_and_are_load_bearing() -> None:
@@ -606,10 +626,8 @@ def test_more_heads_than_features_yields_an_all_zero_screen_and_keeps_one_item()
     `argsort`. So the adaptive cut silently collapses to keeping one arbitrary candidate rather
     than reporting that it has no cut to make.
 
-    Reachable through `derive_heads` for any embedding narrower than the derived head count. Every
-    model in the live pilot is 384–1536 wide, so it is not reachable there. Repairing it —
-    reporting no reading, or bounding `H <= n_features` — would change what that pilot produces, so
-    it is a separate deliberate act.
+    Not reachable through `derive_heads`, whose ceiling is `n_features // 2`; a caller passing
+    `heads` directly still reaches it. Making `head_screen` itself refuse is a separate repair.
 
     This test passes on the defect so it is not forgotten, and fails the day somebody repairs it —
     at which point this test moves in the same commit and the repair is explained rather than
@@ -657,6 +675,27 @@ def test_the_repair_is_what_changed_and_nothing_else() -> None:
         a = np.array(spectrum, dtype=np.float64)
         assert int(_pre_repair_top_break(a)[0].sum()) == before, (spectrum, "before")
         assert int(cut.top_break(a)[0].sum()) == after, (spectrum, "after")
+
+
+def test_the_head_ceiling_repair_moves_only_unstructured_pools_and_narrow_widths() -> None:
+    """The `derive_heads` before-and-after, on the cells of the oracle header's table.
+
+    A structured pool keeps its head count at pilot widths. An isotropic pool past the old 64
+    takes its own effective rank, and a narrow width is held to two coordinates a block."""
+    rng = np.random.default_rng(20261110)
+    for d in (384, 768):
+        for n in (50, 80, 120, 200):
+            centres = rng.normal(size=(4, d))
+            topics = centres[rng.integers(0, 4, n)] + 0.3 * rng.normal(size=(n, d))
+            assert cut.derive_heads(topics) == _pre_repair_derive_heads(topics), (d, n, "topics")
+            iso = rng.normal(size=(n, d))
+            before, after = _pre_repair_derive_heads(iso), cut.derive_heads(iso)
+            if n <= 64:
+                assert after == before, (d, n, "isotropic below 64")
+            else:
+                assert before == 64 and after > 64, (d, n, before, after)
+    narrow = rng.normal(size=(80, 32))
+    assert _pre_repair_derive_heads(narrow) > 16 and cut.derive_heads(narrow) == 16
 
 
 def test_the_repair_reaches_about_one_in_twenty_real_spectra_and_only_ever_keeps_MORE() -> None:

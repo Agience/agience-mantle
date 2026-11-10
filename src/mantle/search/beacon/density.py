@@ -58,7 +58,7 @@ __all__ = ["shannon_bits", "dense_windows", "dense_excerpt"]
 #: `dense_windows`' window size, in `chunking.chunk_text`'s cl100k-token units (its
 #: own 3/4 words-per-token derivation puts this at ~15 words). Stated, not derived —
 #: this is a measurement-scale choice (how fine a grain the cut reads at), not an
-#: output decision, the same status `cut.py`'s `hi = 64` carries: typed, and it binds.
+#: output decision: typed, and it binds.
 #: A window this narrow is what gives the cut something to discriminate between; the
 #: embedding pipeline's 1000-token default answers a different question (how much
 #: text one vector should summarize) and would return a single window here, on which
