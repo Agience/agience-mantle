@@ -77,6 +77,7 @@ from mantle.services.dependencies import (
     AuthContext,
     check_access,
     check_inbound_nonce,
+    job_reach_of,
     offload_sync,
 )
 from mantle.search.field_filters import filterable_field_names as _filterable_field_names
@@ -1838,6 +1839,11 @@ async def _default_create_artifact(
 
     # Top-level: no parent to authorize against; the creator owns it.
     if not parsed.container_id:
+        if job_reach_of(auth) is not None:
+            # A timer's delegation creates only inside what it reaches, where `check_access`
+            # decides: a top-level write has no container to hold it to (John, 2026-11-10).
+            raise HTTPException(status_code=403, detail="a timer's delegation creates only "
+                                "inside the items it was granted")
         derived_id = _derived_identity_id(owner_id, parsed.identity)
 
         # An `identity` that already names an artifact makes this write an UPDATE. That is the
@@ -2633,6 +2639,10 @@ async def update_artifact(
     if not owner_id:
         raise HTTPException(status_code=401, detail="User identification required")
 
+    if body.state is not None and job_reach_of(auth) is not None:
+        # A timer writes what it runs; archiving or restoring is its owner's, never its own.
+        raise HTTPException(status_code=403, detail="a timer's delegation does not archive or "
+                            "restore")
     await offload_sync(check_access, auth, artifact_id, "update", store_db)
 
     doc = await offload_sync(_find_artifact, store_db, artifact_id)

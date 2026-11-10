@@ -5,6 +5,11 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-11-10
+
+### Added
+- A delegation that carries Origin's `job_reach` (a timer's, BUG-024 and BUG-035) reaches only those ids and what they contain, along edges that conduct the action, for create, read, update, invoke and add, and never past what the person holds; and only on routes that name the artifact they touch (`JOB_REACH_ROUTES`). It creates nothing at the top level and archives or restores nothing. A timer's own Lumen delegation may update what it reaches: the timer's state.
+
 ## [0.1.15] - 2026-11-10
 
 ### Fixed

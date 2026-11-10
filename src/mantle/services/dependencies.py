@@ -193,6 +193,11 @@ class AuthContext:
     #: Origin's `narrowed` claim: this delegation, or the persona server delegation exchanged
     #: from one, is narrowed (review 12, H5).
     narrowed: bool = False
+    #: Origin's `job_reach` claim: a timer's delegation, or one exchanged from it, reaches only
+    #: these ids and what they contain (`within_job_reach`), on the routes a timer's work calls
+    #: (`enforce_job_reach_routes`), and never more than the person holds there. None for every
+    #: other credential; an unreadable claim is an empty reach, which reaches nothing.
+    job_reach: Optional[tuple] = None
 
     @property
     def narrowed_audience(self) -> Optional[str]:
@@ -495,6 +500,7 @@ NARROWED_SCOPE_ROUTES = {
 }
 
 _GET_ID = ("GET", re.compile(rf"^/artifacts/{_ID}/?$"))
+_PATCH_ID = ("PATCH", re.compile(rf"^/artifacts/{_ID}/?$"))
 _GET_CHILDREN = ("GET", re.compile(rf"^/artifacts/{_ID}/children/?$"))
 _GET_CONTENT = ("GET", re.compile(rf"^/artifacts/{_ID}/content/?$"))
 _USE = ("POST", re.compile(rf"^/artifacts/{_ID}/use/?$"))
@@ -602,8 +608,12 @@ def enforce_narrowed_bounds(auth: "AuthContext", request: Optional[Request]) -> 
             and aud == str(getattr(auth, "actor", "") or "")):
         persona = aud[len(_SERVER_PREFIX):]
         scopes = (getattr(auth, "scope", None) or "").split()
+        routes = NARROWED_SERVER_ROUTES.get(persona, ())
+        if job_reach_of(auth) is not None:
+            # A timer's own delegation also writes the timer's state, inside its reach.
+            routes = (*routes, *JOB_SERVER_ROUTES.get(persona, ()))
         if (not scopes or f"persona:{persona}" in scopes) and any(
-                method == m and rx.match(path) for m, rx in NARROWED_SERVER_ROUTES.get(persona, ())):
+                method == m and rx.match(path) for m, rx in routes):
             return
     for scope in (getattr(auth, "scope", None) or "").split():
         # A scope counts only for its own audience: `ember:*` for Ember, `persona:<n>` for n.
@@ -655,7 +665,72 @@ def enforce_token_bounds(auth: "AuthContext", request: Optional[Request], *,
     """
     _enforce_token_scope(auth, request)
     enforce_narrowed_bounds(auth, request)
+    enforce_job_reach_routes(auth, request)
     check_inbound_nonce(nonce_source if nonce_source is not None else request, auth)
+
+
+# -- a timer's delegation: its reach (John, 2026-11-10) -------------------------------------------
+
+def job_reach_of(auth: Any) -> Optional[tuple]:
+    """The reach a credential is held to (`AuthContext.job_reach`), or None when it carries none."""
+    reach = getattr(auth, "job_reach", None)
+    return reach if isinstance(reach, tuple) else None
+
+
+def _job_reach_claim(payload: dict) -> Optional[tuple]:
+    """Origin's `job_reach` claim as a tuple of ids, None when the token carries none, and an empty
+    tuple (which reaches nothing) when it carries one that is not a list of ids."""
+    if "job_reach" not in payload:
+        return None
+    raw = payload.get("job_reach")
+    if not isinstance(raw, list) or not all(isinstance(r, str) and r for r in raw):
+        return ()
+    return tuple(raw)
+
+
+#: What a persona's own delegation reaches beyond `NARROWED_SERVER_ROUTES` when it is a timer's
+#: (`job_reach`): Lumen writes the timer's state back. No other Lumen delegation patches.
+JOB_SERVER_ROUTES = {"lumen": (_PATCH_ID,)}
+
+#: What a timer's work calls, each addressed by id or creating inside one, so that every one is
+#: decided by `check_access` against the reach. Listing and search routes, the event stream and
+#: grants are not among them: those answer from the person's whole reach.
+JOB_REACH_ROUTES = (_GET_ID, _PATCH_ID, _GET_CHILDREN, _GET_CONTENT, _CREATE, _USE, _OP,
+                    _OPERATORS, ("POST", re.compile(r"^/artifacts/batch/?$")),
+                    ("GET", re.compile(r"^/type-definitions/[^/]+/?$")))
+
+#: The actions a timer's reach conducts: it reads, writes, adds and runs; it never deletes,
+#: evicts, shares or administers.
+JOB_REACH_ACTIONS = frozenset({"create", "read", "update", "invoke", "add"})
+
+
+def enforce_job_reach_routes(auth: "AuthContext", request: Optional[Request]) -> None:
+    """A timer's delegation reaches only `JOB_REACH_ROUTES`; anything else is 403."""
+    if job_reach_of(auth) is None:
+        return
+    method = (request.method if request is not None else "") or ""
+    path = (request.url.path if request is not None else "") or ""
+    if any(method == m and rx.match(path) for m, rx in JOB_REACH_ROUTES):
+        return
+    logger.warning("refused a timer's delegation on %s %s (principal=%s)", method or "?",
+                   path or "?", auth.principal_id)
+    raise HTTPException(status_code=403, detail="a timer's delegation reaches only the items it "
+                        "was granted")
+
+
+def within_job_reach(store_db: Database, artifact_id: str, action: str, doc: dict,
+                     reach: tuple) -> bool:
+    """Is `artifact_id` one of `reach`, or under one along edges that conduct `action`? The same
+    upward walk `check_access` decides grants by (`origin_chain`), so the reach is a light cone
+    exactly as a grant over those ids would be."""
+    if action not in JOB_REACH_ACTIONS or not reach:
+        return False
+    ids = set(reach)
+    for resource in db_store.origin_chain(store_db, artifact_id, action,
+                                          root_id=doc.get("root_id") or artifact_id):
+        if resource in ids:
+            return True
+    return False
 
 
 def _check_grant_permission(grants: List[GrantEntity], action: str, resource_id: str = None) -> bool:
@@ -904,6 +979,7 @@ def resolve_auth(
                 scope=(str(payload.get("scope")) if payload.get("scope") else None),
                 delegation_aud=_claim_aud_str(payload),
                 narrowed=payload.get("narrowed") is True,
+                job_reach=_job_reach_claim(payload),
             )
 
         # Default: user JWT.
@@ -1313,6 +1389,20 @@ def check_access(
             if grant_is_allow(g) and getattr(g, flag_attr, False):
                 return g
         return None
+
+    # --- A timer's delegation: within its reach, or nothing (John, 2026-11-10) ---
+    #
+    # Decided before the person's grants, and in addition to them: inside the reach the person's
+    # own grants and denies still decide, so the timer never does more than its owner may.
+    reach = job_reach_of(auth)
+    if reach is not None:
+        try:
+            inside = within_job_reach(store_db, artifact_id, action, doc, reach)
+        except db_store.OriginChainUnterminated:
+            inside = False
+        if not inside:
+            _witness("denied", "outside_job_reach")
+            raise HTTPException(status_code=404, detail="Not found")
 
     # --- The light cone, walked upward ---
     #
