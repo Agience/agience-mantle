@@ -8,6 +8,11 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 ## [0.1.11] - 2026-11-09
 
 ### Fixed
+- GitHub CI is green. The full suite installs agience-origin beside agience-prism: two review tests check Mantle's reach against Origin's own replica (`origin.services.authority_reach`) and could not be collected without it. In the base-install job, the store tests that write a grant's sealed fields or a named link are marked as needing the node's data key (agience-prism) and get one where prism is installed; without prism, a grant with a field to seal is refused with the message naming what to install, and a test holds that.
+
+## [0.1.11] - 2026-11-09
+
+### Fixed
 - Every call to Origin reads its answer once decoded. The bounded read (`origin_key_share_client._Bounded`) decoded the body and kept the answer's `Content-Encoding`, so an answer the edge had gzipped was decoded a second time and failed as `DecodingError`. Production reaches Origin through the edge: the authority-ledger seed of release 2026.11.4 stopped at its first entry, and live journaling lost entries the same way. On loopback, uncompressed, it never showed.
 
 ## [0.1.11] - 2026-11-09

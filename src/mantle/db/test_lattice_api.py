@@ -19,6 +19,24 @@ except ImportError:  # mantle dir itself on the path
     from mantle.entities.artifact import Artifact
     from mantle.entities.grant import Grant
 
+try:
+    from prism.trust import key_manager as _key_manager
+except ImportError:
+    _key_manager = None
+
+#: A grant's fields and a link's name are sealed under the node's data key, which comes from
+#: `agience-prism` (`db.node_seal`). The base install, which the `embeddable-surface` job tests,
+#: has no prism: there the store holds no grants and no named links, and says so.
+needs_node_key = pytest.mark.skipif(_key_manager is None, reason="needs the node's data key (agience-prism)")
+
+
+@pytest.fixture(autouse=True)
+def _node_key(monkeypatch):
+    """The node's data key, as a node's startup loads it, wherever prism is installed."""
+    if _key_manager is not None:
+        from cryptography.fernet import Fernet
+        monkeypatch.setattr(_key_manager, "_encryption_key", Fernet.generate_key().decode())
+
 
 @pytest.fixture(autouse=True)
 def _test_master_key(monkeypatch):
@@ -293,6 +311,7 @@ def test_membership_add_last_key_and_remove(db):
     assert len(api.list_collection_artifacts(db, "col-A")) == 1
 
 
+@needs_node_key
 def test_list_collection_artifacts_resolution_and_order(db):
     _mk_collection(db, "col-A")
     # root-X: live in-collection, then a newer legacy draft (the newest live row wins)
@@ -351,6 +370,7 @@ def _grant(gid="g-1", **kw):
     return Grant(**fields)
 
 
+@needs_node_key
 def test_grant_crud_round_trip(db):
     api.create_grant(db, _grant(can_update=True, name="editor grant"))
     g = api.get_grant_by_id(db, "g-1")
@@ -575,6 +595,7 @@ def test_light_cone_propagation_mask(db):
     assert api.list_origin_descendants(db, [], "read") == set()
 
 
+@needs_node_key
 def test_get_edge_and_relationship_target(db):
     api.create_artifact(db, _entity(aid="col-E"))
     api.create_artifact(db, _version("t1", "root-T"))
@@ -669,3 +690,11 @@ def test_a_db_fault_is_not_served_as_no_children(tmp_path):
         api.has_children(db, "parent-1")
     with pytest.raises(sqlite3.OperationalError):
         api.count_children(db, "parent-1")
+
+
+@pytest.mark.skipif(_key_manager is not None, reason="the base install alone: no agience-prism")
+def test_without_the_node_key_a_grant_is_refused_naming_what_to_install(db):
+    """The embedded store without agience-prism seals no grant's fields: a grant with a field to
+    seal (its name) is refused, saying why, rather than stored with that field in the clear."""
+    with pytest.raises(ImportError, match="install agience-prism"):
+        api.create_grant(db, _grant(name="editor grant"))
