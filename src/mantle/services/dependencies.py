@@ -475,14 +475,19 @@ _ID = r"(?!visible$|trash$|platform-operators$|recall$|batch$)[^/]+"
 #: only in the person's own session. A persona's narrowed delegation reaches no Mantle route: a
 #: persona calls Mantle on its own server delegation, which it obtains from Origin for that
 #: narrowed delegation (`persona:<name>` scopes are listed here, empty, so the rule is explicit).
+#: The operators the platform offers, and whether the caller may invoke each: a verdict about the
+#: caller, never content. Crystal's operator gate asks it with the delegation the app sends a persona
+#: (narrowed to that persona, or to Crystal) before every persona tool call (2026-11-10: refused
+#: here, every persona tool call through Crystal answered 503, timers' arm among them).
+_PLATFORM_OPERATORS = ("GET", re.compile(r"^/artifacts/platform-operators/?$"))
 NARROWED_SCOPE_ROUTES = {
     "ember:memory": (("POST", re.compile(r"^/artifacts/?$")),),
     # Ember's read check is a verdict, never content (review 10): Ember opens no person's key.
     "ember:read": (("GET", re.compile(r"^/grants/my-access/?$")),),
-    "persona:iris": (),
-    "persona:lumen": (),
-    "persona:sage": (),
-    "persona:crystal": (),
+    "persona:iris": (_PLATFORM_OPERATORS,),
+    "persona:lumen": (_PLATFORM_OPERATORS,),
+    "persona:sage": (_PLATFORM_OPERATORS,),
+    "persona:crystal": (_PLATFORM_OPERATORS,),
 }
 
 _GET_ID = ("GET", re.compile(rf"^/artifacts/{_ID}/?$"))

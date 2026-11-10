@@ -56,11 +56,20 @@ def test_an_audience_mantle_does_not_know_reaches_nothing():
     assert not _reach(a, "GET", "/artifacts/x") and not _reach(a, "DELETE", "/artifacts/x")
 
 
-def test_a_persona_narrowed_delegation_reaches_no_mantle_route():
+def test_a_persona_narrowed_delegation_reaches_only_the_operators_verdict():
+    """It reaches no content and no write. It does reach the platform operators' verdict, which
+    Crystal's operator gate asks with it before every persona tool call: refused, every persona
+    tool call answered 503 on production (2026-11-10)."""
     for name in ("iris", "lumen", "sage", "crystal"):
         a = _auth(name, f"persona:{name}")
         assert D.is_narrowed(a)
-        assert not _reach(a, "GET", "/artifacts/x"), name
+        assert _reach(a, "GET", "/artifacts/platform-operators"), name
+        for m, p in [("GET", "/artifacts/x"), ("GET", "/artifacts/visible"), ("POST", "/artifacts"),
+                     ("POST", "/artifacts/platform-operators"), ("GET", "/grants/my-access"),
+                     ("POST", "/grants")]:
+            assert not _reach(a, m, p), (name, m, p)
+    # A scope counts only for its own audience: Lumen's scope on a delegation to Sage reaches nothing.
+    assert not _reach(_auth("sage", "persona:lumen"), "GET", "/artifacts/platform-operators")
 
 
 def test_recognised_from_claims_not_from_the_actor_name():

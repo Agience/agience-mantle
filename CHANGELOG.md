@@ -5,6 +5,11 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-11-10
+
+### Fixed
+- Persona tool calls through Crystal work again (BUG-030). Crystal's operator gate asks `GET /artifacts/platform-operators` before every persona tool call, with the delegation the app sends the persona (narrowed to that persona, or to Crystal), and Mantle refused that delegation on every route ("this delegation's scope does not reach this route"); the gate failed closed and every call answered 503, a Timer's arm among them. Each `persona:*` scope now reaches that one read: the verdict of which operators the caller may invoke, never content and no write, as `ember:read` reaches its own verdict.
+
 ## [0.1.12] - 2026-11-09
 
 ### Fixed
