@@ -8,7 +8,7 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 ## [0.1.11] - 2026-11-09
 
 ### Fixed
-- GitHub CI is green. The full suite installs agience-origin beside agience-prism: two review tests check Mantle's reach against Origin's own replica (`origin.services.authority_reach`) and could not be collected without it. In the base-install job, the store tests that write a grant's sealed fields or a named link are marked as needing the node's data key (agience-prism) and get one where prism is installed; without prism, a grant with a field to seal is refused with the message naming what to install, and a test holds that.
+- GitHub CI is green. The full suite installs agience-origin beside agience-prism, as an editable checkout: two review tests check Mantle's reach against Origin's own replica (`origin.services.authority_reach`), and the first-sign-in tests run against a real Origin with its own test helpers (`origin.tests`), which a built wheel leaves out; none could be collected without it. In the base-install job, the store tests that write a grant's sealed fields or a named link are marked as needing the node's data key (agience-prism) and get one where prism is installed; without prism, a grant with a field to seal is refused with the message naming what to install, and a test holds that.
 
 ## [0.1.11] - 2026-11-09
 

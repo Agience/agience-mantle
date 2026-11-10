@@ -49,9 +49,9 @@ jobs:
           # EMPTY token is a hard error ('Input required and not supplied'), which is a worse
           # failure than the Not Found it replaces.
           token: ${{ secrets.WORKSPACE_READ_TOKEN || github.token }}
-      # Origin, for the tests that check Mantle's reach against Origin's own replica
-      # (`tests/test_review28_custody.py`, `tests/test_review29_custody.py` import
-      # `origin.services.authority_reach`). Public, so the job's token reads it.
+      # Origin, for the tests that check Mantle against a real Origin: its replica
+      # (`origin.services.authority_reach`, in the review 28 and 29 tests) and a first sign-in
+      # co-signed there (`origin.tests`). Public, so the job's token reads it.
       - name: Checkout agience-origin
         uses: actions/checkout@v4
         with:
@@ -65,7 +65,9 @@ jobs:
       # wheel in a subprocess and inspects it.
       - run: python -m pip install --upgrade pip setuptools wheel
       - run: python -m pip install ./.prism
-      - run: python -m pip install ./.origin
+      # Editable: tests that run a first sign-in against a real Origin take Origin's own test
+      # helpers (`origin.tests`), which a built wheel leaves out.
+      - run: python -m pip install -e ./.origin
       # `[dev]` does not carry the service stack, and must not: `[dev]` has to install without
       # `[service]` so that
       # `test_beacon_conformance.py` runs for someone who only wants the store. But `tests/conftest.py`
