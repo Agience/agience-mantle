@@ -1965,6 +1965,7 @@ async def _default_create_artifact(
         index=parsed.index,
         vector=vector,
         minted=minted,
+        auth=auth,
     )
     return entity.to_dict()
 

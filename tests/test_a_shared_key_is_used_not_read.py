@@ -38,7 +38,8 @@ LUMEN_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 def _jwk(key, kid):
     from prism.trust import sealing
     n = key.public_key().public_numbers()
-    b = lambda i: sealing._b64(i.to_bytes((i.bit_length() + 7) // 8, "big"))
+    def b(i):
+        return sealing._b64(i.to_bytes((i.bit_length() + 7) // 8, "big"))
     return {"kty": "RSA", "kid": kid, "n": b(n.n), "e": b(n.e)}
 
 

@@ -7,6 +7,10 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [0.1.12] - 2026-11-09
 
+### Fixed
+- A person granted create on a shared workspace creates in the collections it holds (BUG-015). `POST /artifacts` with a `container_id` authorized the caller against a grant on that container alone, so a Collaborator on a shared workspace was refused with a 404 "Workspace not found" creating in its Backlog collection. The create now asks the light cone (`dependencies.check_access`, Create or else Add), as every read and update does; an in-process writer with no caller keeps asking the container's own grant. A reader of the workspace is still refused.
+- Four lint issues in packaging and tests (an unused-placeholder f-string, a joined import, a lambda, an ambiguous name).
+
 ### Added
 - `python -m mantle.system.drop_ungranteed_grants` drops stored grants that name no grantee (archived ones included); `--dry-run` counts them. Such a grant reaches no one, and Origin refuses it as malformed. It runs as a release migration.
 - `cosign_authority` reports, for the grants it left out as touching ids Origin has seen, how many belong to each grantee (`left out: <n> grant(s) to <id>`), so the operator can tell throwaway accounts from people.

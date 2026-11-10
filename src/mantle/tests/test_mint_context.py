@@ -147,7 +147,7 @@ def test_the_module_imports_no_tekton():
     """
     import pathlib
     src = pathlib.Path(mc.__file__).read_text(encoding="utf-8")
-    body = "\n".join(l for l in src.splitlines() if not l.strip().startswith(("#", "*", ">")))
+    body = "\n".join(line for line in src.splitlines() if not line.strip().startswith(("#", "*", ">")))
     for forbidden in ("import astra", "from astra", "import chorus", "from chorus",
                       "import ember", "from ember"):
         assert forbidden not in body, f"mint_context reaches a tekton: {forbidden!r}"

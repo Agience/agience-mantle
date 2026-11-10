@@ -1317,8 +1317,15 @@ def create_workspace_artifact(
     vector=None,
     description: Optional[str] = None,
     minted=None,
+    auth: Any = None,
 ) -> ArtifactEntity:
     """Create an artifact inside a container.
+
+    ``auth``, the caller's (the routes pass it), is authorized on the container through the light
+    cone (`dependencies.check_access`): a grant on the workspace that holds a collection reaches
+    into it, as every read and update does. Without one, an in-process writer, the container's own
+    grant is asked (`get_workspace`). BUG-015, 2026-11-10: a Collaborator on a shared workspace
+    was refused (404 "Workspace not found") creating in the collections it holds.
 
     ``minted`` is the router's mint (`mint_context.Minted`); when given it is the stored context,
     and ``context`` is ignored — the router's mint already holds the writer's keys.
@@ -1342,10 +1349,17 @@ def create_workspace_artifact(
     mass").
     """
     # Create, or Add (fire-and-forget intake: an inbox sender), each standing alone.
-    try:
-        get_workspace(db, user_id, workspace_id, required="create")
-    except HTTPException:
-        get_workspace(db, user_id, workspace_id, required="add")
+    if auth is not None:
+        from mantle.services.dependencies import check_access
+        try:
+            check_access(auth, workspace_id, "create", db)
+        except HTTPException:
+            check_access(auth, workspace_id, "add", db)
+    else:
+        try:
+            get_workspace(db, user_id, workspace_id, required="create")
+        except HTTPException:
+            get_workspace(db, user_id, workspace_id, required="add")
 
     now = _now_iso()
     # ── the FIRST version of a named lineage IS its root ─────────────────────────────────────

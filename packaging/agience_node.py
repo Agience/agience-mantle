@@ -128,9 +128,10 @@ def cmd_version(args: argparse.Namespace) -> int:
     print(f"  python  {sys.version.split()[0]}")
     print(f"  frozen  {getattr(sys, 'frozen', False)}")
     try:
-        import mantle, prism  # noqa: F401
+        import mantle
+        import prism  # noqa: F401
         print(f"  mantle  {Path(mantle.__file__).parent}")
-        print(f"  prism   bundled")
+        print("  prism   bundled")
     except Exception as exc:
         print(f"  ⛔ bundle is incomplete: {exc}")
         return 1
