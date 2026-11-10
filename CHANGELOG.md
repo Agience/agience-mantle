@@ -5,6 +5,11 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-11-10
+
+### Added
+- `python -m mantle.system.drop_grants_to --grantee <id> [--dry-run]` drops every grant to one account, archived ones included: for an account deactivated and retired. A plain store delete, for grants that never reached Origin's replica. The release tool runs it only for an account Origin shows deactivated.
+
 ## [0.1.13] - 2026-11-10
 
 ### Fixed

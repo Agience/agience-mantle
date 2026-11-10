@@ -58,3 +58,17 @@ async def test_a_direct_grant_naming_no_grantee_is_refused_by_the_route(tmp_path
     with acting_as(USER, principal_type="user"), pytest.raises(HTTPException) as e:
         await grants_router.create_grant_endpoint(body=body, auth=auth, store_db=node)
     assert e.value.status_code == 400 and "names its grantee" in e.value.detail
+
+
+def test_every_grant_to_one_account_is_dropped_and_no_other(db):
+    """`mantle.system.drop_grants_to`, for an account deactivated and retired (2026-11-10: the
+    release smoke tests' throwaway accounts)."""
+    from mantle.system import drop_grants_to as dgt
+    for gid, who in (("g-1", "smoke"), ("g-2", "smoke"), ("g-3", "bob")):
+        la.create_grant(db, _grant(gid, who))
+    assert dgt.grants_to(db, "smoke") == ["g-1", "g-2"]
+    assert dgt.drop_grants_to(db, "smoke", dry_run=True) == {"grantee": "smoke", "found": 2, "dropped": 0}
+    assert dgt.drop_grants_to(db, "smoke") == {"grantee": "smoke", "found": 2, "dropped": 2}
+    assert dgt.grants_to(db, "smoke") == [] and la.get_grant_by_id(db, "g-3") is not None
+    with pytest.raises(ValueError):
+        dgt.drop_grants_to(db, "  ")
