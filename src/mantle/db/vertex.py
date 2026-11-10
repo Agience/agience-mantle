@@ -342,7 +342,23 @@ class LatticeArtifactStore(_ArtifactStoreABC):  # type: ignore[misc,valid-type]
             entry = _journal.grant_entry(d)
             if prior_doc is None or _journal.grant_entry(prior_doc) != entry:
                 _journal.record(entry, f"grant:{aid}")
-        self._place(cur, d, stamp_rev=True, is_new=prev is None)
+        # Placed when the row is new or names a new collection: an edit of the same row in the
+        # same collection is no placement, and must not restore a membership removed since
+        # (BUG-034, 2026-11-10: an artifact removed from its home, still held elsewhere, came back
+        # there on its next edit). The home itself, `collection_id`, is kept: its creation edge is
+        # the authority Origin's ledger holds, one per member, ever.
+        # A new row of a lineage already placed there (a prior version's snapshot, a new version
+        # under its own id) is no placement either.
+        cid = str(d.get("collection_id") or "")
+        if old_doc is not None:
+            placing = str(old_doc.get("collection_id") or "") != cid
+        else:
+            placing = not cid or cur.execute(
+                "SELECT 1 FROM vertex WHERE root_id = ? AND id != ? "
+                "AND json_extract(doc, '$.collection_id') = ? LIMIT 1",
+                (str(d.get("root_id") or aid), aid, cid)).fetchone() is None
+        if placing:
+            self._place(cur, d, stamp_rev=True, is_new=prev is None)
         return d
 
     def _recount(self, cur: sqlite3.Cursor, old: Optional[Dict[str, Any]],

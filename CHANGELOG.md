@@ -7,6 +7,9 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [0.1.15] - 2026-11-10
 
+### Fixed
+- An edit never puts an artifact back in a container it was removed from (BUG-034). Every write re-placed the row's home membership when its edge was missing, so an artifact removed from its home and still held elsewhere came back there on its next edit (through the edit itself, and through the prior version's snapshot). A row now places a membership only when it is new to its lineage's collection, or names a new one; the home (`collection_id`, its creation edge at Origin) is kept for authority (John, 2026-11-10).
+
 ### Changed
 - The personas the app now calls directly (FR-006) are narrow audiences here too (`DEFAULT_NARROW_AUDIENCES`): each `persona:<name>` scope reaches the platform operators' verdict alone. A persona's own server delegation reaches what its code calls: Aria, Astra and Ophan the operators' verdict, Seraph an artifact and a container's children. Seraph's archive is the person's, never its own delegation's: no write (John, 2026-11-10).
 
