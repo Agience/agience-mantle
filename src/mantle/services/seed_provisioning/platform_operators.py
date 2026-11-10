@@ -70,6 +70,13 @@ OPERATORS: List[Dict[str, Any]] = [
      "description": "The collections you can reach.",
      "server": "sage", "tool": "browse_collections",
      "input_schema": {"type": "object", "properties": {"limit": {"type": "integer"}}}},
+    # One item, named by a link: what a timer's grant reaches, so a scheduled workflow can read with
+    # Sage (2026-11-10, BUG-051: Sage's only operator listed everything, which no timer reaches).
+    {"slug": "op-read-an-item", "title": "Read an item", "public": True,
+     "description": "Read one item you can reach: its title, type and what it holds.",
+     "server": "sage", "tool": "get_artifact",
+     "input_schema": {"type": "object", "required": ["artifact_id"], "properties": {
+         "artifact_id": _artifact("The item")}}},
     {"slug": "op-ask-a-model", "title": "Ask a model", "public": True,
      "description": "Send a question to a model you have a connection to; its key stays sealed to Lumen.",
      "server": "lumen", "tool": "invoke_connection",

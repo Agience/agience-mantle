@@ -5,6 +5,14 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.20] - 2026-11-10
+
+### Fixed
+- A list of artifacts answers when one of its bodies cannot be opened by the reader (BUG-051): `GET /artifacts/visible` failed whole (500) for a persona's delegation, which opens no person's content key, when one listed artifact's stored body could not be decrypted for it. A page drops that body from its row, as the boundary does for every list; a single read still refuses.
+
+### Added
+- A platform operator, "Read an item" (Sage, `get_artifact`): one item, named by a link. A scheduled workflow can read with Sage, since a timer's grant reaches the items it lists and no listing.
+
 ## [0.1.19] - 2026-11-10
 
 ### Fixed

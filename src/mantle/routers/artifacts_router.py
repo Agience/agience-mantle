@@ -930,6 +930,9 @@ def _hydrate_batch(db: Database, artifact_ids: List[str]) -> Dict[str, dict]:
 
     from mantle.db.backend import get_raw_artifact, find_newest_by_root
     from mantle.db.backend import _decrypt_artifact_content as _decrypt_doc
+    # A page of many: a body this caller cannot open is dropped from its row, as the boundary
+    # does for every list, and the page answers (BUG-051, 2026-11-10: one artifact a persona's
+    # delegation could not decrypt failed `/artifacts/visible` whole, 500, for every reader).
 
     # Ids only, exactly as `_find_artifact` reads them: the keyed read, then the lineage
     # read for whatever it missed. Deduplicated so a repeated id costs one seek.
@@ -943,7 +946,7 @@ def _hydrate_batch(db: Database, artifact_ids: List[str]) -> Dict[str, dict]:
             logger.warning("_hydrate_batch: key lookup failed for %r", key, exc_info=True)
             doc = None
         if doc and doc.get("state") != "archived":
-            _decrypt_doc(doc)
+            _decrypt_doc(doc, strict=False)
             out[aid] = _normalize_artifact_doc(doc)
         else:
             misses.append(aid)
@@ -955,7 +958,7 @@ def _hydrate_batch(db: Database, artifact_ids: List[str]) -> Dict[str, dict]:
             logger.warning("_hydrate_batch: root_id scan failed for %r", aid, exc_info=True)
             continue
         if doc:
-            _decrypt_doc(doc)
+            _decrypt_doc(doc, strict=False)
             out[aid] = _normalize_artifact_doc(doc)
     return out
 
