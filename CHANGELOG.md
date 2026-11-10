@@ -5,6 +5,11 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-11-10
+
+### Fixed
+- A timer's firing runs and is recorded (BUG-041). Crystal's gate asks `GET /grants/my-access` before running a timer's target, and a timer's job delegation could not reach that route, so every firing failed "upstream 403 from /grants/my-access"; it now may, and `check_access` still answers only within the timer's reach. Writing the run back to the timer was refused too: the seal asked for a key without naming the row, so a writer given no key could not fall back to the collection's drop key. It now names the row, as a read does.
+
 ## [0.1.18] - 2026-11-10
 
 ### Changed

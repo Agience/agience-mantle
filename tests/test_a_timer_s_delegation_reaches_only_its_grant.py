@@ -82,10 +82,13 @@ def test_a_timer_s_delegation_reaches_only_the_routes_its_work_calls():
     auth = _timer_auth(USER, ("t",))
     for m, p in [("GET", "/artifacts/t"), ("PATCH", "/artifacts/t"), ("POST", "/artifacts"),
                  ("GET", "/artifacts/t/children"), ("POST", "/artifacts/t/op/invoke"),
-                 ("GET", "/artifacts/platform-operators"), ("POST", "/artifacts/batch")]:
+                 ("GET", "/artifacts/platform-operators"), ("POST", "/artifacts/batch"),
+                 # Crystal's gate before it runs the timer's target (BUG-041); `check_access`
+                 # answers it, inside the reach.
+                 ("GET", "/grants/my-access")]:
         assert _route(auth, m, p), (m, p)
     for m, p in [("GET", "/artifacts/visible"), ("POST", "/artifacts/recall"),
-                 ("DELETE", "/artifacts/t"), ("GET", "/grants/my-access"), ("POST", "/grants"),
+                 ("DELETE", "/artifacts/t"), ("POST", "/grants"),
                  ("GET", "/events"), ("POST", "/artifacts/search")]:
         assert not _route(auth, m, p), (m, p)
     plain = D.AuthContext(principal_id=USER, principal_type="user", user_id=USER)
@@ -129,3 +132,25 @@ async def test_a_timer_creates_nothing_at_the_top_level_and_archives_nothing(db)
             await artifacts.update_artifact(artifact_id=timer, auth=auth, store_db=db,
                                             body=artifacts.UpdateArtifactRequest(state="archived"))
     assert top.value.status_code == 403 and archive.value.status_code == 403
+
+
+def test_sealing_a_row_names_it_so_a_writer_with_no_key_seals_to_its_drop(monkeypatch):
+    """BUG-041 (2026-11-10): a timer's run, written back to the timer on its job delegation, was
+    refused: the seal asked for a key with no row named, so the writer that may not have one could
+    not fall back to the collection's drop key either."""
+    from mantle.db import doc_boundary as B
+    from mantle.services import content_crypto as cc
+
+    named = []
+
+    def encrypt(principal, plaintext, **kw):
+        named.append(cc._KEY_ARTIFACT.get())
+        return b"MEC3" + b"x" * 40
+
+    monkeypatch.setattr(cc, "encrypt_content", encrypt)
+    doc = {"id": "t-1", "root_id": "t-1", "created_by": "alice", "collection_id": "inbox-1",
+           "content_type": "application/vnd.agience.timer+json",
+           "context": {"title": "Digest", "timer_state": {"runs": 1}}}
+    B.seal_content_fields(doc)
+    assert named == ["t-1"]
+

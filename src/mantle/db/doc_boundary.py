@@ -203,9 +203,13 @@ def seal_content_fields(doc: dict) -> None:
     principal = content_key_principal(doc)
     payload = {"v": _PAYLOAD_VERSION, "context": fields, "doc": top}
     try:
-        blob = content_crypto.encrypt_content(
-            principal, json.dumps(payload).encode("utf-8"),
-            collection_id=content_key_scope(doc), creator_id=doc.get("created_by"))
+        # Named to the key oracle as a read is: a writer given no key (a timer's job delegation,
+        # an Add-only writer) seals to the collection's drop key for this row, rather than being
+        # refused for want of a row to name (BUG-041, 2026-11-10: a timer's run was never recorded).
+        with content_crypto.content_key_artifact(doc.get("root_id") or doc.get("id")):
+            blob = content_crypto.encrypt_content(
+                principal, json.dumps(payload).encode("utf-8"),
+                collection_id=content_key_scope(doc), creator_id=doc.get("created_by"))
     except KeyCustodyDenied:
         raise
     except Exception as exc:

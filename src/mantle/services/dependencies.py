@@ -695,8 +695,11 @@ JOB_SERVER_ROUTES = {"lumen": (_PATCH_ID,)}
 #: What a timer's work calls, each addressed by id or creating inside one, so that every one is
 #: decided by `check_access` against the reach. Listing and search routes, the event stream and
 #: grants are not among them: those answer from the person's whole reach.
+#: `_MY_ACCESS`: Crystal's gate asks it before running a timer's target (BUG-041, 2026-11-10: every
+#: firing failed "upstream 403 from /grants/my-access"). It answers through `check_access`, which
+#: holds the job to its reach, so it says yes only within what the grant reaches.
 JOB_REACH_ROUTES = (_GET_ID, _PATCH_ID, _GET_CHILDREN, _GET_CONTENT, _CREATE, _USE, _OP,
-                    _OPERATORS, ("POST", re.compile(r"^/artifacts/batch/?$")),
+                    _OPERATORS, _MY_ACCESS, ("POST", re.compile(r"^/artifacts/batch/?$")),
                     ("GET", re.compile(r"^/type-definitions/[^/]+/?$")))
 
 #: The actions a timer's reach conducts: it reads, writes, adds and runs; it never deletes,
