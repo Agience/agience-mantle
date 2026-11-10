@@ -134,11 +134,19 @@ def content_key_action(action: str) -> Iterator[None]:
         _KEY_ACTION.reset(token)
 
 
-def _refuse_ember(actor) -> None:
+def _refuse_ember(actor, *, may_create: bool = False) -> None:
     """A narrowed delegation opens no person's key (John, 2026-11-02, review 10; review 11 for the
     personas): on one, no content key, master or collection, is asked for, whatever the person's
     grants. An Ember write then goes to the collection's drop key (`encrypt_content`), and a read
-    is refused."""
+    is refused.
+
+    One exception (John, 2026-11-10): a timer's job delegation reads the key of an artifact its
+    job grant lists by id (`ActingPrincipal.job_reach`), and only to decrypt; Origin decides the
+    release on the same rule (`share_credentials.verify_job_credential`). Its writes still go to
+    the drop key."""
+    reach = getattr(actor, "job_reach", ()) or ()
+    if reach and not may_create and _KEY_ARTIFACT.get() in reach:
+        return
     if getattr(actor, "narrowed", None):
         from mantle.services.acting_principal import KeyCustodyDenied
         raise KeyCustodyDenied("an Ember delegation opens no key: Ember writes to a drop key and "
@@ -178,7 +186,7 @@ def _default_master_key(principal_id: str, collection_id: Optional[str] = None,
         raise RuntimeError("key oracle unavailable — cannot encrypt/decrypt content")
 
     actor = require_acting_principal()
-    _refuse_ember(actor)
+    _refuse_ember(actor, may_create=may_create)
     return oracle.get_or_create_master_key(
         principal_id,
         KeyRequest(
@@ -225,7 +233,7 @@ def _default_collection_key(principal_id: str, collection_id: str, *, may_create
     if oracle is None:
         raise RuntimeError("key oracle unavailable — cannot encrypt/decrypt content")
     actor = require_acting_principal()
-    _refuse_ember(actor)
+    _refuse_ember(actor, may_create=may_create)
     return oracle.get_or_create_collection_key(
         principal_id, collection_id,
         KeyRequest(requester_id=actor.principal_id, purpose=KeyPurpose.GRANT,

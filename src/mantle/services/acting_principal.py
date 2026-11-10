@@ -198,6 +198,9 @@ class ActingPrincipal:
     #: The audience Origin narrowed this delegation to (`dependencies.is_narrowed`): Ember or a
     #: persona. A narrowed delegation is never an acting credential for a key.
     narrowed: Optional[str] = None
+    #: A timer's job delegation (`dependencies.job_reach_of`): the artifact ids its job grant
+    #: lists, the only ones whose key it may ask Origin for. Empty for any other credential.
+    job_reach: tuple = ()
     #: The delegation's ``scope`` claim, when present. Recorded for audit.
 
     scope: Optional[str] = None
@@ -263,6 +266,11 @@ def require_acting_principal() -> ActingPrincipal:
     return principal
 
 
+def _job_reach(auth) -> tuple:
+    reach = getattr(auth, "job_reach", None)
+    return tuple(str(r) for r in reach) if isinstance(reach, tuple) else ()
+
+
 def acting_from_auth(auth, credential: Optional[ForwardedCredential] = None) -> ActingPrincipal:
     """Build an :class:`ActingPrincipal` from an ``AuthContext``.
 
@@ -296,6 +304,7 @@ def acting_from_auth(auth, credential: Optional[ForwardedCredential] = None) -> 
         authority=getattr(auth, "authority", None),
         scope=getattr(auth, "scope", None),
         narrowed=getattr(auth, "narrowed_audience", None),
+        job_reach=_job_reach(auth),
         source="request",
         credential=credential,
     )

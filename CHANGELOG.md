@@ -5,6 +5,11 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-11-10
+
+### Changed
+- A timer's job delegation asks Origin for its owner's content key to read an artifact its job grant lists by id, and for nothing else (John, 2026-11-10): the timer's settings and its target are read whole on it, where before every sealed field was missing. Its writes still go to the drop key, and every other narrowed delegation still asks for no key.
+
 ## [0.1.16] - 2026-11-10
 
 ### Added
