@@ -162,12 +162,16 @@ def cosign(db, custodian, bootstrap_credential: str, only: Optional[set] = None)
     p = pending(db)
     counts = {"edges": 0, "roots": 0, "grants": 0, "appended": 0, "unchanged": 0,
               "secondary": p["secondary"], "held": p["held"], "left_out": 0, "malformed": 0,
-              "left_out_by_kind": {"edges": 0, "roots": 0, "grants": 0}, "malformed_by_reason": {}, "malformed_by_kind": {"edges": 0, "roots": 0, "grants": 0}}
+              "left_out_by_kind": {"edges": 0, "roots": 0, "grants": 0}, "left_out_grantees": {},
+              "malformed_by_reason": {}, "malformed_by_kind": {"edges": 0, "roots": 0, "grants": 0}}
     for group in ("edges", "roots", "grants"):
         for entry in p[group]:
             if only is not None and not set(entry_ids(entry)) <= only:
                 counts["left_out"] += 1
                 counts["left_out_by_kind"][group] += 1
+                if group == "grants":
+                    who = str(entry.get("grantee_id") or "")
+                    counts["left_out_grantees"][who] = counts["left_out_grantees"].get(who, 0) + 1
                 continue
             try:
                 answer = custodian.submit_entry(entry, credential=bootstrap_credential,
@@ -268,6 +272,8 @@ def main(argv=None) -> int:
           f"{counts['left_out_by_kind']['roots']} root(s), {counts['left_out_by_kind']['grants']} grant(s); "
           f"malformed, refused: {counts['malformed_by_kind']['edges']} edge(s), "
           f"{counts['malformed_by_kind']['roots']} root(s), {counts['malformed_by_kind']['grants']} grant(s)")
+    for who, n in sorted(counts["left_out_grantees"].items()):
+        print(f"left out: {n} grant(s) to {who}")
     for reason, n in sorted(counts["malformed_by_reason"].items()):
         print(f"malformed: {n} x {reason}")
     return 0

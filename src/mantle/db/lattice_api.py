@@ -1218,7 +1218,16 @@ def _doc_mask(d: Dict[str, Any]):
     return _mask_of(SimpleNamespace(**d))
 
 
+class GrantWithoutGrantee(ValueError):
+    """A grant names no grantee: it reaches no one, and Origin refuses it as malformed."""
+
+
 def _to_grant_doc(entity: Any) -> Dict[str, Any]:
+    # Every grant names its grantee: a person, an invite's token hash, a grant key, a bundle, a
+    # principal. 2026-11-09: two grants with an empty grantee were found when Origin's ledger was
+    # seeded, written by a direct grant whose request named none.
+    if not str(getattr(entity, "grantee_id", "") or "").strip():
+        raise GrantWithoutGrantee(f"grant {getattr(entity, 'id', '')!r} names no grantee")
     d = to_lattice_doc(entity)
     d["content_type"] = _GRANT_CT          # the collection-scoping discriminator, doc-side only
     return d

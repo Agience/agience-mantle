@@ -605,7 +605,9 @@ async def create_grant_endpoint(
         response["email_sent"] = email_sent
         return response
 
-    # Direct user->user grant: requires can_admin on the resource.
+    # Direct user->user grant: requires can_admin on the resource, and names its grantee.
+    if not (body.grantee_id or "").strip():
+        raise HTTPException(status_code=400, detail="a direct grant names its grantee (grantee_id)")
     await offload_sync(_require_admin, auth, body.resource_id, store_db)
 
     from mantle.services import grant_service

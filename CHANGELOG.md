@@ -5,6 +5,15 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-11-09
+
+### Added
+- `python -m mantle.system.drop_ungranteed_grants` drops stored grants that name no grantee (archived ones included); `--dry-run` counts them. Such a grant reaches no one, and Origin refuses it as malformed. It runs as a release migration.
+- `cosign_authority` reports, for the grants it left out as touching ids Origin has seen, how many belong to each grantee (`left out: <n> grant(s) to <id>`), so the operator can tell throwaway accounts from people.
+
+### Fixed
+- Every grant names its grantee. The store refuses to write one without (`lattice_api.GrantWithoutGrantee`), and `POST /grants` refuses a direct grant whose request names no `grantee_id` (400). Two such grants were found in production when Origin's ledger was seeded, written by that route.
+
 ## [0.1.11] - 2026-11-09
 
 ### Fixed

@@ -154,6 +154,9 @@ WRITE_SITES: dict[tuple[str, str], tuple[str, str]] = {
     ("services/authority_ledger.py", "_apply_session"): (
         OFF_FEED, "the grant and containment planes: applies the authority changes people made in "
                   "their Origin sessions, from Origin's ledger (review 12)."),
+    ("system/drop_ungranteed_grants.py", "drop_ungranteed_grants"): (
+        OFF_FEED, "the grant plane: drops stored grants that name no grantee, which reached no one "
+                  "and which grant_service's vocabulary never announced."),
     ("search/mantle/oracle.py", "put"): (
         OFF_FEED, "encrypted-search cell writes. Derived from artifacts already on the feed; "
                   "announcing the derivation as well would double every indexed change."),
