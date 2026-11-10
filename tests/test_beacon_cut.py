@@ -226,8 +226,8 @@ def _o_signal_power(W):
 # This oracle body is maintained here, under the same arrangement as `gap_split` and `top_break`.
 # The source caps the head count at a stated 64. The maintained body caps it at `n_features // 2`,
 # the geometry: a head block narrower than two coordinates has a cosine carrying only a sign. This
-# is the bound `entroptics_context.cut.derive_heads` uses, and that repo's conformance test holds
-# the two equal.
+# is the bound the context library's `cut.derive_heads` uses, and that library's conformance test
+# holds the two equal.
 #
 # What the repair moves, and it is a live pilot's behaviour on these shapes (10 draws per cell):
 #

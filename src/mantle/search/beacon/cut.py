@@ -409,8 +409,8 @@ def derive_heads(item_embs) -> int:
     modes the set actually occupies. The screen is then cut into that many blocks: as many heads as
     the data has independent things to say. Nothing is picked.
 
-    Both bounds are derived, and both match `entroptics_context.cut.derive_heads` exactly
-    (`tests/test_conformance_mantle.py` in that repo pins it).
+    Both bounds are derived, and both match the context library's `cut.derive_heads` exactly
+    (its conformance test against Mantle pins it).
 
     The floor is `_MIN_HEADS`: `_smallest_readable_head_count()`, the fewest heads at which
     `signal_power`'s own read can be taken at all, recovered by asking the engine's readability
