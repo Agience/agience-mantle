@@ -230,14 +230,14 @@ def to_lattice_doc(entity: Any) -> Dict[str, Any]:
 _LATTICE_INTERNAL = ("_origin", "_seq", "_rev", "_fp", "_type")
 
 
-def from_lattice_doc(raw: Optional[Dict[str, Any]], cls: Type[T]) -> Optional[T]:
+def from_lattice_doc(raw: Optional[Dict[str, Any]], cls: Type[T], *, strict: bool = True) -> Optional[T]:
     if not raw:
         return None
     doc = {k: v for k, v in raw.items() if k not in _LATTICE_INTERNAL}
     # Single read chokepoint — every artifact read funnels through here, so all callers see
     # plaintext (or a loud failure; never ciphertext dressed as content).
     if getattr(cls, "PREFIX", None) == "Artifact":
-        _boundary.decrypt_artifact_content(doc)
+        _boundary.decrypt_artifact_content(doc, strict=strict)
     elif getattr(cls, "PREFIX", None) == "Grant":
         from mantle.db import node_seal
         node_seal.unseal_fields(doc)
@@ -282,12 +282,12 @@ def create_artifact(db: LatticeDatabase, entity: ArtifactEntity) -> ArtifactEnti
     return entity
 
 
-def get_artifact(db: LatticeDatabase, artifact_id: str) -> Optional[ArtifactEntity]:
+def get_artifact(db: LatticeDatabase, artifact_id: str, *, strict: bool = True) -> Optional[ArtifactEntity]:
     """Fetch a single artifact version by its id (version id). A drop (`content_dropped`) that
     this caller can read is re-keyed under its collection key, as this caller, the first time,
     and then indexed as this caller (`_rekey_drop`)."""
     raw = db.artifacts.get_artifact(artifact_id)
-    entity = from_lattice_doc(raw, ArtifactEntity)
+    entity = from_lattice_doc(raw, ArtifactEntity, strict=strict)
     if raw and raw.get("content_dropped") and entity is not None and not _REKEYING.get():
         _rekey_drop(db, raw, entity)
     return entity
@@ -401,7 +401,8 @@ def _versions(db: LatticeDatabase, root_id: str):
 
 
 def get_latest_live_artifact(db: LatticeDatabase, root_id: str,
-                             collection_id: Optional[str] = None) -> Optional[ArtifactEntity]:
+                             collection_id: Optional[str] = None, *,
+                             strict: bool = True) -> Optional[ArtifactEntity]:
     """Newest live version for *root_id* (optionally restricted to a collection).
 
     Live is every state but `archived` — `state_of` reads a legacy `committed` or `draft` row as
@@ -412,7 +413,7 @@ def get_latest_live_artifact(db: LatticeDatabase, root_id: str,
             continue
         if collection_id and doc.get("collection_id") != collection_id:
             continue
-        return from_lattice_doc(doc, ArtifactEntity)
+        return from_lattice_doc(doc, ArtifactEntity, strict=strict)
     return None
 
 

@@ -5,6 +5,13 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.23] - 2026-11-11
+
+### Fixed
+- A list of artifacts answers when a body in it can't be read (BUG-059): `/artifacts/visible` dropped the unreadable body and then decrypted the same row again, strictly, in `_normalize_artifact_doc`, so the page failed with a 500 after all. A list page now stays non-strict throughout, and a single read still refuses. On staging, which holds none of production's bodies, every typed listing failed, so the pickers read "No results".
+- A note filed in a collection links as a workflow step's evidence (BUG-062). The link loaded the artifact strictly, so a body the caller holds no key to (Lumen's Add step runs on the persona's delegation) failed the call with a 500. A link writes an edge and needs no body, so it reads the artifact without refusing over it. A container's children list is non-strict, as every list is.
+- A run that links a collection reads the notes it holds (John, 2026-11-11, BUG-052). A job delegation opens the key of an artifact its grant lists, or of one held under a listed artifact along edges that conduct a read, the walk access already decides a job's reach by. Writes still go to the drop key.
+
 ## [0.1.22] - 2026-11-10
 
 ### Changed

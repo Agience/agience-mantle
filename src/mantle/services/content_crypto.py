@@ -134,18 +134,35 @@ def content_key_action(action: str) -> Iterator[None]:
         _KEY_ACTION.reset(token)
 
 
+def _within_reach(artifact: Optional[str], reach: tuple) -> bool:
+    """Is `artifact` one of `reach`, or held under one along edges that conduct a read? The walk
+    is `origin_chain`'s, the one access decides a job's reach by. A chain that doesn't end is no."""
+    if not artifact:
+        return False
+    ids = {str(r) for r in reach}
+    if str(artifact) in ids:
+        return True
+    from mantle.db import backend
+    try:
+        return any(r in ids for r in backend.origin_chain(backend.store_handle(), str(artifact), "read"))
+    except Exception:  # noqa: BLE001 — an unanswerable walk opens nothing
+        logger.warning("job reach walk failed for %s", artifact, exc_info=True)
+        return False
+
+
 def _refuse_ember(actor, *, may_create: bool = False) -> None:
     """A narrowed delegation opens no person's key (John, 2026-11-02, review 10; review 11 for the
     personas): on one, no content key, master or collection, is asked for, whatever the person's
     grants. An Ember write then goes to the collection's drop key (`encrypt_content`), and a read
     is refused.
 
-    One exception (John, 2026-11-10): a timer's job delegation reads the key of an artifact its
-    job grant lists by id (`ActingPrincipal.job_reach`), and only to decrypt; Origin decides the
-    release on the same rule (`share_credentials.verify_job_credential`). Its writes still go to
-    the drop key."""
+    One exception (John, 2026-11-10 and 2026-11-11): a job delegation reads the key of an artifact
+    its job grant lists (`ActingPrincipal.job_reach`), or of one held under a listed artifact along
+    its origin edges, as access decides it (`dependencies.within_job_reach`), and only to decrypt.
+    Origin decides the release on the same rule (`share_credentials.bind_to_job_reach`). Its
+    writes still go to the drop key."""
     reach = getattr(actor, "job_reach", ()) or ()
-    if reach and not may_create and _KEY_ARTIFACT.get() in reach:
+    if reach and not may_create and _within_reach(_KEY_ARTIFACT.get(), reach):
         return
     if getattr(actor, "narrowed", None):
         from mantle.services.acting_principal import KeyCustodyDenied

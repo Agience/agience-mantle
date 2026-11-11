@@ -52,7 +52,7 @@ def route(monkeypatch):
     """The handler with its store and enrichment stubbed — authorization is the subject here."""
     monkeypatch.setattr(artifacts_router.store, "list_collection_artifacts",
                         lambda db, aid, **kw: _docs())
-    monkeypatch.setattr(artifacts_router, "_normalize_artifact_doc", lambda d: d)
+    monkeypatch.setattr(artifacts_router, "_normalize_artifact_doc", lambda d, **_: d)
     import mantle.services.collection_service as cser
     monkeypatch.setattr(cser, "attach_committed_collection_ids", lambda db, ents: None)
     return artifacts_router.list_children

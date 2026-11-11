@@ -798,10 +798,13 @@ def _find_archived_artifact(db: Database, artifact_id: str) -> Optional[dict]:
     return doc
 
 
-def _normalize_artifact_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_artifact_doc(doc: Dict[str, Any], *, strict: bool = True) -> Dict[str, Any]:
     """Normalize an artifact document for API responses.
 
-    Sets defaults for missing fields and strips the lattice internal keys.
+    Sets defaults for missing fields and strips the lattice internal keys. `strict` is the
+    decrypt's: a list page passes False, so a body it could not read stays dropped rather than
+    being tried again strictly and failing the page (BUG-059, 2026-11-10: on staging, which holds
+    none of production's bodies, every typed `/artifacts/visible` answered 500).
     """
     normalized = dict(doc)
 
@@ -809,7 +812,7 @@ def _normalize_artifact_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
     # API response through here. Idempotent (flag-gated) — a no-op on docs already
     # decrypted by from_store_doc / _find_artifact / list_collection_artifacts.
     from mantle.db.backend import _decrypt_artifact_content as _decrypt_doc
-    _decrypt_doc(normalized)
+    _decrypt_doc(normalized, strict=strict)
 
     artifact_id = normalized.get("id") or normalized.get("_key")
     if artifact_id and not normalized.get("root_id"):
@@ -947,7 +950,7 @@ def _hydrate_batch(db: Database, artifact_ids: List[str]) -> Dict[str, dict]:
             doc = None
         if doc and doc.get("state") != "archived":
             _decrypt_doc(doc, strict=False)
-            out[aid] = _normalize_artifact_doc(doc)
+            out[aid] = _normalize_artifact_doc(doc, strict=False)
         else:
             misses.append(aid)
 
@@ -959,7 +962,7 @@ def _hydrate_batch(db: Database, artifact_ids: List[str]) -> Dict[str, dict]:
             continue
         if doc:
             _decrypt_doc(doc, strict=False)
-            out[aid] = _normalize_artifact_doc(doc)
+            out[aid] = _normalize_artifact_doc(doc, strict=False)
     return out
 
 
@@ -2069,9 +2072,12 @@ def _link_source_artifact(
     # would otherwise confirm the artifact's existence to a caller with no read.
     check_access(auth, parsed.source_artifact_id, "read", store_db)
 
-    source = _get_artifact(store_db, parsed.source_artifact_id)
+    # A link writes an edge and needs no body. A caller who may read the artifact but holds no
+    # key to its body (a persona's delegation) still links it, as it links a collection, which
+    # has no body. The returned document then has no content, as on a list page.
+    source = _get_artifact(store_db, parsed.source_artifact_id, strict=False)
     if not source:
-        source = get_latest_live_artifact(store_db, parsed.source_artifact_id)
+        source = get_latest_live_artifact(store_db, parsed.source_artifact_id, strict=False)
     # An archived artifact is linked nowhere new: default listings read past it, so the link would
     # succeed and show nothing in the destination. 2026-10-13, a tester dragged one into a
     # container and it vanished from both with no error.
@@ -2608,9 +2614,10 @@ async def list_children(
     from mantle.services.collection_service import attach_memberships
     await offload_sync(attach_memberships, store_db, children)
 
-    # Normalize each child
+    # Normalize each child. Non-strict, as every list is: the rows were read without refusing,
+    # and a body this reader can't open stays dropped rather than failing the page.
     for child in children:
-        _normalize_artifact_doc(child)
+        _normalize_artifact_doc(child, strict=False)
 
     return _page(children, total=None, has_more=has_more)
 
