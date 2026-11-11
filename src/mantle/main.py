@@ -830,6 +830,22 @@ async def add_seal_pending(request: Request, exc: AddSealPending):
                         headers={"Retry-After": "300"})
 
 
+def _cors_for(request: Request) -> dict:
+    """The CORS headers an allowed browser origin gets. The catch-all handler below answers from
+    Starlette's outermost error middleware, outside the CORS middleware, so without these a server
+    error reaches the web app as a CORS failure and its real status is never seen (BUG-056)."""
+    origin = request.headers.get("origin") or ""
+    if origin and origin.lower() in _CORS_ORIGINS:
+        return {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
+    return {}
+
+
+#: Mantle refuses to write plaintext when it cannot seal: the collection's key is not available on
+#: this node (a staging copy holds none of production's keys) or no key can be had at all.
+from mantle.db.doc_boundary import ContentEncryptionError as _FieldSealRefused  # noqa: E402
+from mantle.services.content_service import ContentEncryptionError as _BodySealRefused  # noqa: E402
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception_logger(request: Request, exc: Exception):
     logger.exception(
@@ -841,7 +857,11 @@ async def unhandled_exception_logger(request: Request, exc: Exception):
         request.path_params.get("artifact_id"),
         repr(exc),
     )
-    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+    if isinstance(exc, (_FieldSealRefused, _BodySealRefused)):
+        return JSONResponse(status_code=503, headers=_cors_for(request), content={
+            "detail": "This item can't be sealed here: its collection's key isn't available on this server."})
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"},
+                        headers=_cors_for(request))
 
 # ----------------------------
 # CORS & Session

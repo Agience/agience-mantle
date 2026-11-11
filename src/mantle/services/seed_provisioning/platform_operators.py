@@ -19,6 +19,7 @@ grants every existing account (a release migration).
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -38,6 +39,16 @@ WORKSPACE_CT = "application/vnd.agience.workspace+json"
 def _artifact(description: str, *content_types: str) -> Dict[str, Any]:
     return {"type": "string", "format": "artifact-id", "x-content-types": list(content_types),
             "description": description}
+
+
+#: What a step reads or answers from: a note, a file, or a collection or workspace of them. A field
+#: naming no type is offered collections alone (BUG-052, 2026-11-10: a single note could not be
+#: linked as evidence).
+ITEM_TYPES = ("text/markdown", "text/plain", "application/pdf")
+
+
+def _item(description: str) -> Dict[str, Any]:
+    return _artifact(description, *ITEM_TYPES, COLLECTION_CT, WORKSPACE_CT)
 
 
 #: The core set. `public` operators are granted to every account; one that spends a platform
@@ -60,7 +71,7 @@ OPERATORS: List[Dict[str, Any]] = [
      "server": "sage", "tool": "ask",
      "input_schema": {"type": "object", "required": ["question", "evidence"], "properties": {
          "question": {"type": "string", "description": "The question"},
-         "evidence": _artifact("What to answer from")}},
+         "evidence": _item("What to answer from")}},
      # A step made before then names its question `input`.
      "arguments": {"question": "$.body.params.question?", "input": "$.body.params.input?",
                    "evidence": "$.body.params.evidence?"}},
@@ -82,7 +93,7 @@ OPERATORS: List[Dict[str, Any]] = [
      "description": "Read one item you can reach: its title, type and what it holds.",
      "server": "sage", "tool": "get_artifact",
      "input_schema": {"type": "object", "required": ["artifact_id"], "properties": {
-         "artifact_id": _artifact("The item")}}},
+         "artifact_id": _item("The item")}}},
     {"slug": "op-ask-a-model", "title": "Ask a model", "public": True,
      "description": "Send a question to a model you have a connection to; its key stays sealed to Lumen.",
      "server": "lumen", "tool": "invoke_connection",
@@ -102,6 +113,69 @@ def ids() -> Dict[str, str]:
     return {slug: derive_uuid(ns, _NS, slug) for slug in [_COLLECTION_SLUG, *(o["slug"] for o in OPERATORS)]}
 
 
+def catalog_title(artifact_id: str) -> str:
+    """The title of the platform operator (or the operators' collection) `artifact_id` names, from
+    its definition here: what a reader is shown when the node cannot open the sealed title, as on
+    staging, which holds none of production's keys (BUG-057). Empty for any other id."""
+    if not artifact_id:
+        return ""
+    titles = {_COLLECTION_SLUG: "Platform operators", **{o["slug"]: o["title"] for o in OPERATORS}}
+    for slug, known in ids().items():
+        if known == artifact_id:
+            return titles.get(slug, "")
+    return ""
+
+
+def _on_rc() -> bool:
+    return (os.getenv("AGIENCE_PLANE") or "").strip().lower() == "rc"
+
+
+def _converge_unsealed(db: Database, artifact_id: str, *, context: dict, name: str,
+                       description: str, owner: str) -> bool:
+    """On the release candidate only: converge a row whose key production wrapped, which this node
+    cannot unwrap, so nothing on it can be sealed here. It is written with no sealed field at all:
+    the definition's open keys as they are, no title (readers get the catalog's,
+    `catalog_title`), and the copied seal, which no one here can open, dropped. On a row that is
+    not readable configuration the name and description are sealed fields too, and go as well."""
+    from mantle.db import doc_boundary as boundary
+    from mantle.db.backend import get_artifact as db_get_artifact
+    from mantle.db.backend import update_artifact as db_update_artifact
+    from mantle.services import mint_context as _mc
+
+    existing = db_get_artifact(db, artifact_id)
+    if existing is None:
+        return False
+    stored = existing.context
+    stored = json.loads(stored) if isinstance(stored, str) and stored else (stored or {})
+    stored = {k: v for k, v in dict(stored).items() if k not in (boundary.SEALED, *boundary.CONTENT_FIELDS)}
+    given = {k: v for k, v in context.items() if k not in boundary.CONTENT_FIELDS}
+    merged = _mc.with_client_keys(json.dumps(stored), given)
+    merged_ctx = json.loads(merged) if isinstance(merged, str) else dict(merged or {})
+    readable = boundary._readable({"content_type": existing.content_type}, merged_ctx)
+    existing.context = merged
+    existing.content = ""
+    existing.name = name if readable else ""
+    existing.description = description if readable else ""
+    existing.modified_by = owner
+    db_update_artifact(db, existing)
+    return True
+
+
+def _ensure(db: Database, artifact_id: str, **kw) -> bool:
+    """`_ensure_artifact`, and on the release candidate, for a row this node cannot seal,
+    `_converge_unsealed` (BUG-057)."""
+    from mantle.services.seed_provisioning.platform_email import _ensure_artifact
+    try:
+        return _ensure_artifact(db, artifact_id, **kw)
+    except Exception as exc:
+        if not (_on_rc() and _is_unsealable_here(exc)):
+            raise
+    logger.info("platform_operators: %s is sealed under keys this node does not hold; "
+                "converged in the open without its title", artifact_id)
+    return _converge_unsealed(db, artifact_id, context=kw["context"], name=kw["name"],
+                              description=kw["description"], owner=kw["owner"])
+
+
 def _context(op: Dict[str, Any]) -> Dict[str, Any]:
     props = (op["input_schema"] or {}).get("properties") or {}
     return {
@@ -116,7 +190,16 @@ def _context(op: Dict[str, Any]) -> Dict[str, Any]:
 def _own(upsert, db: Database, operator: str, artifact_id: str, title: str) -> None:
     """The platform operator's own grant on what it provisions. `created_by` is provenance and
     confers nothing, so without it the operator could not read, change or share its own operators,
-    nor open their titles, which are sealed with their content."""
+    nor open their titles, which are sealed with their content. On the release candidate a grant
+    that cannot be sealed there is the copy's own, already in place, and is left."""
+    try:
+        _own_grant(upsert, db, operator, artifact_id, title)
+    except Exception as exc:
+        if not (_on_rc() and _is_unsealable_here(exc)):
+            raise
+
+
+def _own_grant(upsert, db: Database, operator: str, artifact_id: str, title: str) -> None:
     upsert(db, user_id=operator, collection_id=artifact_id, granted_by=operator,
            can_create=True, can_read=True, can_update=True, can_delete=True, can_evict=True,
            can_invoke=True, can_add=True, can_share=True, can_admin=True, name=f"Owner: {title}")
@@ -128,7 +211,7 @@ def ensure_platform_operators(db: Database) -> bool:
     from mantle.db.backend import upsert_user_collection_grant
     from mantle.services.acting_principal import acting_as
     from mantle.services.platform_topology import register_id
-    from mantle.services.seed_provisioning.platform_email import _ensure_artifact, _operator_id
+    from mantle.services.seed_provisioning.platform_email import _operator_id
 
     operator = _operator_id(db)
     known = ids()
@@ -137,7 +220,7 @@ def ensure_platform_operators(db: Database) -> bool:
         return False
     with acting_as(operator, principal_type="user", scope="platform.operators-provisioning"):
         coll = known[_COLLECTION_SLUG]
-        _ensure_artifact(db, coll, content_type=COLLECTION_CT, name="Platform operators",
+        _ensure(db, coll, content_type=COLLECTION_CT, name="Platform operators",
                          description="Operators the platform provides; each is granted to every account.",
                          context={"content_type": COLLECTION_CT, "title": "Platform operators"},
                          content="", owner=operator)
@@ -145,7 +228,7 @@ def ensure_platform_operators(db: Database) -> bool:
         _own(upsert_user_collection_grant, db, operator, coll, "Platform operators")
         for op in OPERATORS:
             op_id = known[op["slug"]]
-            existed = _ensure_artifact(db, op_id, content_type=OPERATOR_CT, name=op["title"],
+            existed = _ensure(db, op_id, content_type=OPERATOR_CT, name=op["title"],
                                        description=op["description"], context=_context(op),
                                        content="", owner=operator)
             register_id(op["slug"], op_id)

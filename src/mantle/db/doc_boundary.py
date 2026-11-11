@@ -93,10 +93,27 @@ def _content_type_of(doc: dict, ctx: dict) -> str:
     return str(ctx.get("content_type") or doc.get("content_type") or "").split(";", 1)[0].strip().lower()
 
 
+#: An operator the platform seeds (`seed_provisioning/platform_operators.py`, `platform: true`).
+PLATFORM_OPERATOR_TYPE = "application/vnd.agience.operator+json"
+
+
+def _is_platform_operator(doc: dict, ctx: dict) -> bool:
+    return _content_type_of(doc, ctx) == PLATFORM_OPERATOR_TYPE and ctx.get("platform") is True
+
+
+def _readable(doc: dict, ctx: dict) -> bool:
+    """Whether `doc`'s context is platform configuration kept in the open, its title alone sealed:
+    the readable types, and the operators the platform seeds (John, 2026-11-10, BUG-057: their
+    input form and wiring are the platform's public definition, and a node holding none of the
+    keys they were sealed under, staging, could not show a single input field). A person's own
+    operator is not one: its wiring may name a private server, and stays sealed."""
+    return _content_type_of(doc, ctx) in READABLE_CONTEXT_TYPES or _is_platform_operator(doc, ctx)
+
+
 def sealable_keys(doc: dict, ctx: dict) -> list:
     """The context keys of `doc` that are sealed: every one but the structural, and on a readable
     type the title alone."""
-    if _content_type_of(doc, ctx) in READABLE_CONTEXT_TYPES:
+    if _readable(doc, ctx):
         return [k for k in CONTENT_FIELDS if k in ctx]
     return [k for k in ctx if k not in STRUCTURAL_CONTEXT_KEYS and k != SEALED]
 
@@ -104,7 +121,7 @@ def sealable_keys(doc: dict, ctx: dict) -> list:
 def sealable_doc_fields(doc: dict, ctx: dict) -> list:
     """The writer-supplied top-level fields of `doc` that are sealed: none on a readable type, whose
     name and description are configuration like the rest of it."""
-    if _content_type_of(doc, ctx) in READABLE_CONTEXT_TYPES:
+    if _readable(doc, ctx):
         return []
     return [k for k in SEALED_DOC_FIELDS if doc.get(k)]
 
@@ -198,8 +215,20 @@ def seal_content_fields(doc: dict) -> None:
         except Exception as exc:
             raise ContentEncryptionError(
                 "this row's sealed fields cannot be opened by this writer; refusing to overwrite them") from exc
-        fields = {**opened["context"], **fields}
-        top = {**opened["doc"], **top}
+        if _readable(doc, ctx):
+            # A row sealed before its type was readable: what is no longer sealed moves into the
+            # open beside what this write sets, rather than being sealed a second time.
+            for k, v in opened["context"].items():
+                if k in CONTENT_FIELDS:
+                    fields.setdefault(k, v)
+                else:
+                    ctx.setdefault(k, v)
+            for k, v in opened["doc"].items():
+                if not doc.get(k):
+                    doc[k] = v
+        else:
+            fields = {**opened["context"], **fields}
+            top = {**opened["doc"], **top}
     principal = content_key_principal(doc)
     payload = {"v": _PAYLOAD_VERSION, "context": fields, "doc": top}
     try:
@@ -221,6 +250,19 @@ def seal_content_fields(doc: dict) -> None:
 
 
 def unseal_content_fields(raw: dict) -> None:
+    """Restore the sealed fields (`_unseal`), and give a platform operator whose title this node
+    cannot open the title of its definition in the platform's catalog (BUG-057)."""
+    _unseal(raw)
+    ctx, as_string = _context_dict(raw)
+    if ctx and not ctx.get("title") and _is_platform_operator(raw, ctx):
+        from mantle.services.seed_provisioning.platform_operators import catalog_title
+        title = catalog_title(str(raw.get("_key") or raw.get("id") or ""))
+        if title:
+            ctx["title"] = title
+            _put_context(raw, ctx, as_string)
+
+
+def _unseal(raw: dict) -> None:
     """Restore the sealed context keys and top-level fields for an authorized reader.
 
     Fails soft: a reader the key oracle will not serve (a background path with no acting

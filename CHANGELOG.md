@@ -5,6 +5,15 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.22] - 2026-11-10
+
+### Changed
+- The operators the platform seeds are readable platform configuration (John, 2026-11-10, BUG-057): their input form, wiring and description are kept in the open, and their title alone is sealed. A reader that can't open the title is shown the title of the operator's definition in the platform's catalog. A row sealed before this moves into the open on its next write. A person's own operator is unchanged and stays sealed, since its wiring may name a private server. On the release candidate, which holds none of production's keys, the seeder converges a copied operator it can't seal with nothing sealed, instead of failing, so staging shows every operator's form.
+- "Answer from my notes" and "Read an item" take a note, a text file, a PDF, a collection or a workspace (BUG-052): the field names those types, so the picker offers single items as well as collections.
+
+### Fixed
+- A server error reaches the web app as itself, not as a CORS failure (BUG-056): the catch-all handler answers outside the CORS middleware, so it now adds the CORS headers for an allowed origin itself. A refusal to seal (Mantle never writes plaintext) is a 503 that says the collection's key isn't available on this server, not a bare 500.
+
 ## [0.1.21] - 2026-11-10
 
 ### Changed
