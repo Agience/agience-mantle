@@ -5,6 +5,11 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.21] - 2026-11-10
+
+### Changed
+- "Answer from my notes" is served by Sage's grounded `ask` and answers from the item linked to it (John, 2026-11-10, BUG-052): inside a workflow a run's grant reaches what it lists and never a search across everything, and Lumen could not reach Sage for its retrieval (one hop). It takes `question` and `evidence`; a step made earlier with `input` still runs. An operator may now declare its own argument mapping.
+
 ## [0.1.20] - 2026-11-10
 
 ### Fixed

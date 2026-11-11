@@ -52,12 +52,18 @@ OPERATORS: List[Dict[str, Any]] = [
          "inbox_to": _artifact("Where each difference waits for a person", WORKSPACE_CT, COLLECTION_CT),
          "out_to": _artifact("Where the reconciliation is written (the accounts' collection when left out)",
                              COLLECTION_CT, WORKSPACE_CT)}}},
+    # In a workflow it answers from the items linked to it, which the run's grant lists (John,
+    # 2026-11-10, BUG-052): a grant reaches what it names and never a search across everything, and
+    # Sage answers in itself, with no second hop. Ask anything still searches every note.
     {"slug": "op-answer-from-my-notes", "title": "Answer from my notes", "public": True,
-     "description": "Answer a question with cited extracts from what you can read.",
-     "server": "lumen", "tool": "synthesize",
-     "input_schema": {"type": "object", "required": ["input"], "properties": {
-         "input": {"type": "string", "description": "The question"},
-         "workspace_id": _artifact("Look only here (optional)", WORKSPACE_CT, COLLECTION_CT)}}},
+     "description": "Answer a question with cited extracts from the item it is given.",
+     "server": "sage", "tool": "ask",
+     "input_schema": {"type": "object", "required": ["question", "evidence"], "properties": {
+         "question": {"type": "string", "description": "The question"},
+         "evidence": _artifact("What to answer from")}},
+     # A step made before then names its question `input`.
+     "arguments": {"question": "$.body.params.question?", "input": "$.body.params.input?",
+                   "evidence": "$.body.params.evidence?"}},
     {"slug": "op-raise-inbox-item", "title": "Raise an Inbox item", "public": True,
      "description": "Put something in front of a person, with why and what it came from.",
      "server": "lumen", "tool": "raise_item",
@@ -103,7 +109,7 @@ def _context(op: Dict[str, Any]) -> Dict[str, Any]:
         "platform": True,
         "input_schema": op["input_schema"],
         "operator": {"server": op["server"], "tool": op["tool"],
-                     "arguments": {name: f"$.body.params.{name}?" for name in props}},
+                     "arguments": op.get("arguments") or {name: f"$.body.params.{name}?" for name in props}},
     }
 
 
