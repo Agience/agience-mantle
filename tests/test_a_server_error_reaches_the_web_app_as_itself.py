@@ -58,3 +58,19 @@ async def test_a_refusal_to_seal_is_a_503_that_says_why(allowed, exc):
     assert resp.status_code == 503
     assert "can't be sealed" in json.loads(resp.body)["detail"]
     assert resp.headers.get("access-control-allow-origin") == APP
+
+
+@pytest.mark.asyncio
+async def test_a_429_carries_cors_for_an_allowed_origin(allowed, monkeypatch):
+    """The rate limiter sits outside the CORS middleware too (2026-11-11, staging acceptance of
+    2026.11.24: a GET came back as a CORS failure with no status the app could read)."""
+    monkeypatch.setattr(main, "_RL_MAX", 1)
+    monkeypatch.setattr(main, "_rl_admit", lambda client: False)
+
+    async def never(request):
+        raise AssertionError("a refused request reaches nothing")
+    resp = await main._rate_limit(_request(APP), never)
+    assert resp.status_code == 429
+    assert resp.headers.get("access-control-allow-origin") == APP
+    resp = await main._rate_limit(_request("https://elsewhere.test"), never)
+    assert "access-control-allow-origin" not in resp.headers

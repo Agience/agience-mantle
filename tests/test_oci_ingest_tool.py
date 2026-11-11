@@ -99,7 +99,7 @@ def test_a_second_run_writes_nothing_and_still_verifies(tmp_path: Path):
     assert out["verified"] is True
 
 
-def test_the_blobs_are_readable_back_out_of_the_store(tmp_path: Path):
+def test_the_blobs_are_readable_back_out_of_the_store(tmp_path: Path, monkeypatch):
     """The claim `/v2` depends on: after an ingest, this node can serve the image. Read through
     `read_blob` — the same call `routers/oci_router` makes — rather than by looking at files, so it
     exercises decryption and the ref check, not just presence on disk."""
@@ -107,9 +107,10 @@ def test_the_blobs_are_readable_back_out_of_the_store(tmp_path: Path):
     store, keys = _node(tmp_path)
     assert _run(layout, manifest, store, keys).returncode == 0
 
-    import os as _os
-    _os.environ["MANTLE_LATTICE_PATH"] = str(store / "lattice.db")
-    _os.environ["KEYS_DIR"] = str(keys)
+    # Through monkeypatch, so they are restored: set directly, they outlived this test and moved
+    # the store of every later test on the same worker out of the test base.
+    monkeypatch.setenv("MANTLE_LATTICE_PATH", str(store / "lattice.db"))
+    monkeypatch.setenv("KEYS_DIR", str(keys))
     import importlib
     from mantle.db import backend as _backend
     importlib.reload(_backend)

@@ -41,7 +41,8 @@ def test_the_home_or_development_plane_is_refused(isolated, monkeypatch, plane):
         monkeypatch.delenv("AGIENCE_PLANE")
     else:
         monkeypatch.setenv("AGIENCE_PLANE", plane)
-    with pytest.raises(cp.CustodyRefused, match="plane"):
+    # A home plane is refused too unless it is a home node (its issuer under home.agience.ai).
+    with pytest.raises(cp.CustodyRefused, match="plane|home node"):
         cp.require_isolated_production(str(isolated))
 
 
@@ -110,3 +111,61 @@ def test_custody_needs_the_store_folder_its_own_at_0700(isolated, monkeypatch, t
     assert why and "store" in why
     with pytest.raises(cp.CustodyRefused):
         cp.require_isolated_production(str(isolated))
+
+
+# -- The home node's test custody (John, 2026-11-11) ---------------------------------------------
+
+def _home(monkeypatch, tmp_path):
+    from mantle.services import custody_plane as cp
+    monkeypatch.delenv("MANTLE_CUSTODY_PLANE_OVERRIDE", raising=False)
+    monkeypatch.setenv("AGIENCE_PLANE", "home")
+    monkeypatch.setenv("ORIGIN_URI", "https://origin.home.agience.ai")
+    monkeypatch.delenv("AUTHORITY_ISSUER", raising=False)
+    monkeypatch.delenv("EMBER_PEERS", raising=False)
+    monkeypatch.setenv("KEYS_DIR", str(tmp_path / "keys"))
+    from mantle import config
+    monkeypatch.setattr(config, "AUTHORITY_ISSUER", "https://origin.home.agience.ai")
+    return cp, str(tmp_path / "keys")
+
+
+def test_the_home_node_holds_test_custody(monkeypatch, tmp_path):
+    cp, keys = _home(monkeypatch, tmp_path)
+    assert cp.custody_refusal(keys) is None
+
+
+def test_home_test_custody_is_given_up_once_the_node_peers(monkeypatch, tmp_path):
+    cp, keys = _home(monkeypatch, tmp_path)
+    monkeypatch.setenv("EMBER_PEERS", "http://peer.example.invalid:8091")
+    assert "peers" in cp.custody_refusal(keys)
+
+
+@pytest.mark.parametrize("issuer", ["https://origin.agience.ai", "https://origin.staging.agience.ai",
+                                    "https://home.agience.ai.example.invalid"])
+def test_a_home_plane_whose_issuer_is_not_a_home_host_holds_none(monkeypatch, tmp_path, issuer):
+    cp, keys = _home(monkeypatch, tmp_path)
+    monkeypatch.setenv("AUTHORITY_ISSUER", issuer)
+    assert "home node" in cp.custody_refusal(keys)
+
+
+@pytest.mark.parametrize("plane", ["rc", "dev", "", "test"])
+def test_every_other_plane_but_production_is_still_refused(monkeypatch, tmp_path, plane):
+    cp, keys = _home(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGIENCE_PLANE", plane)
+    assert "'production'" in cp.custody_refusal(keys)
+
+
+def test_a_home_plane_signing_as_another_issuer_holds_none(monkeypatch, tmp_path):
+    """Every issuer source must be a home host, as Origin decides (review, 2026-11-11)."""
+    cp, keys = _home(monkeypatch, tmp_path)
+    from mantle import config
+    monkeypatch.setattr(config, "AUTHORITY_ISSUER", "https://origin.agience.ai")
+    assert "home node" in cp.custody_refusal(keys)
+    monkeypatch.setattr(config, "AUTHORITY_ISSUER", "https://origin.home.agience.ai")
+    monkeypatch.setenv("AUTHORITY_ISSUER", "https://my.agience.ai")
+    assert "home node" in cp.custody_refusal(keys)
+
+
+def test_home_test_custody_needs_keys_dir_set_as_origin_reads_it(monkeypatch, tmp_path):
+    cp, keys = _home(monkeypatch, tmp_path)
+    monkeypatch.delenv("KEYS_DIR")
+    assert "KEYS_DIR" in cp.custody_refusal(keys), "a default keys folder is not one the node was given"

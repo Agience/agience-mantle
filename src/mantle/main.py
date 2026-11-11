@@ -1085,10 +1085,12 @@ async def _rate_limit(request: Request, call_next):
     if _RL_MAX <= 0 or request.url.path in _RL_EXEMPT:
         return await call_next(request)
     if not _rl_admit(_rate_limit_client(request)):
+        # This middleware sits outside the CORS one, so its answer carries CORS itself, or the web
+        # app sees a CORS failure instead of the 429 (2026-11-11, staging acceptance of 2026.11.24).
         return JSONResponse(
             status_code=429,
             content={"detail": "Rate limit exceeded"},
-            headers={"Retry-After": str(int(_RL_WINDOW_S))},
+            headers={"Retry-After": str(int(_RL_WINDOW_S)), **_cors_for(request)},
         )
     return await call_next(request)
 

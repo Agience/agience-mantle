@@ -5,6 +5,15 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.24] - 2026-11-11
+
+### Fixed
+- A request refused by the rate limiter reaches the web app as a 429, not a CORS failure: the limiter answers outside the CORS middleware, so its answer now carries the CORS headers for an allowed origin itself, as the catch-all error handler does (BUG-056). On staging, a fast acceptance run read it as "blocked by CORS policy".
+- A run that links a collection answers from the notes it holds (BUG-052). Sage lists a linked collection's children, and a narrowed Sage delegation was refused that route, so the collection read as empty and the run had no evidence. Sage may now list children. Each child is still decided by the caller's access and, on a run, by the job's reach.
+
+### Changed
+- The home node holds test custody while it is the test gate (John, 2026-11-11): with `AGIENCE_PLANE=home`, an issuer under `home.agience.ai`, no peers (`EMBER_PEERS`) and its own keys folder, `custody_plane` lets it hold custody over its own keys, so runs, timers and their approvals can be accepted there before promote. Every other plane but production is still refused, and production's own rule is unchanged.
+
 ## [0.1.23] - 2026-11-11
 
 ### Fixed

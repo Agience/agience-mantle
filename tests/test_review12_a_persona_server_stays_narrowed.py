@@ -51,6 +51,8 @@ def test_a_persona_server_never_grants_or_deletes(name, method, path):
     ("lumen", "GET", "/artifacts/visible"), ("lumen", "POST", "/artifacts/a-1/op/invoke"),
     ("iris", "POST", "/artifacts/sec-1/use"), ("iris", "GET", "/grants/my-access"),
     ("sage", "POST", "/artifacts/recall"), ("crystal", "GET", "/artifacts/a-1/children"),
+    # BUG-052 (2026-11-11): Sage answers from what a linked collection holds.
+    ("sage", "GET", "/artifacts/a-1/children"),
 ])
 def test_a_persona_server_reaches_the_routes_its_persona_calls(name, method, path):
     md.enforce_narrowed_bounds(_server(name), _req(method, path))

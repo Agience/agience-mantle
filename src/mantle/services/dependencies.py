@@ -517,7 +517,10 @@ NARROWED_SERVER_ROUTES = {
     "iris": (_GET_ID, _MY_ACCESS, _CREATE, _USE, ("POST", re.compile(r"^/mcp/?$"))),
     "lumen": (_GET_ID, _GET_CHILDREN, _VISIBLE, _OPERATORS, _MY_ACCESS, _CREATE, _USE, _OP,
               ("POST", re.compile(r"^/artifacts/batch/?$"))),
-    "sage": (_GET_ID, _VISIBLE, _RECALL, _CREATE, _USE),
+    # Sage answers from what a linked collection or workspace holds, so it lists one's children;
+    # each child is still decided by `check_access` and, on a run, by the job's reach (BUG-052,
+    # 2026-11-11: refused here, the collection read as empty and the run had no evidence).
+    "sage": (_GET_ID, _GET_CHILDREN, _VISIBLE, _RECALL, _CREATE, _USE),
     # FR-006 (John, 2026-11-10): the app calls these directly. Aria and Ophan call nothing on Mantle
     # of their own and Astra none on a person's behalf: the operators' verdict alone. Seraph reads
     # (an artifact, a container's children); its archive goes through the person, never its own
