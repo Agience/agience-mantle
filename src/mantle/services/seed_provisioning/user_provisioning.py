@@ -591,6 +591,10 @@ def provision_existing_accounts(store_db: Database, base: Optional[Path]) -> Dic
                 if base is not None and (base / "user").is_dir():
                     _apply_grant_set(store_db, base / "user", UserContext(id=a), a)
                 out["operators"] += grant_to_account(store_db, a, skip=pairs)
+                # The account's grants may be memoized from before the seed (it signed in first):
+                # its next read must see these, not wait out the memo (71/test, 2026-11-12: 30 s).
+                from mantle.search.mantle.wiring import invalidate_grant_cache
+                invalidate_grant_cache(a)
             except Exception:  # noqa: BLE001 — one account must not stop the rest
                 logger.warning("provision_existing_accounts (%s): not provisioned", a, exc_info=True)
     return out

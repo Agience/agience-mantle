@@ -76,3 +76,20 @@ def test_a_sign_in_before_the_seed_grants_no_operator_that_does_not_exist_yet(mo
                         lambda db, *, user_id, collection_id, **k: written.append(collection_id))
     assert P.grant_to_account(object(), "alice") == 1
     assert written == [ids[public[0]]]
+
+
+def test_each_provisioned_account_s_memoized_grants_are_dropped(monkeypatch):
+    # An account that signed in before the seed has its grants memoized empty; its first read
+    # after the seed must see the new ones (71/test, 2026-11-12: the first load waited 30 s).
+    import mantle.db.lattice_api as la
+    import mantle.services.peer_signing as ps
+    from mantle.search.mantle import wiring
+
+    docs = [{"grantee_type": "user", "grantee_id": "bob", "resource_id": "inbox-b", "state": "active"}]
+    monkeypatch.setattr(la, "_grant_docs", lambda db, state=None: list(docs))
+    monkeypatch.setattr(ps, "get_system_principal_id", lambda: "sys")
+    monkeypatch.setattr(P, "grant_to_account", lambda db, a, skip=frozenset(): 0)
+    dropped = []
+    monkeypatch.setattr(wiring, "invalidate_grant_cache", lambda rid=None: dropped.append(rid))
+    U.provision_existing_accounts(object(), None)
+    assert dropped == ["bob"]
