@@ -1072,6 +1072,18 @@ PAGE_CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.j
 
 
 @app.middleware("http")
+async def _deferred_mints(request: Request, call_next):
+    """A collection made by this request gets its own key once the request is done
+    (`content_crypto.mint_holder_key`), never beside the request's own writes."""
+    from mantle.services.content_crypto import mint_queue_begin, mint_queue_flush
+    token, queue = mint_queue_begin()
+    try:
+        return await call_next(request)
+    finally:
+        mint_queue_flush(token, queue)
+
+
+@app.middleware("http")
 async def _page_policy(request: Request, call_next):
     response = await call_next(request)
     if "text/html" in response.headers.get("content-type", ""):

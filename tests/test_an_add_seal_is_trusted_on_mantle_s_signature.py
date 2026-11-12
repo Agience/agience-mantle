@@ -74,3 +74,18 @@ def test_a_new_collection_has_its_signed_seal_before_anyone_reads_it(node, mantl
     oracle.evict()
     monkeypatch.setattr(oracle, "_key_for_seal", lambda cid: None)
     assert _send(db, inbox, "the timer's run").id
+
+
+def test_a_request_s_collection_keys_are_minted_after_it_not_beside_it(monkeypatch):
+    # 71/test, 2026-11-12: a mint beside the seed fought its next writes for the custody lock.
+    from types import SimpleNamespace as NS
+    started = []
+    monkeypatch.setattr(cc, "_start_mint", lambda cid, ctx, mint: started.append(cid))
+    token, queue = cc.mint_queue_begin()
+    cc.mint_holder_key(NS(id="c-1", content_type="application/vnd.agience.collection+json", created_by="u"))
+    cc.mint_holder_key(NS(id="a-1", content_type="text/plain", created_by="u"))
+    assert started == [] and [q[0] for q in queue] == ["c-1"]
+    cc.mint_queue_flush(token, queue)
+    assert started == ["c-1"]
+    cc.mint_holder_key(NS(id="c-2", content_type="application/vnd.agience.collection+json", created_by="u"))
+    assert started == ["c-1", "c-2"], "outside a request it starts at once"

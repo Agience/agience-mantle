@@ -565,14 +565,42 @@ def mint_holder_key(entity) -> None:
             logger.debug("collection %s: its key is minted at its first read instead", cid,
                          exc_info=True)
 
-    # Off the request, as the creator: the create runs under the custody lock, and a mint inside
-    # it waits that lock's 30 s timeout (71/test, 2026-11-12: a new workspace took 30 s to open).
+    # As the creator, after the request: the create runs under the custody lock, and a mint inside
+    # it waits that lock's 30 s timeout (71/test, 2026-11-12: a new workspace took 30 s to open). A
+    # mint beside the request competes for the lock with the request's next writes, which then
+    # fail (the seed, the same day). So a request queues it, and its end starts it.
     import contextvars
+    ctx = contextvars.copy_context()
+    queue = _MINT_QUEUE.get()
+    if queue is not None:
+        queue.append((cid, ctx, mint))
+    else:
+        _start_mint(cid, ctx, mint)
+
+
+#: The mints a request queued, started when it ends (`deferred_mints`). None outside a request.
+_MINT_QUEUE: "contextvars.ContextVar[Optional[list]]" = contextvars.ContextVar("mint_queue", default=None)
+
+
+def _start_mint(cid: str, ctx, mint) -> None:
     import threading
-    t = threading.Thread(target=contextvars.copy_context().run, args=(mint,), daemon=True,
-                         name=f"mint-key-{cid[:8]}")
+    t = threading.Thread(target=ctx.run, args=(mint,), daemon=True, name=f"mint-key-{cid[:8]}")
     _MINTING.append(t)
     t.start()
+
+
+def mint_queue_begin():
+    """Open a request's mint queue. Returns the token and the queue for `mint_queue_flush`."""
+    queue: list = []
+    return _MINT_QUEUE.set(queue), queue
+
+
+def mint_queue_flush(token, queue: list) -> None:
+    """Close a request's mint queue and start what it queued, now that the request has let go of
+    the custody lock."""
+    _MINT_QUEUE.reset(token)
+    for cid, ctx, mint in queue:
+        _start_mint(cid, ctx, mint)
 
 
 #: The background mints started by `mint_holder_key`, for `wait_minted`.
