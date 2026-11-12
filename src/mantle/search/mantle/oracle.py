@@ -1006,13 +1006,16 @@ class OracleService:
         row = self._seal_row(collection_id)
         if row is None:
             return None
-        ck = self._key_for_seal(collection_id)
-        if ck is None:
-            return None
         try:
             public = _b64.b64decode(row["public"])
         except (ValueError, TypeError):
             return None
+        ck = self._key_for_seal(collection_id)
+        if ck is None:
+            # No reader has opened the collection lately (a timer firing hours after its arm): the
+            # seal is trusted on Mantle's own signature, made when a reader's open wrote the row
+            # (John, 2026-11-12). Writing to the store alone cannot forge one.
+            return public if self._seal_signed(collection_id, public, row) else None
         from mantle.services.content_crypto import drop_public_key
         bound = (public == drop_public_key(ck) and _hmac.compare_digest(
             str(row.get("mac") or ""), self._seal_mac(ck, collection_id, public)))
@@ -1039,6 +1042,24 @@ class OracleService:
         if verdict is not None:
             verdict(key_id, collection_id=collection_id, artifact_id=request.artifact_id)
 
+    @staticmethod
+    def _seal_signed_bytes(collection_id: str, public: bytes) -> bytes:
+        return b"add-seal-sig-v1\0" + str(collection_id).encode("utf-8") + b"\0" + public
+
+    def _sign_seal(self, collection_id: str, public: bytes) -> str:
+        from mantle.services.peer_signing import sign_bytes
+        try:
+            return sign_bytes(self._seal_signed_bytes(collection_id, public))
+        except Exception:  # noqa: BLE001 — no key here: the seal keeps its MAC binding only
+            logger.warning("the Add seal of %s is not signed: Mantle's key is unavailable",
+                           collection_id)
+            return ""
+
+    def _seal_signed(self, collection_id: str, public: bytes, row: dict) -> bool:
+        from mantle.services.peer_signing import verify_bytes
+        sig = row.get("sig")
+        return bool(sig) and verify_bytes(self._seal_signed_bytes(collection_id, public), sig)
+
     def _check_drop_key(self, collection_id: str, collection_key: bytes) -> None:
         """On every Read open of a collection key: this store's cached Add seal is the one the key
         derives. Missing, it is cached now; a mismatch is an ALARM and is repaired, since a writer
@@ -1050,7 +1071,8 @@ class OracleService:
         derived = drop_public_key(collection_key)
         mac = self._seal_mac(collection_key, collection_id, derived)
         row = self._seal_row(collection_id) or {}
-        if row.get("public") == _b64.b64encode(derived).decode("ascii") and row.get("mac") == mac:
+        if (row.get("public") == _b64.b64encode(derived).decode("ascii") and row.get("mac") == mac
+                and self._seal_signed(collection_id, derived, row)):
             return
         if row:
             logger.error("ALARM: the Add seal of collection %s is not the one its key derives, "
@@ -1062,6 +1084,7 @@ class OracleService:
                 "id": f"add-seal:{collection_id}", "state": "live",
                 "content_type": self.ADD_SEAL_CONTENT_TYPE,
                 "context": {"public": _b64.b64encode(derived).decode("ascii"), "mac": mac,
+                            "sig": self._sign_seal(collection_id, derived),
                             "collection_id": collection_id}})
             if db.artifacts.get_artifact(self._LEGACY_SEAL_ROW + collection_id) is not None:
                 db.artifacts.delete_artifact(self._LEGACY_SEAL_ROW + collection_id)

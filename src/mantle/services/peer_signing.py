@@ -91,3 +91,34 @@ def sign_service_jwt(audience: str = "mantle", ttl_seconds: int = _TTL,
         for k, v in additional_claims.items():
             claims.setdefault(k, v)
     return _jwt.encode(claims, _pem(), algorithm="RS256", headers={"kid": _KID})
+
+
+# -- signing bytes with Mantle's own key -------------------------------------
+
+def sign_bytes(data: bytes) -> str:
+    """Mantle's RSA-SHA256 signature over `data`, base64. What only this Mantle can have written
+    (an Add seal's binding when no collection key is at hand)."""
+    import base64
+
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    key = serialization.load_pem_private_key(_pem().encode("ascii"), password=None)
+    return base64.b64encode(key.sign(data, padding.PKCS1v15(), hashes.SHA256())).decode("ascii")
+
+
+def verify_bytes(data: bytes, signature_b64: str) -> bool:
+    """`signature_b64` is this Mantle's signature over `data`."""
+    import base64
+
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    try:
+        key = serialization.load_pem_private_key(_pem().encode("ascii"), password=None)
+        key.public_key().verify(base64.b64decode(signature_b64), data, padding.PKCS1v15(),
+                                hashes.SHA256())
+        return True
+    except (InvalidSignature, ValueError, TypeError):
+        return False
