@@ -56,3 +56,23 @@ def test_the_user_grant_set_skips_every_pair_with_a_record():
     finally:
         mod.db_upsert_user_collection_grant = real
     assert calls == [("bob", "r-new")] and r.grants_skipped == 1
+
+
+def test_a_sign_in_before_the_seed_grants_no_operator_that_does_not_exist_yet(monkeypatch):
+    # The grant would name the operator before its creation, and its first key is minted only
+    # while no grant names it: the seed could then never make it.
+    import mantle.db.backend as B
+    import mantle.db.lattice_api as la
+    import mantle.services.seed_provisioning.platform_email as E
+
+    public = [o["slug"] for o in P.OPERATORS if o.get("public")]
+    ids = {P._COLLECTION_SLUG: "coll", **{o["slug"]: f"id-{o['slug']}" for o in P.OPERATORS}}
+    made = {ids[public[0]]}
+    monkeypatch.setattr(P, "ids", lambda: ids)
+    monkeypatch.setattr(E, "_operator_id", lambda db: "op")
+    monkeypatch.setattr(la, "get_artifact", lambda db, i, **k: object() if i in made else None)
+    written = []
+    monkeypatch.setattr(B, "upsert_user_collection_grant",
+                        lambda db, *, user_id, collection_id, **k: written.append(collection_id))
+    assert P.grant_to_account(object(), "alice") == 1
+    assert written == [ids[public[0]]]

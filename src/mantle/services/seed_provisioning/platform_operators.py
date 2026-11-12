@@ -254,6 +254,15 @@ def ensure_platform_operators(db: Database) -> bool:
     return True
 
 
+def _exists(db: Database, artifact_id: str) -> bool:
+    """The artifact is in the store, whether or not this caller may open it."""
+    from mantle.db import lattice_api as la
+    try:
+        return la.get_artifact(db, artifact_id) is not None
+    except Exception:  # noqa: BLE001 — present, but sealed to this caller
+        return True
+
+
 def grant_to_account(db: Database, user_id: str, skip: frozenset = frozenset()) -> int:
     """Grant `user_id` read and invoke on each public operator. Idempotent; returns how many."""
     from mantle.db.backend import upsert_user_collection_grant
@@ -265,7 +274,11 @@ def grant_to_account(db: Database, user_id: str, skip: frozenset = frozenset()) 
         return 0
     n = 0
     for op in OPERATORS:
-        if op.get("public") and (str(user_id), known[op["slug"]]) not in skip:
+        # Only an operator that exists: a grant naming one not yet made would stop its creation,
+        # whose first key is minted only while no grant names it (71/test, 2026-11-12: an account
+        # that signed in before the seed). The seed grants the rest to every account afterwards.
+        if (op.get("public") and (str(user_id), known[op["slug"]]) not in skip
+                and _exists(db, known[op["slug"]])):
             upsert_user_collection_grant(db, user_id=user_id, collection_id=known[op["slug"]],
                                          granted_by=operator, can_read=True, can_invoke=True,
                                          name=f"Platform operator: {op['title']}")
