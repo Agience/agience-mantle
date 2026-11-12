@@ -17,6 +17,10 @@ See ``.dev/features/declarative-bootstrap-artifacts.md`` for the full design.
 """
 from __future__ import annotations
 
+import contextvars
+
+import contextlib
+
 import json
 import logging
 import os
@@ -542,13 +546,32 @@ def _create_platform_collection(store_db: Database, collection) -> None:
             invalidate_grant_cache(str(actor.principal_id))
 
 
+#: While set, the `(principal, resource)` pairs that already have a grant record in any state: the
+#: grant passes write none of them, so a grant once withheld (revoked) is never written again.
+_EXISTING_PAIRS: "contextvars.ContextVar[Optional[frozenset]]" = contextvars.ContextVar(
+    "seed_existing_grant_pairs", default=None)
+
+
+@contextlib.contextmanager
+def only_where_never_granted(pairs: frozenset):
+    token = _EXISTING_PAIRS.set(frozenset(pairs))
+    try:
+        yield
+    finally:
+        _EXISTING_PAIRS.reset(token)
+
+
 def _apply_accumulated_grants(
     store_db: Database,
     accumulated: dict,
     report: SeedReport,
 ) -> None:
     """Upsert the unioned grants — one write per ``(principal, resource)``."""
+    existing = _EXISTING_PAIRS.get()
     for (principal, resource), spec in accumulated.items():
+        if existing is not None and (str(principal), str(resource)) in existing:
+            report.grants_skipped += 1
+            continue
         try:
             _grant, changed = db_upsert_user_collection_grant(
                 store_db,

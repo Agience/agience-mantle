@@ -462,6 +462,15 @@ async def seed_platform(
                     "on this store it can't be repaired from here)")
         errors.append(f"platform operators: {type(exc).__name__}: {exc}{hint}")
         summary += " | operators: not provisioned"
+    # Accounts that signed in before this seed found nothing to be granted then.
+    try:
+        from mantle.services.seed_provisioning.user_provisioning import provision_existing_accounts
+        done = await offload_sync(provision_existing_accounts, store_db, Path(base))
+        if done.get("accounts"):
+            summary += f" | accounts provisioned {done['accounts']}"
+    except Exception as exc:  # noqa: BLE001 — reported, never a failed seed
+        logger.exception("existing accounts could not be provisioned from the seed route")
+        errors.append(f"existing accounts: {type(exc).__name__}: {exc}")
     if len(errors) != len(report.errors):
         # The seed's own summary counts the seed's errors only; say how many this answer holds.
         summary += f" | errors {len(errors)} in all"

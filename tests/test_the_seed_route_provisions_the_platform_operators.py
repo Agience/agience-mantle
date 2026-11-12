@@ -43,6 +43,8 @@ async def test_an_operators_failure_is_reported_and_the_seed_still_answers(monke
             return "artifacts +0 ~0 =41 | errors 0"
     import mantle.services.seed_provisioning as SP
     monkeypatch.setattr(SP, "seed_from_artifacts", lambda db, root: Report())
+    import mantle.services.seed_provisioning.user_provisioning as UP
+    monkeypatch.setattr(UP, "provision_existing_accounts", lambda db, base: {"accounts": 0, "operators": 0})
 
     def boom(db):
         raise RuntimeError("no key")

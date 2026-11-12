@@ -254,7 +254,7 @@ def ensure_platform_operators(db: Database) -> bool:
     return True
 
 
-def grant_to_account(db: Database, user_id: str) -> int:
+def grant_to_account(db: Database, user_id: str, skip: frozenset = frozenset()) -> int:
     """Grant `user_id` read and invoke on each public operator. Idempotent; returns how many."""
     from mantle.db.backend import upsert_user_collection_grant
     from mantle.services.seed_provisioning.platform_email import _operator_id
@@ -265,7 +265,7 @@ def grant_to_account(db: Database, user_id: str) -> int:
         return 0
     n = 0
     for op in OPERATORS:
-        if op.get("public"):
+        if op.get("public") and (str(user_id), known[op["slug"]]) not in skip:
             upsert_user_collection_grant(db, user_id=user_id, collection_id=known[op["slug"]],
                                          granted_by=operator, can_read=True, can_invoke=True,
                                          name=f"Platform operator: {op['title']}")

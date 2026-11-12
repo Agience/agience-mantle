@@ -25,7 +25,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from mantle.db.store import Database
 
@@ -565,3 +565,32 @@ def _materialize_inbox(store_db: Database, user_id: str, inbox_workspace_id: str
                     "Failed importing seed artifact root %s into inbox workspace %s",
                     root_id, inbox_workspace_id,
                 )
+
+
+def provision_existing_accounts(store_db: Database, base: Optional[Path]) -> Dict[str, int]:
+    """After a seed: give every account the store knows the user grant set and the platform
+    operators, for each `(account, resource)` pair that has never had a grant record.
+
+    An account that signed in before the seed found nothing to be granted, and first sign-in runs
+    once (71/test, 2026-11-12). A pair with any record, active or revoked, is left as it is, so a
+    grant once withheld stays withheld."""
+    from mantle.db import lattice_api as la
+    from mantle.services.peer_signing import get_system_principal_id
+    from mantle.services.seed_provisioning.loader import UserContext, only_where_never_granted
+    from mantle.services.seed_provisioning.platform_operators import grant_to_account
+
+    docs = list(la._grant_docs(store_db))
+    pairs = frozenset((str(d.get("grantee_id")), str(d.get("resource_id"))) for d in docs)
+    accounts = {str(d["grantee_id"]) for d in docs
+                if d.get("grantee_type") == "user" and d.get("grantee_id")}
+    accounts -= {get_system_principal_id(), ""}
+    out = {"accounts": len(accounts), "operators": 0}
+    with only_where_never_granted(pairs):
+        for a in sorted(accounts):
+            try:
+                if base is not None and (base / "user").is_dir():
+                    _apply_grant_set(store_db, base / "user", UserContext(id=a), a)
+                out["operators"] += grant_to_account(store_db, a, skip=pairs)
+            except Exception:  # noqa: BLE001 — one account must not stop the rest
+                logger.warning("provision_existing_accounts (%s): not provisioned", a, exc_info=True)
+    return out
