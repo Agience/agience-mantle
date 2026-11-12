@@ -279,6 +279,8 @@ def create_artifact(db: LatticeDatabase, entity: ArtifactEntity) -> ArtifactEnti
     entity.content_key_scope = getattr(entity, "collection_id", None) or None
     db.artifacts.put_artifact(to_lattice_doc(entity))
     _boundary.emit_artifact_change(entity, "artifact.created")
+    from mantle.services.content_crypto import mint_holder_key
+    mint_holder_key(entity)        # a collection's own key and Add seal, from its creation
     return entity
 
 
@@ -568,6 +570,8 @@ def create_collection(db: LatticeDatabase, entity: Any) -> Any:
     ("everything is an artifact, and deserves an event")."""
     db.artifacts.put_artifact(to_lattice_doc(entity))
     _boundary.emit_artifact_change(entity, "artifact.created")
+    from mantle.services.content_crypto import mint_holder_key
+    mint_holder_key(entity)        # a collection's own key and Add seal, from its creation
     return entity
 
 

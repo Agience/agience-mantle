@@ -60,3 +60,16 @@ def test_a_planted_or_altered_seal_is_not_trusted_without_the_key(node, mantle_k
     db.artifacts.put_artifact({"id": f"add-seal:{inbox}", "state": "live",
                                "content_type": o.OracleService.ADD_SEAL_CONTENT_TYPE, "context": ctx})
     assert oracle.add_seal_public(inbox) is None and pub
+
+
+def test_a_new_collection_has_its_signed_seal_before_anyone_reads_it(node, mantle_key, monkeypatch):
+    # 71/test, 2026-11-12: a timer's run was the first write into a new collection, and a
+    # writer holding Add alone cannot mint the key the seal comes from.
+    from .test_add_does_not_carry_read import _send
+    db, oracle = node
+    inbox = _inbox(db)                                   # created; never opened by a reader
+    seal = db.artifacts.get_artifact(f"add-seal:{inbox}")
+    assert seal and seal["context"]["sig"]
+    oracle.evict()
+    monkeypatch.setattr(oracle, "_key_for_seal", lambda cid: None)
+    assert _send(db, inbox, "the timer's run").id

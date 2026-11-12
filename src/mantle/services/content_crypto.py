@@ -539,3 +539,25 @@ def decrypt_content(
         principal_id, collection_id,
     )
     return plain
+
+
+#: The content types that hold other artifacts, and so have a key of their own.
+_HOLDER_TYPES = ("application/vnd.agience.collection+json", "application/vnd.agience.workspace+json")
+
+
+def mint_holder_key(entity) -> None:
+    """At a collection's creation, its creator mints the collection's own key, which also writes
+    its signed Add seal (`oracle._check_drop_key`). Without it the key is minted only at the first
+    write of content into the collection, and a writer holding Add alone (a timer recording its
+    run) could never be that first write (71/test, 2026-11-12). Non-fatal: a creator that may open
+    no key (a narrowed delegation) mints nothing, and the first reader's open makes the seal."""
+    if getattr(entity, "content_type", None) not in _HOLDER_TYPES:
+        return
+    cid = str(getattr(entity, "id", "") or "")
+    if not cid:
+        return
+    try:
+        _default_collection_key(cid, cid, may_create=True,
+                                creator_id=getattr(entity, "created_by", None))
+    except Exception:  # noqa: BLE001 — see the docstring
+        logger.debug("collection %s: its key is minted at its first read instead", cid, exc_info=True)
