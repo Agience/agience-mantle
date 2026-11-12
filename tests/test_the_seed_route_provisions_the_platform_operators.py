@@ -69,3 +69,31 @@ async def test_an_operators_failure_is_reported_and_the_seed_still_answers(monke
     monkeypatch.setattr(B, "get_artifact", lambda db, i: object())
     out = await S.seed_platform(auth=None, store_db=object())
     assert out.errors == [] and out.summary.endswith("| operators converged") and granted == [1]
+
+
+async def test_one_call_repeats_the_seed_while_each_pass_clears_errors(monkeypatch, tmp_path):
+    # 71/test, 2026-11-12: pass 1 left 12 Add-seal ordering errors that pass 2 cleared.
+    from mantle.routers import system_router as S
+    import mantle.services.seed_provisioning as SP
+
+    (tmp_path / "platform").mkdir()
+    monkeypatch.setenv("AGIENCE_SEEDS_ROOT", str(tmp_path))
+    monkeypatch.setattr(S, "require_platform_admin", lambda auth, db: "op-1", raising=False)
+
+    def report(n):
+        class R:
+            errors = [f"e{i}" for i in range(n)]
+
+            def summary(self):
+                return f"errors {n}"
+        return R()
+    runs = iter([report(12), report(0)])
+    monkeypatch.setattr(SP, "seed_from_artifacts", lambda db, root: next(runs))
+    monkeypatch.setattr(P, "ensure_platform_operators", lambda db: (_ for _ in ()).throw(RuntimeError("x")))
+    out = await S.seed_platform(auth=None, store_db=object())
+    assert out.summary.startswith("errors 0 | passes 2"), out.summary
+
+    stuck = iter([report(3), report(3), report(0)])
+    monkeypatch.setattr(SP, "seed_from_artifacts", lambda db, root: next(stuck))
+    out = await S.seed_platform(auth=None, store_db=object())
+    assert out.summary.startswith("errors 3 | passes 2"), "a pass that clears nothing ends it"

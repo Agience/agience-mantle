@@ -370,6 +370,10 @@ def _platform_user_page(
     return users, int(page.get("total") or 0)
 
 
+#: Seed passes one call may make; each must clear errors for the next to run.
+_SEED_MAX_PASSES = 4
+
+
 @router.post(
     "/seed",
     responses=_errors(401, 403, 409),
@@ -406,10 +410,20 @@ async def seed_platform(
     # Reads a whole seed tree off disk and writes every artifact and grant in it — the
     # longest-running call in this service, and it must run start to finish in one thread.
     report = await offload_sync(seed_from_artifacts, store_db, root)
+    # On a fresh store a card can be written before its collection's Add seal exists; the next
+    # pass finds the seal. Passes repeat while each one clears errors, so one call converges.
+    passes = 1
+    while report.errors and passes < _SEED_MAX_PASSES:
+        again = await offload_sync(seed_from_artifacts, store_db, root)
+        passes += 1
+        cleared = len(again.errors) < len(report.errors)
+        report = again
+        if not cleared:
+            break
 
-    logger.info("platform seed applied: %s", report.summary())
+    logger.info("platform seed applied in %d pass(es): %s", passes, report.summary())
     errors = list(report.errors)
-    summary = report.summary()
+    summary = report.summary() + (f" | passes {passes}" if passes > 1 else "")
     # The platform operators, provisioned on the calling admin's own request, so on their
     # credential. Mantle's startup provisions them too, but on a fresh node it can start before
     # Origin answers and find no operator; a job grant is the other way, and John chose this one
