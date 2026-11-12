@@ -1173,7 +1173,7 @@ def is_platform_admin(
 
     if operator_id is None:
         from mantle.services.operator import resolve_operator_id
-        operator_id = resolve_operator_id(store_db)
+        operator_id = resolve_operator_id(store_db, fresh=True)
 
     # `operator_id and` is the whole safety of this line, not defensive noise: on a
     # part-provisioned store an unresolved operator and an unidentified caller are both

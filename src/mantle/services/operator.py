@@ -28,7 +28,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-def resolve_operator_id(db: Any = None) -> str:
+def resolve_operator_id(db: Any = None, *, fresh: bool = False) -> str:
     from mantle import config
     from mantle.services.platform_settings_service import settings as platform_settings
 
@@ -42,7 +42,7 @@ def resolve_operator_id(db: Any = None) -> str:
 
     try:
         from mantle.clients.origin_client import get_origin_client
-        return str(get_origin_client().get_operator_id() or "")
+        return str(get_origin_client().get_operator_id(fresh=fresh) or "")
     except Exception:
         logger.debug("operator_id: Origin fallback unavailable (non-fatal)", exc_info=True)
         return ""

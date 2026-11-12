@@ -213,3 +213,24 @@ def test_no_route_depends_on_get_person():
         "Origin, or resolve the person from the token claims instead of fetching it."
         % ", ".join(sorted(offenders))
     )
+
+
+def test_a_request_time_lookup_asks_an_origin_that_was_only_late_at_boot(monkeypatch):
+    """71/test, 2026-11-11: Mantle started before Origin answered, and the admin's seed 44 s later
+    was refused for the boot's memo. Boot callers keep the memo; the admin's own call asks again."""
+    calls: list = []
+    client = _refusing_client(monkeypatch, calls)
+    assert client.get_operator_id() is None
+    assert client.get_operator_id() is None and len(calls) == 1, "boot callers share the memo"
+    assert client.get_operator_id(fresh=True) is None and len(calls) == 2
+
+
+def test_the_platform_admin_check_resolves_the_operator_fresh(monkeypatch):
+    from mantle.services import dependencies as D
+    from mantle.services import operator
+
+    seen = []
+    monkeypatch.setattr(operator, "resolve_operator_id",
+                        lambda db=None, *, fresh=False: seen.append(fresh) or "")
+    assert D.is_platform_admin(object(), "u-1", authority_id="a-1") is False
+    assert seen == [True]

@@ -120,7 +120,7 @@ class OriginClient:
             "Content-Type": "application/json",
         }
 
-    def get_operator_id(self) -> Optional[str]:
+    def get_operator_id(self, *, fresh: bool = False) -> Optional[str]:
         """Fetch the platform operator UUID from Origin.
 
         Used by Mantle when neither ``platform.operator_id`` in its own
@@ -137,7 +137,9 @@ class OriginClient:
         if not self.enabled:
             logger.debug("No ORIGIN_URI configured; resolving the operator locally")
             return None
-        if time.monotonic() < self._unreachable_until:
+        if not fresh and time.monotonic() < self._unreachable_until:
+            # `fresh` is a request-time lookup (a platform admin's own call): an Origin that was
+            # only late at boot is asked again rather than held against the caller for 60 s.
             logger.debug("Origin recently unreachable; skipping get_operator_id")
             return None
         try:
