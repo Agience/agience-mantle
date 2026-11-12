@@ -524,7 +524,13 @@ def _create_platform_collection(store_db: Database, collection) -> None:
             with rj.proof(created_by=str(actor.principal_id),
                           created_at=datetime.now(timezone.utc).isoformat()):
                 rj.submit(rj.root_entry(collection.id))
-        db_create_collection(store_db, collection)
+        # The acting principal mints the collection's first key: `created_by` stays the platform
+        # user, which no caller is, so without this the key is refused and the write falls to an
+        # Add seal no reader has made yet (AddSealPending).
+        from mantle.services.content_crypto import collection_key_minted_by
+        with collection_key_minted_by(str(actor.principal_id) if actor is not None else "",
+                                      collection.id):
+            db_create_collection(store_db, collection)
         if actor is not None and rj.installed():
             db_upsert_user_collection_grant(
                 store_db, user_id=str(actor.principal_id), collection_id=collection.id,

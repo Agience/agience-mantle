@@ -124,6 +124,23 @@ def content_key_artifact(artifact_id: Optional[str]) -> Iterator[None]:
         _KEY_ARTIFACT.reset(token)
 
 
+#: The principal that mints a new collection's key, while it does, as `(principal_id,
+#: collection_id)`. A platform collection's `created_by` is the platform user, which no caller is,
+#: so the seed names who is creating it. Only the first key of that one collection is affected:
+#: `KeyRequest.creator_id` is consulted on the minting path alone, before any grant names it.
+_KEY_CREATOR: contextvars.ContextVar[Optional[tuple]] = contextvars.ContextVar("mantle_content_key_creator", default=None)
+
+
+@contextlib.contextmanager
+def collection_key_minted_by(principal_id: str, collection_id: str) -> Iterator[None]:
+    """Name *principal_id* as the creator of *collection_id*'s key for the duration."""
+    token = _KEY_CREATOR.set((principal_id, collection_id) if principal_id and collection_id else None)
+    try:
+        yield
+    finally:
+        _KEY_CREATOR.reset(token)
+
+
 @contextlib.contextmanager
 def content_key_action(action: str) -> Iterator[None]:
     """Demand content keys under `action` for the duration. Only the use route widens this."""
@@ -399,6 +416,9 @@ def encrypt_content(
         raise ValueError("principal_id is required to encrypt content")
     if isinstance(plaintext, str):
         plaintext = plaintext.encode("utf-8")
+    minting = _KEY_CREATOR.get()
+    if minting is not None and collection_id and minting[1] == collection_id:
+        creator_id = minting[0]
     if collection_id and (collection_key_provider is not None or master_key_provider is None):
         # The collection's own key: every collection's content is keyed under its own. A writer
         # who may not read the collection (Add or Create alone) is given no key: their content
