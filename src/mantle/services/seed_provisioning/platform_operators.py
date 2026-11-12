@@ -303,8 +303,10 @@ def grant_to_every_account(db: Database) -> Dict[str, int]:
     from mantle.db import lattice_api as la
     from mantle.services.peer_signing import get_system_principal_id
     # The platform's own system principal holds principal-typed grants on the platform's
-    # collections (`ensure_platform_principal_grant`) and is not an account.
-    not_accounts = {get_system_principal_id()} - {""}
+    # collections (`ensure_platform_principal_grant`) and is not an account; the operator account
+    # owns the operators and is never granted them.
+    from mantle.services.seed_provisioning.platform_email import _operator_id
+    not_accounts = {get_system_principal_id(), _operator_id(db) or ""} - {""}
     accounts = set()
     for doc in la._grant_docs(db, state="active"):
         if doc.get("grantee_type") == "user" and doc.get("grantee_id"):
