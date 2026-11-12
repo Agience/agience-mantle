@@ -83,6 +83,18 @@ OPERATORS: List[Dict[str, Any]] = [
          "title": {"type": "string"},
          "reason": {"type": "string", "description": "Why it needs a person"},
          "source_id": _artifact("What raised it (optional)")}}},
+    # A server artifact's tool as a step (John, 2026-11-12, pilot check 5): the server is an input
+    # artifact, so the step links it and the run's grant reaches it; Iris sends one tools/call with
+    # the server's own key, never the caller's credential.
+    {"slug": "op-use-a-server-tool", "title": "Use a server tool", "public": True,
+     "description": "Run one tool on an MCP server added to the workspace as a server artifact.",
+     "server": "iris", "tool": "use_server_tool",
+     "input_schema": {"type": "object", "required": ["server", "tool"], "properties": {
+         "server": _artifact("The server artifact", "application/vnd.agience.mcp-server+json"),
+         "tool": {"type": "string", "description": "The tool's name, as the server lists it"},
+         "arguments": {"type": "object", "description": "The tool's arguments"}}},
+     "arguments": {"server_artifact_id": "$.body.params.server", "tool": "$.body.params.tool",
+                   "arguments": "$.body.params.arguments?"}},
     {"slug": "op-list-my-collections", "title": "List my collections", "public": True,
      "description": "The collections you can reach.",
      "server": "sage", "tool": "browse_collections",
