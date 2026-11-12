@@ -127,6 +127,14 @@ class VaultTransitKeyProvider:
         return base64.b64decode(data["plaintext"])
 
 
+def load_platform_key() -> None:
+    """Load the platform encryption key the local provider wraps keys under, as the server does
+    at startup. A command-line tool calls this before it seals anything; without it the oracle
+    has no key and every sealed field is refused (2026-11-11, the seed command)."""
+    from prism.trust.key_manager import init_encryption_key
+    init_encryption_key()
+
+
 def build_key_provider() -> KeyProvider:
     """Construct the KeyProvider selected by ``MANTLE_KEK_PROVIDER`` (default ``local``).
 

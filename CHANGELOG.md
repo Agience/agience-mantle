@@ -5,6 +5,10 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- The admin seed route (`POST /system/seed`) also provisions the platform operators on the calling admin's own credential, and grants them to every account, as the operator, only when this call creates them. A later call converges them and grants nothing, so a withheld grant stays withheld. On a fresh node, Mantle's startup ran before Origin answered and found no operator, so no account had operators. Its command-line migration holds no credential, and under custody gets no key. A failure here is listed in the response's `errors` and never fails the seed (John, 2026-11-11: the home node is seeded through the admin route, with no job grant).
+- The seed command (`mantle.system.manage_seed`) loads the platform encryption key first, as the server does at startup. Without it every sealed field was refused, and a fresh store's seeded servers and operators were left without their forms and wiring.
+
 ## [0.1.24] - 2026-11-11
 
 ### Fixed

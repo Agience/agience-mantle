@@ -246,6 +246,13 @@ def main():
     if args.action in ("grant-write", "revoke") and not args.user:
         parser.error(f"--user is required for --action {args.action}")
 
+    # The key oracle needs the platform encryption key, which the server loads at startup and a CLI
+    # must load itself, as `cosign_authority` does. Without it every sealed field is refused
+    # ("context field encryption unavailable"), and a fresh store's seeded servers and operators
+    # were left without their forms and wiring (2026-11-11, the home test node).
+    from mantle.search.mantle.key_provider import load_platform_key
+    load_platform_key()
+
     db = connect()
     platform_settings.load_all(db)
     pre_resolve_platform_ids(db)

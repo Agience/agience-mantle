@@ -408,7 +408,49 @@ async def seed_platform(
     report = await offload_sync(seed_from_artifacts, store_db, root)
 
     logger.info("platform seed applied: %s", report.summary())
-    return SeedResponse(applied=True, summary=report.summary(), errors=list(report.errors))
+    errors = list(report.errors)
+    summary = report.summary()
+    # The platform operators, provisioned on the calling admin's own request, so on their
+    # credential. Mantle's startup provisions them too, but on a fresh node it can start before
+    # Origin answers and find no operator; a job grant is the other way, and John chose this one
+    # (2026-11-11). Every account is granted them only by the call that creates them: a later call
+    # converges the operators and grants nothing, so a grant withheld from an account stays
+    # withheld, and a store's grants are not rescanned on every seed (review, 2026-11-11). A new
+    # account is granted them at its first sign-in. A failure here is reported, never a failed seed.
+    from mantle.db.backend import get_artifact as _get_artifact
+    from mantle.services.seed_provisioning import platform_operators as platform_ops
+    try:
+        coll = platform_ops.ids().get(platform_ops._COLLECTION_SLUG)
+        existed = bool(coll) and await offload_sync(_get_artifact, store_db, coll) is not None
+        if await offload_sync(platform_ops.ensure_platform_operators, store_db):
+            if existed:
+                summary += " | operators converged"
+            else:
+                def _grant_as_operator(db):
+                    # The grants record the operator as granting them, so the operator grants
+                    # them: the caller's own principal when that is the operator, else as startup.
+                    from mantle.services.seed_provisioning.platform_email import _operator_id
+                    with platform_ops._as_operator(_operator_id(db)):
+                        return platform_ops.grant_to_every_account(db)
+                counts = await offload_sync(_grant_as_operator, store_db)
+                summary += f" | operators granted {counts.get('granted', 0)} of {counts.get('accounts', 0)}"
+        else:
+            errors.append("platform operators: no operator or instance namespace yet")
+    except Exception as exc:  # noqa: BLE001 — reported in the response, as the seed's own errors are
+        logger.exception("platform operators could not be provisioned from the seed route")
+        hint = ""
+        if type(exc).__name__ == "AddSealPending":
+            # The operators' collection exists but no reader can open its key, so no Add seal can
+            # be made for it. That happens when something without a credential created it; a store
+            # where this route creates it, on the admin's own credential, has its key and seal.
+            hint = (" (the operators' collection was created without a key any reader holds; "
+                    "on this store it can't be repaired from here)")
+        errors.append(f"platform operators: {type(exc).__name__}: {exc}{hint}")
+        summary += " | operators: not provisioned"
+    if len(errors) != len(report.errors):
+        # The seed's own summary counts the seed's errors only; say how many this answer holds.
+        summary += f" | errors {len(errors)} in all"
+    return SeedResponse(applied=True, summary=summary, errors=errors)
 
 
 @router.post(

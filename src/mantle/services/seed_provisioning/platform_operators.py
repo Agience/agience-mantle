@@ -205,11 +205,26 @@ def _own_grant(upsert, db: Database, operator: str, artifact_id: str, title: str
            can_invoke=True, can_add=True, can_share=True, can_admin=True, name=f"Owner: {title}")
 
 
+def _as_operator(operator: str):
+    """Act as the operator for the provisioning. When the operator is already acting, on their own
+    request through the admin seed route, keep that principal and the credential it carries: under
+    custody a bare principal of the same id is given no key, and the provisioning fails
+    (2026-11-11, the home test node; John chose the admin route over a job grant)."""
+    from contextlib import nullcontext
+
+    from mantle.services.acting_principal import acting_as, current_acting_principal
+
+    current = current_acting_principal()
+    if (current is not None and str(getattr(current, "principal_id", "")) == str(operator)
+            and getattr(current, "principal_type", "") == "user"):
+        return nullcontext()
+    return acting_as(operator, principal_type="user", scope="platform.operators-provisioning")
+
+
 def ensure_platform_operators(db: Database) -> bool:
     """Create or converge the collection and its operators. False when not yet possible."""
     from mantle.db.backend import add_artifact_to_collection as db_add_edge
     from mantle.db.backend import upsert_user_collection_grant
-    from mantle.services.acting_principal import acting_as
     from mantle.services.platform_topology import register_id
     from mantle.services.seed_provisioning.platform_email import _operator_id
 
@@ -218,7 +233,7 @@ def ensure_platform_operators(db: Database) -> bool:
     if not operator or not known:
         logger.info("platform_operators: no operator or instance namespace yet — will retry")
         return False
-    with acting_as(operator, principal_type="user", scope="platform.operators-provisioning"):
+    with _as_operator(operator):
         coll = known[_COLLECTION_SLUG]
         _ensure(db, coll, content_type=COLLECTION_CT, name="Platform operators",
                          description="Operators the platform provides; each is granted to every account.",
