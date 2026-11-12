@@ -536,6 +536,10 @@ def _create_platform_collection(store_db: Database, collection) -> None:
                 store_db, user_id=str(actor.principal_id), collection_id=collection.id,
                 granted_by=str(actor.principal_id), name="Creation grant",
                 **{f"can_{a}": True for a in ACTIONS})
+            # The creator's grants may be memoized from before this one (a first sign-in a moment
+            # earlier); the seed's next write into this collection must see it.
+            from mantle.search.mantle.wiring import invalidate_grant_cache
+            invalidate_grant_cache(str(actor.principal_id))
 
 
 def _apply_accumulated_grants(

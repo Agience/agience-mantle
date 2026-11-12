@@ -1039,6 +1039,24 @@ def test_a_seeded_platform_collection_comes_with_its_root_and_creation_grant(db,
     assert grant["grantee_id"] == "sys-1" and grant["resource_id"] == "plat-1"
 
 
+def test_the_creators_memoized_grants_are_dropped_once_the_creation_grant_is_written(db, monkeypatch):
+    # 71/test, 2026-11-11: the admin's grants were memoized empty at first sign-in, seconds before
+    # the seed; every write into the new collections was then refused for the memo's 30 s.
+    from mantle.entities.collection import Collection
+    from mantle.search.mantle import wiring
+    from mantle.services.seed_provisioning import loader
+
+    dropped = []
+    monkeypatch.setattr(wiring, "invalidate_grant_cache", lambda rid=None: dropped.append(rid))
+    monkeypatch.setattr("mantle.services.peer_signing.get_system_principal_id", lambda: "sys-1")
+    _install(FakeOrigin(), "enforce")
+    with acting_as("sys-1", source="system", scope="platform.manage-seed"):
+        loader._create_platform_collection(db, Collection(id="plat-2", name="Platform",
+                                                          created_by="sys-1",
+                                                          content_type="application/vnd.agience.collection+json"))
+    assert "sys-1" in dropped
+
+
 # -- fifth review: the operator's changes at Origin reach this store -------------------------------
 
 def test_an_operator_revocation_at_origin_is_applied_to_this_store(db, person, monkeypatch):
