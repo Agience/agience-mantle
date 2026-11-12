@@ -91,7 +91,7 @@ async def test_one_call_repeats_the_seed_while_each_pass_clears_errors(monkeypat
     monkeypatch.setattr(SP, "seed_from_artifacts", lambda db, root: next(runs))
     monkeypatch.setattr(P, "ensure_platform_operators", lambda db: (_ for _ in ()).throw(RuntimeError("x")))
     out = await S.seed_platform(auth=None, store_db=object())
-    assert out.summary.startswith("errors 0 | passes 2"), out.summary
+    assert out.summary.startswith("errors 0 | passes 2 (first: errors 12)"), out.summary
 
     stuck = iter([report(3), report(3), report(0)])
     monkeypatch.setattr(SP, "seed_from_artifacts", lambda db, root: next(stuck))

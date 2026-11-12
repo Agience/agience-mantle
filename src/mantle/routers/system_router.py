@@ -412,6 +412,7 @@ async def seed_platform(
     report = await offload_sync(seed_from_artifacts, store_db, root)
     # On a fresh store a card can be written before its collection's Add seal exists; the next
     # pass finds the seal. Passes repeat while each one clears errors, so one call converges.
+    first = report.summary()
     passes = 1
     while report.errors and passes < _SEED_MAX_PASSES:
         again = await offload_sync(seed_from_artifacts, store_db, root)
@@ -423,7 +424,7 @@ async def seed_platform(
 
     logger.info("platform seed applied in %d pass(es): %s", passes, report.summary())
     errors = list(report.errors)
-    summary = report.summary() + (f" | passes {passes}" if passes > 1 else "")
+    summary = report.summary() + (f" | passes {passes} (first: {first})" if passes > 1 else "")
     # The platform operators, provisioned on the calling admin's own request, so on their
     # credential. Mantle's startup provisions them too, but on a fresh node it can start before
     # Origin answers and find no operator; a job grant is the other way, and John chose this one
