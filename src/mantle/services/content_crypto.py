@@ -556,8 +556,30 @@ def mint_holder_key(entity) -> None:
     cid = str(getattr(entity, "id", "") or "")
     if not cid:
         return
-    try:
-        _default_collection_key(cid, cid, may_create=True,
-                                creator_id=getattr(entity, "created_by", None))
-    except Exception:  # noqa: BLE001 — see the docstring
-        logger.debug("collection %s: its key is minted at its first read instead", cid, exc_info=True)
+    creator = getattr(entity, "created_by", None)
+
+    def mint() -> None:
+        try:
+            _default_collection_key(cid, cid, may_create=True, creator_id=creator)
+        except Exception:  # noqa: BLE001 — see the docstring
+            logger.debug("collection %s: its key is minted at its first read instead", cid,
+                         exc_info=True)
+
+    # Off the request, as the creator: the create runs under the custody lock, and a mint inside
+    # it waits that lock's 30 s timeout (71/test, 2026-11-12: a new workspace took 30 s to open).
+    import contextvars
+    import threading
+    t = threading.Thread(target=contextvars.copy_context().run, args=(mint,), daemon=True,
+                         name=f"mint-key-{cid[:8]}")
+    _MINTING.append(t)
+    t.start()
+
+
+#: The background mints started by `mint_holder_key`, for `wait_minted`.
+_MINTING: list = []
+
+
+def wait_minted(timeout: float = 60.0) -> None:
+    """Wait for the background mints started so far (tests, and a caller that needs the seal)."""
+    while _MINTING:
+        _MINTING.pop().join(timeout)

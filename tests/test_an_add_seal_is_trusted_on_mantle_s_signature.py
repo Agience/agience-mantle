@@ -68,6 +68,7 @@ def test_a_new_collection_has_its_signed_seal_before_anyone_reads_it(node, mantl
     from .test_add_does_not_carry_read import _send
     db, oracle = node
     inbox = _inbox(db)                                   # created; never opened by a reader
+    cc.wait_minted()                                     # minted off the request, just after
     seal = db.artifacts.get_artifact(f"add-seal:{inbox}")
     assert seal and seal["context"]["sig"]
     oracle.evict()
