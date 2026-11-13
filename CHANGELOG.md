@@ -5,6 +5,13 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.26] - 2026-11-13
+
+### Fixed
+- A collection with many items lists again within the app's wait. Mantle checked a collection's Add seal on every read of its key, and since 0.1.25 each check parsed Mantle's signing key afresh, which takes tens to hundreds of milliseconds; a ninety-item collection took longer than ten seconds and showed as empty. The key is parsed once per process, and a seal already verified is not verified again.
+
+## [0.1.25] - 2026-11-12
+
 ### Fixed
 - The admin seed route (`POST /system/seed`) also provisions the platform operators on the calling admin's own credential, and grants them to every account, as the operator, only when this call creates them. A later call converges them and grants nothing, so a withheld grant stays withheld. On a fresh node, Mantle's startup ran before Origin answered and found no operator, so no account had operators. Its command-line migration holds no credential, and under custody gets no key. A failure here is listed in the response's `errors` and never fails the seed (John, 2026-11-11: the home node is seeded through the admin route, with no job grant).
 - The seed command (`mantle.system.manage_seed`) loads the platform encryption key first, as the server does at startup. Without it every sealed field was refused, and a fresh store's seeded servers and operators were left without their forms and wiring.
