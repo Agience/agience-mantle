@@ -5,6 +5,8 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.26] - 2026-11-13
+
 ### Fixed
 - A collection with many items lists again within the app's wait. Mantle checked a collection's Add seal on every read of its key, and since 0.1.25 each check parsed Mantle's signing key afresh, which takes tens to hundreds of milliseconds; a ninety-item collection took longer than ten seconds and showed as empty. The key is parsed once per process, and a seal already verified is not verified again.
 
