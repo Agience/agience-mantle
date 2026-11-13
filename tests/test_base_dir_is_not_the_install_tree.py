@@ -105,7 +105,10 @@ def test_an_explicit_base_dir_wins_over_every_derivation(monkeypatch, tmp_path):
         assert reloaded.BASE_DIR == (tmp_path / "node").resolve()
         assert reloaded.DEFAULT_LATTICE_PATH == (tmp_path / "node").resolve() / ".data" / "mantle-lattice.db"
     finally:
-        monkeypatch.delenv("AGIENCE_BASE_DIR", raising=False)
+        # The environment the session set (the conftest's test base) back first, then `config`
+        # read again from it: deleting the variable before the reload left `config.BASE_DIR` outside
+        # the test base for every later test on this worker (2026-11-13, node 45, xdist).
+        monkeypatch.undo()
         importlib.reload(cfg)
 
 
@@ -141,4 +144,5 @@ def test_no_derived_default_lands_in_an_install_tree(monkeypatch, tmp_path):
                 "%s is inside the install tree — `pip install --upgrade` deletes it" % path)
             assert base in path.parents
     finally:
+        monkeypatch.undo()                       # as above: the session's environment, then reload
         importlib.reload(cfg)
