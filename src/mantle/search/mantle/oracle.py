@@ -1056,9 +1056,20 @@ class OracleService:
             return ""
 
     def _seal_signed(self, collection_id: str, public: bytes, row: dict) -> bool:
+        """Whether the seal row carries Mantle's signature over `public`. A seal verified once is
+        not verified again in this process: `_check_drop_key` asks on every collection-key open."""
         from mantle.services.peer_signing import verify_bytes
         sig = row.get("sig")
-        return bool(sig) and verify_bytes(self._seal_signed_bytes(collection_id, public), sig)
+        if not sig:
+            return False
+        seen = (str(collection_id), bytes(public), str(sig))
+        verified = self.__dict__.setdefault("_verified_seals", set())
+        if seen in verified:
+            return True
+        if not verify_bytes(self._seal_signed_bytes(collection_id, public), sig):
+            return False
+        verified.add(seen)
+        return True
 
     def _check_drop_key(self, collection_id: str, collection_key: bytes) -> None:
         """On every Read open of a collection key: this store's cached Add seal is the one the key
