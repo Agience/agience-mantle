@@ -95,16 +95,31 @@ def sign_service_jwt(audience: str = "mantle", ttl_seconds: int = _TTL,
 
 # -- signing bytes with Mantle's own key -------------------------------------
 
+#: `(pem, key)`: the private key parsed once per process, and again only when the PEM changes.
+#: Parsing an RSA key costs tens to hundreds of milliseconds (it is validated on load); a verify
+#: with a loaded key costs a twentieth of one. 2026-11-13: parsed on every collection-key open,
+#: it made a collection of ninety items take longer to list than the app waits.
+_loaded_key: Optional[tuple] = None
+
+
+def _private_key():
+    global _loaded_key
+    pem = _pem()
+    if _loaded_key is None or _loaded_key[0] != pem:
+        from cryptography.hazmat.primitives import serialization
+        _loaded_key = (pem, serialization.load_pem_private_key(pem.encode("ascii"), password=None))
+    return _loaded_key[1]
+
+
 def sign_bytes(data: bytes) -> str:
     """Mantle's RSA-SHA256 signature over `data`, base64. What only this Mantle can have written
     (an Add seal's binding when no collection key is at hand)."""
     import base64
 
-    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding
 
-    key = serialization.load_pem_private_key(_pem().encode("ascii"), password=None)
-    return base64.b64encode(key.sign(data, padding.PKCS1v15(), hashes.SHA256())).decode("ascii")
+    return base64.b64encode(_private_key().sign(data, padding.PKCS1v15(), hashes.SHA256())).decode("ascii")
 
 
 def verify_bytes(data: bytes, signature_b64: str) -> bool:
@@ -112,13 +127,12 @@ def verify_bytes(data: bytes, signature_b64: str) -> bool:
     import base64
 
     from cryptography.exceptions import InvalidSignature
-    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding
 
     try:
-        key = serialization.load_pem_private_key(_pem().encode("ascii"), password=None)
-        key.public_key().verify(base64.b64decode(signature_b64), data, padding.PKCS1v15(),
-                                hashes.SHA256())
+        _private_key().public_key().verify(base64.b64decode(signature_b64), data,
+                                           padding.PKCS1v15(), hashes.SHA256())
         return True
     except (InvalidSignature, ValueError, TypeError):
         return False
