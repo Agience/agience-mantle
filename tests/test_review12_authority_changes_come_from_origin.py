@@ -100,6 +100,19 @@ def test_a_session_grant_from_the_feed_is_applied(db):
     assert g is not None and g.grantee_id == "bob" and g.can_read and not g.can_admin
 
 
+def test_a_grant_from_the_feed_holds_at_once_not_after_the_memo_s_ttl(db, monkeypatch):
+    """2026-11-13, 71/test: an invitee who accepted could not open the workspace until a later
+    sign-in, because the light-cone memo still held the decision from before the grant."""
+    from mantle.search.mantle import wiring
+    dropped = []
+    monkeypatch.setattr(wiring, "invalidate_grant_cache", lambda *a: dropped.append(a))
+    assert authority_ledger.apply_remote(db, Feed([_entry(1, GENESIS, _grant_body())])) == 1
+    assert dropped, "the memo was not dropped after a grant was applied"
+    dropped.clear()
+    assert authority_ledger.apply_remote(db, Feed([_entry(1, GENESIS, _grant_body())])) == 0
+    assert not dropped, "a pass that applied nothing drops nothing"
+
+
 def test_a_session_deny_and_an_edge_with_its_mask_are_applied(db):
     e1 = _entry(1, GENESIS, _grant_body("g-d", effect="deny"))
     e2 = _entry(2, e1["entry_hash"], {"kind": "edge.add", "src": "C1", "dst": "A1",

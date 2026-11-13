@@ -421,8 +421,16 @@ def apply_remote(db, custodian=None) -> int:
         with conn.write() as cur:
             cur.execute("INSERT OR REPLACE INTO authority_receipt(subject, kind, seq, entry_hash) "
                         "VALUES(?, 'applied', ?, ?)", (_APPLIED, last, prev))
-    if applied:
-        logger.warning("authority ledger: applied %d change(s) from Origin", applied)
+    if applied or caught:
+        logger.warning("authority ledger: applied %d change(s) from Origin", applied + caught)
+        # A grant made at Origin (an accepted invite, a revocation) holds from the moment it is
+        # applied here, never after the memo's TTL. 2026-11-13, 71/test: an invitee who accepted
+        # could not open the workspace until a later sign-in.
+        try:
+            from mantle.search.mantle.wiring import invalidate_grant_cache
+            invalidate_grant_cache()
+        except Exception:  # noqa: BLE001 — the memo then lapses at its TTL, as before
+            logger.warning("authority ledger: the grant memo could not be dropped", exc_info=True)
     return applied + caught
 
 
