@@ -217,8 +217,11 @@ def retry_outstanding(db) -> int:
 
 # -- what Mantle did not submit: people's changes at Origin, and the operator's -------------------
 
-#: How often the ledger is read for entries this node did not submit: within the canon's 30 s.
-FEED_INTERVAL_S = 15.0
+#: How often the ledger is read for entries this node did not submit: within the canon's 30 s, and
+#: short enough that a person who accepts an invite at Origin opens what it shares within seconds
+#: (2026-11-13, 71/test: 15 s left the invitee refused for the first quarter-minute). One small
+#: read of Origin's feed per interval.
+FEED_INTERVAL_S = 5.0
 _APPLIED = "ledger:applied"
 
 
