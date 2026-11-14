@@ -145,18 +145,25 @@ def test_a_removed_note_is_not_recalled_from_its_workspace(db):
 
 
 def test_a_removed_note_another_collection_holds_stays_there(db):
+    from fastapi import HTTPException
     inbox = _container(db, "Inbox")
     shared = _container(db, "Shared")
     note = _note(db, inbox, "periwinkle harbour schedule")
     with acting_as(USER, principal_type="user"):
         store.add_artifact_to_collection(db, shared, note, origin=False)
-        ws.remove_artifact_from_container(db, USER, inbox, note, auth=_auth())
+        # Made in the Inbox and shown in Shared: it is not removed from where it was made
+        # (2026-11-14: that removal deleted it at Origin while Shared still listed it).
+        with pytest.raises(HTTPException) as refused:
+            ws.remove_artifact_from_container(db, USER, inbox, note, auth=_auth())
+        assert refused.value.status_code == 409
+        ws.remove_artifact_from_container(db, USER, shared, note, auth=_auth())
 
-    assert note not in _recall(db, "periwinkle", scope=[inbox]), (
-        "the note still answers a recall scoped to the workspace it was removed from")
-    listed = {row.get("root_id") or row.get("id")
-              for row in store.list_collection_artifacts(db, shared)}
-    assert note in listed, "removing it from one collection took it out of another"
+    def _listed(container):
+        return {row.get("root_id") or row.get("id")
+                for row in store.list_collection_artifacts(db, container)}
+    assert note not in _listed(shared)
+    assert note in _listed(inbox), "removing it from one collection took it out of another"
+    assert note in _recall(db, "periwinkle", scope=[inbox])
     assert store.get_artifact(db, note) is not None
 
 

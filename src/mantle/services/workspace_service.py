@@ -2208,6 +2208,13 @@ def remove_artifact_from_container(
             "exist elsewhere, or not exist at all; this route cannot tell you which.")
 
     held_elsewhere = store.count_other_containers_for_root(db, root_id, container_id) > 0
+    if held_elsewhere and _is_creation_edge(db, container_id, root_id):
+        # 2026-11-14: removing the edge an artifact was made through, while it is held elsewhere,
+        # left it with no home, and Origin then reads it as deleted for everyone but its owner.
+        # Its content is keyed under the collection it was made in, so it stays here.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This was made here. Remove it everywhere, or keep it here and also show it there.")
     if not held_elsewhere:
         # 2026-10-14, John: Remove only unlinks. An artifact held nowhere else used to be destroyed.
         current = (store.get_current_in_collection(db, container_id, root_id)
@@ -2264,6 +2271,11 @@ def add_artifact_to_workspace(
     order_key = after_key(store.get_last_order_key(workspace_db, workspace_id))
     store.add_artifact_to_collection(workspace_db, workspace_id, artifact_root_id, order_key)
     return live
+
+
+def _is_creation_edge(db: Database, container_id: str, root_id: str) -> bool:
+    """Is the edge `container_id` -> `root_id` the artifact's creation edge (`is_origin`)?"""
+    return bool((store.get_edge(db, container_id, root_id) or {}).get("origin"))
 
 
 def move_artifact_between_containers(
