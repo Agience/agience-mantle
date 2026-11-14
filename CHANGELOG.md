@@ -5,6 +5,15 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-14
+
+### Breaking
+- When the authority ledger is installed, the grant-key routes `POST /keys`, `DELETE /keys/{key_id}`, `POST /keys/{key_id}/members` and `DELETE /keys/{key_id}/members/{member_id}` in `grants_router` return 409. Keys are minted and revoked at Origin (`POST /auth/me/keys`) in the person's Origin session, and this node applies them from Origin's ledger.
+
+### Added
+- `authority_ledger` applies `key` entries from Origin's ledger. A key minted at Origin authenticates here by its token hash, resolves to its own principal with the actions its members carry, and stops authenticating once Origin revokes it.
+- An operator's revocation of a key by id applies only to keys this node holds. A key this node does not hold, such as one minted before the ledger, is left unchanged.
+
 ## [0.1.28] - 2026-11-14
 
 ### Fixed
