@@ -371,6 +371,13 @@ def _apply_one(db, e: dict) -> int:
         elif b.get("kind") == "edge.remove":
             if db.graph.delete_edge(b["src"], b["dst"], "contains"):
                 return 1
+        elif b.get("kind") == "edge.add" and b.get("origin"):
+            # The operator restores a creation edge a removal took from a member still held
+            # elsewhere (2026-11-14): back as it was, mask included.
+            from mantle.db import lattice_api as la
+            la.add_artifact_to_collection(db, b["src"], b["dst"], origin=True,
+                                          propagate=b.get("propagate"))
+            return 1
     return 0
 
 

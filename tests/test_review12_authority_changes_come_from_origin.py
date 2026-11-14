@@ -191,3 +191,14 @@ def test_mantle_s_entry_hash_is_origin_s():
         seq=7, prev_hash="a" * 64, body=e["body"], actor=e["actor"],
         credential_kind=e["credential_kind"], credential_ref=e["credential_ref"],
         bootstrap=False, compensates=None, kid=e["kid"], claimed_from=None)
+
+
+def test_the_operator_s_restored_creation_edge_is_applied(db):
+    """2026-11-14: a removal took a member's creation edge while another container held it; the
+    operator restores it at Origin, and this node puts it back as it was."""
+    la.add_artifact_to_collection(db, "C", "X", origin=False, propagate=[])
+    e1 = _entry(1, GENESIS, {"kind": "edge.add", "src": "A", "dst": "X", "origin": True,
+                             "propagate": None}, kind_of="operator")
+    assert authority_ledger.apply_remote(db, Feed([e1])) == 1
+    assert la.get_origin_parent(db, "X")[0] == "A"
+    assert la.get_edge(db, "C", "X")["origin"] is False
