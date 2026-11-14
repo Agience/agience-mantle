@@ -327,6 +327,8 @@ def _apply_session(db, e: dict) -> int:
         else:
             la.update_grant(db, g)
         return 1
+    if kind == "key":
+        return _apply_key(db, b, e.get("actor"))
     if kind == "edge.add":
         la.add_artifact_to_collection(db, b["src"], b["dst"], origin=bool(b.get("origin")),
                                       propagate=b.get("propagate"))
@@ -334,6 +336,33 @@ def _apply_session(db, e: dict) -> int:
     if kind == "edge.remove":
         return 1 if db.graph.delete_edge(b["src"], b["dst"], "contains") else 0
     return 0                             # roots, job grants: Origin's alone
+
+
+def _apply_key(db, b: dict, actor) -> int:
+    """A grant key the person minted at Origin's own page: the root `grant_key` grant this store
+    authenticates by the token's hash, open as a ceiling, so each member carries its own actions.
+    A revocation of a key this store does not hold (one minted before the ledger, revoked by the
+    operator by id) changes nothing."""
+    from mantle.db import lattice_api as la
+    from mantle.entities.grant import Grant
+    from mantle.services import grant_key_service
+    prior = la.get_grant_by_id(db, b["grant_id"])
+    if prior is not None:
+        if b.get("state") == "revoked" and prior.state != "revoked":
+            prior.state = "revoked"
+            la.update_grant(db, prior)
+            grant_key_service.invalidate_for(db, prior)
+            return 1
+        return 0
+    if b.get("state") != "active":
+        return 0
+    g = Grant(resource_id="", grantee_type=Grant.GRANTEE_GRANT_KEY, grantee_id=b["token_hash"],
+              granted_by=str(actor or ""), id=b["grant_id"], key_hint=b.get("hint"),
+              name=b.get("name"), expires_at=b.get("expires_at"), state="active",
+              **grant_key_service._open_ceiling())
+    la.create_grant(db, g)
+    grant_key_service.invalidate_for(db, g)
+    return 1
 
 
 def _retire_add_seal(db, principal_id: str) -> int:
@@ -361,6 +390,8 @@ def _apply_one(db, e: dict) -> int:
     with reach_journal.suspended():
         if b.get("kind") == "root.retire":
             return _retire_add_seal(db, b["principal_id"])
+        if b.get("kind") == "key":
+            return _apply_key(db, {**b, "state": "revoked"}, e.get("actor"))
         if b.get("kind") == "grant":
             doc = db.artifacts.get_artifact(b["grant_id"])
             if doc and doc.get("state") == "active" and b.get("state") != "active":
@@ -465,6 +496,8 @@ def feed_at_head(db, custodian) -> tuple:
 def _row_key(b: dict):
     if b.get("kind") == "grant":
         return ("grant", b.get("grant_id"))
+    if b.get("kind") == "key":
+        return ("key", b.get("grant_id"))
     if b.get("kind") in ("edge.add", "edge.remove"):
         return ("edge", b.get("src"), b.get("dst"))
     return None

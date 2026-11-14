@@ -46,6 +46,18 @@ def authority_changes_are_made_at_origin() -> None:
                    "applies them from Origin's ledger")
 
 
+def keys_are_minted_at_origin() -> None:
+    """A grant key is minted, given what it carries, and revoked at Origin's own page, in the
+    person's Origin session (`POST /auth/me/keys`, John 2026-11-14); this node applies it from
+    Origin's ledger. Without the ledger, Mantle decides alone."""
+    from mantle.db import reach_journal
+    if reach_journal.installed():
+        raise HTTPException(
+            status_code=409,
+            detail="keys are minted and revoked at Origin (POST /auth/me/keys), in your Origin "
+                   "session; this node applies them from Origin's ledger")
+
+
 #: `responses=` for one route. Declaration only, no runtime effect.
 #:
 #: Declaring only `422` when the handlers raise 400, 401, 403, 404 and 410 would leave a
@@ -740,7 +752,7 @@ def _require_key_owner(grant: GrantEntity, auth: AuthContext) -> None:
 
 
 @router.post("/keys", status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(authority_changes_are_made_at_origin)],
+    dependencies=[Depends(keys_are_minted_at_origin)],
     responses=_errors(400, 401, 403, ok=GrantKeyCreatedResponse, ok_code=201),
 )
 async def create_grant_key_endpoint(
@@ -829,7 +841,7 @@ async def read_grant_key_endpoint(
 
 
 @router.delete("/keys/{key_id}",
-    dependencies=[Depends(authority_changes_are_made_at_origin)],
+    dependencies=[Depends(keys_are_minted_at_origin)],
     responses=_errors(401, 404, ok=RevokedResponse),
 )
 async def revoke_grant_key_endpoint(
@@ -855,7 +867,7 @@ async def revoke_grant_key_endpoint(
 
 
 @router.post("/keys/{key_id}/members", status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(authority_changes_are_made_at_origin)],
+    dependencies=[Depends(keys_are_minted_at_origin)],
     responses=_errors(400, 401, 404, ok=GrantResponse, ok_code=201),
 )
 async def add_bundle_member_endpoint(
@@ -899,7 +911,7 @@ async def add_bundle_member_endpoint(
 
 
 @router.delete("/keys/{key_id}/members/{member_id}",
-    dependencies=[Depends(authority_changes_are_made_at_origin)],
+    dependencies=[Depends(keys_are_minted_at_origin)],
     responses=_errors(401, 404, ok=RevokedResponse),
 )
 async def remove_bundle_member_endpoint(

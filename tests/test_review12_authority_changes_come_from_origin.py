@@ -181,7 +181,10 @@ def test_every_grant_route_that_changes_authority_carries_the_rule(method, path)
 
     route = next(r for r in grants_router.router.routes
                  if r.path == path and method in r.methods)
-    assert grants_router.authority_changes_are_made_at_origin in set(calls(route.dependant))
+    # A key route names Origin's key route (John, 2026-11-14); every other, the general rule.
+    rules = {grants_router.authority_changes_are_made_at_origin,
+             grants_router.keys_are_minted_at_origin}
+    assert rules & set(calls(route.dependant))
 
 
 def test_mantle_s_entry_hash_is_origin_s():
@@ -191,3 +194,34 @@ def test_mantle_s_entry_hash_is_origin_s():
         seq=7, prev_hash="a" * 64, body=e["body"], actor=e["actor"],
         credential_kind=e["credential_kind"], credential_ref=e["credential_ref"],
         bootstrap=False, compensates=None, kid=e["kid"], claimed_from=None)
+
+
+def _key_body(state="active"):
+    return {"kind": "key", "grant_id": "k-1", "token_hash": hashlib.sha256(b"agk_t").hexdigest(),
+            "hint": "_t", "name": "reader", "expires_at": "2099-01-01T00:00:00+00:00",
+            "state": state}
+
+
+def test_a_key_minted_at_origin_s_page_authenticates_here_with_what_its_members_carry(db):
+    """John, 2026-11-14: a key is minted at Origin's own page; this node applies it, and the token
+    resolves to the key's own principal with its members' actions, never to the person."""
+    from mantle.services import grant_key_service
+    member = {**_grant_body("m-1", actions=("read",)), "grantee_id": "k-1",
+              "grantee_type": "grant"}
+    own = {**_grant_body("g-alice", actions=("read", "admin")), "grantee_id": "alice"}
+    e0 = _entry(1, GENESIS, own)
+    e1 = _entry(2, e0["entry_hash"], _key_body(), kind_of="origin_page")
+    e2 = _entry(3, e1["entry_hash"], member, kind_of="origin_page")
+    assert authority_ledger.apply_remote(db, Feed([e0, e1, e2])) == 3
+    root = grant_key_service.authenticate(db, "agk_t")
+    assert root is not None and root.id == "k-1" and root.granted_by == "alice"
+    held = grant_key_service.resolve(db, root)
+    assert [(g.resource_id, g.can_read, g.can_update) for g in held] == [("C1", True, False)]
+    e3 = _entry(4, e2["entry_hash"], _key_body("revoked"), kind_of="origin_page")
+    assert authority_ledger.apply_remote(db, Feed([e0, e1, e2, e3])) == 1
+    assert grant_key_service.authenticate(db, "agk_t") is None
+
+
+def test_the_operator_revokes_a_key_this_node_holds_and_nothing_else(db):
+    e1 = _entry(1, GENESIS, _key_body("revoked"), kind_of="operator")
+    assert authority_ledger.apply_remote(db, Feed([e1])) == 0      # unknown here: nothing to do
