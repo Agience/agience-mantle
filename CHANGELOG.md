@@ -5,6 +5,13 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.27] - 2026-11-13
+
+### Changed
+- `authority_ledger` now reads Origin's feed every 5 seconds instead of every 15, so a person who accepts an invite at Origin can open the shared workspace within seconds.
+- Grants and revocations applied from Origin's feed take effect immediately: `authority_ledger` drops the grant memo as soon as a pass applies changes, rather than waiting for the memo's TTL.
+- The `authority ledger: applied N change(s) from Origin` log line now counts every change applied in the pass.
+
 ## [0.1.26] - 2026-11-13
 
 ### Fixed
