@@ -5,6 +5,14 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.28] - 2026-11-14
+
+### Fixed
+- An artifact is never removed from the container it was made in while another container still holds it. Removing it there took its creation edge, which Origin reads as deleting it, so it stayed listed elsewhere and opened for no one. That removal is refused (409): "This was made here. Remove it everywhere, or keep it here and also show it there."
+
+### Added
+- The authority ledger applies the operator's restored creation edge (an operator `edge.add` with `origin`), as it was, mask included.
+
 ## [0.1.27] - 2026-11-13
 
 ### Changed
