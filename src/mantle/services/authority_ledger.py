@@ -38,8 +38,6 @@ logger = logging.getLogger(__name__)
 MODE_SETTING = "MANTLE_AUTHORITY_LEDGER"
 _RECEIPT_KEYS = ("seq", "entry_hash", "signature", "kid", "head_seq", "outcome", "batch")
 
-_warned: set = set()
-_warn_lock = threading.Lock()
 
 
 def mode() -> str:
@@ -84,17 +82,6 @@ def _system_id() -> str:
         return get_system_principal_id() or ""
     except Exception:  # noqa: BLE001
         return ""
-
-
-def _warn_once(reason: str, entry: dict, exc: BaseException) -> None:
-    key = (entry.get("kind"), reason)
-    with _warn_lock:
-        first = key not in _warned
-        _warned.add(key)
-    log = logger.warning if first else logger.debug
-    log("authority ledger (record mode): %s entry not co-signed (%s): %s; the change is written "
-        "without a receipt%s", entry.get("kind"), reason, exc,
-        "" if first else " (repeat)")
 
 
 class Submitter:
@@ -146,12 +133,12 @@ class Submitter:
             answer = self.custodian.submit_entry(entry, credential=credential, proof=proof,
                                                  compensates=compensates, **extra)
         except AuthorityRefused as exc:
-            if self.mode == "enforce":
-                raise reach_journal.ReachChangeRefused(
-                    f"Origin did not co-sign this {entry.get('kind')} change: {exc.detail}"
-                ) from exc
-            _warn_once(f"refused {exc.status}", entry, exc)
-            return None
+            # Origin answered, and refused: the change is not written, in any mode. 2026-11-15,
+            # production in record mode had written grants, roots and edges Origin refused (403,
+            # 409) since 11-09, with no entry in the ledger (BUG-079).
+            raise reach_journal.ReachChangeRefused(
+                f"Origin did not co-sign this {entry.get('kind')} change: {exc.detail}"
+            ) from exc
         except reach_journal.ReachChangeRefused:
             raise
         except Exception as exc:  # noqa: BLE001 — no credential, or Origin unreachable
@@ -159,7 +146,11 @@ class Submitter:
                 raise reach_journal.ReachChangeRefused(
                     f"the {entry.get('kind')} change could not be co-signed by Origin, and under "
                     f"threshold custody it is not written without: {exc}") from exc
-            _warn_once(type(exc).__name__, entry, exc)
+            # Record mode writes on when Origin cannot be asked (unreachable, a 5xx, no credential),
+            # and says so every time, as an alarm: the change has no entry in the ledger.
+            logger.error("ALARM authority ledger (record mode): %s entry not co-signed (%s): %s; "
+                         "the change is written without a receipt", entry.get("kind"),
+                         type(exc).__name__, exc)
             return None
         receipt = receipt_of(answer)
         try:

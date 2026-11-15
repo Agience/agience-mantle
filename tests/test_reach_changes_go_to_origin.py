@@ -407,20 +407,32 @@ def test_an_invite_claim_carries_its_token_as_proof(db, person):
     assert origin.proofs == [{"invite_id": "inv-1", "token": "raw"}]
 
 
-# -- record: written, not enforced ------------------------------------------------------------------
+# -- record: an unreachable Origin does not stop a write; a refusal always does ---------------------
 
-def test_recorded_a_refused_change_is_written_without_a_receipt_and_logged(db, person, caplog):
+# 2026-11-15, BUG-079: production ran record mode, and since 11-09 had written grants, roots and
+# edges Origin refused (403, 409), with no entry in the ledger. A refusal is now never written.
+def test_recorded_a_grant_origin_refuses_is_not_written(db, person):
     _install(FakeOrigin(refuse=lambda e: True), "record")
-    with caplog.at_level(logging.WARNING, logger="mantle.services.authority_ledger"):
+    with pytest.raises(reach_journal.ReachChangeRefused):
         la.create_grant(db, _grant())
-    assert db.artifacts.get_artifact("g-1") is not None and _receipt(db, "grant:g-1") is None
-    assert "not co-signed" in caplog.text
+    assert db.artifacts.get_artifact("g-1") is None and _receipt(db, "grant:g-1") is None
 
 
-def test_recorded_an_unreachable_origin_does_not_stop_a_write(db, person):
+def test_recorded_an_edge_origin_refuses_is_not_written(db, person):
+    _install(FakeOrigin(refuse=lambda e: e.get("kind") == "edge.add"), "record")
+    with pytest.raises(reach_journal.ReachChangeRefused):
+        la.add_artifact_to_collection(db, "C1", "m-1")
+    assert _edge(db, "C1", "m-1") is None
+
+
+def test_recorded_an_unreachable_origin_does_not_stop_a_write_and_raises_the_alarm(db, person, caplog):
     _install(FakeOrigin(down=True), "record")
-    assert la.add_artifact_to_collection(db, "C1", "m-1")
+    with caplog.at_level(logging.ERROR, logger="mantle.services.authority_ledger"):
+        assert la.add_artifact_to_collection(db, "C1", "m-1")
+        la.create_grant(db, _grant())
     assert _edge(db, "C1", "m-1") is not None
+    alarms = [r for r in caplog.records if r.levelno >= logging.ERROR and "ALARM" in r.getMessage()]
+    assert len(alarms) >= 2, "each write without a receipt is an alarm, not once per kind"
 
 
 def test_with_no_authority_installed_nothing_is_journaled(db, person):
