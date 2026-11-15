@@ -5,6 +5,14 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-14
+
+### Fixed
+- `authority_ledger`: in record mode (`MANTLE_AUTHORITY_LEDGER=record`), a change that Origin refuses (for example a 403 or 409 response) is no longer written. It raises `ReachChangeRefused`, as it already does in enforce mode, so grants, roots and edges that Origin refuses no longer take effect.
+
+### Changed
+- `authority_ledger`: in record mode, when Origin cannot be asked (unreachable, a 5xx response, or no credential), the change is still written without a receipt. Every such write is now logged at error level with an `ALARM` prefix, rather than a warning once per entry kind.
+
 ## [0.2.0] - 2026-11-14
 
 ### Breaking
