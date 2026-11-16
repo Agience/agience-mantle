@@ -153,7 +153,7 @@ def content_key_action(action: str) -> Iterator[None]:
 
 def _within_reach(artifact: Optional[str], reach: tuple) -> bool:
     """Is `artifact` one of `reach`, or held under one along edges that conduct a read? The walk
-    is `origin_chain`'s, the one access decides a job's reach by. A chain that doesn't end is no."""
+    is `light_cone`'s, the one access decides a job's reach by. A walk that doesn't end is no."""
     if not artifact:
         return False
     ids = {str(r) for r in reach}
@@ -161,7 +161,7 @@ def _within_reach(artifact: Optional[str], reach: tuple) -> bool:
         return True
     from mantle.db import backend
     try:
-        return any(r in ids for r in backend.origin_chain(backend.store_handle(), str(artifact), "read"))
+        return any(r in ids for r in backend.light_cone(backend.store_handle(), str(artifact), "read"))
     except Exception:  # noqa: BLE001 — an unanswerable walk opens nothing
         logger.warning("job reach walk failed for %s", artifact, exc_info=True)
         return False

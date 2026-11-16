@@ -2053,14 +2053,16 @@ def _link_source_artifact(
          unauthorized caller must never learn the source's content this way — the
          authorization check has to happen before the source is touched at all.
 
-      2. The link must be written with `origin=False, propagate=[]`, so it never
-         becomes a **creation-lineage** edge. Grants propagate parent -> child and
-         `check_access` walks UP from a target via `get_origin_parent`; an
-         `origin=True` link would let the linking container be returned as the
-         source's origin parent and confer grants over the whole subtree.
-         `propagate=[]` means no action propagates — belt-and-suspenders should
-         `origin` alone ever stop being sufficient — so the link can never become
-         a grant-inheritance path, regardless of who is allowed to create it.
+      2. The link is written with `origin=False`, so it never becomes the source's
+         creation edge: its creation lineage, and the key it is held under, stay where it was
+         made.
+      3. What the link conducts (BUG-074, John 2026-11-14): every `contains` edge conducts by
+         its mask, so a link that propagates shares the source with everyone who reaches the
+         container. It is written with no mask (propagate) only when the caller holds Share on
+         the source, since linking it is then the share they could make anyway. Otherwise it is
+         written blocked (`propagate=[]`): the source is listed in the container and opens only
+         for those who already reach it. A link that names a relationship (an operator, an
+         authorizer) stays blocked until John decides how relationship edges flow.
     """
     from mantle.db.backend import (
         get_artifact as _get_artifact,
@@ -2089,12 +2091,19 @@ def _link_source_artifact(
     if not source:
         raise HTTPException(status_code=404, detail="Source artifact not found")
     root_id = source.root_id or source.id
+    propagate: Optional[list] = []
+    if not parsed.relationship:
+        try:
+            check_access(auth, parsed.source_artifact_id, "share", store_db)
+            propagate = None                      # the linker could share it: the link conducts
+        except HTTPException:
+            propagate = []                        # listed, and conducts nothing
     add_artifact_to_collection(
         store_db,
         parsed.container_id,
         root_id,
         origin=False,
-        propagate=[],
+        propagate=propagate,
         relationship=parsed.relationship or None,
     )
     return source.to_dict()

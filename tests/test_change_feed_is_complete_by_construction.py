@@ -189,6 +189,9 @@ WRITE_SITES: dict[tuple[str, str], tuple[str, str]] = {
                   "workflow's catalogue and runner), never from the feed."),
     ("db/lattice_api.py", "set_edge_order_key"): (
         OFF_FEED, "reordering. No artifact version changes."),
+    ("db/lattice_api.py", "set_edge_propagate"): (
+        OFF_FEED, "the containment plane: restates a link's mask as the operator's entry on "
+                  "Origin's ledger conducts it (see _apply_one). No artifact version changes."),
     ("db/lattice_api.py", "remove_all_edges_for_root"): (
         OFF_FEED, "edge cleanup behind a delete already announced by the service."),
 

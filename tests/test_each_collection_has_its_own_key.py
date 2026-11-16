@@ -120,9 +120,9 @@ def test_a_collection_key_is_cached_under_its_own_id_for_30_seconds(node, monkey
 
 
 def test_a_moved_artifact_stays_under_its_creation_parent_s_key(node):
-    """The content key follows the creation parent, as reach does; a move is secondary
-    containment and does not re-key. Readers of the move target open it only if they reach the
-    artifact; the creation parent's readers and the artifact's own grantees do."""
+    """The content key follows the creation parent; a move is secondary containment and does not
+    re-key. Since BUG-074 (John, 2026-11-14) a grant flows along every containment edge, so the
+    move target's readers reach the artifact and open it, under the creation parent's key."""
     from mantle.entities.artifact import Artifact
 
     db, _o, _m, _ = node
@@ -151,10 +151,8 @@ def test_a_moved_artifact_stays_under_its_creation_parent_s_key(node):
                 return False
 
     assert opens(OWNER) and opens("bob")                       # C's reader: the creation parent
-    assert not opens("dave")                                   # C3's reader: the move target
-    la.create_grant(db, Grant(id="g-dx", resource_id="X", grantee_type="user", grantee_id="dave",
-                              granted_by=OWNER, **{f"can_{a}": a == "read" for a in ACTIONS}))
-    assert opens("dave")                                       # reaching X itself, it opens
+    assert opens("dave")                                       # C3's reader reaches X through C3
+    assert not opens("erin")                                   # a reader of neither does not
 
 
 # -- the pass ---------------------------------------------------------------------------------------

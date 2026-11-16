@@ -400,6 +400,11 @@ def _apply_one(db, e: dict) -> int:
             la.add_artifact_to_collection(db, b["src"], b["dst"], origin=True,
                                           propagate=b.get("propagate"))
             return 1
+        elif b.get("kind") == "edge.add":
+            # The operator conducts an existing link whose adder holds Share on what it links
+            # (John, 2026-11-15): its mask is restated; its place and kind stay.
+            from mantle.db import lattice_api as la
+            return 1 if la.set_edge_propagate(db, b["src"], b["dst"], b.get("propagate")) else 0
     return 0
 
 

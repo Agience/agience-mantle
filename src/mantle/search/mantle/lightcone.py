@@ -583,12 +583,17 @@ def _reaches(store_db, artifact_id: str, action: str, allow: set, deny: set,
     mask does not carry the action. Deny is checked at every level before allow, so nothing further
     up re-allows what a nearer deny refused.
     """
-    from mantle.db.backend import OriginChainUnterminated, origin_chain
+    from mantle.db.backend import OriginChainUnterminated, light_cone
 
+    own = {str(artifact_id), str(root_id or artifact_id)}
     try:
-        for resource in origin_chain(store_db, artifact_id, action, root_id=root_id):
+        # BUG-074: every `contains` edge conducts by its mask; a deny above cuts only its paths.
+        for resource in light_cone(store_db, artifact_id, action, root_id=root_id,
+                                   cut=deny.__contains__):
             if resource in deny:
-                return False
+                if resource in own:
+                    return False
+                continue
             if resource in allow:
                 return True
     except OriginChainUnterminated:
@@ -786,19 +791,25 @@ def resolve_authorized_scope(
 
         def _authorized(artifact_id: str, root_id: str) -> bool:
             """`_reaches`, with the shared tail memoised on the first ancestor."""
-            from mantle.db.backend import OriginChainUnterminated, origin_chain
+            from mantle.db.backend import OriginChainUnterminated, light_cone
 
+            own = {str(artifact_id), str(root_id or artifact_id)}
             try:
-                for resource in origin_chain(store_db, artifact_id, action, root_id=root_id):
+                # BUG-074: every path up, cut at a deny above; an ancestor's own answer is shared.
+                for resource in light_cone(store_db, artifact_id, action, root_id=root_id,
+                                           cut=deny.__contains__):
                     if resource in deny:
-                        return False
+                        if resource in own:
+                            return False
+                        continue
                     if resource in allow:
                         return True
-                    if resource != artifact_id and resource != root_id:
+                    if resource not in own:
                         if resource not in _above:
                             _above[resource] = _reaches(
                                 store_db, resource, action, allow, deny, root_id=resource)
-                        return _above[resource]
+                        if _above[resource]:
+                            return True
             except OriginChainUnterminated:
                 return False
             except Exception:  # noqa: BLE001 — an unreadable chain under-reaches, fail-closed

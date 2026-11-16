@@ -53,6 +53,14 @@ def _lattice_with(*docs):
     art = MagicMock()
     art.get.side_effect = lambda key: by_key.get(key)
     db.collection.return_value = art
+
+    # The walk reads every `contains` edge into a node (BUG-074). These tests state the shape as
+    # `get_origin_parent(db, node)`, patched per test; each such parent is the node's one edge.
+    def _edges_in(node, label=None, direction=None):
+        from mantle.db import lattice_api
+        parent = lattice_api.get_origin_parent(db, node)
+        return [{"src": parent[0], "dst": node, "propagate": parent[1]}] if parent else []
+    db.graph.edges_of.side_effect = _edges_in
     return db
 
 

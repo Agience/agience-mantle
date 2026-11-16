@@ -41,6 +41,7 @@ before its contents are judged.
 from __future__ import annotations
 
 import importlib.util
+import atexit
 import shutil
 import subprocess
 import sys
@@ -109,11 +110,12 @@ def _wheel() -> Path:
     """Build one wheel for the whole module and return the path to it.
 
     Cached because the build is the expensive part and every test below asks about the same
-    archive. The temporary tree is deliberately NOT cleaned up inside the session — the wheel is
-    read from it by later tests — and lives under the OS temp directory, so it is not the repo's
-    problem.
+    archive. The temporary tree lives for the whole session, since later tests read the wheel from
+    it, and is removed when the session ends: on a CI host whose temp directory is held in memory,
+    a tree left by every run fills it.
     """
     root = Path(tempfile.mkdtemp(prefix="mantle-wheel-"))
+    atexit.register(shutil.rmtree, root, ignore_errors=True)
     src = root / "src-tree"
     out = root / "wheelhouse"
     out.mkdir()

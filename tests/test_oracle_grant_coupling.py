@@ -366,10 +366,10 @@ class _Resolver:
 
 
 def _chain_is(monkeypatch, *resources):
-    """`origin_chain` yields these, in this order — the collection and whatever sits above it."""
+    """`light_cone` yields these, in this order — the collection and whatever sits above it."""
     import mantle.db.backend as backend
 
-    monkeypatch.setattr(backend, "origin_chain",
+    monkeypatch.setattr(backend, "light_cone",
                         lambda db, aid, action, **kw: iter(resources))
 
 

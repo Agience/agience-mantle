@@ -727,13 +727,13 @@ def enforce_job_reach_routes(auth: "AuthContext", request: Optional[Request]) ->
 def within_job_reach(store_db: Database, artifact_id: str, action: str, doc: dict,
                      reach: tuple) -> bool:
     """Is `artifact_id` one of `reach`, or under one along edges that conduct `action`? The same
-    upward walk `check_access` decides grants by (`origin_chain`), so the reach is a light cone
+    upward walk `check_access` decides grants by (`light_cone`), so the reach is a light cone
     exactly as a grant over those ids would be."""
     if action not in JOB_REACH_ACTIONS or not reach:
         return False
     ids = set(reach)
-    for resource in db_store.origin_chain(store_db, artifact_id, action,
-                                          root_id=doc.get("root_id") or artifact_id):
+    for resource in db_store.light_cone(store_db, artifact_id, action,
+                                        root_id=doc.get("root_id") or artifact_id):
         if resource in ids:
             return True
     return False
@@ -1374,7 +1374,7 @@ def check_access(
         except Exception:  # auditing must never break access
             logger.debug("access witness failed", exc_info=True)
 
-    def _check_grants(resource_id: str) -> Optional[GrantEntity]:
+    def _grants_at(resource_id: str) -> List[GrantEntity]:
         if is_key:
             # Already resolved and masked at authentication — re-querying by grantee
             # would find the members UNMASKED and hand back more than the bundle allows.
@@ -1387,11 +1387,18 @@ def check_access(
             )
             if grant_memo is not None:
                 grant_memo[resource_id] = grants
-        for g in grants:
-            if grant_is_deny(g) and getattr(g, flag_attr, False):
-                _witness("denied", "deny_grant")
-                raise HTTPException(status_code=404, detail="Not found")
-        for g in grants:
+        return grants
+
+    def _denied_at(resource_id: str) -> bool:
+        return any(grant_is_deny(g) and getattr(g, flag_attr, False)
+                   for g in _grants_at(resource_id))
+
+    def _check_grants(resource_id: str) -> Optional[GrantEntity]:
+        """An allow on this resource, or None; a deny here refuses (the artifact's own deny)."""
+        if _denied_at(resource_id):
+            _witness("denied", "deny_grant")
+            raise HTTPException(status_code=404, detail="Not found")
+        for g in _grants_at(resource_id):
             if grant_is_allow(g) and getattr(g, flag_attr, False):
                 return g
         return None
@@ -1426,10 +1433,16 @@ def check_access(
     #
     # `_check_grants` raises on a deny at every level it visits, so the order of this loop is the
     # deny-first rule: nothing further up can re-allow what a nearer deny refused.
+    own = {str(artifact_id), str(doc.get("root_id") or artifact_id)}
     try:
-        for resource in db_store.origin_chain(
+        # BUG-074 (John, 2026-11-14): every `contains` edge conducts by its mask, not only the
+        # creation edge. A deny on the artifact itself refuses; a deny above it cuts the paths
+        # through it, and another path may still reach.
+        for resource in db_store.light_cone(
                 store_db, artifact_id, action,
-                root_id=doc.get("root_id") or artifact_id):
+                root_id=doc.get("root_id") or artifact_id, cut=_denied_at):
+            if resource not in own and _denied_at(resource):
+                continue
             held = _check_grants(resource)
             if held is not None:
                 # Under threshold custody Origin's own walk must agree, for every action: a store

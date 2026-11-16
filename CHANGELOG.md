@@ -5,6 +5,21 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-15
+
+### Breaking
+- Access checks (`check_access`), search scoping (`lightcone`), the oracle grant verifier and job reach now follow every `contains` edge upward, not only the creation edge. A grant on a container now reaches anything added to it by a link, and each edge conducts according to its stored `propagate` mask (no mask propagates, a list narrows, an empty list blocks).
+- A deny on an artifact itself refuses access by every path. A deny on a container above it cuts only the paths through that container, so another path can still reach.
+- Links made through `_link_source_artifact` in `artifacts_router` are written with no mask when the caller holds Share on the source, and blocked (`propagate=[]`) otherwise. Links that name a relationship stay blocked.
+
+### Added
+- `light_cone` in `lattice_api` yields every resource a grant could sit on to reach an artifact for an action, nearest first. It cuts paths at denied nodes and raises `OriginChainUnterminated` if the walk does not close.
+- `set_edge_propagate` in `lattice_api` restates the `propagate` mask on one membership edge while keeping its order, kind and other attributes.
+- Authority ledger entries of kind `edge.add` from the operator are applied by `authority_ledger`: an existing link has its mask restated and keeps its place and kind. An entry for a missing link changes nothing.
+
+### Changed
+- Content keys still follow the creation parent. An artifact moved into another collection stays under its creation parent's key, and readers of the move target now reach and open it.
+
 ## [0.2.1] - 2026-11-14
 
 ### Fixed

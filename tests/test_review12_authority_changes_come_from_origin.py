@@ -236,3 +236,25 @@ def test_the_operator_s_restored_creation_edge_is_applied(db):
     assert authority_ledger.apply_remote(db, Feed([e1])) == 1
     assert la.get_origin_parent(db, "X")[0] == "A"
     assert la.get_edge(db, "C", "X")["origin"] is False
+
+
+def test_the_operator_s_conducted_link_is_applied_in_its_place(db):
+    """2026-11-15: the operator conducts an existing link stored with the empty mask; this node
+    restates the mask and keeps the link's place and kind."""
+    la.add_artifact_to_collection(db, "C", "X", origin=False, propagate=[])
+    la.add_artifact_to_collection(db, "C", "Y", origin=False, propagate=[])
+    before = la.get_edge(db, "C", "X")["order_key"]
+    e1 = _entry(1, GENESIS, {"kind": "edge.add", "src": "C", "dst": "X", "origin": False,
+                             "propagate": None}, kind_of="operator")
+    assert authority_ledger.apply_remote(db, Feed([e1])) == 1
+    e = la.get_edge(db, "C", "X")
+    assert e["origin"] is False and e["propagate"] is None
+    assert before and e["order_key"] == before, "the link keeps its place"
+    assert la.get_edge(db, "C", "Y")["propagate"] == [], "the other link is untouched"
+
+
+def test_the_operator_s_link_entry_for_a_missing_link_makes_nothing(db):
+    e1 = _entry(1, GENESIS, {"kind": "edge.add", "src": "C", "dst": "X", "origin": False,
+                             "propagate": None}, kind_of="operator")
+    assert authority_ledger.apply_remote(db, Feed([e1])) == 0
+    assert not la.get_edge(db, "C", "X")

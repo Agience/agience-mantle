@@ -804,6 +804,25 @@ def set_edge_order_key(db: LatticeDatabase, collection_id: str, root_id: str,
         return False
 
 
+def set_edge_propagate(db: LatticeDatabase, collection_id: str, root_id: str,
+                       propagate: Optional[list]) -> bool:
+    """Restate the mask on a single membership edge; its order, kind and other attributes stay."""
+    e = _find_membership(db, collection_id, root_id)
+    if e is None:
+        return False
+    props = dict(e.get("props") or {})
+    props.update({"order_key": _eprop(e, "order_key"),
+                  "is_origin": _eprop(e, "is_origin"),
+                  "propagate": _ser_propagate(propagate)})
+    try:
+        db.graph.add_edge(collection_id, root_id, e.get("label"), props)
+        return True
+    except _journal.ReachChangeRefused:
+        raise                   # refused by the authority ledger: not written, and said so
+    except Exception:
+        return False
+
+
 def reorder_collection_artifacts(db: LatticeDatabase, collection_id: str,
                                  ordered_root_ids: list) -> int:
     """Assign monotonically increasing order_keys along the given sequence. Returns edges updated."""
@@ -1027,6 +1046,62 @@ def origin_chain(db: LatticeDatabase, artifact_id: str, action: str,
 class OriginChainUnterminated(RuntimeError):
     """An origin chain ran past its ceiling. Raised rather than truncated, because a partial chain
     would answer a narrower authorization question than the one that was asked."""
+
+
+def light_cone(db: LatticeDatabase, artifact_id: str, action: str, *,
+               root_id: Optional[str] = None, cut=None, ceiling: int = ORIGIN_WALK_CEILING):
+    """Every resource a grant could sit on to reach `artifact_id` under `action`, nearest first
+    (BUG-074, John 2026-11-14).
+
+    Yields the artifact, its root, then every node above it along `contains` edges, whether the
+    creation edge or any other, breadth-first. Each edge conducts only when its `propagate` mask
+    carries the action: no mask propagates, a list narrows, and an empty list blocks. The same
+    `attenuation.propagates` operator is applied to every edge, so the walk reads only the stored
+    mask, never the kind of edge. A node `cut(node)` is true of (a deny) is yielded but not walked
+    past: it cuts the paths through it, and every other path still stands. A walk that does not
+    terminate within `ceiling` nodes raises, as `origin_chain` does.
+    """
+    first = str(artifact_id)
+    seen = {first}
+    yield first
+    start = str(root_id) if root_id else None
+    if start is None:
+        try:
+            doc = db.artifacts.get_artifact(first)
+        except Exception:  # noqa: BLE001 — store reads raise broadly; an unreadable doc has no cone
+            doc = None
+        start = str((doc or {}).get("root_id") or first)
+    frontier = [first]
+    if start not in seen:
+        seen.add(start)
+        yield start
+        frontier = [start]
+    while frontier:
+        nxt = []
+        for node in frontier:
+            if cut is not None and cut(node):
+                continue
+            try:
+                edges = db.graph.edges_of(node, label=_CONTAINS, direction="in") or []
+            except EdgesTruncated:
+                raise
+            except Exception:  # noqa: BLE001 — an unreadable edge set under-reaches: fail-closed
+                edges = []
+            for e in edges:
+                src = e.get("src")
+                if not src or not _propagates(_prop_mask(e), action):
+                    continue
+                src = str(src)
+                if src in seen:
+                    continue
+                seen.add(src)
+                if len(seen) > ceiling:
+                    raise OriginChainUnterminated(
+                        "the light cone above %r did not close within %d nodes; the lattice is "
+                        "malformed" % (artifact_id, ceiling))
+                yield src
+                nxt.append(src)
+        frontier = nxt
 
 
 def list_origin_descendants(db: LatticeDatabase, root_ids: list, action: str) -> set:

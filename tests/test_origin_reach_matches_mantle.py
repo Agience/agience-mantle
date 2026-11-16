@@ -42,10 +42,12 @@ EDGES = [
     ("C1", "C2", True, ["update"]),              # attenuates read
     ("C1", "C3", True, ["read", "update"]),
     ("C3", "card", True, None),
-    ("W1", "L", False, None),                    # a link: conducts nothing upward
+    ("W1", "L", False, None),                    # a link with no mask: conducts (BUG-074)
     ("C1", "X", True, "r"),                      # the compact substrate form: carries nothing
     ("C1", "E", True, []),                       # explicitly nothing
     ("W2", "D1", True, ["read"]),
+    ("W2", "C3", False, None),                   # a second path to C3, through a link
+    ("W2", "card", False, []),                   # a blocked link
 ]
 
 
@@ -123,6 +125,11 @@ def mismatches(db, reach) -> list:
         o = list(reach.chain(node, action))
         if m != o:
             out.append(("chain", node, action, m, o))
+    for node, action in itertools.product(NODES, ACTIONS):
+        m = set(la.light_cone(db, node, action, root_id=node))
+        o = set(reach.cone(node, action))
+        if m != o:
+            out.append(("cone", node, action, sorted(m), sorted(o)))
     for node in NODES:
         if str(la.get_origin_root(db, node)) != reach.root_of(node):
             out.append(("root", node))

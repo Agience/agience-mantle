@@ -115,30 +115,28 @@ def test_denied_source_prevents_the_link_and_the_read(parsed, source_entity):
     assert not source_entity.to_dict.called, "victim content must not be serialized"
 
 
-def test_link_edge_is_not_a_grant_inheritance_path(parsed, source_entity):
-    """The edge must be a link, not creation lineage.
+def test_link_edge_is_never_creation_lineage_and_conducts_only_with_share(parsed, source_entity):
+    """The edge is a link, never the source's creation edge. Since BUG-074 (John, 2026-11-14) a
+    grant flows along every `contains` edge by its mask, so a link that conducts is a share: it is
+    written with no mask only when the caller holds Share on the source, and blocked (`[]`)
+    otherwise."""
+    from fastapi import HTTPException
 
-    Defence in depth: even a caller legitimately allowed to link must not thereby
-    graft the source into their own grant subtree. `get_origin_parent` filters
-    `origin == true`, and `check_access` breaks when the action is absent from a
-    non-None propagate mask — so either of these alone closes the path.
-    """
-    add_edge = MagicMock(return_value=True)
+    def read_only(auth, artifact_id, action, db):
+        if action == "share":
+            raise HTTPException(status_code=404, detail="Not found")
 
-    _call_link(parsed, source_entity, MagicMock(), add_edge)
+    blocked = MagicMock(return_value=True)
+    _call_link(parsed, source_entity, MagicMock(side_effect=read_only), blocked)
+    kwargs = blocked.call_args.kwargs
+    assert kwargs.get("origin") is False, "a link must never become the source's creation edge"
+    assert kwargs.get("propagate") == [], "a caller without Share must not open the source by linking"
 
-    add_edge.assert_called_once()
-    kwargs = add_edge.call_args.kwargs
-
-    assert kwargs.get("origin") is False, (
-        "link edge was written with origin=True (the default) — it becomes a "
-        "creation-lineage edge and check_access inherits grants through it"
-    )
-    assert kwargs.get("propagate") == [], (
-        "propagate must be an empty list, not None. None means ALL actions "
-        "propagate; the traversal tests `propagate_mask is not None`, so [] "
-        "correctly blocks every action while None blocks nothing"
-    )
+    shared = MagicMock(return_value=True)
+    _call_link(parsed, source_entity, MagicMock(), shared)
+    kwargs = shared.call_args.kwargs
+    assert kwargs.get("origin") is False
+    assert kwargs.get("propagate") is None, "a caller holding Share links it, and the link conducts"
 
 
 def test_positive_control_allowed_link_still_returns_the_source(parsed, source_entity):

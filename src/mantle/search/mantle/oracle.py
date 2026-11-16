@@ -729,9 +729,11 @@ class LightConeGrantVerifier:
             return False
 
         try:
-            for resource in self._chain(str(collection_id), action):
+            for resource in self._chain(str(collection_id), action, cut=deny.__contains__):
                 if resource in deny:
-                    return False
+                    if resource == str(collection_id):
+                        return False
+                    continue                  # a deny above cuts the paths through it only
                 if resource in allow:
                     return True
         except Exception:  # noqa: BLE001 — a malformed or unreadable chain authorizes nothing,
@@ -782,16 +784,17 @@ class LightConeGrantVerifier:
             seen.add(cur)
             yield cur
 
-    def _chain(self, collection_id: str, action: str):
+    def _chain(self, collection_id: str, action: str, cut=None):
         """Where a grant could sit to reach `collection_id` under `action`, nearest first.
 
         One method for one external dependency, so a test can describe a containment shape without
-        reaching past this object into the store. Production reads
-        `lattice_api.origin_chain`, the same walk `check_access` performs for an artifact.
+        reaching past this object into the store. Production reads `lattice_api.light_cone`, the
+        same walk `check_access` performs for an artifact: every `contains` edge by its mask,
+        each path cut at a node `cut` is true of (BUG-074).
         """
-        from mantle.db.backend import origin_chain
+        from mantle.db.backend import light_cone
 
-        return origin_chain(self._db, collection_id, action)
+        return light_cone(self._db, collection_id, action, cut=cut)
 
     def _grants(self, requester_id: str, requester_type: str):
         """The requester's grants, memoized on `(requester, type)` for the same TTL the resolved

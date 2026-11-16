@@ -58,7 +58,7 @@ def _verifier(pairs=(), grants=(), roots=None):
     v._grants = lambda requester_id, requester_type: list(grants)           # noqa: SLF001
     # A flat store: every collection is its own root and has no parent, so the chain is the
     # collection itself. Tests that need a container describe one explicitly.
-    v._chain = lambda collection_id, action: iter([collection_id])          # noqa: SLF001
+    v._chain = lambda collection_id, action, cut=None: iter([collection_id])  # noqa: SLF001
     # A resource's origin root is its cell principal. The unscoped branch asks whether any resource
     # the requester holds sits under the principal being asked about, so a test describes reach
     # there by naming roots. Unnamed, a resource is its own root — a flat store.
