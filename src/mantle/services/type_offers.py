@@ -24,6 +24,7 @@ any user wrote would otherwise decide how everyone's artifacts are indexed (the 
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import threading
@@ -65,6 +66,84 @@ def validate_offer(offer: Any) -> List[str]:
             problems.append(f"offer.{key} is not one of {', '.join(OFFER_KEYS)}")
         elif not isinstance(paths, list) or not all(isinstance(p, str) and p.strip() for p in paths):
             problems.append(f"offer.{key} must be a list of paths")
+    return problems
+
+
+#: What a type may declare its artifacts do when a create reaches them over an edge
+#: (``on_create: {"does": <verb>}``); `services.on_create` runs the verb.
+ON_CREATE_VERBS: Tuple[str, ...] = ("number", "create")
+
+#: What an ``on_update`` stamp writes into its field.
+STAMPS: Tuple[str, ...] = ("caller", "time")
+
+
+def validate_on_create(declared: Any) -> List[str]:
+    """The problems with a type's own ``on_create`` block; empty when it is well formed."""
+    if declared is None:
+        return []
+    if not isinstance(declared, dict):
+        return ["on_create must be an object"]
+    problems = []
+    unknown = set(declared) - {"does"}
+    if unknown:
+        problems.append(f"on_create has unknown keys {', '.join(sorted(unknown))}")
+    if declared.get("does") not in ON_CREATE_VERBS:
+        problems.append(f"on_create.does must be one of {', '.join(ON_CREATE_VERBS)}")
+    return problems
+
+
+def validate_field_rules(fields: Any) -> List[str]:
+    """The problems with a ``fields`` block; empty when it is well formed.
+
+    A field may carry ``on_create: {"from_edge": <label>, "key": <field>?}``: on create its value
+    comes from the artifact the creating collection's ``from_edge`` edge points to, as that
+    artifact's type declares, and ``key``, when named, receives a second value from it. A field
+    may carry ``on_update: {"stamp": "caller" | "time", "when": <field>}``: an update that changes
+    ``when`` sets it to the caller or the time."""
+    if fields is None:
+        return []
+    if not isinstance(fields, dict):
+        return ["fields must be an object"]
+    problems = []
+    for name, rule in fields.items():
+        if not isinstance(rule, dict):
+            problems.append(f"fields.{name} must be an object")
+            continue
+        problems += _stamp_problems(name, rule.get("on_update"))
+        on_create = rule.get("on_create")
+        if on_create is None:
+            continue
+        where = f"fields.{name}.on_create"
+        if not isinstance(on_create, dict):
+            problems.append(f"{where} must be an object")
+            continue
+        unknown = set(on_create) - {"from_edge", "key"}
+        if unknown:
+            problems.append(f"{where} has unknown keys {', '.join(sorted(unknown))}")
+        edge = on_create.get("from_edge")
+        if not isinstance(edge, str) or not edge.strip():
+            problems.append(f"{where}.from_edge must name an edge")
+        key = on_create.get("key")
+        if key is not None and (not isinstance(key, str) or not key.strip() or key == name):
+            problems.append(f"{where}.key must name another field")
+    return problems
+
+
+def _stamp_problems(name: str, stamp: Any) -> List[str]:
+    if stamp is None:
+        return []
+    where = f"fields.{name}.on_update"
+    if not isinstance(stamp, dict):
+        return [f"{where} must be an object"]
+    problems = []
+    unknown = set(stamp) - {"stamp", "when"}
+    if unknown:
+        problems.append(f"{where} has unknown keys {', '.join(sorted(unknown))}")
+    if stamp.get("stamp") not in STAMPS:
+        problems.append(f"{where}.stamp must be one of {', '.join(STAMPS)}")
+    when = stamp.get("when")
+    if not isinstance(when, str) or not when.strip() or when == name:
+        problems.append(f"{where}.when must name another field")
     return problems
 
 
@@ -180,6 +259,88 @@ def offer_of(content_type: Any) -> Dict[str, Tuple[str, ...]]:
     return resolved
 
 
+def _field_rules(content_type: Any, kind: str) -> Dict[str, dict]:
+    """``{field: rule}`` of ``kind`` for ``content_type``: each field's rule from the nearest type
+    in its lineage that declares the field. Empty for a type with none, the common case."""
+    ct = _normalize(content_type)
+    if not ct:
+        return {}
+    resolved: Dict[str, Any] = {}
+    with _lock:
+        if not _definitions:
+            return {}
+        for link in _lineage(ct):
+            declared = (_definitions.get(link) or {}).get("fields")
+            if not isinstance(declared, dict) or validate_field_rules(declared):
+                continue
+            for name, rule in declared.items():
+                if name not in resolved:
+                    resolved[name] = rule.get(kind)
+    return {name: dict(rule) for name, rule in resolved.items() if rule}
+
+
+def on_create_rules(content_type: Any) -> Dict[str, dict]:
+    """``{field: on_create rule}`` for ``content_type``."""
+    return _field_rules(content_type, "on_create")
+
+
+def on_update_rules(content_type: Any) -> Dict[str, dict]:
+    """``{field: on_update stamp}`` for ``content_type``."""
+    return _field_rules(content_type, "on_update")
+
+
+def secret_fields(content_type: Any) -> set:
+    """The fields ``content_type`` marks ``"secret": true``, from the nearest type in its lineage
+    that declares each field."""
+    ct = _normalize(content_type)
+    if not ct:
+        return set()
+    resolved: Dict[str, bool] = {}
+    with _lock:
+        for link in _lineage(ct):
+            declared = (_definitions.get(link) or {}).get("fields")
+            if not isinstance(declared, dict):
+                continue
+            for name, rule in declared.items():
+                if name not in resolved and isinstance(rule, dict):
+                    resolved[name] = rule.get("secret") is True
+    return {name for name, secret in resolved.items() if secret}
+
+
+def defaults(content_type: Any) -> Dict[str, Any]:
+    """``{field: default}`` from ``content_type``'s ``context_schema``: each field's ``default``
+    from the nearest type in its lineage that declares the field. A type is the only place a
+    field's default lives."""
+    ct = _normalize(content_type)
+    if not ct:
+        return {}
+    resolved: Dict[str, Any] = {}
+    with _lock:
+        for link in _lineage(ct):
+            schema = (_definitions.get(link) or {}).get("context_schema")
+            if not isinstance(schema, dict):
+                continue
+            for name, rule in schema.items():
+                if name not in resolved and isinstance(rule, dict):
+                    resolved[name] = rule
+    return {name: copy.deepcopy(rule["default"]) for name, rule in resolved.items()
+            if "default" in rule}
+
+
+def on_create_does(content_type: Any) -> Optional[str]:
+    """The verb ``content_type`` declares for a create that reaches one of its artifacts over an
+    edge, from the nearest type in its lineage that declares one; ``None`` when none does."""
+    ct = _normalize(content_type)
+    if not ct:
+        return None
+    with _lock:
+        for link in _lineage(ct):
+            declared = (_definitions.get(link) or {}).get("on_create")
+            if declared is not None and not validate_on_create(declared):
+                return declared["does"]
+    return None
+
+
 def set_definitions(definitions: Dict[str, dict]) -> None:
     """Replace the in-memory definitions (startup load and tests)."""
     with _lock:
@@ -261,7 +422,9 @@ def publish(db: Any, server: str, definitions: List[dict]) -> Dict[str, Any]:
         target = _normalize(definition.get("content_type"))
         if not target:
             continue
-        problems = validate_offer(definition.get("offer"))
+        problems = (validate_offer(definition.get("offer"))
+                    + validate_field_rules(definition.get("fields"))
+                    + validate_on_create(definition.get("on_create")))
         if problems:
             refused[target] = problems
             continue
@@ -317,7 +480,8 @@ def publish(db: Any, server: str, definitions: List[dict]) -> Dict[str, Any]:
 
 
 __all__ = [
-    "BUILTIN_SOURCE", "DEFAULT_OFFER", "OFFER_KEYS",
-    "all_values", "first_value", "load_definitions", "offer_of", "publish", "read_path",
-    "set_definitions", "validate_offer",
+    "BUILTIN_SOURCE", "DEFAULT_OFFER", "OFFER_KEYS", "ON_CREATE_VERBS", "STAMPS",
+    "all_values", "first_value", "load_definitions", "offer_of", "on_create_does",
+    "on_create_rules", "on_update_rules", "publish", "read_path", "set_definitions",
+    "validate_field_rules", "validate_offer", "validate_on_create",
 ]

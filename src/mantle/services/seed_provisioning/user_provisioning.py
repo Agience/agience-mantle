@@ -22,6 +22,7 @@ import contextlib
 import json
 import logging
 import os
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -151,13 +152,40 @@ def provision_user(
     Everything it writes is theirs, and their Inbox's name is sealed under their key, so it runs
     as them whoever called it: the first-login request (already them), or an admin script
     (`manage_seed`, `manage_bootstrap`) that has no principal of its own. 2026-10-29, sealing
-    everything: run bare, the Inbox write was refused key material."""
+    everything: run bare, the Inbox write was refused key material.
+
+    One account is provisioned once at a time (BUG-091). A new account's first page load sends
+    several requests at once, and each finds no reach; run side by side, the second creates
+    nothing of its own, Origin refuses its creation grants, and its answer goes out empty before
+    "New accounts receive" has landed. A second request waits for the first, then finds
+    everything made. The grant memo is dropped afterwards, so what Origin granted opens at once."""
     if not user_id:
         logger.warning("provision_user called with empty user_id — skipping")
         return
     from mantle.services.acting_principal import acting_as
-    with acting_as(str(user_id), principal_type="user"):
-        _provision_user(store_db, user_id, **kwargs)
+    with _account_lock(str(user_id)):
+        try:
+            with acting_as(str(user_id), principal_type="user"):
+                _provision_user(store_db, user_id, **kwargs)
+        finally:
+            try:
+                from mantle.search.mantle.wiring import invalidate_grant_cache
+                invalidate_grant_cache(str(user_id))
+            except Exception:  # noqa: BLE001 — the memo lapses on its own
+                logger.debug("grant-cache invalidation failed", exc_info=True)
+
+
+_account_locks: Dict[str, threading.Lock] = {}
+_account_locks_guard = threading.Lock()
+
+
+@contextlib.contextmanager
+def _account_lock(user_id: str):
+    """The one provisioning lock for `user_id` in this process."""
+    with _account_locks_guard:
+        lock = _account_locks.setdefault(user_id, threading.Lock())
+    with lock:
+        yield
 
 
 def _provision_user(
@@ -195,7 +223,11 @@ def _provision_user(
     # Declarative grant seeds are applied ONLY when the install package supplies a
     # seed corpus (AGIENCE_SEEDS_ROOT). Bare Mantle has none — skip cleanly.
     if base is not None:
-        _apply_grant_set(store_db, base / "user", ctx, user_id)
+        # Where Origin keeps the ledger, Origin makes what "New accounts receive" lists, this set
+        # among it, when `grant_to_account` names the person.
+        from mantle.services.seed_provisioning.platform_operators import _origin_grants
+        if _origin_grants() is None:
+            _apply_grant_set(store_db, base / "user", ctx, user_id)
         if _is_platform_admin(store_db, user_id):
             _apply_grant_set(store_db, base / "admin", ctx, user_id)
 
@@ -577,7 +609,7 @@ def provision_existing_accounts(store_db: Database, base: Optional[Path]) -> Dic
     from mantle.db import lattice_api as la
     from mantle.services.peer_signing import get_system_principal_id
     from mantle.services.seed_provisioning.loader import UserContext, only_where_never_granted
-    from mantle.services.seed_provisioning.platform_operators import grant_to_account
+    from mantle.services.seed_provisioning.platform_operators import _origin_grants, grant_to_account
 
     docs = list(la._grant_docs(store_db))
     pairs = frozenset((str(d.get("grantee_id")), str(d.get("resource_id"))) for d in docs)
@@ -588,7 +620,8 @@ def provision_existing_accounts(store_db: Database, base: Optional[Path]) -> Dic
     with only_where_never_granted(pairs):
         for a in sorted(accounts):
             try:
-                if base is not None and (base / "user").is_dir():
+                # Where Origin keeps the ledger, `grant_to_account` asks Origin for this set too.
+                if base is not None and (base / "user").is_dir() and _origin_grants() is None:
                     _apply_grant_set(store_db, base / "user", UserContext(id=a), a)
                 out["operators"] += grant_to_account(store_db, a, skip=pairs)
                 # The account's grants may be memoized from before the seed (it signed in first):

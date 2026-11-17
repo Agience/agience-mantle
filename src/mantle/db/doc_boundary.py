@@ -74,6 +74,7 @@ READABLE_CONTEXT_TYPES = frozenset({
     "application/vnd.agience.anchor+json",
     "application/vnd.agience.crosswalk+json",
     "application/vnd.agience.subscription+json",
+    "application/vnd.agience.number-provider+json",
 })
 
 #: Top-level fields a writer supplies: content, sealed with the context.
@@ -106,8 +107,14 @@ def _readable(doc: dict, ctx: dict) -> bool:
     the readable types, and the operators the platform seeds (John, 2026-11-10, BUG-057: their
     input form and wiring are the platform's public definition, and a node holding none of the
     keys they were sealed under, staging, could not show a single input field). A person's own
-    operator is not one: its wiring may name a private server, and stays sealed."""
-    return _content_type_of(doc, ctx) in READABLE_CONTEXT_TYPES or _is_platform_operator(doc, ctx)
+    operator is not one: its wiring may name a private server, and stays sealed. An artifact whose
+    type declares what it does on create is configuration too: Mantle reads it inside the create
+    of another artifact, under no key of its own (`services.on_create`)."""
+    ct = _content_type_of(doc, ctx)
+    if ct in READABLE_CONTEXT_TYPES or _is_platform_operator(doc, ctx):
+        return True
+    from mantle.services import type_offers
+    return type_offers.on_create_does(ct) is not None
 
 
 def sealable_keys(doc: dict, ctx: dict) -> list:

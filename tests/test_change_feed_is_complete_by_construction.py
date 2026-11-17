@@ -90,6 +90,10 @@ WRITE_SITES: dict[tuple[str, str], tuple[str, str]] = {
         BOUNDARY, "the artifact create. Emits artifact.created."),
     ("db/lattice_api.py", "update_artifact"): (
         BOUNDARY, "the artifact update. Emits artifact.updated."),
+    ("services/on_create.py", "_write_provider"): (
+        BOUNDARY, "a number provider's `last`, written inside the create's transaction. Emits "
+                  "artifact.updated through db.conn.after_commit, so a rolled-back create "
+                  "announces nothing."),
     ("db/lattice_api.py", "create_collection"): (
         BOUNDARY, "a container create IS an artifact create — same chokepoint, same event."),
     ("db/lattice_api.py", "update_collection"): (

@@ -16,6 +16,12 @@ stores the choice as a link. Its arguments map each input from the invoke reques
 Idempotent, non-fatal, runs every startup (`main.py`); `grant_to_account` runs at an account's first
 sign-in (`user_provisioning`), and `python -m mantle.services.seed_provisioning.platform_operators`
 grants every existing account (a release migration).
+
+Where Origin keeps the ledger, what every new account receives is the operator's "New accounts
+receive" collection: each edge out of it names a member and conducts read, or read and invoke, to the
+person. Its id is derived from the operator's, so Origin finds it with no setting. Mantle links the
+operators' collection and each per-user seed into it; Origin makes the grants, as the operator's own
+entries, when Mantle names a new person.
 """
 from __future__ import annotations
 
@@ -23,6 +29,7 @@ import json
 import logging
 import os
 import sys
+import uuid
 from typing import Any, Dict, List
 
 from mantle.db.store import Database
@@ -199,24 +206,6 @@ def _context(op: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _own(upsert, db: Database, operator: str, artifact_id: str, title: str) -> None:
-    """The platform operator's own grant on what it provisions. `created_by` is provenance and
-    confers nothing, so without it the operator could not read, change or share its own operators,
-    nor open their titles, which are sealed with their content. On the release candidate a grant
-    that cannot be sealed there is the copy's own, already in place, and is left."""
-    try:
-        _own_grant(upsert, db, operator, artifact_id, title)
-    except Exception as exc:
-        if not (_on_rc() and _is_unsealable_here(exc)):
-            raise
-
-
-def _own_grant(upsert, db: Database, operator: str, artifact_id: str, title: str) -> None:
-    upsert(db, user_id=operator, collection_id=artifact_id, granted_by=operator,
-           can_create=True, can_read=True, can_update=True, can_delete=True, can_evict=True,
-           can_invoke=True, can_add=True, can_share=True, can_admin=True, name=f"Owner: {title}")
-
-
 def _as_operator(operator: str):
     """Act as the operator for the provisioning. When the operator is already acting, on their own
     request through the admin seed route, keep that principal and the credential it carries: under
@@ -236,7 +225,6 @@ def _as_operator(operator: str):
 def ensure_platform_operators(db: Database) -> bool:
     """Create or converge the collection and its operators. False when not yet possible."""
     from mantle.db.backend import add_artifact_to_collection as db_add_edge
-    from mantle.db.backend import upsert_user_collection_grant
     from mantle.services.platform_topology import register_id
     from mantle.services.seed_provisioning.platform_email import _operator_id
 
@@ -247,23 +235,98 @@ def ensure_platform_operators(db: Database) -> bool:
         return False
     with _as_operator(operator):
         coll = known[_COLLECTION_SLUG]
-        _ensure(db, coll, content_type=COLLECTION_CT, name="Platform operators",
-                         description="Operators the platform provides; each is granted to every account.",
-                         context={"content_type": COLLECTION_CT, "title": "Platform operators"},
-                         content="", owner=operator)
+        # Made as any creator makes a container: the root and the creator's own grant in one batch,
+        # which Origin co-signs. The release candidate, a copy of production that cannot seal under
+        # its keys, converges the row in the open (BUG-057).
+        if not _exists(db, coll) and not _on_rc():
+            from mantle.services import workspace_service
+            workspace_service.create_container(
+                db, operator, content_type=COLLECTION_CT, name="Platform operators",
+                description="Operators the platform provides; each is granted to every account.",
+                context=json.dumps({"content_type": COLLECTION_CT, "title": "Platform operators"}),
+                artifact_id=coll)
+        else:
+            _ensure(db, coll, content_type=COLLECTION_CT, name="Platform operators",
+                    description="Operators the platform provides; each is granted to every account.",
+                    context={"content_type": COLLECTION_CT, "title": "Platform operators"},
+                    content="", owner=operator)
         register_id(_COLLECTION_SLUG, coll)
-        _own(upsert_user_collection_grant, db, operator, coll, "Platform operators")
         for op in OPERATORS:
             op_id = known[op["slug"]]
             existed = _ensure(db, op_id, content_type=OPERATOR_CT, name=op["title"],
-                                       description=op["description"], context=_context(op),
-                                       content="", owner=operator)
+                              description=op["description"], context=_context(op),
+                              content="", owner=operator)
             register_id(op["slug"], op_id)
-            _own(upsert_user_collection_grant, db, operator, op_id, op["title"])
             if not existed:
+                # Its creation edge in the collection, which the operator owns at Origin.
                 db_add_edge(db, coll, op_id, origin=True)
+        if not _on_rc():
+            ensure_new_accounts_receive(db, operator, coll)
     logger.info("platform_operators: %d operators in %s", len(OPERATORS), known[_COLLECTION_SLUG])
     return True
+
+
+#: The most an edge out of "New accounts receive" conducts to a person; Origin holds the same bound.
+NEW_ACCOUNT_ACTIONS = ("invoke", "read")
+
+
+def new_accounts_receive_id(operator: str) -> str:
+    """The operator's "New accounts receive" collection; Origin derives the same id."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"agience://new-accounts-receive/{operator}"))
+
+
+def _per_user_seeds() -> List[tuple]:
+    """(collection id, actions) for each per-user grant seed (`<seeds>/user/grants/*.yaml`, principal
+    `{{user.id}}`): the seeded collections every account is given."""
+    import yaml
+
+    from mantle.services.seed_provisioning.loader import derive_uuid, get_instance_namespace
+    from mantle.services.seed_provisioning.user_provisioning import _seeds_base
+
+    base = _seeds_base()
+    ns = get_instance_namespace()
+    if base is None or ns is None:
+        return []
+    out = []
+    for f in sorted((base / "user" / "grants").glob("*.yaml")):
+        doc = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
+        if doc.get("type") != "grant" or doc.get("principal") != "{{user.id}}":
+            continue
+        space, _, slug = str(doc.get("resource") or "").partition("/")
+        actions = sorted(set(doc.get("actions") or []) & set(NEW_ACCOUNT_ACTIONS))
+        if space and slug and actions:
+            out.append((derive_uuid(ns, space, slug), actions))
+    return out
+
+
+def ensure_new_accounts_receive(db: Database, operator: str, operators_collection: str) -> str:
+    """Create the operator's "New accounts receive" collection and link into it what every account
+    is given: the operators' collection, read and invoke, and each per-user seed with its actions.
+    A member not in the store yet is linked on a later pass; an existing edge is left as it is."""
+    from mantle.db import lattice_api as la
+    from mantle.services import workspace_service
+
+    nar = new_accounts_receive_id(operator)
+    if not _exists(db, nar):
+        workspace_service.create_container(
+            db, operator, content_type=COLLECTION_CT, name="New accounts receive",
+            description="What every new account receives: on each member, what its edge conducts.",
+            context=json.dumps({"content_type": COLLECTION_CT, "title": "New accounts receive"}),
+            artifact_id=nar)
+    members = [(operators_collection, list(NEW_ACCOUNT_ACTIONS)), *_per_user_seeds()]
+    for member, actions in members:
+        if _exists(db, member) and la._find_membership(db, nar, member) is None:
+            la.add_artifact_to_collection(db, nar, member, origin=False, propagate=actions)
+    return nar
+
+
+def apply_remote(db: Database) -> int:
+    """Apply Origin's new entries now, so the grants it just made are here at once."""
+    from mantle.services import authority_ledger
+    try:
+        return authority_ledger.apply_remote(db)
+    except Exception:  # noqa: BLE001 — the feed pass applies them shortly
+        return 0
 
 
 def _exists(db: Database, artifact_id: str) -> bool:
@@ -275,11 +338,28 @@ def _exists(db: Database, artifact_id: str) -> bool:
         return True
 
 
+def _origin_grants() -> object:
+    """Origin's client, when this store's changes to reach go to Origin's ledger, else None."""
+    from mantle.db import reach_journal
+    sub = getattr(reach_journal, "_authority", None)
+    return getattr(sub, "custodian", None) if sub is not None else None
+
+
 def grant_to_account(db: Database, user_id: str, skip: frozenset = frozenset()) -> int:
-    """Grant `user_id` read and invoke on each public operator. Idempotent; returns how many."""
+    """Grant `user_id` read and invoke on each public operator. Idempotent; returns how many.
+
+    Where Origin keeps the ledger, Mantle names the person and Origin makes what "New accounts
+    receive" lists, as the operator's own entries, which this store then applies from the ledger.
+    Without a ledger, the grants are written here."""
     from mantle.db.backend import upsert_user_collection_grant
     from mantle.services.seed_provisioning.platform_email import _operator_id
 
+    origin = _origin_grants()
+    if origin is not None and hasattr(origin, "new_person_grants"):
+        answer = origin.new_person_grants(user_id) or {}
+        if answer.get("granted"):
+            apply_remote(db)
+        return int(answer.get("granted") or 0)
     operator = _operator_id(db)
     known = ids()
     if not operator or not known or not user_id or user_id == operator:

@@ -187,6 +187,7 @@ def test_updating_a_member_changes_its_name_and_description():
     with (
         patch("mantle.services.workspace_service.store.get_collection_by_id"),
         patch("mantle.services.workspace_service.get_workspace"),
+        patch("mantle.services.dependencies.check_access"),
         patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
         patch("mantle.services.workspace_service.store.update_artifact", return_value=art),
         patch("mantle.services.workspace_service._emit_event"),
@@ -206,6 +207,7 @@ def test_updating_a_member_without_naming_them_leaves_them_alone():
     with (
         patch("mantle.services.workspace_service.store.get_collection_by_id"),
         patch("mantle.services.workspace_service.get_workspace"),
+        patch("mantle.services.dependencies.check_access"),
         patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
         patch("mantle.services.workspace_service.store.update_artifact", return_value=art),
         patch("mantle.services.workspace_service._emit_event"),

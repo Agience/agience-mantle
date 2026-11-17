@@ -348,6 +348,7 @@ def update_workspace(
     content_type: Optional[str] = None,
     state: Optional[str] = None,
     caller_context: Optional[str] = None,
+    verb: str = "update",
 ) -> CollectionEntity:
     """Update a top-level artifact's name, description, context, content and/or content_type;
     return the current entity.
@@ -362,8 +363,9 @@ def update_workspace(
     restating what the container means even when no scalar field differs.
 
     ``context`` replaces the stored context wholesale (see:func:`update_workspace_context`), and
-    a string is parsed as JSON with an unparseable value read as ``{}``. Requires ``update``;
-    raises ``HTTPException(404)`` for a missing workspace or a caller without that verb.
+    a string is parsed as JSON with an unparseable value read as ``{}``. Requires ``verb``:
+    ``update``, or ``delete`` when moving to Trash archives through here. Raises
+    ``HTTPException(404)`` for a missing workspace or a caller without that verb.
 
     ``content`` and ``content_type`` are here because a top-level artifact is not always a
     container. :func:`create_container` is the only create path that takes no parent, so every
@@ -385,7 +387,7 @@ def update_workspace(
 
     Unarchiving returns the artifact to ``live``, whichever non-archived value ``state`` names.
     """
-    ws = get_workspace(db, user_id, workspace_id, required="update")
+    ws = get_workspace(db, user_id, workspace_id, required=verb)
 
     # State transitions settle the artifact's segment and return; they never combine with a
     # content edit in one call, because the two answer different questions ("where does this
@@ -1290,8 +1292,9 @@ def _reads(db: Database, user_id: str, container_id: str) -> bool:
 
 def _holds_owners_rights(db: Database, user_id: str, container_id: str) -> bool:
     """Does `user_id` already reach every action an owner grant carries on `container_id`, by the
-    light-cone walk? Only then is their creation also their own (`create_workspace_artifact`).
-    The same test Origin applies to a member's creator, so Mantle asks for no grant Origin refuses."""
+    light-cone walk? Only then does their creation carry a full owner grant; any other creator gets
+    update alone (`create_workspace_artifact`). The same test Origin applies to a member's creator
+    (reach plus update), so Mantle asks for no grant Origin refuses."""
     from mantle.attenuation import ACTIONS
     from mantle.search.mantle.oracle import LightConeGrantVerifier
 
@@ -1453,33 +1456,33 @@ def create_workspace_artifact(
     # collection is just an artifact with child edges. (The container edge still
     # propagates the collection's grants to OTHER members for sharing; see `origin`.)
     #
-    # Only for a creator who already holds the owner's rights on the container (John,
-    # 2026-11-01). A contributor who does not (an inbox's create-only sender, a `contributor`)
-    # gets nothing extra: what they add belongs to the collection's owner, and no grant is asked
-    # of the authority for it.
-    if _holds_owners_rights(db, user_id, workspace_id):
-        try:
-            store.upsert_user_collection_grant(
-                db, user_id=user_id, collection_id=artifact.root_id, granted_by=user_id,
-                can_create=True, can_read=True, can_update=True, can_delete=True,
-                can_evict=True, can_invoke=True, can_add=True, can_share=True, can_admin=True,
-            )
-        except Exception:
-            # `warning`, not `debug`: this failure produces a durably unreachable artifact. Most
-            # `logger.debug(... failed)` in this codebase are best-effort notifications — an event that
-            # did not emit, a websocket send, a probe. This is not one of them. Authorization is
-            # grant-based and `services/dependencies.py::check_access` walks grants — `created_by` is
-            # never consulted — so a create whose owner grant failed leaves a row that EXISTS and that
-            # no principal can read, update or contain anything in. Every API surface answers 404.
-            #
-            # An artifact in this state is one row of genuinely probed content answering 404 from
-            # `get_artifact`, indefinitely, because nothing says anything. The 404 cannot tell you
-            # which it is either: `check_access` returns the same code
-            # for "absent" and "present but you hold no grant", deliberately, so it is not an existence
-            # oracle. **This log line is the only place the difference would ever have been visible.**
-            logger.warning("owner grant on create FAILED for %s — the artifact will exist and be "
-                           "unreachable through every API surface", getattr(artifact, "id", "?"),
-                           exc_info=True)
+    # The full owner grant goes to a creator who already holds the owner's rights on the container
+    # (John, 2026-11-01). Any other creator (an inbox's create-only sender, a `contributor`) gets
+    # update and nothing more: whoever creates an artifact may change it (BUG-118). What they can
+    # read still comes from the container, so a create-only sender opens nothing.
+    owner = _holds_owners_rights(db, user_id, workspace_id)
+    rights = (dict(can_create=True, can_read=True, can_update=True, can_delete=True,
+                   can_evict=True, can_invoke=True, can_add=True, can_share=True, can_admin=True)
+              if owner else dict(can_read=False, can_update=True))
+    try:
+        store.upsert_user_collection_grant(
+            db, user_id=user_id, collection_id=artifact.root_id, granted_by=user_id, **rights)
+    except Exception:
+        # `warning`, not `debug`: this failure produces a durably unreachable artifact. Most
+        # `logger.debug(... failed)` in this codebase are best-effort notifications — an event that
+        # did not emit, a websocket send, a probe. This is not one of them. Authorization is
+        # grant-based and `services/dependencies.py::check_access` walks grants — `created_by` is
+        # never consulted — so a create whose owner grant failed leaves a row that EXISTS and that
+        # no principal can read, update or contain anything in. Every API surface answers 404.
+        #
+        # An artifact in this state is one row of genuinely probed content answering 404 from
+        # `get_artifact`, indefinitely, because nothing says anything. The 404 cannot tell you
+        # which it is either: `check_access` returns the same code
+        # for "absent" and "present but you hold no grant", deliberately, so it is not an existence
+        # oracle. **This log line is the only place the difference would ever have been visible.**
+        logger.warning("owner grant on create FAILED for %s — the artifact will exist and be "
+                       "unreachable through every API surface", getattr(artifact, "id", "?"),
+                       exc_info=True)
 
     if artifact.persona_sealed:
         # Origin keeps the digests of the copies its writer made (review 22, F2), from a subject
@@ -1742,6 +1745,7 @@ def update_artifact(
     description: Optional[str] = None,
     auth: Any = None,
     caller_context: Optional[str] = None,
+    verb: str = "update",
 ) -> ArtifactEntity:
     """Update an artifact in a container.
 
@@ -1775,11 +1779,11 @@ def update_artifact(
     legacy `draft` beside a newer `committed` row, or the reverse; both read as live, and the
     newer one takes the edit.
 
-    Authorization is the caller's, on the ARTIFACT: the routes run `check_access(artifact,
-    "update" | "delete")` first, which walks the artifact's own grants and then its container's.
-    2026-10-22: this asked for `update` on the CONTAINER instead, by direct grant only, so the maker
-    of a card in someone else's collection — who holds an owner's grant on it — could not edit it,
-    and an editor of the collection could rewrite any card in it, whoever made it.
+    Authorization is the caller's ``verb`` on the ARTIFACT, checked here (`_require`): the
+    artifact's own grants, then its container's. ``verb`` is ``update`` for an edit or a restore;
+    moving to Trash archives through this function and passes ``delete``, the right Trash asks.
+    When the row written is a newer version than the one named, ``verb`` is checked on that row
+    as well.
     """
     if get_workspace_unsafe(db, workspace_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Workspace not found")
@@ -1791,6 +1795,7 @@ def update_artifact(
         target = store.get_latest_live_artifact(db, artifact_id, workspace_id)
     if target is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Artifact not found")
+    _require(db, user_id, auth, target.id, verb)
 
     # Archive toggle. A transition is the whole of its write (see `update_workspace`).
     edits = (context, content, content_type, name, description, vector, caller_context)
@@ -1831,13 +1836,12 @@ def update_artifact(
         raise HTTPException(status.HTTP_409_CONFLICT, "Cannot edit an archived artifact")
 
     # Edit the lineage's current version in this container, in place (see the docstring). When
-    # that is a different row from the one the caller named, the caller's `update` is checked on
-    # the row actually written as well (`auth`, when the caller supplies one).
+    # that is a different row from the one the caller named, the caller's ``verb`` is checked on
+    # the row actually written as well.
     current = store.get_current_in_collection(db, workspace_id, target.root_id or target.id)
     if current is not None:
-        if auth is not None and current.id != target.id:
-            from mantle.services.dependencies import check_access
-            check_access(auth, current.id, "update", db)
+        if current.id != target.id:
+            _require(db, user_id, auth, current.id, verb)
         target = current
     if caller_context is not None:
         context = _mc.merge_caller_update(target.context, caller_context)
@@ -2080,6 +2084,10 @@ def delete_artifact(
     as:func:`delete_workspace` handles a top-level container's members: detached (evicted rather
     than destroyed) unless ``cascade=True``. Without the check a sub-collection would be unlinked
     while its own members' edges still pointed at a container id that resolves to nothing.
+
+    Requires the caller's ``delete`` on the artifact (`_require`), checked here, so the trash
+    purge, which deletes as the person who trashed it, is refused once that person may no longer
+    delete it.
     """
     if not workspace_id:
         raise HTTPException(
@@ -2087,6 +2095,7 @@ def delete_artifact(
             "delete_artifact requires the containing collection id",
         )
     artifact = get_workspace_artifact(db, user_id, workspace_id, artifact_id)
+    _require(db, user_id, auth, artifact.id, "delete")
 
     children = store.list_collection_artifacts(db, artifact_id, include_archived=True)
     counts = {"detached": 0, "destroyed": 0, "refused": 0}
@@ -2126,6 +2135,31 @@ def delete_artifact(
 
     _emit_event(workspace_id, "artifact.deleted", {"artifact_id": artifact_id}, actor_id=user_id)
     return counts
+
+
+def _require(db: Database, user_id: str, auth: Any, artifact_id: str, verb: str) -> None:
+    """Refuse unless the caller holds ``verb`` on ``artifact_id`` (``check_access``: its own grants,
+    then the light cone above it). Each member write runs it itself, so a caller that is not a
+    route (the trash purge, an operator) is checked exactly as a request is. ``auth`` is the
+    request's when there is one, since a grant key's reach is its own; without one the check is
+    the person ``user_id``'s. A refusal is the 404 ``check_access`` raises."""
+    from mantle.services.dependencies import AuthContext, check_access
+
+    if auth is None:
+        auth = AuthContext(principal_id=user_id, principal_type="user", user_id=user_id)
+    check_access(auth, artifact_id, verb, db)
+
+
+def _raw_root_id(db: Database, any_id: str) -> str:
+    """The root id of an artifact named by its root id or any of its version ids, read from the
+    raw row (no decryption); an id with no row is its own."""
+    try:
+        raw = db.artifacts.get_artifact(any_id)
+    except Exception:  # noqa: BLE001 — unreadable: the id as given
+        return any_id
+    if not isinstance(raw, dict):
+        return any_id
+    return str(raw.get("root_id") or raw.get("id") or any_id)
 
 
 def _may_update_artifact(db: Database, auth: Any, artifact_id: str) -> bool:
@@ -2168,8 +2202,11 @@ def remove_artifact_from_container(
 ) -> ArtifactEntity:
     """Remove an artifact from a container. Removing never destroys.
 
-    Works on any container, not just workspaces. Access is gated by the caller's `check_access`,
-    with the `evict` action.
+    Works on any container, not just workspaces. Authorized here: ``evict`` on the container for a
+    secondary edge, since detaching is a container operation and the member survives it. Removing
+    the member's creation edge deletes it at Origin, so that asks ``delete`` on the member. Admin on
+    the container passes either. Both ids are read as root ids first, so a member or a container
+    named by one of its version ids is the same edge.
 
     - **Another container still holds the root:** its edge here is detached and nothing else
       changes. An artifact HOMED here (its current version's `collection_id` is this container) is
@@ -2185,6 +2222,16 @@ def remove_artifact_from_container(
 
     Returns the artifact: its `state` is `archived` when the removal archived it.
     """
+    parent = store.get_origin_parent(db, _raw_root_id(db, artifact_id))
+    creation = bool(parent) and parent[0] == _raw_root_id(db, container_id)
+    try:
+        _require(db, user_id, auth, *((artifact_id, "delete") if creation
+                                      else (container_id, "evict")))
+    except HTTPException:
+        from mantle.services import grant_service
+        if not grant_service.can_admin(db, user_id, container_id):
+            raise
+
     # Resolve the root_id: the caller may pass a version id or a root_id.
     root_id = artifact_id
     artifact = store.get_artifact(db, artifact_id)
@@ -2276,32 +2323,6 @@ def add_artifact_to_workspace(
 def _is_creation_edge(db: Database, container_id: str, root_id: str) -> bool:
     """Is the edge `container_id` -> `root_id` the artifact's creation edge (`is_origin`)?"""
     return bool((store.get_edge(db, container_id, root_id) or {}).get("origin"))
-
-
-def move_artifact_between_containers(
-    db: Database,
-    user_id: str,
-    source_container_id: str,
-    target_container_id: str,
-    artifact_id: str,
-) -> ArtifactEntity:
-    """Move an artifact from one container to another. P2 — type-blind."""
-    artifact = store.get_artifact(db, artifact_id)
-    if not artifact or artifact.collection_id != source_container_id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Artifact not found")
-
-    artifact.collection_id = target_container_id
-    artifact.modified_by = user_id
-    artifact.modified_time = _now_iso()
-    store.update_artifact(db, artifact)
-
-    store.remove_artifact_from_collection(db, source_container_id, artifact.root_id)
-    order_key = after_key(store.get_last_order_key(db, target_container_id))
-    store.add_artifact_to_collection(db, target_container_id, artifact.root_id, order_key)
-
-    _emit_event(source_container_id, "artifact.deleted", {"artifact_id": artifact_id}, actor_id=user_id)
-    _emit_event(target_container_id, "artifact.created", {"artifact": artifact.to_dict()}, actor_id=user_id)
-    return artifact
 
 
 def move_workspace_artifact(

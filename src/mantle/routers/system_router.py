@@ -14,7 +14,8 @@ Routes
 - ``POST   /system/issuers``                     — add a trusted issuer
 - ``DELETE /system/issuers/{artifact_id}``       — revoke trust in an issuer
 - ``GET    /system/users``                       — list users + admin status
-- ``POST   /system/seed``                        — apply the platform seed corpus
+- ``POST   /system/seed``                        — start applying the platform seed corpus (202)
+- ``GET    /system/seed/{run_id}``               — follow a seed run
 - ``POST   /system/users/{user_id}/grant-admin``
 - ``DELETE /system/users/{user_id}/revoke-admin``
 - ``POST   /system/erasure/{person_id}``         — inventory (default) or erase one person
@@ -56,12 +57,15 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+import asyncio
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Literal, Optional
 
 from mantle.api.errors import ERROR_DESCRIPTIONS
 from mantle.api.unknown_fields import CountsUnknownFields
 from mantle.db.store import Database
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 
 from mantle.db import backend as db_store
@@ -176,8 +180,15 @@ class PlatformUserListResponse(BaseModel):
 
 
 class SeedResponse(BaseModel):
-    applied: bool
-    summary: str
+    """One seed run. ``POST /system/seed`` answers with it at once; ``follow`` reports it until
+    ``state`` is ``done`` or ``failed``."""
+    run_id: str
+    state: Literal["running", "done", "failed"]
+    follow: str = Field(..., description="Path that reports this run: `GET /system/seed/{run_id}`.")
+    started_at: str
+    finished_at: Optional[str] = None
+    applied: bool = Field(False, description="True once the run is done.")
+    summary: str = ""
     errors: List[str] = Field(default_factory=list)
 
 
@@ -374,18 +385,36 @@ def _platform_user_page(
 _SEED_MAX_PASSES = 4
 
 
+#: Seed runs this process remembers, newest last. Mantle is one process (`main.py`, workers=1).
+_SEED_RUNS: Dict[str, Dict[str, Any]] = {}
+_SEED_RUNS_KEPT = 8
+#: The running task, held so it is not collected before it finishes.
+_SEED_TASKS: set = set()
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 @router.post(
     "/seed",
+    status_code=status.HTTP_202_ACCEPTED,
     responses=_errors(401, 403, 409),
     response_model=SeedResponse,
-    summary="Apply the platform seed corpus",
-    description="Idempotent. Admin-only. 409 when this node is bare (no seed corpus mounted).",
+    summary="Start applying the platform seed corpus",
+    description=(
+        "Admin-only. Idempotent. Answers 202 at once with the run and its `follow` path (also the "
+        "`Location` header); the seed runs on, and `GET /system/seed/{run_id}` reports it until "
+        "`state` is `done` or `failed`. While a run is going, a second call answers with that run "
+        "and starts nothing. 409 when this node is bare (no seed corpus mounted)."
+    ),
 )
 async def seed_platform(
+    response: Response,
     auth: AuthContext = Depends(get_auth),
     store_db: Database = Depends(get_store_db),
 ) -> SeedResponse:
-    """Apply the platform seed corpus (the ``platform/`` artifacts + grants that the
+    """Start applying the platform seed corpus (the ``platform/`` artifacts + grants that the
     user/admin grant seeds target).
 
     Mantle bundles no seeds and does not apply them at boot (bare). The seed corpus
@@ -393,6 +422,10 @@ async def seed_platform(
     package calls this endpoint once (after the operator is established, before
     users) so Mantle applies the platform artifacts on explicit request — the
     application on top drives seeding via the API, not the data layer at boot.
+
+    On a fresh store the seed takes longer than a caller or a proxy waits for one answer, so it
+    runs as a task. The task is created inside this request, so it carries the request's context,
+    the caller's acting principal and credential among it.
     """
     await offload_sync(require_platform_admin, auth, store_db)
 
@@ -406,6 +439,56 @@ async def seed_platform(
     if not root.is_dir():
         raise HTTPException(status_code=409, detail=f"Platform seed tree not found at {root}")
 
+    run = next((r for r in _SEED_RUNS.values() if r["state"] == "running"), None)
+    if run is None:
+        run_id = str(uuid.uuid4())
+        run = {"run_id": run_id, "state": "running", "follow": f"/system/seed/{run_id}",
+               "started_at": _now(), "finished_at": None, "applied": False, "summary": "",
+               "errors": []}
+        _SEED_RUNS[run_id] = run
+        while len(_SEED_RUNS) > _SEED_RUNS_KEPT:
+            oldest = next(k for k, r in _SEED_RUNS.items() if r["state"] != "running")
+            del _SEED_RUNS[oldest]
+        task = asyncio.create_task(_run_seed(run, store_db, base, root))
+        _SEED_TASKS.add(task)
+        task.add_done_callback(_SEED_TASKS.discard)
+    response.headers["Location"] = run["follow"]
+    return SeedResponse(**run)
+
+
+@router.get(
+    "/seed/{run_id}",
+    responses=_errors(401, 403, 404),
+    response_model=SeedResponse,
+    summary="Follow a seed run",
+    description="Admin-only. The run `POST /system/seed` started: `running`, then `done` or `failed`.",
+)
+async def seed_run(
+    run_id: str,
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+) -> SeedResponse:
+    await offload_sync(require_platform_admin, auth, store_db)
+    run = _SEED_RUNS.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="No such seed run on this node.")
+    return SeedResponse(**run)
+
+
+async def _run_seed(run: Dict[str, Any], store_db: Database, base: str, root: Path) -> None:
+    try:
+        summary, errors = await _apply_seed(store_db, base, root)
+        run.update(state="done", applied=True, summary=summary, errors=errors)
+    except Exception as exc:  # noqa: BLE001 — the run reports it; nothing else is waiting on it
+        logger.exception("platform seed run %s failed", run["run_id"])
+        run.update(state="failed", errors=[f"seed: {type(exc).__name__}: {exc}"])
+    finally:
+        run["finished_at"] = _now()
+
+
+async def _apply_seed(store_db: Database, base: str, root: Path):
+    """Apply the seed tree, provision the platform operators and the accounts that signed in
+    before it. Answers ``(summary, errors)``."""
     from mantle.services.seed_provisioning import seed_from_artifacts
     # Reads a whole seed tree off disk and writes every artifact and grant in it — the
     # longest-running call in this service, and it must run start to finish in one thread.
@@ -474,7 +557,7 @@ async def seed_platform(
     if len(errors) != len(report.errors):
         # The seed's own summary counts the seed's errors only; say how many this answer holds.
         summary += f" | errors {len(errors)} in all"
-    return SeedResponse(applied=True, summary=summary, errors=errors)
+    return summary, errors
 
 
 @router.post(

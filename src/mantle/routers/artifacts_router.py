@@ -1699,7 +1699,7 @@ async def list_platform_operators(
     ),
 
     responses=_errors(
-        400, 401, 403, 404, 413, 500,
+        400, 401, 403, 404, 409, 413, 500,
         updated=("NOTHING WAS CREATED — the write resolved to an existing artifact. Two "
                  "requests produce this. (1) An `identity` that already names an artifact makes "
                  "the write an UPDATE, which is the whole reason to supply one. (2) A "
@@ -1739,7 +1739,12 @@ async def create_artifact(
     #: collection. `_default_create_artifact` reports which it did through `report=`, because its
     #: return value is the artifact document either way and cannot carry the distinction.
     outcome: Dict[str, Any] = {}
-    result = await _default_create_artifact(body, auth, store_db, report=outcome)
+    # A type whose fields are set on create checks Invoke on the artifact its collection is edged
+    # to as this caller: 403 without it, 409 when none is found or its values are allocated on
+    # another node.
+    from mantle.services import on_create
+    with on_create.creating_as(auth):
+        result = await _default_create_artifact(body, auth, store_db, report=outcome)
     if outcome.get("created") is False:
         response.status_code = status.HTTP_200_OK
 
@@ -2522,10 +2527,13 @@ async def list_children(
     offset: int = Query(0, ge=0, description="How many children to skip."),
     links: Optional[str] = Query(
         None, pattern=r"^(\*|[A-Za-z0-9_.:-]{1,64})$",
-        description="List the artifact's typed links instead of its members: `*` for every link, "
-                    "or a relationship's name (a name followed by `.` matches its sub-names, so "
-                    "`step1` lists `step1.collection_id`). Each item carries its `relationship`. "
-                    "Each linked artifact is shown only to a reader who may read it."),
+        description="Deprecated: use `GET /artifacts/{artifact_id}/links?direction=out`, which "
+                    "returns the same items. List the artifact's typed links instead of its "
+                    "members: `*` for every link, or a relationship's name (a name followed by "
+                    "`.` matches its sub-names, so `step1` lists `step1.collection_id`). Each item "
+                    "carries its `relationship`. Each linked artifact is shown only to a reader "
+                    "who may read it.",
+        deprecated=True),
     store_db: Database = Depends(get_store_db),
     auth: AuthContext = Depends(get_auth),
 ):
@@ -2548,70 +2556,26 @@ async def list_children(
 
     # An edge scan plus a lineage resolution per member — unbounded in the container's size,
     # and it runs before the page is taken.
-    if state == "archived":
-        listed = await offload_sync(store.list_collection_artifacts, store_db, artifact_id,
-                                    include_archived=True)
-        # Archived, not trashed: an artifact in Trash is listed in its owner's Trash instead.
-        children = [c for c in listed
-                    if c.get("state") == "archived" and not c.get("trashed_by")]
-    else:
-        children = await offload_sync(store.list_collection_artifacts, store_db, artifact_id)
-
-    # Members, or with `links` the typed links (relationship != null means non-containment).
+    archived = state == "archived"
     if isinstance(links, str) and links:   # called directly, an unset Query is its default object
-        children = [c for c in children if c.get("relationship") and (
-            links == "*" or c["relationship"] == links or str(c["relationship"]).startswith(links + "."))]
+        # The typed links, through the one path `GET /{artifact_id}/links?direction=out` takes.
+        listed = await offload_sync(store.list_links, store_db, artifact_id, direction="out",
+                                    relationship=links, include_archived=archived)
     else:
-        children = [c for c in children if not c.get("relationship")]
+        # Members only (relationship == null is containment).
+        listed = [c for c in await offload_sync(store.list_collection_artifacts, store_db,
+                                                artifact_id, include_archived=archived)
+                  if not c.get("relationship")]
+    # Archived, not trashed: an artifact in Trash is listed in its owner's Trash instead.
+    children = ([c for c in listed if c.get("state") == "archived" and not c.get("trashed_by")]
+                if archived else listed)
 
     # Optional content_type filter
     if content_type:
         children = [c for c in children if c.get("content_type") == content_type]
 
-    # Every member is authorized separately: reading a container is not reading its members.
-    #
-    # `check_access` above answers for `artifact_id` — the container — and nothing else. But
-    # `list_collection_artifacts` returns each member's WHOLE document and decrypts the body on the
-    # way out (`lattice_api.py:565-601`, decrypt at:593), and that decryption succeeds for anyone
-    # holding the collection, because `content_key_scope` keys a member by its COLLECTION
-    # (`doc_boundary.py:111-113`) while the read gate is per artifact. Without this filter the
-    # route hands back plaintext for members whose own gate refuses the same caller one call later:
-    #
-    #   * a member carrying an explicit `deny{read}` naming the caller — never consulted here;
-    #   * a member linked in by `_link_source_artifact` with `origin=False, propagate=[]`, so no
-    #     grant reaches it at all, which is exactly what that edge shape is FOR.
-    #
-    # So this is the same per-id authorization `_fetch_authorized_docs` performs for the batch
-    # route, and for the same stated reason: silent skip, never a 403, so the endpoint reports
-    # "not in this container, for you" rather than becoming an existence oracle over the members.
-    #
-    # The authorization runs on the page rather than on the whole container. `check_access` is
-    # several queries plus an access-audit write per decision, so authorizing every member first
-    # costs a 10,000-child container 10,000 of each to return 100 rows. Here the cost is
-    # proportional to how densely readable the container is for this caller. The worst case is a
-    # caller who may read almost nothing: that walks the members and returns empty.
-    #
-    # The page is filled, not sliced, and the loop is the security property rather than an
-    # optimisation. Authorizing a single slice returns a short page whose shortfall counts the
-    # members the caller may not read, and a caller can sum that page by page into an existence
-    # oracle over the members. Filling means a short page only ever means a genuinely last one.
-    # `tests/test_children_authorize_every_member.py` pins this against the sliced version.
-    #
-    # Filled to `limit + 1` readable rows rather than `limit`, so `has_more` means "another
-    # member you may read exists" rather than "more members exist". Stopping at `limit` leaks the
-    # same way: with two members, one readable, and `limit=1` it answers `has_more: true` and then
-    # serves an empty page, the shortfall counting the member the caller may not see.
-    #
-    # What keeps the remaining disclosure bounded is `total: null`. Page length is the only signal
-    # and it is bounded by `limit` rather than by the container, so a caller learns at most "some
-    # of these 100 were not yours", never "you cannot see 9,900 things".
-    members, page, cursor = children, [], offset
-    while len(page) <= limit and cursor < len(members):
-        chunk = members[cursor:cursor + limit]
-        cursor += len(chunk)
-        page.extend(await offload_sync(_readable_members, chunk, auth, store_db))
-    has_more = len(page) > limit
-    children = page[:limit]
+    # Every member is authorized separately: `_fill_readable_page` says why the page is filled.
+    children, has_more = await _fill_readable_page(children, offset, limit, auth, store_db)
 
     #: `total` is `null` here by design. The authorized count is only knowable by authorizing
     #: every member, which is the cost the per-page authorization above avoids, so reporting a
@@ -2779,10 +2743,12 @@ async def trash_artifact(
         container_id = doc.get("collection_id")
         if container_id:
             await offload_sync(workspace_service.update_artifact, store_db, auth.user_id,
-                               container_id, artifact_id, state="archived", auth=auth)
+                               container_id, artifact_id, state="archived", auth=auth,
+                               verb="delete")
         else:
             await offload_sync(workspace_service.update_workspace, store_db, auth.user_id,
-                               artifact_id, name=None, description=None, state="archived")
+                               artifact_id, name=None, description=None, state="archived",
+                               verb="delete")
     elif not await offload_sync(_find_archived_artifact, store_db, artifact_id):
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -2795,6 +2761,61 @@ async def trash_artifact(
     body["trashed_time"] = marked.get("trashed_time")
     body["purge_after"] = trash.purge_after(marked.get("trashed_time"))
     return body
+
+
+class AdoptNumbersRequest(BaseModel):
+    """Give the artifacts in a collection the numbers their titles already carry."""
+    collection_id: str = Field(description="The collection whose artifacts are numbered.")
+    pattern: str = Field(description="A regular expression with a group `n` (the number) and, "
+                                     "optionally, a group `prefix` that must match the "
+                                     "provider's.")
+    field: str = Field(default="number", description="The field the rule sets.")
+    strip: bool = Field(default=True, description="Remove the matched text from each title.")
+    dry_run: bool = Field(default=True, description="List the changes and write nothing.")
+
+
+class AdoptedNumber(BaseModel):
+    """One artifact and the number it takes from its title."""
+    id: str = Field(description="The artifact version that is updated.")
+    root_id: str = Field(description="The artifact's root id.")
+    number: int = Field(description="The number its title carries.")
+    title: str = Field(description="Its title after the run.")
+    key: Optional[str] = Field(default=None, description="Its key, when the rule sets one.")
+
+
+class AdoptNumbersResult(BaseModel):
+    """What an adopt run changes (or, on a dry run, would change)."""
+    changes: List[AdoptedNumber] = Field(description="One entry per artifact that takes a number.")
+    last: int = Field(description="The provider's `last` after the run.")
+    dry_run: bool = Field(description="True when nothing was written.")
+
+
+@router.post("/{artifact_id}/adopt", status_code=status.HTTP_200_OK,
+    response_model=AdoptNumbersResult,
+    summary="Adopt the numbers in a collection's titles",
+    description=(
+        "For an import into a collection numbered by this provider: each artifact whose ruled "
+        "field is empty and whose title matches `pattern` takes the number in its title, and the "
+        "provider's `last` becomes the highest. Two artifacts with one number refuse the whole "
+        "run (409, listing them). `dry_run` (the default) returns the changes and writes nothing. "
+        "Needs `update` on the provider and on the collection."
+    ),
+    responses=_errors(400, 401, 404, 409, 500),
+)
+async def adopt_numbers(
+    artifact_id: Annotated[str, Path(description=_ARTIFACT_PARAM)],
+    body: AdoptNumbersRequest,
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    if not auth.user_id:
+        raise HTTPException(status_code=401, detail="User identification required")
+    await offload_sync(check_access, auth, artifact_id, "update", store_db)
+    await offload_sync(check_access, auth, body.collection_id, "update", store_db)
+    from mantle.services import on_create
+    return await offload_sync(lambda: on_create.adopt(
+        store_db, artifact_id, body.collection_id, body.pattern, field=body.field,
+        strip=body.strip, dry_run=body.dry_run))
 
 
 @router.post("/{artifact_id}/untrash", status_code=status.HTTP_200_OK,
@@ -2904,18 +2925,6 @@ async def delete_artifact(
             "detached": detached, "destroyed": destroyed, "refused": refused}
 
 
-def _root_id(store_db: Database, any_id: str) -> str:
-    """The root id of an artifact named by its root id or any of its version ids, read from the
-    raw row (no decryption, no re-key); an id with no row is its own."""
-    try:
-        raw = store_db.artifacts.get_artifact(any_id)
-    except Exception:  # noqa: BLE001 — unreadable: the id as given
-        return any_id
-    if not isinstance(raw, dict):
-        return any_id
-    return str(raw.get("root_id") or raw.get("id") or any_id)
-
-
 @router.delete("/{artifact_id}/children/{child_id}", status_code=status.HTTP_200_OK,
     summary="Remove a member from a container",
     responses=_errors(401, 500, ok=RemoveItemResponse) | {
@@ -2946,32 +2955,12 @@ async def remove_child_from_container(
 
     Authorizes `evict` on the container rather than `delete` on the member for a secondary edge:
     detaching is a container operation and the member survives it. Detaching a member from the
-    container it was created in removes its creation edge, which deletes it at Origin (review 15),
-    so that asks `delete` on the member (or Admin on the container), as a cascade delete does.
+    container it was created in removes its creation edge, which deletes it at Origin, so that asks
+    `delete` on the member (or Admin on the container), as a cascade delete does. The check is the
+    write's own (`workspace_service.remove_artifact_from_container`).
     """
     if not auth.user_id:
         raise HTTPException(status_code=401, detail="User identification required")
-
-    # Evict removes a secondary edge (architecture §51), or Admin on the container. Removing the
-    # member's creation edge deletes it at Origin (review 15), so that one needs Delete reaching
-    # the member, or Admin on the container: the authority's rule.
-    from mantle.db import lattice_api as _la
-    from mantle.services import grant_service
-
-    # Both ids as root ids first (review 16, L2): a member named by one of its version ids, or a
-    # container by one of its, is the same edge, and the same removal of a creation edge.
-    container_root = await offload_sync(_root_id, store_db, artifact_id)
-    member_root = await offload_sync(_root_id, store_db, child_id)
-    parent = await offload_sync(_la.get_origin_parent, store_db, member_root)
-    creation = bool(parent) and parent[0] == container_root
-    try:
-        if creation:
-            await offload_sync(check_access, auth, child_id, "delete", store_db)
-        else:
-            await offload_sync(check_access, auth, artifact_id, "evict", store_db)
-    except HTTPException:
-        if not await offload_sync(grant_service.can_admin, store_db, auth.user_id, artifact_id):
-            raise
 
     from mantle.services import workspace_service
 
@@ -2987,6 +2976,46 @@ async def remove_child_from_container(
     #: than a path position, and a caller reading the body should not have to know the URL shape.
     return {"id": artifact.id, "removed": True, "container_id": artifact_id,
             "archived": getattr(artifact, "state", None) == _ArtifactStates.STATE_ARCHIVED}
+
+
+@router.get(
+    "/{artifact_id}/links",
+    summary="List an artifact's links, both ways",
+    description=(
+        "The typed links at an artifact: `out` lists the links it holds, `in` the links that "
+        "point at it, `both` (the default) the two. Each item is the artifact at the other end, "
+        "with `relationship` (the link's name) and `direction` (`in` or `out`). Containment and "
+        "`context` are not links and are not listed; archived and trashed ends are not listed. "
+        "Results are filtered by read: an artifact you may not read is neither shown nor counted, "
+        "so `total` is always `null` and the page is filled as `children` fills it; page with "
+        "`has_more`. A link grants nothing: listing one gives no access to the artifact at its "
+        "other end. Ordered by direction, then relationship, then id, so pages are stable."
+    ),
+    responses=_errors(401, 404, 500, ok=PageResponse),
+)
+async def list_links(
+    artifact_id: Annotated[str, Path(description=_ARTIFACT_PARAM)],
+    direction: Literal["in", "out", "both"] = Query(
+        "both", description="`out`: links this artifact holds. `in`: links that point at it. "
+                            "`both`: the two."),
+    relationship: Optional[str] = Query(
+        None, pattern=r"^(\*|[A-Za-z0-9_.:-]{1,64})$",
+        description="Only links with this name, or `*` (the default) for every link. A name "
+                    "followed by `.` matches its sub-names, so `step1` lists `step1.collection_id`."),
+    limit: int = Query(100, ge=1, le=1000, description="Page size."),
+    offset: int = Query(0, ge=0, description="How many links to skip."),
+    store_db: Database = Depends(get_store_db),
+    auth: AuthContext = Depends(get_auth),
+):
+    await offload_sync(check_access, auth, artifact_id, "read", store_db)
+    rows = await offload_sync(store.list_links, store_db, artifact_id, direction=direction,
+                              relationship=relationship)
+    items, has_more = await _fill_readable_page(rows, offset, limit, auth, store_db)
+    from mantle.services.collection_service import attach_memberships
+    await offload_sync(attach_memberships, store_db, items)
+    for item in items:
+        _normalize_artifact_doc(item, strict=False)
+    return _page(items, total=None, has_more=has_more)
 
 
 class LinksRemovedResponse(BaseModel):
@@ -3499,6 +3528,57 @@ class BatchFetchRequest(CountsUnknownFields):
 # =============================================================================
 
 # ---------- POST /artifacts/batch ----------
+
+async def _fill_readable_page(rows: list, offset: int, limit: int, auth: AuthContext,
+                              store_db: Database) -> Tuple[list, bool]:
+    """The page of `rows` the reader may read, from `offset`, and whether another readable row
+    exists. One copy, for `children` and `/links`.
+
+    Hidden rows are neither shown nor counted, so the route answers `total: null`."""
+    # Every member is authorized separately: reading a container is not reading its members.
+    #
+    # `check_access` above answers for `artifact_id` — the container — and nothing else. But
+    # `list_collection_artifacts` returns each member's WHOLE document and decrypts the body on the
+    # way out (`lattice_api.py:565-601`, decrypt at:593), and that decryption succeeds for anyone
+    # holding the collection, because `content_key_scope` keys a member by its COLLECTION
+    # (`doc_boundary.py:111-113`) while the read gate is per artifact. Without this filter the
+    # route hands back plaintext for members whose own gate refuses the same caller one call later:
+    #
+    #   * a member carrying an explicit `deny{read}` naming the caller — never consulted here;
+    #   * a member linked in by `_link_source_artifact` with `origin=False, propagate=[]`, so no
+    #     grant reaches it at all, which is exactly what that edge shape is FOR.
+    #
+    # So this is the same per-id authorization `_fetch_authorized_docs` performs for the batch
+    # route, and for the same stated reason: silent skip, never a 403, so the endpoint reports
+    # "not in this container, for you" rather than becoming an existence oracle over the members.
+    #
+    # The authorization runs on the page rather than on the whole container. `check_access` is
+    # several queries plus an access-audit write per decision, so authorizing every member first
+    # costs a 10,000-child container 10,000 of each to return 100 rows. Here the cost is
+    # proportional to how densely readable the container is for this caller. The worst case is a
+    # caller who may read almost nothing: that walks the members and returns empty.
+    #
+    # The page is filled, not sliced, and the loop is the security property rather than an
+    # optimisation. Authorizing a single slice returns a short page whose shortfall counts the
+    # members the caller may not read, and a caller can sum that page by page into an existence
+    # oracle over the members. Filling means a short page only ever means a genuinely last one.
+    # `tests/test_children_authorize_every_member.py` pins this against the sliced version.
+    #
+    # Filled to `limit + 1` readable rows rather than `limit`, so `has_more` means "another
+    # member you may read exists" rather than "more members exist". Stopping at `limit` leaks the
+    # same way: with two members, one readable, and `limit=1` it answers `has_more: true` and then
+    # serves an empty page, the shortfall counting the member the caller may not see.
+    #
+    # What keeps the remaining disclosure bounded is `total: null`. Page length is the only signal
+    # and it is bounded by `limit` rather than by the container, so a caller learns at most "some
+    # of these 100 were not yours", never "you cannot see 9,900 things".
+    page, cursor = [], offset
+    while len(page) <= limit and cursor < len(rows):
+        chunk = rows[cursor:cursor + limit]
+        cursor += len(chunk)
+        page.extend(await offload_sync(_readable_members, chunk, auth, store_db))
+    return page[:limit], len(page) > limit
+
 
 def _readable_members(children: list, auth: AuthContext, store_db: Database) -> list:
     """Keep only the members *auth* may read. One sync pass, handed across whole.

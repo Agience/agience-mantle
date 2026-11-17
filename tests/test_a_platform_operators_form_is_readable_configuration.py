@@ -72,6 +72,10 @@ def test_a_persons_own_operator_stays_sealed():
 def test_the_rc_converges_a_row_it_cannot_seal_with_nothing_sealed(db, monkeypatch):  # noqa: F811
     """Staging: every rewrite of a copied operator must seal its title under a key production
     wrapped. The RC writes the definition in the open without the title instead."""
+    # The rows the RC finds are production's, made as production made them, on the RC's own path:
+    # a fresh store makes its operators' collection through `create_container`, with a key of its
+    # own, which an RC never holds.
+    monkeypatch.setenv("AGIENCE_PLANE", "rc")
     P.ensure_platform_operators(db)
     known = P.ids()
     from mantle.services.seed_provisioning import platform_email

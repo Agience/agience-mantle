@@ -19,17 +19,36 @@ from mantle.main import app
 from mantle.routers import artifacts_router
 
 
-def _list_children_src():
+def _function(name):
     tree = ast.parse(io.open(artifacts_router.__file__, encoding="utf-8").read())
     for n in ast.walk(tree):
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "list_children":
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name:
             return n
-    raise AssertionError("list_children not found")
+    raise AssertionError("%s not found" % name)
+
+
+def _list_children_src():
+    return _function("list_children")
+
+
+def _fill_src():
+    """The page is filled in one place, for `children` and `/links`."""
+    return _function("_fill_readable_page")
+
+
+def _calls(node, name):
+    return any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == name for n in ast.walk(node))
+
+
+def test_children_and_links_fill_their_page_through_the_one_helper():
+    for route in ("list_children", "list_links"):
+        assert _calls(_function(route), "_fill_readable_page"), (
+            "%s no longer fills its page through `_fill_readable_page`" % route)
 
 
 def test_the_page_is_taken_before_the_members_are_authorized():
     """The whole ruling in one assertion: the slice must precede the authorization call."""
-    node = _list_children_src()
+    node = _fill_src()
     slice_line = auth_line = None
     for sub in ast.walk(node):
         if isinstance(sub, ast.Subscript) and isinstance(sub.slice, ast.Slice):
@@ -69,7 +88,7 @@ def test_the_page_is_filled_so_a_short_page_cannot_count_what_is_hidden():
     The loop fills to `limit + 1` READABLE rows. The extra row is what makes `has_more` mean
     "another member you may read exists" instead of "more members exist" — the weaker form answered `true` and then served an empty page, which is the same disclosure wearing a
     different code."""
-    node = _list_children_src()
+    node = _fill_src()
     loops = [n for n in ast.walk(node) if isinstance(n, ast.While)]
     assert loops, "the page is no longer filled — a single slice returns short pages"
 

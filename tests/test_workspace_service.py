@@ -218,8 +218,8 @@ class TestWorkspaceCrud:
         assert kw["collection_id"] == art.root_id
         assert kw["can_admin"] is True and kw["can_read"] is True
 
-    def test_a_creator_without_the_owner_s_rights_gets_no_grant(self):
-        """John, 2026-11-01: what a contributor adds is the collection's owner's."""
+    def test_a_creator_without_the_owner_s_rights_gets_update_alone(self):
+        """BUG-118: whoever creates an artifact may change it; read still comes from the container."""
         db = MagicMock()
         with (
             patch("mantle.services.workspace_service.get_workspace"),
@@ -232,7 +232,10 @@ class TestWorkspaceCrud:
         ):
             ws_svc.create_workspace_artifact(db, "user-1", "ws-1", context="{}", content="",
                                              order_key="a0", enqueue_index=False)
-        grant.assert_not_called()
+        grant.assert_called_once()
+        kw = grant.call_args.kwargs
+        assert kw["can_update"] is True and kw["can_read"] is False
+        assert not {k for k, v in kw.items() if k.startswith("can_") and v} - {"can_update"}
 
     def test_get_workspace_no_grant_404(self):
         """Workspace exists but user has no the lattice grant → 404.
@@ -441,6 +444,7 @@ class TestUpdateArtifactStateMachine:
             patch("mantle.services.workspace_service._emit_event"),
             patch("mantle.services.workspace_service.store.get_current_in_collection",
                   return_value=None),
+            patch("mantle.services.dependencies.check_access"),
         ):
             yield
 
@@ -578,8 +582,8 @@ class TestUpdateArtifactStateMachine:
         assert idx.call_args.kwargs["replace"] is True
 
     def test_an_edit_redirected_to_another_row_checks_update_on_that_row(self):
-        """The caller's `update` was checked on the id it named; the row actually written is
-        checked too, and a refusal there writes nothing."""
+        """The caller's `update` is checked on the id it named, then on the row actually
+        written, and a refusal there writes nothing."""
         db = MagicMock()
         older = _artifact(aid="older-id")
         newest = _artifact(aid="newest-id", root_id=older.root_id)
@@ -587,7 +591,8 @@ class TestUpdateArtifactStateMachine:
 
         def _check(auth, artifact_id, action, _db):
             checked.append((artifact_id, action))
-            raise HTTPException(404, "Not found")
+            if artifact_id == "newest-id":
+                raise HTTPException(404, "Not found")
 
         with (
             patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=_ws()),
@@ -601,7 +606,7 @@ class TestUpdateArtifactStateMachine:
                 ws_svc.update_artifact(db, "user-1", "ws-1", "older-id", content="x",
                                        reindex=False, auth=object())
         assert exc.value.status_code == 404
-        assert checked == [("newest-id", "update")]
+        assert checked == [("older-id", "update"), ("newest-id", "update")]
         upd.assert_not_called()
 
     def test_root_id_update_resolves_the_newest_live_version(self):
@@ -864,13 +869,15 @@ class TestRemoveArtifactFromWorkspace:
     def _remove(self, *, homed: bool, others: int, may_update, raises=None):
         db = MagicMock()
         art = _artifact(state=ArtifactEntity.STATE_LIVE, collection_id="ws-1" if homed else "other-ws")
-        access = (patch("mantle.services.dependencies.check_access", return_value=None)
-                  if may_update else
-                  patch("mantle.services.dependencies.check_access",
-                        side_effect=HTTPException(status_code=404, detail="Not found")))
+        def _check(_auth, _rid, action, _db, **_k):
+            if action != "evict" and not may_update:
+                raise HTTPException(status_code=404, detail="Not found")
+
+        access = patch("mantle.services.dependencies.check_access", side_effect=_check)
         with (
             patch("mantle.services.workspace_service.store.get_artifact", return_value=art),
             patch("mantle.services.workspace_service.store.get_edge", return_value={"_id": "ws-1/a-1"}),
+            patch("mantle.services.workspace_service.store.get_origin_parent", return_value=None),
             patch("mantle.services.workspace_service.store.remove_artifact_from_collection") as rm_edge,
             patch("mantle.services.workspace_service.store.get_current_in_collection",
                   return_value=art if homed else None),

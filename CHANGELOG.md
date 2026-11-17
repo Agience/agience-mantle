@@ -5,6 +5,28 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-16
+
+### Breaking
+- `POST /system/seed` now answers `202` at once with a run object (`run_id`, `state`, `follow`, `started_at`, `finished_at`) and a `Location` header, and applies the seed in the background. A second call while a run is going returns that run and starts nothing. Callers that read `applied` and `summary` from the first response must now poll `GET /system/seed/{run_id}`.
+- Grants and reads now flow up every `contains` edge, not only the creation edge. Each edge conducts according to its `propagate` mask, and a deny cuts only the paths through the node it sits on. Access through `check_access`, the light-cone search scope, the oracle grant verifier and job reach follows this rule.
+- `POST /artifacts` can now answer `409` or `403` for artifact types that set fields on create (`on_create`). It answers `403` when the caller lacks Invoke on the artifact the collection is edged to. It answers `409` when no such artifact is found or the values are allocated on another node.
+- Linking an artifact into a container now conducts access when the linker holds Share on the source and the link names no relationship. Otherwise the link is listed but conducts nothing, as before. Links that name a relationship stay blocked.
+
+### Added
+- `GET /artifacts/{artifact_id}/links` lists an artifact's typed links in both directions, or one with `direction=in|out|both`. It also takes `relationship`, `limit` and `offset`. Results are filtered by read, `total` is `null`, and paging uses `has_more`.
+- `POST /artifacts/{artifact_id}/adopt` gives the artifacts in a collection the numbers their titles already carry, for an import into a collection numbered by a number provider. It defaults to `dry_run`, and duplicate numbers refuse the whole run with `409`.
+- `GET /system/seed/{run_id}` reports a seed run as `running` until it finishes.
+- Artifact types can declare field rules applied on create (`services.on_create`), taking values from the artifact the collection is edged to, such as numbers from a provider. The part such a create makes is keyed under its own key.
+- `application/vnd.agience.number-provider+json` artifacts are readable configuration, as are artifacts whose type declares what it does on create.
+- New accounts receive the grants Origin lists under "New accounts receive". Origin records them as the operator's own ledger entries, and the store applies them from the ledger through `OriginShareCustodian.new_person_grants`. Ledger entries of kind `edge.add` can restate the mask on an existing link.
+
+### Changed
+- The `links` parameter on `GET /artifacts/{artifact_id}/children` is deprecated in favour of `GET /artifacts/{artifact_id}/links?direction=out`, which returns the same items.
+- Fields a type sets on create keep their value on update, and its `on_update` stamps are written.
+- Trashing an artifact is authorized as a delete. Removing a member from a container checks access inside `workspace_service`, with the same rules as before.
+- Package version is `0.3.0`.
+
 ## [0.3.0] - 2026-11-15
 
 ### Breaking

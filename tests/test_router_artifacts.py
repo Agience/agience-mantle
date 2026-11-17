@@ -719,44 +719,43 @@ class TestRemoveArtifactFromWorkspace:
             r = await client.delete("/artifacts/ws-1/children/missing")
         assert r.status_code == 404
 
-    @pytest.mark.asyncio
-    async def test_evict_alone_does_not_remove_a_creation_edge(self, client: AsyncClient):
-        """Review 15: removing a member's creation edge deletes it at Origin, so it needs Delete
-        reaching the member, or Admin on the container; Evict alone removes a secondary edge."""
+    @staticmethod
+    def _remove(container_id, member_id, *, parents, roots=None):
+        """The write's own check, run with Evict alone and no Admin. Past the check the member is
+        not found in the container (`get_edge` is None), so a 404 naming membership means the
+        check passed, and the bare "Not Found" means it refused."""
         from fastapi import HTTPException
+        from mantle.services import workspace_service as ws
 
-        def evict_only(_auth, _rid, action, _db):
+        def evict_only(_auth, _rid, action, _db, **_k):
             if action != "evict":
                 raise HTTPException(status_code=404, detail="Not Found")
             return MagicMock()
 
-        with patch("mantle.routers.artifacts_router.check_access", side_effect=evict_only),              patch("mantle.services.grant_service.can_admin", return_value=False),              patch("mantle.db.lattice_api.get_origin_parent", return_value=("ws-1", None)),              patch("mantle.services.workspace_service.remove_artifact_from_container") as svc:
-            r = await client.delete("/artifacts/ws-1/children/art-1")
-        assert r.status_code == 404 and not svc.called
-        with patch("mantle.routers.artifacts_router.check_access", side_effect=evict_only),              patch("mantle.services.grant_service.can_admin", return_value=False),              patch("mantle.db.lattice_api.get_origin_parent", return_value=("elsewhere", None)),              patch("mantle.services.workspace_service.remove_artifact_from_container") as svc:
-            svc.return_value = MagicMock(id="art-1", state="live")
-            r = await client.delete("/artifacts/ws-1/children/art-1")
-        assert r.status_code == 200 and svc.called          # a secondary edge: Evict suffices
+        roots = roots or {}
+        with patch("mantle.services.dependencies.check_access", side_effect=evict_only), \
+             patch("mantle.services.grant_service.can_admin", return_value=False), \
+             patch.object(ws, "_raw_root_id", side_effect=lambda _db, i: roots.get(i, i)), \
+             patch.object(ws.store, "get_origin_parent",
+                          side_effect=lambda _db, i: parents.get(i)), \
+             patch.object(ws.store, "get_artifact", return_value=None), \
+             patch.object(ws.store, "get_edge", return_value=None):
+            with pytest.raises(HTTPException) as e:
+                ws.remove_artifact_from_container(MagicMock(), "user-1", container_id, member_id)
+        return e.value.detail
 
-    @pytest.mark.asyncio
-    async def test_a_version_id_does_not_slip_past_the_creation_edge_check(self,
-                                                                           client: AsyncClient):
-        """Review 16, L2: both ids resolve to root ids first, so naming the member by one of its
-        version ids is the same removal of its creation edge."""
-        from fastapi import HTTPException
+    def test_evict_alone_does_not_remove_a_creation_edge(self):
+        """Removing a member's creation edge deletes it at Origin, so it needs Delete reaching the
+        member, or Admin on the container; Evict alone removes a secondary edge."""
+        assert self._remove("ws-1", "art-1", parents={"art-1": ("ws-1", None)}) == "Not Found"
+        assert "not a member" in self._remove("ws-1", "art-1",
+                                              parents={"art-1": ("elsewhere", None)})
 
-        def evict_only(_auth, _rid, action, _db):
-            if action != "evict":
-                raise HTTPException(status_code=404, detail="Not Found")
-            return MagicMock()
-
-        roots = {"ver-7": "art-1", "ws-v": "ws-1"}
-        parents = {"art-1": ("ws-1", None)}
-        with patch("mantle.routers.artifacts_router.check_access", side_effect=evict_only),              patch("mantle.services.grant_service.can_admin", return_value=False),              patch("mantle.routers.artifacts_router._root_id",
-                   side_effect=lambda _db, i: roots.get(i, i)),              patch("mantle.db.lattice_api.get_origin_parent",
-                   side_effect=lambda _db, i: parents.get(i)),              patch("mantle.services.workspace_service.remove_artifact_from_container") as svc:
-            r = await client.delete("/artifacts/ws-v/children/ver-7")
-        assert r.status_code == 404 and not svc.called
+    def test_a_version_id_does_not_slip_past_the_creation_edge_check(self):
+        """Both ids resolve to root ids first, so naming the member by one of its version ids is
+        the same removal of its creation edge."""
+        assert self._remove("ws-v", "ver-7", parents={"art-1": ("ws-1", None)},
+                            roots={"ver-7": "art-1", "ws-v": "ws-1"}) == "Not Found"
 
 
 # ---------------------------------------------------------------------------

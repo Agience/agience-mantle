@@ -385,6 +385,10 @@ def _apply_one(db, e: dict) -> int:
             return _apply_key(db, {**b, "state": "revoked"}, e.get("actor"))
         if b.get("kind") == "grant":
             doc = db.artifacts.get_artifact(b["grant_id"])
+            if doc is None and b.get("state") == "active":
+                # A grant Origin made as the operator's own entry (what "New accounts receive"
+                # lists, for a new person): written here as Origin decided it.
+                return _apply_session(db, e)
             if doc and doc.get("state") == "active" and b.get("state") != "active":
                 db.artifacts.put_artifact({**{k: v for k, v in doc.items()
                                               if not k.startswith("_")},

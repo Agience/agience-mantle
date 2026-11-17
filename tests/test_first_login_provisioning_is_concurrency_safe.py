@@ -148,3 +148,49 @@ def test_a_caller_cannot_derive_its_way_onto_the_inbox():
 
     # ...and the two provisioning derivations do not collide with each other.
     assert up.inbox_workspace_id(user) != up.person_artifact_id(user)
+
+
+def test_one_account_is_provisioned_once_at_a_time(monkeypatch):
+    """BUG-091: a new account's first page load provisions from several requests at once. Run
+    side by side, the second's creation grants are refused at Origin and its listing goes out
+    empty before "New accounts receive" lands. The second waits for the first instead, and the
+    grant memo is dropped after each, so what Origin granted opens at once."""
+    import threading
+    import time
+
+    from mantle.search.mantle import wiring
+
+    inside, most, dropped = [0], [0], []
+    guard = threading.Lock()
+
+    def slow(store_db, user_id, **kw):
+        with guard:
+            inside[0] += 1
+            most[0] = max(most[0], inside[0])
+        time.sleep(0.05)
+        with guard:
+            inside[0] -= 1
+
+    monkeypatch.setattr(up, "_provision_user", slow)
+    monkeypatch.setattr(wiring, "invalidate_grant_cache", lambda uid=None: dropped.append(uid))
+    runs = [threading.Thread(target=up.provision_user, args=(None, "newcomer")) for _ in range(4)]
+    for t in runs:
+        t.start()
+    for t in runs:
+        t.join()
+    assert most[0] == 1, "one account was provisioned by %d requests at once" % most[0]
+    assert dropped == ["newcomer"] * 4
+
+
+def test_two_accounts_are_provisioned_side_by_side(monkeypatch):
+    """The lock is per account: one newcomer never waits on another."""
+    import threading
+
+    both = threading.Barrier(2, timeout=5)
+    monkeypatch.setattr(up, "_provision_user", lambda store_db, user_id, **kw: both.wait())
+    runs = [threading.Thread(target=up.provision_user, args=(None, u)) for u in ("one", "two")]
+    for t in runs:
+        t.start()
+    for t in runs:
+        t.join()
+    assert not both.broken

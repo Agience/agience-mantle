@@ -272,13 +272,46 @@ def _stamp_origin_root(db: LatticeDatabase, entity: ArtifactEntity) -> None:
         pass                                   # unstamped is VISIBLE; never guess a principal
 
 
-def create_artifact(db: LatticeDatabase, entity: ArtifactEntity) -> ArtifactEntity:
+def _after_commit(db: LatticeDatabase, fn) -> None:
+    """Run `fn` once the open write commits, or now when none is open."""
+    conn = getattr(db, "conn", None)
+    hook = getattr(conn, "after_commit", None)
+    if hook is None:
+        fn()
+    else:
+        hook(fn)
+
+
+def create_artifact(db: LatticeDatabase, entity: ArtifactEntity, *,
+                    own_key: bool = False) -> ArtifactEntity:
+    """Write a new artifact. A type with `on_create` field rules takes its values from the
+    artifacts its collection is edged to, in the same transaction as the write
+    (`services.on_create`). The create is announced once it commits.
+
+    ``own_key`` makes the artifact its own seal boundary: its content is keyed under its own key,
+    not its collection's, so a reach to it opens that key and no other in its collection. Only
+    the server sets it (`services.on_create` for the part it makes)."""
+    from mantle.services import on_create
+    on_create.strip_stamps(db, entity)
+    rules = on_create.rules_for(entity)
     _stamp_origin_root(db, entity)
     # The content key follows the creation parent, fixed now: a later move does not re-key.
-    # Never taken from the caller: always the collection it is created in.
-    entity.content_key_scope = getattr(entity, "collection_id", None) or None
-    db.artifacts.put_artifact(to_lattice_doc(entity))
-    _boundary.emit_artifact_change(entity, "artifact.created")
+    # Never taken from the caller: the collection it is created in, or itself with `own_key`.
+    entity.content_key_scope = (str(entity.id) if own_key
+                                else getattr(entity, "collection_id", None) or None)
+    if own_key:
+        from mantle.services.content_crypto import mint_own_key
+        mint_own_key(str(entity.id))
+    if rules:
+        with db.conn.write():
+            after_put = on_create.apply_on_create(db, entity, rules)
+            db.artifacts.put_artifact(to_lattice_doc(entity))
+            for step in after_put:
+                step()
+            _after_commit(db, lambda: _boundary.emit_artifact_change(entity, "artifact.created"))
+    else:
+        db.artifacts.put_artifact(to_lattice_doc(entity))
+        _after_commit(db, lambda: _boundary.emit_artifact_change(entity, "artifact.created"))
     from mantle.services.content_crypto import mint_holder_key
     mint_holder_key(entity)        # a collection's own key and Add seal, from its creation
     return entity
@@ -365,7 +398,10 @@ def _content_changed(db: LatticeDatabase, entity: ArtifactEntity) -> bool:
 def update_artifact(db: LatticeDatabase, entity: ArtifactEntity) -> ArtifactEntity:
     """Write `entity` over its live version. When its content changes — the body or the title — the
     version it replaces is kept, archived, and the live one names it as its `parent_id`; every other
-    change (lifecycle, placement, description, bindings) is written in place."""
+    change (lifecycle, placement, description, bindings) is written in place. Fields a type sets
+    on create keep their value, and its `on_update` stamps are written (`on_create.guard_update`)."""
+    from mantle.services import on_create
+    on_create.guard_update(db, entity)
     db.artifacts.put_artifact(to_lattice_doc(entity), new_version=_content_changed(db, entity))
     _boundary.emit_artifact_change(entity, "artifact.updated")
     return entity
@@ -868,6 +904,69 @@ def list_collection_artifacts(db: LatticeDatabase, collection_id: str, *,
         out.append(d)
     out.sort(key=lambda d: (d.get("order_key") is None, d.get("order_key") or ""))
     return out
+
+
+_UNLISTED_LABELS = frozenset({_CONTAINS, "context"})
+
+
+def _names_link(e: dict, name: Optional[str], token: Optional[str]) -> bool:
+    """Whether edge `e` is a link named `name` or one of its `name.` sub-names. `None` or `*`
+    names every link. Tokens are compared, so no name is unsealed to filter."""
+    if not name or name == "*":
+        return True
+    label = e.get("label") or ""
+    return (label == name or label.startswith(name + ".")           # a system label, stored plain
+            or label == token or token in (_eprop(e, "label_prefixes") or []))
+
+
+def list_links(db: LatticeDatabase, artifact_id: str, *, direction: str = "both",
+               relationship: Optional[str] = None, include_archived: bool = False) -> list:
+    """The typed links at `artifact_id`: `out` the links it holds, `in` the links that point at it,
+    `both` the two. Each item is the artifact at the other end with `relationship` (the link's
+    name) and `direction`. Containment and `context` edges are walked by the store, not named by
+    a person, and are not listed.
+
+    The other end is its current live version: for `out` the one `list_collection_artifacts`
+    resolves, for `in` the lineage's newest version when that is not archived (an artifact in
+    Trash is archived). `include_archived` keeps archived ends, for the Archived view.
+
+    Rows are ordered by (direction, relationship token, other-end id), so pages are stable.
+    Exact or it raises: `EdgesTruncated` propagates rather than return a clipped list. Nothing
+    here authorizes; the caller filters by read."""
+    if direction not in ("in", "out", "both"):
+        raise ValueError(f"direction must be in, out or both, not {direction!r}")
+    token = _label_token(relationship) if relationship and relationship != "*" else None
+    sides = ("in", "out") if direction == "both" else (direction,)
+    picked = []
+    for side in sides:
+        for e in db.graph.edges_of(artifact_id, direction=side) or []:
+            if e.get("label") in _UNLISTED_LABELS or not _names_link(e, relationship, token):
+                continue
+            picked.append((side, e, e.get("dst") if side == "out" else e.get("src")))
+    lineages = _versions_many(db, {other for _s, _e, other in picked})
+    out = []
+    for side, e, other in picked:
+        versions = lineages.get(other) or []
+        if not versions:
+            continue
+        if side == "out":
+            live = [v for v in versions if state_of(v) != "archived"]
+            chosen = (_current_in(versions, artifact_id) or (live[-1] if live else None)
+                      or (versions[-1] if include_archived else None))
+        else:
+            chosen = versions[-1]
+        if chosen is None or (not include_archived and state_of(chosen) == "archived"):
+            continue
+        d = {k: v for k, v in chosen.items() if k not in _LATTICE_INTERNAL}
+        _boundary.decrypt_artifact_content(d, strict=False)   # non-strict, as every list is
+        d["order_key"] = _eprop(e, "order_key")
+        d["origin"] = bool(_eprop(e, "is_origin"))
+        d["propagate"] = _prop_mask(e)
+        d["relationship"] = _shown_label(e)
+        d["direction"] = side
+        out.append((side, e.get("label") or "", str(other), d))
+    out.sort(key=lambda r: r[:3])
+    return [r[3] for r in out]
 
 
 def count_other_containers_for_root(db: LatticeDatabase, root_id: str,

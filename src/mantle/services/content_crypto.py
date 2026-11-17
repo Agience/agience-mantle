@@ -541,6 +541,16 @@ def decrypt_content(
     return plain
 
 
+def mint_own_key(artifact_id: str) -> None:
+    """Mint the key of an artifact that is its own seal boundary, as the principal creating it,
+    before any grant names it (the oracle's create base case), with its Add seal. The create's
+    write seals to that Add seal unless the writer reaches the artifact for read; its first
+    reader re-keys it."""
+    from mantle.services.acting_principal import require_acting_principal
+    creator = require_acting_principal().principal_id
+    _default_collection_key(artifact_id, artifact_id, may_create=True, creator_id=creator)
+
+
 #: The content types that hold other artifacts, and so have a key of their own.
 _HOLDER_TYPES = ("application/vnd.agience.collection+json", "application/vnd.agience.workspace+json")
 

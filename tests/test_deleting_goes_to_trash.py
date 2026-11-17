@@ -1,19 +1,23 @@
 """Delete moves an artifact to Trash; it is restorable there for 30 days and then deleted.
 
 Runs on a real store with the real local index (the stack of `test_there_is_no_promotion_state`);
-only key custody and the access check are stood in for.
+only key custody and the routes' own access check are stood in for. The check each write runs
+itself is real, so the purge tests grant and revoke for real.
 """
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 
+from mantle.attenuation import ACTIONS
+from mantle.db import lattice_api as store
+from mantle.entities.grant import Grant
 from mantle.routers import artifacts_router as artifacts
 from mantle.services import trash
-from mantle.services import workspace_service as ws
 from mantle.services.acting_principal import acting_as
 
 from .test_there_is_no_promotion_state import (
@@ -213,15 +217,57 @@ async def test_after_thirty_days_it_is_deleted(db, monkeypatch):
     assert await _list_trash(db) == []
 
 
-async def test_the_purge_cannot_do_what_the_person_could_not(db, monkeypatch):
-    _inbox, root = _note(db, monkeypatch)
-    await _trash(db, root)
+def _grant(db, resource, grantee, actions):
+    grant = Grant(id=str(uuid.uuid4()), resource_id=resource, grantee_type="user",
+                  grantee_id=grantee, granted_by=USER, effect="allow", state=Grant.STATE_ACTIVE,
+                  **{f"can_{a}": a in actions for a in ACTIONS})
+    with acting_as(USER, principal_type="user"):
+        store.create_grant(db, grant)
+    return grant
 
-    def _no_longer_permitted(*a, **k):
-        raise HTTPException(status_code=404, detail="Not found")
-    monkeypatch.setattr(ws, "delete_artifact", _no_longer_permitted)
+
+def _revoke(db, grant):
+    grant.state = Grant.STATE_REVOKED
+    grant.revoked_by = USER
+    with acting_as(USER, principal_type="user"):
+        store.update_grant(db, grant)
+
+
+async def _trashed_by_other(db, monkeypatch):
+    """A note in USER's Inbox, which OTHER may read and delete, put in Trash by OTHER."""
+    inbox, root = _note(db, monkeypatch)
+    reads = _grant(db, inbox, OTHER, {"read"})
+    deletes = _grant(db, inbox, OTHER, {"read", "delete"})
+    await _trash(db, root, user=OTHER)
+    assert db.artifacts.get_artifact(root)["trashed_by"] == OTHER
+    return root, reads, deletes
+
+
+def _still_in_trash(db, root):
+    assert db.artifacts.versions_of(root), "a refused purge deleted the artifact"
+    kept = db.artifacts.get_artifact(root)
+    assert kept["state"] == "archived" and kept["trashed_by"] == OTHER
+
+
+async def test_the_purge_deletes_as_the_person_who_trashed_it(db, monkeypatch):
+    root, _reads, _deletes = await _trashed_by_other(db, monkeypatch)
+    assert trash.purge_expired(db, now=_days_on(31)) == {"deleted": 1, "refused": 0, "failed": 0}
+    assert not db.artifacts.versions_of(root)
+
+
+async def test_a_purge_after_the_delete_right_is_revoked_is_refused(db, monkeypatch):
+    root, _reads, deletes = await _trashed_by_other(db, monkeypatch)
+    _revoke(db, deletes)  # OTHER can still read the Inbox, and no longer delete in it
     assert trash.purge_expired(db, now=_days_on(31)) == {"deleted": 0, "refused": 1, "failed": 0}
-    assert db.artifacts.versions_of(root)
+    _still_in_trash(db, root)
+
+
+async def test_a_purge_after_every_grant_is_revoked_is_refused(db, monkeypatch):
+    root, reads, deletes = await _trashed_by_other(db, monkeypatch)
+    _revoke(db, reads)
+    _revoke(db, deletes)
+    assert trash.purge_expired(db, now=_days_on(31)) == {"deleted": 0, "refused": 1, "failed": 0}
+    _still_in_trash(db, root)
 
 
 async def test_a_restored_artifact_is_never_purged(db, monkeypatch):

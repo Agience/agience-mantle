@@ -69,31 +69,37 @@ async def _add(db, who, container, text):
                                                  context=json.dumps({"title": text}))))["id"]
 
 
-async def test_what_a_contributor_adds_belongs_to_the_collection_s_owner(db):
-    """John, 2026-11-01: a creator who does not already hold the owner's rights on the collection
-    gets no creator grant on what they add. A `contributor` reads it, through the collection, and
-    cannot change or delete it; the collection's owner can."""
+async def test_a_contributor_may_change_what_they_add_and_nothing_else(db):
+    """BUG-118: whoever creates an artifact may change it. A `contributor` gets update alone on
+    what they add; they read it through the collection, cannot delete it, and still cannot change
+    anything another member made. The collection's owner keeps every right on it."""
 
     with acting_as(USER, principal_type="user"):
         ideas = ws.create_container(db, USER, content_type="application/vnd.agience.collection+json", name="Ideas").id
+        first = ws.create_workspace_artifact(db, USER, ideas, context=json.dumps({"title": "Idea 1"}),
+                                             content="Host's idea").id
         invite, token = grant_service.create_invite(db, user_id=USER, resource_id=ideas, role="contributor")
     grant_service.claim_invite(db, ANA, token, "")
     mine = await _add(db, ANA, ideas, "Ana's idea")
     from mantle.db import lattice_api as la
-    assert la.get_active_grants_for_principal_resource(db, grantee_id=ANA, resource_id=mine) == []
+    held = la.get_active_grants_for_principal_resource(db, grantee_id=ANA, resource_id=mine)
+    assert len(held) == 1 and held[0].can_update and not held[0].can_read and not held[0].can_delete
     with acting_as(ANA, principal_type="user"):
         check_access(_auth(ANA), mine, "read", db)
+        check_access(_auth(ANA), mine, "update", db)
+        with pytest.raises(HTTPException):
+            check_access(_auth(ANA), mine, "delete", db)
         for action in ("update", "delete"):
             with pytest.raises(HTTPException):
-                check_access(_auth(ANA), mine, action, db)
+                check_access(_auth(ANA), first, action, db)
     with acting_as(USER, principal_type="user"):
         check_access(_auth(USER), mine, "update", db)
         check_access(_auth(USER), mine, "delete", db)
 
 
-async def test_an_inbox_sender_adds_asks_for_no_grant_and_reads_nothing(db):
-    """A create-only sender's add succeeds; no grant is asked of the authority; afterwards they
-    can read neither the item nor the inbox."""
+async def test_an_inbox_sender_adds_and_reads_nothing(db):
+    """A create-only sender's add succeeds; the only grant asked of the authority is update on the
+    item; afterwards they can read neither the item nor the inbox."""
     from mantle.attenuation import ACTIONS
     from mantle.db import lattice_api as la
     from mantle.db import reach_journal
@@ -110,7 +116,10 @@ async def test_an_inbox_sender_adds_asks_for_no_grant_and_reads_nothing(db):
         item = await _add(db, ANA, inbox, "a note for the host")
     finally:
         reach_journal._authority = prior
-    assert item and not [e for e in seen if e["kind"] == "grant"]
+    asked = [e for e in seen if e["kind"] == "grant"]
+    assert item and [(e["resource_id"], e["actions"]) for e in asked] == [(item, ["update"])]
+    with acting_as(ANA, principal_type="user"):
+        check_access(_auth(ANA), item, "update", db)
     with acting_as(ANA, principal_type="user"):
         for target in (item, inbox):
             with pytest.raises(HTTPException):
