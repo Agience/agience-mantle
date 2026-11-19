@@ -198,6 +198,18 @@ class AuthContext:
     #: (`enforce_job_reach_routes`), and never more than the person holds there. None for every
     #: other credential; an unreadable claim is an empty reach, which reaches nothing.
     job_reach: Optional[tuple] = None
+    #: Origin's `reach_actions` claim: the actions an agent session's delegation conducts inside
+    #: its `job_reach`, from the approval it was exchanged for. None when the token carries none;
+    #: an unreadable claim conducts nothing.
+    reach_actions: Optional[frozenset] = None
+    #: Origin's `reach_by` claim: the actions conducted on each id in `job_reach`, as
+    #: {id: frozenset}. None when the token carries none; an unreadable claim conducts nothing.
+    reach_by: Optional[dict] = None
+    #: The artifact whose token authenticated this caller (`services.artifact_tokens`): a Key
+    #: artifact, an agent's or the person's own. None for every other credential.
+    token_artifact: Optional[str] = None
+    #: When that token ends, as its artifact says; None when it names no end.
+    token_ends: Optional[str] = None
 
     @property
     def narrowed_audience(self) -> Optional[str]:
@@ -510,6 +522,7 @@ _VISIBLE = ("GET", re.compile(r"^/artifacts/visible/?$"))
 _OPERATORS = ("GET", re.compile(r"^/artifacts/platform-operators/?$"))
 _MY_ACCESS = ("GET", re.compile(r"^/grants/my-access/?$"))
 _RECALL = ("POST", re.compile(r"^/artifacts/recall/?$"))
+_EVENTS = ("GET", re.compile(r"^/events/?$"))
 #: What a persona's own server delegation reaches when Origin exchanged it from a delegation
 #: narrowed to that persona (review 12, H5): the routes that persona's code calls on Mantle, and
 #: nothing else. No grant, no delete, no update, no platform route.
@@ -691,23 +704,73 @@ def _job_reach_claim(payload: dict) -> Optional[tuple]:
     return tuple(raw)
 
 
+def _reach_actions_claim(payload: dict) -> Optional[frozenset]:
+    """Origin's `reach_actions` claim as a set of actions, None when the token carries none, and
+    an empty set (which conducts nothing) when it carries one that is not a list of names."""
+    if "reach_actions" not in payload:
+        return None
+    raw = payload.get("reach_actions")
+    if not isinstance(raw, list) or not all(isinstance(r, str) and r for r in raw):
+        return frozenset()
+    return frozenset(raw)
+
+
+def _reach_by_claim(payload: dict) -> Optional[dict]:
+    """Origin's `reach_by` claim as {id: frozenset of actions}, None when the token carries
+    none, and an empty map (which conducts nothing) when it is not a map of id to names."""
+    if "reach_by" not in payload:
+        return None
+    raw = payload.get("reach_by")
+    if not isinstance(raw, dict) or not all(
+            isinstance(k, str) and k and isinstance(v, list)
+            and all(isinstance(a, str) and a for a in v) for k, v in raw.items()):
+        return {}
+    return {k: frozenset(v) for k, v in raw.items()}
+
+
+def reach_by_of(auth: Any) -> Optional[dict]:
+    """The actions a credential's reach conducts on each id (`AuthContext.reach_by`), or None."""
+    by = getattr(auth, "reach_by", None)
+    return by if isinstance(by, dict) else None
+
+
+def reach_actions_of(auth: Any) -> Optional[frozenset]:
+    """The actions a credential's reach conducts (`AuthContext.reach_actions`), or None."""
+    actions = getattr(auth, "reach_actions", None)
+    return actions if isinstance(actions, frozenset) else None
+
+
 #: What a persona's own delegation reaches beyond `NARROWED_SERVER_ROUTES` when it is a timer's
-#: (`job_reach`): Lumen writes the timer's state back. No other Lumen delegation patches.
-JOB_SERVER_ROUTES = {"lumen": (_PATCH_ID,)}
+#: (`job_reach`): Lumen writes the timer's state back and listens on the event stream for what a
+#: trigger watches, and Crystal closes the run record it opened inside the reach. No other
+#: delegation of either patches or listens.
+JOB_SERVER_ROUTES = {"lumen": (_PATCH_ID, _EVENTS), "crystal": (_PATCH_ID,)}
 
 #: What a timer's work calls, each addressed by id or creating inside one, so that every one is
-#: decided by `check_access` against the reach. Listing and search routes, the event stream and
-#: grants are not among them: those answer from the person's whole reach.
+#: decided by `check_access` against the reach. The event stream is among them because it asks
+#: `check_access` of each event it delivers, so a job hears only what its reach holds. Listing and
+#: search routes and grants are not: those answer from the person's whole reach.
 #: `_MY_ACCESS`: Crystal's gate asks it before running a timer's target (BUG-041, 2026-11-10: every
 #: firing failed "upstream 403 from /grants/my-access"). It answers through `check_access`, which
 #: holds the job to its reach, so it says yes only within what the grant reaches.
 JOB_REACH_ROUTES = (_GET_ID, _PATCH_ID, _GET_CHILDREN, _GET_CONTENT, _CREATE, _USE, _OP,
-                    _OPERATORS, _MY_ACCESS, ("POST", re.compile(r"^/artifacts/batch/?$")),
+                    _OPERATORS, _MY_ACCESS, _EVENTS, ("POST", re.compile(r"^/artifacts/batch/?$")),
                     ("GET", re.compile(r"^/type-definitions/[^/]+/?$")))
 
 #: The actions a timer's reach conducts: it reads, writes, adds and runs; it never deletes,
 #: evicts, shares or administers.
 JOB_REACH_ACTIONS = frozenset({"create", "read", "update", "invoke", "add"})
+
+#: The scope of an agent session's delegation (FR-032): the person's (`sub`), acted by the agent
+#: (`act.sub`), held to the approval's collections (`job_reach`) and actions (`reach_actions`).
+AGENT_SCOPE = "mantle:agent"
+#: What an agent session's delegation reaches: a timer's routes, and an artifact's links, which
+#: name its inbox and whom it may message. Each is decided by `check_access` against the reach.
+#: A Key artifact's token (`services.artifact_tokens`) also speaks MCP, whose tools dispatch
+#: into these same handlers, and reads what it is (`GET /credentials/self`).
+AGENT_ROUTES = (*JOB_REACH_ROUTES, ("GET", re.compile(rf"^/artifacts/{_ID}/links/?$")),
+                ("POST", re.compile(r"^/mcp/?$")), ("GET", re.compile(r"^/credentials/self/?$")))
+NARROWED_SCOPE_ROUTES[AGENT_SCOPE] = AGENT_ROUTES
 
 
 def enforce_job_reach_routes(auth: "AuthContext", request: Optional[Request]) -> None:
@@ -716,7 +779,9 @@ def enforce_job_reach_routes(auth: "AuthContext", request: Optional[Request]) ->
         return
     method = (request.method if request is not None else "") or ""
     path = (request.url.path if request is not None else "") or ""
-    if any(method == m and rx.match(path) for m, rx in JOB_REACH_ROUTES):
+    scopes = (getattr(auth, "scope", None) or "").split()
+    routes = AGENT_ROUTES if AGENT_SCOPE in scopes else JOB_REACH_ROUTES
+    if any(method == m and rx.match(path) for m, rx in routes):
         return
     logger.warning("refused a timer's delegation on %s %s (principal=%s)", method or "?",
                    path or "?", auth.principal_id)
@@ -725,16 +790,20 @@ def enforce_job_reach_routes(auth: "AuthContext", request: Optional[Request]) ->
 
 
 def within_job_reach(store_db: Database, artifact_id: str, action: str, doc: dict,
-                     reach: tuple) -> bool:
+                     reach: tuple, actions: Optional[frozenset] = None,
+                     by: Optional[dict] = None) -> bool:
     """Is `artifact_id` one of `reach`, or under one along edges that conduct `action`? The same
     upward walk `check_access` decides grants by (`light_cone`), so the reach is a light cone
-    exactly as a grant over those ids would be."""
+    exactly as a grant over those ids would be. `actions`, when given (`reach_actions`), narrows
+    what the reach conducts further, and `by` (`reach_by`) what each id in it conducts."""
     if action not in JOB_REACH_ACTIONS or not reach:
+        return False
+    if actions is not None and action not in actions:
         return False
     ids = set(reach)
     for resource in db_store.light_cone(store_db, artifact_id, action,
                                         root_id=doc.get("root_id") or artifact_id):
-        if resource in ids:
+        if resource in ids and (by is None or action in by.get(resource, ())):
             return True
     return False
 
@@ -808,12 +877,26 @@ def resolve_auth(
     2. ``agk_`` prefix → grant key: the bearer acts AS a grant (see
        :mod:`services.grant_key_service`).
     3. JWT (``ey`` prefix) → decode + dispatch by ``principal_type``.
+
+    First, a token shaped ``<prefix><root id>.<secret>`` is an artifact's token
+    (:mod:`services.artifact_tokens`).
     """
     if not token:
         raise HTTPException(status_code=401, detail="Missing Bearer token")
 
     raw_token = token.strip()
     target_artifact_id: Optional[str] = None
+
+    # --- An artifact's token: `<prefix><root id>.<secret>` (`services.artifact_tokens`) ---
+    # The person who created the Key artifact, acted by its agent if it names one, held to its
+    # reach. A token of
+    # this shape that does not resolve is refused here; it never falls through.
+    from mantle.services import artifact_tokens
+    if artifact_tokens.looks_like(raw_token):
+        resolved = artifact_tokens.auth_of(store_db, raw_token)
+        if resolved is None:
+            raise HTTPException(status_code=401, detail="Invalid or ended artifact token")
+        return resolved
 
     # --- prefix parsing: {artifact_id}:agk_xxx ---
     if ":" in raw_token and not raw_token.startswith("ey"):
@@ -986,6 +1069,8 @@ def resolve_auth(
                 delegation_aud=_claim_aud_str(payload),
                 narrowed=payload.get("narrowed") is True,
                 job_reach=_job_reach_claim(payload),
+                reach_actions=_reach_actions_claim(payload),
+                reach_by=_reach_by_claim(payload),
             )
 
         # Default: user JWT.
@@ -1281,8 +1366,12 @@ def check_access(
     *,
     grant_memo: Optional[Dict[str, list]] = None,
     consult_origin: bool = True,
+    witness: bool = True,
 ) -> GrantEntity:
     """Verify *auth* has permission to perform *action* on *artifact_id*.
+
+    ``witness=False`` asks without recording: `allowed_actions` uses it to say what the caller may
+    do, which is not an access. Every access still goes through the witnessed call.
 
     ``consult_origin=False`` decides by the store's co-signed grants alone, for a principal this
     request holds no credential of (a persona whose own Read a credential's use needs); the store
@@ -1356,6 +1445,8 @@ def check_access(
     }
 
     def _witness(result: str, reason: Optional[str] = None) -> None:
+        if not witness:
+            return
         try:
             from mantle.services import audit_service
             ctx = dict(_audit_ctx)
@@ -1410,7 +1501,8 @@ def check_access(
     reach = job_reach_of(auth)
     if reach is not None:
         try:
-            inside = within_job_reach(store_db, artifact_id, action, doc, reach)
+            inside = within_job_reach(store_db, artifact_id, action, doc, reach,
+                                      reach_actions_of(auth), reach_by_of(auth))
         except db_store.OriginChainUnterminated:
             inside = False
         if not inside:
@@ -1501,6 +1593,26 @@ def check_access(
 
     _witness("denied", "no_grant")
     raise HTTPException(status_code=404, detail="Not found")
+
+
+def allowed_actions(auth: AuthContext, artifact_id: str, store_db: Database, *,
+                    grant_memo: Optional[Dict[str, list]] = None) -> List[str]:
+    """Every action *auth* may take on *artifact_id*, in `ACTIONS` order.
+
+    The same walk `check_access` makes, once per action, unwitnessed, so a client shows exactly
+    the controls the caller may use and never decides that itself. A refusal of any kind leaves
+    the action out.
+    """
+    from mantle.attenuation import ACTIONS
+    out: List[str] = []
+    for action in ACTIONS:
+        try:
+            check_access(auth, artifact_id, action, store_db, grant_memo=grant_memo,
+                         witness=False)
+        except HTTPException:
+            continue
+        out.append(action)
+    return out
 
 
 def check_inbound_nonce(request: Optional[Request], auth: AuthContext) -> None:

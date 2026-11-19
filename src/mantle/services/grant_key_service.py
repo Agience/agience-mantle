@@ -34,9 +34,12 @@ import logging
 import secrets
 import uuid
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from mantle.entities.grant import Grant as GrantEntity
+
+if TYPE_CHECKING:
+    from mantle.db.store import Database
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +76,7 @@ def key_hint(raw_token: str) -> str:
 def _flags_from(
     flags: Optional[Dict[str, bool]] = None,
     role: Optional[str] = None,
+    db: Optional[Database] = None,
 ) -> Dict[str, bool]:
     """Normalize a permission spec to a full CRUDEASIO map.
 
@@ -81,7 +85,8 @@ def _flags_from(
     widens a caller who passed ``{"can_invoke": True}`` meaning only that.
     """
     if role:
-        resolved = GrantEntity.permissions_for_role(role)
+        from mantle.services import role_presets
+        resolved = role_presets.permissions_for_role(db, role)
     else:
         resolved = dict(flags or {})
     return {flag: bool(resolved.get(flag, False)) for flag in GrantEntity.PERMISSION_FLAGS}
@@ -139,11 +144,11 @@ def mint(
         # establishes that the issuer may mint HERE; this establishes HOW MUCH.
         from mantle.services.grant_service import clamp_to_issuer
         bits = clamp_to_issuer(db, issuer_id=user_id, resource_id=resource_id,
-                               requested=_flags_from(flags, role))
+                               requested=_flags_from(flags, role, db))
     else:
         # A bundle root with explicit flags is a caller deliberately pre-narrowing the
         # ceiling; without them it stays open. See `_open_ceiling`.
-        bits = _flags_from(flags, role) if (flags or role) else _open_ceiling()
+        bits = _flags_from(flags, role, db) if (flags or role) else _open_ceiling()
 
     grant = GrantEntity(
         id=str(uuid.uuid4()),
@@ -204,7 +209,7 @@ def add_member(
         created_time=now,
         modified_time=now,
         **clamp_to_issuer(db, issuer_id=granted_by, resource_id=resource_id,
-                          requested=_flags_from(flags, role)),
+                          requested=_flags_from(flags, role, db)),
     )
     store.create_grant(db, member)
     # NOT `_invalidate(bundle_id)`: a nested bundle names its immediate parent, while the

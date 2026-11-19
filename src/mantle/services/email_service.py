@@ -37,6 +37,19 @@ def _provider() -> str:
     return (os.getenv("EMAIL_PROVIDER", "") or "").strip().lower()
 
 
+#: True only in a test that has replaced the Gmail transport with a fake. Under pytest every other
+#: send through Gmail raises, so a suite that inherits the operator's `EMAIL_PROVIDER` fails loudly
+#: instead of mailing a real address.
+REAL_PROVIDER_UNDER_TEST = False
+
+
+def refuse_a_real_provider_under_test(provider: str) -> None:
+    """Raise when pytest is running and ``provider`` would send real mail."""
+    if provider != "outbox" and os.getenv("PYTEST_CURRENT_TEST") and not REAL_PROVIDER_UNDER_TEST:
+        raise RuntimeError(f"email provider {provider!r} would send real mail under test; "
+                           "a test stack uses EMAIL_PROVIDER=outbox")
+
+
 def _gmail() -> dict:
     return {k: (os.getenv(f"GMAIL_OAUTH_{k.upper()}", "") or "").strip()
             for k in ("client_id", "client_secret", "refresh_token")}
@@ -110,6 +123,7 @@ async def send_email(to: str, subject: str, html_body: str, text: str) -> bool:
     if not is_configured():
         logger.info("mail not configured; nothing sent")
         return False
+    refuse_a_real_provider_under_test(_provider())
     try:
         if _provider() == "outbox":
             return _send_outbox(to, subject, html_body, text)

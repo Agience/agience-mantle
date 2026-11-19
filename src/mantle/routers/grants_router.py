@@ -520,6 +520,33 @@ async def list_grants_endpoint(
 #: rules — "may this principal do this?" is a question a stranger is entitled to ask about
 #: itself, and the honest answer is `false`, not `401`. Declaring a 401 here would advertise
 #: a refusal this endpoint deliberately does not make.
+class RoleResponse(BaseModel):
+    name: str = Field(..., description="The role preset's name, as `role` takes it.")
+    actions: List[str] = Field(..., description="The CRUDEASIO actions the role grants, in "
+                                                "the vocabulary's order.")
+
+
+class RolesResponse(BaseModel):
+    roles: List[RoleResponse]
+
+
+def roles(db: Optional[Database] = None) -> List[dict]:
+    """Every Role with the actions it grants, fewest actions first (`services.role_presets`)."""
+    from mantle.services import role_presets
+    return [{"name": name, "actions": [a for a in ACTIONS if preset.get(f"can_{a}")]}
+            for name, preset in role_presets.presets(db).items()]
+
+
+#: Registered before `/{grant_id}`, which would otherwise take `roles` as a grant id.
+@router.get("/roles", responses=_errors(401, ok=RolesResponse))
+async def list_roles(auth: AuthContext = Depends(get_auth), store_db: Database = Depends(get_store_db)):
+    """The role presets a share or invite offers, each with the actions it grants. A client
+    names a grant by the role whose actions it holds exactly, and sends the role's actions."""
+    if not auth.user_id:
+        raise HTTPException(status_code=401, detail="User identification required")
+    return {"roles": await offload_sync(roles, store_db)}
+
+
 @router.get("/my-access",
     #: Success only — no error codes, and that is C-3's measured answer, not an omission.
     responses=_errors(ok=MyAccessResponse),
@@ -591,7 +618,7 @@ async def create_grant_endpoint(
         if (body.target_entity_type or "").lower() == "email":
             target_email = body.target_entity
 
-        role = body.role or _role_from_bits(body) or "viewer"
+        role = body.role or _role_from_bits(body, store_db) or "viewer"
         try:
             created, raw_token = await offload_sync(
                 grant_service.create_invite,
@@ -672,8 +699,9 @@ async def create_grant_endpoint(
     return _grant_response(created)
 
 
-def _role_from_bits(body: CreateGrantRequest) -> Optional[str]:
-    """Reverse-map CRUDEASIO bits on the request to an exact role preset, if any."""
+def _role_from_bits(body: CreateGrantRequest, db: Optional[Database] = None) -> Optional[str]:
+    """Reverse-map CRUDEASIO bits on the request to the Role that grants exactly them, if any."""
+    from mantle.services import role_presets
     actual = {
         "can_create": body.can_create, "can_read": body.can_read,
         "can_update": body.can_update, "can_delete": body.can_delete,
@@ -681,7 +709,7 @@ def _role_from_bits(body: CreateGrantRequest) -> Optional[str]:
         "can_share": body.can_share, "can_admin": body.can_admin,
     }
     enabled = {k for k, v in actual.items() if v}
-    for role_name, preset in GrantEntity.ROLE_PRESETS.items():
+    for role_name, preset in role_presets.presets(db).items():
         if enabled == {k for k, v in preset.items() if v}:
             return role_name
     return None

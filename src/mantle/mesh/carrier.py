@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 #: One unit handed to the medium: (key, bytes). The key is the segment's mesh path, carried with the
 #: payload so a receiver can spool it back to the same place — the medium stays dumb.

@@ -58,7 +58,8 @@ def test_an_account_may_invoke_and_read_each_operator_and_nothing_more(db):
     with pytest.raises(HTTPException):
         with acting_as(USER, principal_type="user"):
             check_access(_auth(USER), op, "invoke", db)
-    assert P.grant_to_account(db, USER) == len([o for o in P.OPERATORS if o.get("public")])
+    assert P.grant_to_account(db, USER) == len([o for o in P.OPERATORS if o.get("public")]) + 1, (
+        "each public operator, and read on the platform Search")
     with acting_as(USER, principal_type="user"):
         check_access(_auth(USER), op, "invoke", db)
         check_access(_auth(USER), op, "read", db)
@@ -158,3 +159,15 @@ async def test_a_timers_key_is_told_which_operators_it_may_invoke(db):
     got = {i["slug"]: i["may_invoke"] for i in
            (await artifacts.list_platform_operators(auth=key, store_db=db))["items"]}
     assert got["op-raise-inbox-item"] is True and got["op-reconcile-accounts"] is False
+
+def test_new_accounts_receive_is_bounded_by_its_ceiling_edge(db):
+    from mantle.db import lattice_api as la
+    assert P.ensure_platform_operators(db)
+    nar = P.new_accounts_receive_id(PLATFORM)
+    ceiling = P.new_account_ceiling_id(PLATFORM)
+    assert P._ceiling(db, ceiling, nar) == ["invoke", "read"]
+    assert la._find_membership(db, nar, P.ids()[P._COLLECTION_SLUG]) is not None
+    la.remove_artifact_from_collection(db, ceiling, nar)
+    la.add_artifact_to_collection(db, ceiling, nar, origin=False, propagate=["read"])
+    assert P.ensure_platform_operators(db)
+    assert P._ceiling(db, ceiling, nar) == ["read"], "the operator's edit stands"

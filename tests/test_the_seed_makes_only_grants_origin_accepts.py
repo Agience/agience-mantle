@@ -39,6 +39,10 @@ class HeldTokenOrigin(FakeOrigin):
         self.asked.append(person_id)
         return {"granted": 0, "seqs": []}
 
+    def definitions_grant(self):
+        self.definitions = getattr(self, "definitions", 0) + 1
+        return {"granted": 0, "seqs": []}
+
 
 @pytest.fixture
 def origin(monkeypatch):
@@ -55,6 +59,7 @@ def test_the_operator_seeding_on_its_own_session_is_accepted(db, origin):  # noq
         assert P.ensure_platform_operators(db)
         assert P.ensure_platform_operators(db), "a second pass converges"
         P.grant_to_every_account(db)
+    assert getattr(origin, "definitions", 0) >= 1, "the definitions grant is asked of Origin"
     grants = [e for e in origin.entries if e.get("kind") == "grant"]
     assert grants and {g["grantee_id"] for g in grants} == {PLATFORM}
     assert {g["resource_id"] for g in grants} <= set(origin.roots)

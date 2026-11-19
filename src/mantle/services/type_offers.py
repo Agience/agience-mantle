@@ -27,6 +27,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import re
 import threading
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -71,7 +72,7 @@ def validate_offer(offer: Any) -> List[str]:
 
 #: What a type may declare its artifacts do when a create reaches them over an edge
 #: (``on_create: {"does": <verb>}``); `services.on_create` runs the verb.
-ON_CREATE_VERBS: Tuple[str, ...] = ("number", "create")
+ON_CREATE_VERBS: Tuple[str, ...] = ("number", "create", "add")
 
 #: What an ``on_update`` stamp writes into its field.
 STAMPS: Tuple[str, ...] = ("caller", "time")
@@ -92,14 +93,33 @@ def validate_on_create(declared: Any) -> List[str]:
     return problems
 
 
+#: What an ``on_create`` stamp may set a field to: ``level``, the level the creating token speaks
+#: at; ``token``, the hash of a bearer token issued once to the create (`on_create`).
+ON_CREATE_STAMPS = frozenset({"level", "token"})
+#: The fields a ``token`` stamp may name, each another field of the artifact: ``hint`` takes the
+#: token's last four characters; ``acts`` names the actor the token acts as, ``reach`` the ids it
+#: reaches, ``actions`` what it may do there, and ``ends`` when it ends.
+TOKEN_FIELDS = ("hint", "acts", "reach", "actions", "ends")
+#: A token's prefix: two to eight lower-case letters and an underscore, e.g. ``agk_``.
+_TOKEN_PREFIX = re.compile(r"^[a-z]{2,8}_$")
+
+
 def validate_field_rules(fields: Any) -> List[str]:
     """The problems with a ``fields`` block; empty when it is well formed.
 
-    A field may carry ``on_create: {"from_edge": <label>, "key": <field>?}``: on create its value
-    comes from the artifact the creating collection's ``from_edge`` edge points to, as that
-    artifact's type declares, and ``key``, when named, receives a second value from it. A field
-    may carry ``on_update: {"stamp": "caller" | "time", "when": <field>}``: an update that changes
-    ``when`` sets it to the caller or the time."""
+    A field may carry ``on_create: {"from_edge": <label>, "key": <field>?, "amount": <field>?,
+    "to": <field>?, "limit": <field>?}``: on create its value comes from the artifact the creating
+    collection's ``from_edge`` edge points to, as that artifact's type declares; ``key``, when
+    named, receives a second value from it. For an ``add``, ``amount`` names this artifact's field
+    holding what is added, and ``to`` and ``limit`` name the edged artifact's fields it is added
+    to and bounded by. Or
+    ``on_create: {"stamp": "level"}``: on create it is the level the creating token speaks at
+    (``typed`` for a person's own token, ``agent`` for one acted by another). Or
+    ``on_create: {"stamp": "token", "prefix": <prefix>, "hint"|"acts"|"reach"|"actions"|"ends":
+    <field>}``: on create it is the hash of a bearer token issued once to the create (see
+    `TOKEN_FIELDS`). A field may carry
+    ``on_update: {"stamp": "caller" | "time", "when": <field>}``: an update that changes ``when``
+    sets it to the caller or the time."""
     if fields is None:
         return []
     if not isinstance(fields, dict):
@@ -117,15 +137,47 @@ def validate_field_rules(fields: Any) -> List[str]:
         if not isinstance(on_create, dict):
             problems.append(f"{where} must be an object")
             continue
-        unknown = set(on_create) - {"from_edge", "key"}
+        if on_create.get("stamp") == "token":
+            problems += _token_problems(name, where, on_create)
+            continue
+        if "stamp" in on_create:
+            if set(on_create) != {"stamp"} or on_create["stamp"] not in ON_CREATE_STAMPS:
+                problems.append(f"{where} stamps one of {', '.join(sorted(ON_CREATE_STAMPS))} "
+                                "and names nothing else")
+            continue
+        unknown = set(on_create) - {"from_edge", "key", "amount", "to", "limit"}
         if unknown:
             problems.append(f"{where} has unknown keys {', '.join(sorted(unknown))}")
         edge = on_create.get("from_edge")
         if not isinstance(edge, str) or not edge.strip():
             problems.append(f"{where}.from_edge must name an edge")
-        key = on_create.get("key")
-        if key is not None and (not isinstance(key, str) or not key.strip() or key == name):
-            problems.append(f"{where}.key must name another field")
+        for named in ("key", "amount"):
+            other = on_create.get(named)
+            if other is not None and (not isinstance(other, str) or not other.strip()
+                                      or other == name):
+                problems.append(f"{where}.{named} must name another field")
+        for named in ("to", "limit"):
+            other = on_create.get(named)
+            if other is not None and (not isinstance(other, str) or not other.strip()):
+                problems.append(f"{where}.{named} must name a field of the edged artifact")
+        if on_create.get("to") is not None and on_create.get("to") == on_create.get("limit"):
+            problems.append(f"{where}.to and limit must name two fields")
+    return problems
+
+
+def _token_problems(name: str, where: str, rule: dict) -> List[str]:
+    problems = []
+    unknown = set(rule) - {"stamp", "prefix", *TOKEN_FIELDS}
+    if unknown:
+        problems.append(f"{where} has unknown keys {', '.join(sorted(unknown))}")
+    prefix = rule.get("prefix")
+    if not isinstance(prefix, str) or not _TOKEN_PREFIX.match(prefix):
+        problems.append(f"{where}.prefix is two to eight lower-case letters and an underscore")
+    for named in TOKEN_FIELDS:
+        other = rule.get(named)
+        if other is not None and (not isinstance(other, str) or not other.strip()
+                                  or other == name):
+            problems.append(f"{where}.{named} must name another field")
     return problems
 
 
@@ -289,6 +341,15 @@ def on_update_rules(content_type: Any) -> Dict[str, dict]:
     return _field_rules(content_type, "on_update")
 
 
+def token_rule(content_type: Any) -> Optional[Tuple[str, dict]]:
+    """``(field, rule)`` of ``content_type``'s ``token`` stamp, or None: a type issues at most one
+    token, and the first field declaring one is it."""
+    for name, rule in on_create_rules(content_type).items():
+        if rule.get("stamp") == "token":
+            return name, rule
+    return None
+
+
 def secret_fields(content_type: Any) -> set:
     """The fields ``content_type`` marks ``"secret": true``, from the nearest type in its lineage
     that declares each field."""
@@ -339,6 +400,21 @@ def on_create_does(content_type: Any) -> Optional[str]:
             if declared is not None and not validate_on_create(declared):
                 return declared["does"]
     return None
+
+
+def readable_context(content_type: Any) -> bool:
+    """Whether ``content_type`` declares its context platform configuration, kept in the open with
+    its title alone sealed (``"readable_context": true``), from the nearest type in its lineage that
+    declares it."""
+    ct = _normalize(content_type)
+    if not ct:
+        return False
+    with _lock:
+        for link in _lineage(ct):
+            declared = (_definitions.get(link) or {}).get("readable_context")
+            if isinstance(declared, bool):
+                return declared
+    return False
 
 
 def set_definitions(definitions: Dict[str, dict]) -> None:

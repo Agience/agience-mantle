@@ -61,8 +61,8 @@ def test_the_index_lookup_finds_matches_wherever_they_sort(lattice):
     """The property the fix rests on: if this cannot find a late-sorting id, nothing downstream
     can either."""
     _populate(lattice)
-    assert _ids_of_content_type(lattice, HOST) == {"zzz-host"}
-    assert _ids_of_content_type(lattice, SENSOR) == {"zzy-sensor-a", "0001-sensor-b"}
+    assert _ids_of_content_type(lattice, HOST).keys() == {"zzz-host"}
+    assert _ids_of_content_type(lattice, SENSOR).keys() == {"zzy-sensor-a", "0001-sensor-b"}
 
 
 def test_the_lookup_cost_does_not_scale_with_what_the_caller_can_see(lattice):
@@ -71,7 +71,7 @@ def test_the_lookup_cost_does_not_scale_with_what_the_caller_can_see(lattice):
     result or the work.
     """
     _populate(lattice, noise=2000)
-    found = _ids_of_content_type(lattice, HOST)
+    found = _ids_of_content_type(lattice, HOST).keys()
     assert found == {"zzz-host"}, found
 
 
@@ -85,14 +85,14 @@ def test_archived_versions_are_not_listed_as_separate_artifacts(lattice):
     lattice.artifacts.put_artifact({"id": "s-1", "content_type": SENSOR, "state": "live"})
     lattice.artifacts.put_artifact(
         {"id": "s-1@old", "root_id": "s-1", "content_type": SENSOR, "state": "archived"})
-    assert _ids_of_content_type(lattice, SENSOR) == {"s-1"}
+    assert _ids_of_content_type(lattice, SENSOR).keys() == {"s-1"}
 
 
 def test_a_type_nothing_carries_is_empty_not_everything(lattice):
     """The failure direction that would be worst: an empty narrow set must mean "no matches", not
     "no filter" — an intersection with the wrong empty value returns the caller's whole reach."""
     _populate(lattice)
-    assert _ids_of_content_type(lattice, "application/vnd.nothing+json") == set()
+    assert _ids_of_content_type(lattice, "application/vnd.nothing+json").keys() == set()
 
 
 def test_the_filter_is_applied_before_paging_in_the_router() -> None:
@@ -174,7 +174,7 @@ def _drive(store_db, authorized, content_type, limit=5, offset=0):
     with patch("mantle.search.mantle.lightcone.LightConeResolver", _Resolver), \
             patch.object(ar, "_hydrate_batch", side_effect=lambda db, ids: {i: docs[i] for i in ids}), \
             patch.object(ar, "_ids_of_content_type",
-                         side_effect=lambda db, ct: {i for i, c in authorized.items() if c == ct}):
+                         side_effect=lambda db, ct: {i: "" for i, c in authorized.items() if c == ct}):
         return asyncio.run(ar.list_visible(
             content_type=content_type, action="read", limit=limit, offset=offset,
             auth=auth, store_db=store_db))

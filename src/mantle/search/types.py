@@ -159,6 +159,10 @@ class SearchHit:
     # Highlighting
     highlights: Optional[Dict[str, List[str]]] = None
 
+    #: Store fields a caller that orders hits itself reads: who created it, when it last changed.
+    created_by: Optional[str] = None
+    modified_time: Optional[str] = None
+
 
 @dataclass
 class SearchResult:

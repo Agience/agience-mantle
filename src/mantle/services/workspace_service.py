@@ -263,6 +263,9 @@ def _index_container(db: Database, entity: CollectionEntity, *, vector=None) -> 
         logger.warning("Failed to index container artifact %s", entity.id, exc_info=True)
 
 
+from mantle.services.new_titles import DEFAULT_WORKSPACE_NAME  # noqa: E402
+
+
 def create_workspace(
     db: Database,
     user_id: str,
@@ -281,7 +284,8 @@ def create_workspace(
     (`_ensure_inbox_workspace`), so it is corrected rather than worked around.
     """
     return create_container(
-        db, user_id, content_type=WORKSPACE_CONTENT_TYPE, name=name,
+        db, user_id, content_type=WORKSPACE_CONTENT_TYPE,
+        name=(name or "").strip() or DEFAULT_WORKSPACE_NAME,
         artifact_id=artifact_id,
     )
 
@@ -1304,6 +1308,13 @@ def _holds_owners_rights(db: Database, user_id: str, container_id: str) -> bool:
     return all(verifier._reaches(str(user_id), "user", str(container_id), a) for a in ACTIONS)
 
 
+def _key_before(db: Database, container_id: str, before_id: Optional[str]) -> str:
+    """The order key that puts a new member just before ``before_id`` (version or root id), or at
+    the end."""
+    before = store.get_artifact(db, before_id) if before_id else None
+    return store.key_before(db, container_id, before.root_id if before else None)
+
+
 @_in_one_batch
 def create_workspace_artifact(
     db: Database,
@@ -1321,8 +1332,9 @@ def create_workspace_artifact(
     description: Optional[str] = None,
     minted=None,
     auth: Any = None,
+    before_id: Optional[str] = None,
 ) -> ArtifactEntity:
-    """Create an artifact inside a container.
+    """Create an artifact inside a container, at the end or just before ``before_id``.
 
     ``auth``, the caller's (the routes pass it), is authorized on the container through the light
     cone (`dependencies.check_access`): a grant on the workspace that holds a collection reaches
@@ -1443,7 +1455,7 @@ def create_workspace_artifact(
 
     # Insert the stable collection_artifacts edge pointing at root_id.
     if order_key is None:
-        order_key = after_key(store.get_last_order_key(db, workspace_id))
+        order_key = _key_before(db, workspace_id, before_id)
     store.add_artifact_to_collection(db, workspace_id, artifact.root_id, order_key)
 
     # Wire target_collections binding: create collection_artifacts edges to
@@ -2393,7 +2405,7 @@ def initiate_upload_and_create_artifact(
     filename: str,
     content_type: str,
     size: int,
-    order_key: Optional[str] = None,
+    before_id: Optional[str] = None,
     context: Optional[dict] = None,
 ):
     """Create an artifact to receive a file upload; return ``(descriptor, artifact)``.
@@ -2439,7 +2451,7 @@ def initiate_upload_and_create_artifact(
         workspace_id,
         context=_ensure_json_str(base_ctx),
         content="",
-        order_key=order_key,
+        before_id=before_id,
         enqueue_index=False,
         content_type=content_type or None,
     )
@@ -2859,6 +2871,6 @@ def receive_card_inbound_message(
 
 async def dispatch_create_workspace(artifact: dict, body: dict, ctx: Any) -> dict:
     """Create a workspace via the ``create`` operation on workspace type."""
-    name = (body or {}).get("name", "New Workspace")
+    name = (body or {}).get("name") or DEFAULT_WORKSPACE_NAME
     ws = create_workspace(ctx.store_db, ctx.user_id, name)
     return ws.to_dict()

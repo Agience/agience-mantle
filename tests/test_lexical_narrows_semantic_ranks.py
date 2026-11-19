@@ -475,7 +475,9 @@ class TestTextOnlyRecallIsAnOrdinaryRequest:
         result = _accessor(stack, embeddings=_NoVector()).search(
             _query('"latest filing"'))
         assert [h.doc_id for h in result.hits] == [NEW]
-        assert result.hits[0].metadata == {"matched_stems": 2, "matched_bigrams": 1}
+        meta = result.hits[0].metadata
+        assert (meta["matched_stems"], meta["matched_bigrams"]) == (2, 1)
+        assert sorted(meta["matched"]) == ["file", "latest"]
 
     def test_the_total_is_exact_rather_than_capped(self, stack):
         """The coverage path orders the whole narrowed set, so it has no horizon to stop at."""

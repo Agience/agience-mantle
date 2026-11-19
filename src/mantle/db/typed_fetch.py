@@ -8,7 +8,6 @@ rows it actually wants, and reports whether the answer was EXHAUSTIVE rather tha
 """
 from __future__ import annotations
 
-from typing import Any, List
 
 from mantle.db.constants import CT_FETCH_CAP as _CT_FETCH_CAP
 

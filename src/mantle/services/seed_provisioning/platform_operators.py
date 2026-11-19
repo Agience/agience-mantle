@@ -41,6 +41,7 @@ _COLLECTION_SLUG = "platform-operators"
 OPERATOR_CT = "application/vnd.agience.operator+json"
 COLLECTION_CT = "application/vnd.agience.collection+json"
 WORKSPACE_CT = "application/vnd.agience.workspace+json"
+SEARCH_CT = "application/vnd.agience.search+json"
 
 
 def _artifact(description: str, *content_types: str) -> Dict[str, Any]:
@@ -75,7 +76,7 @@ OPERATORS: List[Dict[str, Any]] = [
     # Sage answers in itself, with no second hop. Ask anything still searches every note.
     {"slug": "op-answer-from-my-notes", "title": "Answer from my notes", "public": True,
      "description": "Answer a question with cited extracts from the item it is given.",
-     "server": "sage", "tool": "ask",
+     "server": "sage", "tool": "ask", "definition": "op.retrieve",
      "input_schema": {"type": "object", "required": ["question", "evidence"], "properties": {
          "question": {"type": "string", "description": "The question"},
          "evidence": _item("What to answer from")}},
@@ -95,7 +96,7 @@ OPERATORS: List[Dict[str, Any]] = [
     # the server's own key, never the caller's credential.
     {"slug": "op-use-a-server-tool", "title": "Use a server tool", "public": True,
      "description": "Run one tool on an MCP server added to the workspace as a server artifact.",
-     "server": "iris", "tool": "use_server_tool",
+     "server": "iris", "tool": "use_server_tool", "definition": "op.mcp.call",
      "input_schema": {"type": "object", "required": ["server", "tool"], "properties": {
          "server": _artifact("The server artifact", "application/vnd.agience.mcp-server+json"),
          "tool": {"type": "string", "description": "The tool's name, as the server lists it"},
@@ -123,13 +124,31 @@ OPERATORS: List[Dict[str, Any]] = [
 ]
 
 
+#: The platform's Search: what a Chat runs when it links no Search of its own. Its fields are the
+#: recall it makes (`/artifacts/recall` with `search_id`): rarest matched words first, then what the
+#: reader made, then the newest; six hits; no scope, so everything the reader may read.
+PLATFORM_SEARCH: Dict[str, Any] = {
+    "slug": "search-platform", "title": "Platform Search",
+    "description": ("Finds what you may read: an exact title first, then the rarest matched words,"
+                    " then your own, then the newest."),
+    "size": 6, "rank": ["title", "rarity", "own", "recency"],
+}
+
+
 def ids() -> Dict[str, str]:
-    """{slug: id} for the collection and every operator, derived from the instance namespace."""
+    """{slug: id} for the collection, every operator and the platform Search, derived from the
+    instance namespace."""
     from mantle.services.seed_provisioning.loader import derive_uuid, get_instance_namespace
     ns = get_instance_namespace()
     if not ns:
         return {}
-    return {slug: derive_uuid(ns, _NS, slug) for slug in [_COLLECTION_SLUG, *(o["slug"] for o in OPERATORS)]}
+    slugs = [_COLLECTION_SLUG, *(o["slug"] for o in OPERATORS), PLATFORM_SEARCH["slug"]]
+    return {slug: derive_uuid(ns, _NS, slug) for slug in slugs}
+
+
+def platform_search_id() -> str:
+    """The platform Search's id on this node, or empty before the instance namespace is known."""
+    return ids().get(PLATFORM_SEARCH["slug"], "")
 
 
 def catalog_title(artifact_id: str) -> str:
@@ -138,7 +157,8 @@ def catalog_title(artifact_id: str) -> str:
     staging, which holds none of production's keys (BUG-057). Empty for any other id."""
     if not artifact_id:
         return ""
-    titles = {_COLLECTION_SLUG: "Platform operators", **{o["slug"]: o["title"] for o in OPERATORS}}
+    titles = {_COLLECTION_SLUG: "Platform operators", **{o["slug"]: o["title"] for o in OPERATORS},
+              PLATFORM_SEARCH["slug"]: PLATFORM_SEARCH["title"]}
     for slug, known in ids().items():
         if known == artifact_id:
             return titles.get(slug, "")
@@ -195,15 +215,56 @@ def _ensure(db: Database, artifact_id: str, **kw) -> bool:
                               description=kw["description"], owner=kw["owner"])
 
 
+def _search_context() -> Dict[str, Any]:
+    return {"content_type": SEARCH_CT, "title": PLATFORM_SEARCH["title"],
+            "description": PLATFORM_SEARCH["description"], "platform": True,
+            "size": PLATFORM_SEARCH["size"], "rank": list(PLATFORM_SEARCH["rank"])}
+
+
 def _context(op: Dict[str, Any]) -> Dict[str, Any]:
     props = (op["input_schema"] or {}).get("properties") or {}
-    return {
+    context = {
         "content_type": OPERATOR_CT, "title": op["title"], "description": op["description"],
         "platform": True,
         "input_schema": op["input_schema"],
         "operator": {"server": op["server"], "tool": op["tool"],
                      "arguments": op.get("arguments") or {name: f"$.body.params.{name}?" for name in props}},
     }
+    if op.get("definition"):
+        # The operator definition it runs, by id; the definition is an artifact in this collection.
+        context["definition"] = op["definition"]
+    return context
+
+
+#: What the definitions' publisher is given on the collection: create only. Create does not carry
+#: read, so it adds definitions and lists only what its own creation grants reach.
+DEFINITIONS_GRANT_NAME = "Operator definitions (create)"
+
+
+def ensure_definitions_grant(db: Database, operator: str, collection_id: str) -> bool:
+    """Grant the platform's system principal create on the operators' collection, as the operator,
+    so the operator definitions the services carry are published into it. Idempotent; True when a
+    grant was made.
+
+    Where Origin keeps the ledger, Origin makes the grant as the operator's own entry, on the
+    collection it derives from the instance namespace, and this store applies it from the ledger.
+    Without a ledger, the grant is written here."""
+    from mantle.db.backend import upsert_user_collection_grant
+    from mantle.services.peer_signing import get_system_principal_id
+
+    origin = _origin_grants()
+    if origin is not None and hasattr(origin, "definitions_grant"):
+        answer = origin.definitions_grant() or {}
+        if answer.get("granted"):
+            apply_remote(db)
+        return bool(answer.get("granted"))
+    system = get_system_principal_id()
+    if not system or not collection_id or str(system) == str(operator):
+        return False
+    _grant, changed = upsert_user_collection_grant(
+        db, user_id=system, collection_id=collection_id, granted_by=operator,
+        can_create=True, can_read=False, name=DEFINITIONS_GRANT_NAME)
+    return bool(changed)
 
 
 def _as_operator(operator: str):
@@ -260,14 +321,25 @@ def ensure_platform_operators(db: Database) -> bool:
             if not existed:
                 # Its creation edge in the collection, which the operator owns at Origin.
                 db_add_edge(db, coll, op_id, origin=True)
+        search_id = known[PLATFORM_SEARCH["slug"]]
+        existed = _ensure(db, search_id, content_type=SEARCH_CT, name=PLATFORM_SEARCH["title"],
+                          description=PLATFORM_SEARCH["description"], context=_search_context(),
+                          content="", owner=operator)
+        register_id(PLATFORM_SEARCH["slug"], search_id)
+        if not existed:
+            db_add_edge(db, coll, search_id, origin=True)
+        ensure_definitions_grant(db, operator, coll)
         if not _on_rc():
+            from mantle.services.role_presets import ensure_roles
+            ensure_roles(db, operator)
             ensure_new_accounts_receive(db, operator, coll)
     logger.info("platform_operators: %d operators in %s", len(OPERATORS), known[_COLLECTION_SLUG])
     return True
 
 
-#: The most an edge out of "New accounts receive" conducts to a person; Origin holds the same bound.
-NEW_ACCOUNT_ACTIONS = ("invoke", "read")
+#: The mask the "New account ceiling" edge is seeded with. Once seeded, the edge is the bound:
+#: Origin reads it from the ledger, and the operator changes it by editing the edge.
+CEILING_SEED = ("invoke", "read")
 
 
 def new_accounts_receive_id(operator: str) -> str:
@@ -275,7 +347,25 @@ def new_accounts_receive_id(operator: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"agience://new-accounts-receive/{operator}"))
 
 
-def _per_user_seeds() -> List[tuple]:
+def new_account_ceiling_id(operator: str) -> str:
+    """The operator's "New account ceiling"; its edge into "New accounts receive" bounds every
+    edge of the list. Origin derives the same id."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"agience://new-account-ceiling/{operator}"))
+
+
+def _ceiling(db: Database, ceiling: str, nar: str) -> List[str]:
+    """The actions the ceiling edge conducts now."""
+    from mantle.db import lattice_api as la
+    edge = la._find_membership(db, ceiling, nar)
+    if edge is None:
+        return []
+    propagate = edge.get("propagate")
+    if isinstance(propagate, str):
+        propagate = json.loads(propagate) if propagate.startswith("[") else [propagate]
+    return sorted(str(a) for a in (propagate or ()))
+
+
+def _per_user_seeds(ceiling: List[str]) -> List[tuple]:
     """(collection id, actions) for each per-user grant seed (`<seeds>/user/grants/*.yaml`, principal
     `{{user.id}}`): the seeded collections every account is given."""
     import yaml
@@ -293,16 +383,17 @@ def _per_user_seeds() -> List[tuple]:
         if doc.get("type") != "grant" or doc.get("principal") != "{{user.id}}":
             continue
         space, _, slug = str(doc.get("resource") or "").partition("/")
-        actions = sorted(set(doc.get("actions") or []) & set(NEW_ACCOUNT_ACTIONS))
+        actions = sorted(set(doc.get("actions") or []) & set(ceiling))
         if space and slug and actions:
             out.append((derive_uuid(ns, space, slug), actions))
     return out
 
 
 def ensure_new_accounts_receive(db: Database, operator: str, operators_collection: str) -> str:
-    """Create the operator's "New accounts receive" collection and link into it what every account
-    is given: the operators' collection, read and invoke, and each per-user seed with its actions.
-    A member not in the store yet is linked on a later pass; an existing edge is left as it is."""
+    """Create the operator's "New accounts receive" collection, and its "New account ceiling"
+    with an edge into it seeded `CEILING_SEED`, and link into the list what every account is
+    given: the operators' collection and each per-user seed, each within the ceiling. A member not
+    in the store yet is linked on a later pass; an existing edge is left as it is."""
     from mantle.db import lattice_api as la
     from mantle.services import workspace_service
 
@@ -313,9 +404,20 @@ def ensure_new_accounts_receive(db: Database, operator: str, operators_collectio
             description="What every new account receives: on each member, what its edge conducts.",
             context=json.dumps({"content_type": COLLECTION_CT, "title": "New accounts receive"}),
             artifact_id=nar)
-    members = [(operators_collection, list(NEW_ACCOUNT_ACTIONS)), *_per_user_seeds()]
+    ceiling = new_account_ceiling_id(operator)
+    if not _exists(db, ceiling):
+        workspace_service.create_container(
+            db, operator, content_type=COLLECTION_CT, name="New account ceiling",
+            description="The most a new account receives on any one member: the mask on its "
+                        "edge into New accounts receive.",
+            context=json.dumps({"content_type": COLLECTION_CT, "title": "New account ceiling"}),
+            artifact_id=ceiling)
+    if la._find_membership(db, ceiling, nar) is None:
+        la.add_artifact_to_collection(db, ceiling, nar, origin=False, propagate=list(CEILING_SEED))
+    bound = _ceiling(db, ceiling, nar)
+    members = [(operators_collection, bound), *_per_user_seeds(bound)]
     for member, actions in members:
-        if _exists(db, member) and la._find_membership(db, nar, member) is None:
+        if actions and _exists(db, member) and la._find_membership(db, nar, member) is None:
             la.add_artifact_to_collection(db, nar, member, origin=False, propagate=actions)
     return nar
 
@@ -346,7 +448,8 @@ def _origin_grants() -> object:
 
 
 def grant_to_account(db: Database, user_id: str, skip: frozenset = frozenset()) -> int:
-    """Grant `user_id` read and invoke on each public operator. Idempotent; returns how many.
+    """Grant `user_id` read and invoke on each public operator, and read on the platform Search.
+    Idempotent; returns how many.
 
     Where Origin keeps the ledger, Mantle names the person and Origin makes what "New accounts
     receive" lists, as the operator's own entries, which this store then applies from the ledger.
@@ -375,6 +478,12 @@ def grant_to_account(db: Database, user_id: str, skip: frozenset = frozenset()) 
                                          granted_by=operator, can_read=True, can_invoke=True,
                                          name=f"Platform operator: {op['title']}")
             n += 1
+    search_id = known.get(PLATFORM_SEARCH["slug"])
+    if search_id and (str(user_id), search_id) not in skip and _exists(db, search_id):
+        upsert_user_collection_grant(db, user_id=user_id, collection_id=search_id,
+                                     granted_by=operator, can_read=True,
+                                     name=f"Platform Search: {PLATFORM_SEARCH['title']}")
+        n += 1
     return n
 
 

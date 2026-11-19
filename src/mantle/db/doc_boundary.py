@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import logging
 
+from mantle.services.bootstrap_types import TYPE_DEFINITION_CONTENT_TYPE
+
 # Module level, not inside the try blocks that use it: an `except KeyCustodyDenied`
 # with a lazily-imported name would raise NameError at the worst possible moment.
 try:                                        # plain path first — the canonical import inside the
@@ -63,20 +65,6 @@ STRUCTURAL_CONTEXT_KEYS = frozenset({
     "upload", "processing", "storage",
 })
 
-#: Content types whose whole context is platform configuration, read before any person's key is
-#: issued: issuers at token verification (`services/issuers.py`), type definitions at boot
-#: (`services/type_offers.py`), anchors and crosswalks at recall routing (`search/anchors`), and
-#: subscriptions by the delivery and resume paths (`entities/subscription.py`). Their title is still
-#: sealed.
-READABLE_CONTEXT_TYPES = frozenset({
-    "application/vnd.agience.issuer+json",
-    "application/vnd.agience.type+json",
-    "application/vnd.agience.anchor+json",
-    "application/vnd.agience.crosswalk+json",
-    "application/vnd.agience.subscription+json",
-    "application/vnd.agience.number-provider+json",
-})
-
 #: Top-level fields a writer supplies: content, sealed with the context.
 SEALED_DOC_FIELDS = ("name", "description")
 
@@ -94,27 +82,38 @@ def _content_type_of(doc: dict, ctx: dict) -> str:
     return str(ctx.get("content_type") or doc.get("content_type") or "").split(";", 1)[0].strip().lower()
 
 
-#: An operator the platform seeds (`seed_provisioning/platform_operators.py`, `platform: true`).
+#: What the platform seeds (`seed_provisioning/platform_operators.py`, `platform: true`): its
+#: operators, the Search a Chat runs when it links none, and the Roles a share or invite offers
+#: (`services.role_presets`).
 PLATFORM_OPERATOR_TYPE = "application/vnd.agience.operator+json"
+PLATFORM_SEARCH_TYPE = "application/vnd.agience.search+json"
+PLATFORM_ROLE_TYPE = "application/vnd.agience.role+json"
+_PLATFORM_DEFINITION_TYPES = frozenset({PLATFORM_OPERATOR_TYPE, PLATFORM_SEARCH_TYPE, PLATFORM_ROLE_TYPE})
 
 
 def _is_platform_operator(doc: dict, ctx: dict) -> bool:
-    return _content_type_of(doc, ctx) == PLATFORM_OPERATOR_TYPE and ctx.get("platform") is True
+    return _content_type_of(doc, ctx) in _PLATFORM_DEFINITION_TYPES and ctx.get("platform") is True
 
 
 def _readable(doc: dict, ctx: dict) -> bool:
     """Whether `doc`'s context is platform configuration kept in the open, its title alone sealed:
-    the readable types, and the operators the platform seeds (John, 2026-11-10, BUG-057: their
+    a type whose definition says `"readable_context": true` (read before any person's key is
+    issued: issuers at token verification, anchors and crosswalks at recall routing, subscriptions
+    by the delivery paths), a type definition itself (read at boot, before any other definition is
+    known), and the operators the platform seeds (John, 2026-11-10, BUG-057: their
     input form and wiring are the platform's public definition, and a node holding none of the
     keys they were sealed under, staging, could not show a single input field). A person's own
     operator is not one: its wiring may name a private server, and stays sealed. An artifact whose
     type declares what it does on create is configuration too: Mantle reads it inside the create
-    of another artifact, under no key of its own (`services.on_create`)."""
-    ct = _content_type_of(doc, ctx)
-    if ct in READABLE_CONTEXT_TYPES or _is_platform_operator(doc, ctx):
-        return True
+    of another artifact, under no key of its own (`services.on_create`). So is one whose type
+    issues a token: Mantle reads it before it knows who the bearer is (`services.artifact_tokens`),
+    and it holds the token's hash, never the token."""
     from mantle.services import type_offers
-    return type_offers.on_create_does(ct) is not None
+    ct = _content_type_of(doc, ctx)
+    if ct == TYPE_DEFINITION_CONTENT_TYPE or _is_platform_operator(doc, ctx):
+        return True
+    return (type_offers.readable_context(ct) or type_offers.on_create_does(ct) is not None
+            or type_offers.token_rule(ct) is not None)
 
 
 def sealable_keys(doc: dict, ctx: dict) -> list:
@@ -257,8 +256,8 @@ def seal_content_fields(doc: dict) -> None:
 
 
 def unseal_content_fields(raw: dict) -> None:
-    """Restore the sealed fields (`_unseal`), and give a platform operator whose title this node
-    cannot open the title of its definition in the platform's catalog (BUG-057)."""
+    """Restore the sealed fields (`_unseal`), and give a platform operator or Search whose title
+    this node cannot open the title of its definition in the platform's catalog (BUG-057)."""
     _unseal(raw)
     ctx, as_string = _context_dict(raw)
     if ctx and not ctx.get("title") and _is_platform_operator(raw, ctx):

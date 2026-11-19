@@ -595,7 +595,8 @@ class TestOrdering:
                                    coverage={"art-1": Coverage(3, 2)}),
         )
         result = acc.search(_make_query("alpha"))
-        assert result.hits[0].metadata == {"matched_stems": 3, "matched_bigrams": 2}
+        meta = result.hits[0].metadata
+        assert (meta["matched_stems"], meta["matched_bigrams"]) == (3, 2)
 
     def test_a_count_belonging_to_an_unauthorized_artifact_is_never_read(self):
         """THE leak question, at the accessor.

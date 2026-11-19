@@ -39,8 +39,8 @@ def artifact_ops():
            for method, op in item.items()
            if isinstance(op, dict) and "Artifacts" in (op.get("tags") or [])}
     # Pinned, so a new operation cannot arrive without being covered by the checks below.
-    assert len(ops) == 28, (
-        "expected 28 artifact operations, found %d — this suite's subject moved" % len(ops))
+    assert len(ops) == 30, (
+        "expected 30 artifact operations, found %d — this suite's subject moved" % len(ops))
     return ops
 
 

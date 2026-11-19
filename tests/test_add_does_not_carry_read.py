@@ -43,7 +43,8 @@ def node(tmp_path, monkeypatch):
     monkeypatch.setattr(ws, "_store_content_in_s3",
                         lambda artifact_id, content, context_str, **_: (
                             f"artifacts/{artifact_id}.content", content, None))
-    return db, oracle
+    yield db, oracle
+    cc.wait_minted()        # no mint left to write into the next test's store
 
 
 def _inbox(db, actions=("add",)):
@@ -55,6 +56,9 @@ def _inbox(db, actions=("add",)):
         la.create_grant(db, Grant(id="g-sam", resource_id=inbox, grantee_type="user",
                                   grantee_id=SAM, granted_by=OWNER,
                                   **{f"can_{a}": a in actions for a in ACTIONS}))
+    # The creator's key and signed seal are minted on a thread just after the create; a test
+    # that then deletes or plants the seal must not race it.
+    cc.wait_minted()
     return inbox
 
 

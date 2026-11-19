@@ -153,3 +153,23 @@ def test_a_nonce_key_with_its_challenge_connects(resolves_to, monkeypatch):
     ws = _FakeWs({"X-Agience-Challenge": _nonce("key-1", "col-1")})
     _, session = _run(ws)
     assert session is not None and ws.closed is None
+
+
+def _lumen(reach):
+    return AuthContext(user_id="u-1", principal_id="u-1", principal_type="user",
+                       actor="agience-server-lumen", delegation_aud="agience-server-lumen",
+                       narrowed=True, scope="persona:lumen", job_reach=reach)
+
+
+def test_a_job_s_lumen_delegation_opens_the_socket(resolves_to):
+    resolves_to(_lumen(("c-1",)))
+    ws = _FakeWs()
+    _, session = _run(ws)
+    assert session is not None and ws.closed is None
+
+
+def test_a_person_s_lumen_delegation_is_refused_on_the_socket(resolves_to):
+    resolves_to(_lumen(None))
+    ws = _FakeWs()
+    _, session = _run(ws)
+    assert session is None and ws.closed == 4403

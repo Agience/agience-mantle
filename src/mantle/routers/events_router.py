@@ -128,6 +128,7 @@ import asyncio
 import logging
 import os
 import time
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
@@ -836,6 +837,10 @@ def _persist_cursor(store_db: Any, sub: "_Subscription", cursor: Any,
     return merged
 
 
+#: The route the handshake is judged as: a WebSocket scope has no method.
+_HANDSHAKE = SimpleNamespace(method="GET", url=SimpleNamespace(path="/events"))
+
+
 async def _authenticate_ws(ws: WebSocket) -> Optional["_Session"]:
     """Authenticate a WebSocket connection via Bearer header or ?access_token query param.
 
@@ -870,11 +875,12 @@ async def _authenticate_ws(ws: WebSocket) -> Optional["_Session"]:
         await ws.close(code=4401, reason="Invalid token")
         return None
 
-    # The same bounds `get_auth` applies after resolution. A platform-scoped token is judged with
-    # no request, which refuses it: no scope names this socket. A key flagged `requires_nonce`
-    # must present its `X-Agience-Challenge` on the handshake.
+    # The same bounds `get_auth` applies after resolution, judged as `GET /events`. No platform
+    # scope names this route, so a platform-scoped token is refused; a job's delegation reaches it,
+    # and each event it is then sent is decided by `check_access` against its reach. A key flagged
+    # `requires_nonce` must present its `X-Agience-Challenge` on the handshake.
     try:
-        enforce_token_bounds(auth, None, nonce_source=ws)
+        enforce_token_bounds(auth, _HANDSHAKE, nonce_source=ws)
     except HTTPException as exc:
         logger.info("events WS refused: %s", exc.detail)
         await ws.close(code=4403, reason="Forbidden")

@@ -1254,3 +1254,70 @@ def test_a_divergence_from_origin_s_replica_is_an_alarm(db, person, caplog):
     assert any("diverges" in r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)
     origin.verify_reach = lambda digest: {"match": True, "replica": digest}
     assert authority_ledger.verify_with_origin(db, origin) is True
+
+
+def _operator_grant(seq, gid):
+    return {"seq": seq, "kind": "grant", "credential_kind": "operator", "actor": "op",
+            "body": {"kind": "grant", "grant_id": gid, "resource_id": "C1", "state": "active"}}
+
+
+def _diverges(digest):
+    return {"match": False, "replica": {"digest": "f" * 64, "grants": digest["grants"] + 1,
+                                        "edges": digest["edges"]}}
+
+
+def test_grants_written_at_origin_between_feed_passes_are_not_a_divergence(
+        db, person, caplog, monkeypatch):
+    """Origin wrote a new person's grants after the feed's last pass and the
+    comparison ran before its next one (here 42 grants, Origin 52). Reach is compared at the entry
+    the feed has applied: nothing is raised, and once the feed applies them the two agree."""
+    monkeypatch.setattr(authority_ledger, "_waiting_on", None)
+    origin = _install(FakeOrigin(), "enforce")
+    la.create_grant(db, _grant("g-1"))
+    pending = [_operator_grant(1, "g-new")]
+    origin.ledger_feed = lambda after: {"entries": [e for e in pending if e["seq"] > after],
+                                        "head": 1}
+    origin.verify_reach = _diverges
+    with caplog.at_level(logging.ERROR):
+        assert authority_ledger.verify_with_origin(db, origin) is None
+    assert not any("diverges" in r.getMessage() for r in caplog.records)
+    with reach_journal.suspended():                          # the feed's next pass
+        la.create_grant(db, _grant("g-new"))
+    with db.graph.db.write() as cur:
+        cur.execute("INSERT OR REPLACE INTO authority_receipt(subject, kind, seq, entry_hash) "
+                    "VALUES(?, 'applied', 1, 'h')", (authority_ledger._APPLIED,))
+    origin.verify_reach = lambda digest: {"match": True, "replica": digest}
+    assert authority_ledger.verify_with_origin(db, origin) is True
+
+
+def test_a_grant_written_while_the_digest_is_compared_is_not_a_divergence(
+        db, person, caplog, monkeypatch):
+    monkeypatch.setattr(authority_ledger, "_waiting_on", None)
+    origin = _install(FakeOrigin(), "enforce")
+    la.create_grant(db, _grant("g-1"))
+    pending = []
+    origin.ledger_feed = lambda after: {"entries": list(pending), "head": len(pending)}
+
+    def verify(digest):                                      # Origin writes one as it answers
+        pending.append(_operator_grant(1, "g-new"))
+        return _diverges(digest)
+
+    origin.verify_reach = verify
+    with caplog.at_level(logging.ERROR):
+        assert authority_ledger.verify_with_origin(db, origin) is None
+    assert not any("diverges" in r.getMessage() for r in caplog.records)
+
+
+def test_an_entry_the_feed_leaves_unapplied_is_still_an_alarm(db, person, caplog, monkeypatch):
+    """One the feed has not applied a whole interval later is no race: it is compared, and the
+    divergence is raised."""
+    monkeypatch.setattr(authority_ledger, "_waiting_on", None)
+    origin = _install(FakeOrigin(), "enforce")
+    la.create_grant(db, _grant("g-1"))
+    stuck = [_operator_grant(1, "g-new")]
+    origin.ledger_feed = lambda after: {"entries": list(stuck), "head": 1}
+    origin.verify_reach = _diverges
+    assert authority_ledger.verify_with_origin(db, origin) is None
+    with caplog.at_level(logging.ERROR):
+        assert authority_ledger.verify_with_origin(db, origin) is False
+    assert any("diverges" in r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)

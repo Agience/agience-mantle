@@ -487,7 +487,7 @@ class MantleSseSearchAccessor:
         available and walks down this list.
         """
         if getattr(query, "sort", None) == SORT_RECENCY:
-            return ORDER_RECENCY, self._by_recency(authorized)
+            return ORDER_RECENCY, self._by_recency(authorized, coverage)
 
         if embedding is not None:
             ranked = self._by_cosine(
@@ -532,7 +532,7 @@ class MantleSseSearchAccessor:
             if reached is not None:
                 return ORDER_REACH, reached
             return ORDER_COVERAGE, ordered
-        return ORDER_RECENCY, self._by_recency(authorized)
+        return ORDER_RECENCY, self._by_recency(authorized, coverage)
 
     def _by_reach(
         self, query, ordered: List[_Ranked], *, top_k: int,
@@ -969,7 +969,9 @@ class MantleSseSearchAccessor:
         ]
 
     @staticmethod
-    def _by_recency(authorized: AuthorizedScope) -> List[_Ranked]:
+    def _by_recency(
+        authorized: AuthorizedScope, coverage: Optional[Mapping[str, Coverage]] = None,
+    ) -> List[_Ranked]:
         """The narrowed set, most-recently-updated first, with no score on any of it.
 
         Reached two ways, and it is a real answer to a real request in both. The caller asked
@@ -983,10 +985,14 @@ class MantleSseSearchAccessor:
         `updated_at:` FILTERS by. The artifact id breaks ties, so the same query pages the same
         way twice. An id whose doc could not be read has no timestamp and sorts last, because
         an unread doc is not evidence that it is old.
+
+        Each row carries the query stems the narrowing found it under, when there were any, so a
+        caller that orders the set itself can read what matched.
         """
         stamps = authorized.updated_at
+        found = coverage or {}
         return [
-            _Ranked(artifact_id, None, None, None)
+            _Ranked(artifact_id, None, None, None, found.get(artifact_id))
             for artifact_id in sorted(
                 authorized.artifact_ids,
                 key=lambda a: (stamps.get(a) or "", a),
@@ -1491,7 +1497,6 @@ class MantleSseSearchAccessor:
         """
         if not ordered:
             return []
-        zero = Coverage()
 
         return sorted(ordered, key=MantleSseSearchAccessor._rarity_key(ordered),
                       reverse=True)[:top_k]
@@ -1671,7 +1676,8 @@ class MantleSseSearchAccessor:
                     tags=tags,
                     metadata=(
                         {"matched_stems": hit.coverage.stems,
-                         "matched_bigrams": hit.coverage.bigrams}
+                         "matched_bigrams": hit.coverage.bigrams,
+                         "matched": list(hit.coverage.matched)}
                         if hit.coverage is not None
                         else {"vector_score": hit.score}
                     ),
@@ -1683,6 +1689,8 @@ class MantleSseSearchAccessor:
                     state=state_of(doc) if doc else None,
                     is_head=None,
                     highlights=None,
+                    created_by=(doc or {}).get("created_by"),
+                    modified_time=(doc or {}).get("modified_time"),
                 )
             )
         return out

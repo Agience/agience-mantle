@@ -54,11 +54,10 @@ class Grant(BaseEntity):
     EFFECT_DENY = "deny"
     VALID_EFFECTS = {EFFECT_ALLOW, EFFECT_DENY}
 
-    # Role presets --- named permission bundles for the share/invite flow.
+    # Role presets --- the seed of the platform's Role artifacts, which a share or invite names.
     #
-    # Use via ``Grant.permissions_for_role(role_name)`` rather than reading
-    # this dict directly so new roles can be added without callers needing
-    # to know about every flag.
+    # Read a role through ``services.role_presets``, which answers the Role artifacts as they are
+    # now; this dict is what the platform seeds them with, and what is answered before they exist.
     ROLE_PRESETS: Dict[str, Dict[str, bool]] = {
         "viewer": {
             "can_read": True,
@@ -157,19 +156,6 @@ class Grant(BaseEntity):
         if grant_is_allow(self) and not narrowed.is_allow:
             masked.effect = self.EFFECT_DENY
         return masked
-
-    @classmethod
-    def permissions_for_role(cls, role: str) -> Dict[str, bool]:
-        """Return the CRUDEASIO bit pattern for a named role.
-
-        Raises :class:`ValueError` if *role* is not a known preset.
-        """
-        preset = cls.ROLE_PRESETS.get(role)
-        if preset is None:
-            raise ValueError(
-                f"Unknown role {role!r}; valid roles: {sorted(cls.ROLE_PRESETS)}"
-            )
-        return dict(preset)
 
     def __init__(
         self,

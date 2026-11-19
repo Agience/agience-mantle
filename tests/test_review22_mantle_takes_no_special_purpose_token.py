@@ -1,8 +1,8 @@
 """Review 22, F6: Mantle takes no special-purpose token as a bearer.
 
-Origin signs its refresh, email-verification and password-reset tokens, and a use verdict, with
-the same key as its access tokens, and marks each with `token_type`. Mantle resolved one as an
-ordinary bearer for its subject. Any `token_type` claim is now refused.
+Origin signs its refresh, email-verification and password-reset tokens, a use verdict and an
+agent session's approval (FR-032) with the same key as its access tokens, and marks each with
+`token_type`. Mantle refuses any token carrying a `token_type` claim as a bearer.
 """
 from __future__ import annotations
 
@@ -15,7 +15,8 @@ from mantle.config import AUTHORITY_ISSUER
 from mantle.services.dependencies import resolve_auth
 
 
-@pytest.mark.parametrize("token_type", ["refresh", "email_verify", "password_reset", "use_verdict"])
+@pytest.mark.parametrize("token_type", ["refresh", "email_verify", "password_reset", "use_verdict",
+                                        "agent-approval"])
 def test_a_token_with_a_purpose_is_no_bearer(token_type):
     payload = {"sub": "user-123", "aud": AUTHORITY_ISSUER, "token_type": token_type}
     with patch("mantle.services.dependencies.verify_token", return_value=payload):

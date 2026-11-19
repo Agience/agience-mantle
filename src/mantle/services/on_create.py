@@ -23,16 +23,39 @@ does there, in its definition's ``on_create: {"does": <verb>}``. The verbs:
   ``conducts``, when given, lists the actions a grant on the new artifact carries to the made one
   (``["read"]``: whoever reads the item reads its part, and nothing else in ``in``). The spec is
   readable configuration, so a field the made type marks ``"secret": true`` refuses the create.
+- ``add``: a bounded add. The rule names three fields: ``amount`` on the artifact being
+  created (a number of zero or more), and ``to`` and ``limit`` on the edged artifact. The create
+  adds ``amount`` to ``to``, writes it back and stamps the field with the edged artifact's id. An
+  add that would take ``to`` past ``limit`` is refused, and so is an edged artifact with no
+  ``limit``. Who may add to it is whoever holds Invoke on it; who may change its fields is
+  whoever holds update on it.
 
 Everything is written in the create's transaction, so a refusal writes nothing.
 
 Refusals: no edged artifact, two at the nearest level, one first written on another node (its
-values are allocated on its home node), one whose type declares no verb, or a malformed spec, is a
-409; a creator without Invoke on the edged artifact is a 403.
+values are allocated on its home node), one whose type declares no verb, a malformed spec, or an
+add past its limit, is a 409; a creator without Invoke on the edged artifact is a 403;
+an amount that is not a number of zero or more is a 422.
 
 Fields with an ``on_create`` rule keep their value: an update may leave them out (the stored value
 carries forward) or repeat them, and a different value is refused (`guard_update`). ``adopt`` is
 the one writer that sets them on existing artifacts, for an import.
+
+A field marked ``on_create: {"stamp": "level"}`` is set on create to the level the creating
+token speaks at: ``typed`` for a person's own token, ``agent`` for one an agent, persona or server
+acts on (`level_of`). It is never taken from the create's body, and an update keeps it.
+
+A field marked ``on_create: {"stamp": "token", "prefix": <prefix>, ...}`` makes the artifact a
+bearer credential. The create issues a token ``<prefix><root id>.<secret>``, stores its SHA-256
+in the field and the token's last four characters in the ``hint`` field the rule names, and hands
+the token back once (`issued_tokens`); it is never stored. Only a person's own token may issue
+one (``typed``): an agent cannot mint itself a credential. The rule may name the fields that say
+what the token is: ``acts`` (the agent it acts as; left out, it is the person's own), ``reach`` (the ids it reaches), ``actions``
+(what it may do there) and ``ends`` (when it ends, a time in the future). An artifact created without
+naming any of them holds no token until the first update that names them issues it, under the
+same rules; once issued, none of them changes, an empty one included, and archiving the artifact
+ends the token (`services.artifact_tokens`). Only the person who created the artifact issues its
+token, and neither a create nor an update supplies the hash or the hint.
 
 A field may also carry ``on_update: {"stamp": "caller" | "time", "when": <field>}``. An update that
 changes ``when`` sets the field to the caller (``modified_by``) or the time; any other write keeps
@@ -42,11 +65,14 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import hashlib
 import json
 import logging
 import re
+import secrets
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from fastapi import HTTPException
@@ -66,14 +92,32 @@ _adopting: contextvars.ContextVar[bool] = contextvars.ContextVar("on_create_adop
                                                                  default=False)
 
 
+#: The tokens issued by the creates inside a `creating_as` block, ``{field: token}``.
+_issued: contextvars.ContextVar[Optional[Dict[str, str]]] = contextvars.ContextVar(
+    "on_create_issued", default=None)
+
+
 @contextlib.contextmanager
 def creating_as(auth: Any) -> Iterator[None]:
     """Check Invoke on an edged artifact as ``auth`` for the creates made inside this block."""
     token = _creator.set(auth)
+    issued = _issued.set({})
     try:
         yield
     finally:
+        _issued.reset(issued)
         _creator.reset(token)
+
+
+def issued_tokens() -> Dict[str, str]:
+    """The tokens the creates in the current `creating_as` block issued, ``{field: token}``: the
+    only time a token is seen. Read inside the block."""
+    return dict(_issued.get() or {})
+
+
+def token_hash(token: str) -> str:
+    """What a ``token`` stamp stores for ``token``."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 # ── context helpers ──────────────────────────────────────────────────────────────────────────
@@ -117,12 +161,15 @@ def stamps_for(entity: Any) -> Dict[str, dict]:
 
 
 def guarded_fields(rules: Dict[str, dict]) -> List[str]:
-    """Every field the rules set: each ruled field and the key field it names."""
+    """Every field the rules set or read: each ruled field, the key field it names, and the amount
+    an add was made for."""
+    from mantle.services.type_offers import TOKEN_FIELDS
     out: List[str] = []
     for name, rule in rules.items():
         out.append(name)
-        if rule.get("key"):
-            out.append(rule["key"])
+        for named in ("key", "amount", *TOKEN_FIELDS):
+            if rule.get(named):
+                out.append(rule[named])
     return out
 
 
@@ -192,6 +239,16 @@ def _creator_auth(entity: Any) -> Any:
     if auth is not None:
         return auth
     return _auth_of(getattr(entity, "created_by", None) or "")
+
+
+def level_of(auth: Any) -> str:
+    """The level a create speaks at: ``typed`` for a person's own token on a request, ``agent``
+    for anything else (a token acted by an agent, a persona or a server, or a create made with no
+    request). A value the create supplies is overwritten."""
+    if (auth is not None and getattr(auth, "principal_type", None) == "user"
+            and not getattr(auth, "actor", None)):
+        return "typed"
+    return "agent"
 
 
 def _auth_of(who: str) -> Any:
@@ -332,10 +389,54 @@ def _create(db: Any, entity: Any, field: str, rule: dict, provider_id: str,
     return {field: part_id}, [link_from_item]
 
 
+# ── the verb `add` ──────────────────────────────────────────────────────────────────────────
+
+def _quantity(value: Any) -> Optional[Decimal]:
+    """``value`` as a finite number of zero or more, else None. A boolean is not a number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        out = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        return None
+    return out if out.is_finite() and out >= 0 else None
+
+
+def _stored_number(value: Decimal) -> Any:
+    """A quantity written back as JSON: an integer when it is whole."""
+    return int(value) if value == value.to_integral_value() else float(value)
+
+
+def _add(db: Any, entity: Any, field: str, rule: dict, provider_id: str,
+         doc: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Callable[[], None]]]:
+    amount_field, to, limit_field = rule.get("amount"), rule.get("to"), rule.get("limit")
+    if not (amount_field and to and limit_field):
+        raise CreateRefused(409, f"the rule on {field} must name amount, to and limit to add to "
+                                 f"{provider_id}; nothing was created")
+    ctx, _ = _ctx_of(getattr(entity, "context", None))
+    amount = _quantity(ctx.get(amount_field))
+    if amount is None:
+        raise CreateRefused(422, f"{amount_field} must be a number of zero or more; nothing was "
+                                 "created")
+    pctx, p_string = _ctx_of(doc.get("context"))
+    limit = _quantity(pctx.get(limit_field))
+    if limit is None:
+        raise CreateRefused(409, f"{provider_id} has no {limit_field} to add against; nothing "
+                                 "was created")
+    total = _quantity(pctx.get(to)) or Decimal(0)
+    if total + amount > limit:
+        raise CreateRefused(409, f"adding {amount} to {to} on {provider_id} would pass its "
+                                 f"{limit_field} ({total} of {limit}); nothing was created")
+    pctx[to] = _stored_number(total + amount)
+    _write_provider(db, doc, pctx, p_string)
+    return {field: str(doc.get("root_id") or provider_id)}, []
+
+
 #: What a create does at an edged artifact, by the verb its type declares.
 _VERBS: Dict[str, Callable[..., Tuple[Dict[str, Any], List[Callable[[], None]]]]] = {
     "number": _number,
     "create": _create,
+    "add": _add,
 }
 
 
@@ -348,6 +449,73 @@ def _verb_of(provider_id: str, doc: Dict[str, Any]) -> Callable[..., Any]:
         raise CreateRefused(409, f"the type of {provider_id} ({ct or 'none'}) declares nothing "
                                  "to do on create; nothing was created")
     return _VERBS[does]
+
+
+# ── the stamp `token` ────────────────────────────────────────────────────────────────────────
+
+def parse_time(value: Any) -> Optional[datetime]:
+    """An ISO time as an aware datetime, or None."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        out = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return out if out.tzinfo else out.replace(tzinfo=timezone.utc)
+
+
+def _token(entity: Any, field: str, rule: dict, ctx: Dict[str, Any], auth: Any) -> None:
+    """Issue ``entity``'s token: check what it says it is, stamp its hash and hint, and keep the
+    token for `issued_tokens`."""
+    from mantle.attenuation import ACTIONS
+    if _creator.get() is None or level_of(auth) != "typed":
+        raise CreateRefused(403, f"{field} issues a credential, which only a person's own token "
+                                 "may create; nothing was created")
+    owner = str(getattr(entity, "created_by", None) or "")
+    if owner and owner != str(getattr(auth, "user_id", None) or getattr(auth, "principal_id", "")):
+        raise CreateRefused(403, f"{field} issues a credential, which only the person who "
+                                 "created the artifact may do; nothing was changed")
+    acts, reach, actions, ends = (rule.get(k) for k in ("acts", "reach", "actions", "ends"))
+    if acts and ctx.get(acts) not in (None, "") and (not isinstance(ctx[acts], str)
+                                                     or not ctx[acts].strip()):
+        raise CreateRefused(422, f"{acts} names the agent the credential acts as, or is left "
+                                 "out for the person's own; nothing was created")
+    if reach:
+        ids = ctx.get(reach)
+        if (not isinstance(ids, list) or not ids
+                or not all(isinstance(i, str) and i.strip() for i in ids)):
+            raise CreateRefused(422, f"{reach} lists the ids the credential reaches; nothing was "
+                                     "created")
+    if actions:
+        may = ctx.get(actions)
+        if not isinstance(may, list) or not may or not set(may) <= set(ACTIONS):
+            raise CreateRefused(422, f"{actions} lists what the credential may do, of "
+                                     f"{', '.join(ACTIONS)}; nothing was created")
+    if ends:
+        until = parse_time(ctx.get(ends))
+        if until is None or until <= datetime.now(timezone.utc):
+            raise CreateRefused(422, f"{ends} is a time in the future; nothing was created")
+    root = str(getattr(entity, "root_id", None) or entity.id)
+    raw = f"{rule['prefix']}{root}.{secrets.token_urlsafe(32)}"
+    ctx[field] = token_hash(raw)
+    if rule.get("hint"):
+        ctx[rule["hint"]] = raw[-4:]
+    issued = _issued.get()
+    if issued is not None:
+        issued[field] = raw
+
+
+def _token_says(rule: dict, ctx: Dict[str, Any]) -> bool:
+    """Does ``ctx`` name what a token is (any of the fields its rule names)? A rule that names
+    none is always issued."""
+    named = [rule[k] for k in ("acts", "reach", "actions", "ends") if rule.get(k)]
+    return not named or any(ctx.get(f) not in (None, "", []) for f in named)
+
+
+def _unissued(field: str, rule: dict, ctx: Dict[str, Any]) -> None:
+    ctx.pop(field, None)
+    if rule.get("hint"):
+        ctx.pop(rule["hint"], None)
 
 
 # ── create ───────────────────────────────────────────────────────────────────────────────────
@@ -388,6 +556,15 @@ def apply_on_create(db: Any, entity: Any, rules: Dict[str, dict]) -> List[Callab
     after_put: List[Callable[[], None]] = []
     for field, rule in rules.items():
         if exists and stored and not _blank(stored.get(field)):
+            continue
+        if rule.get("stamp") == "token":
+            if _token_says(rule, ctx):
+                _token(entity, field, rule, ctx, auth)
+            else:
+                _unissued(field, rule, ctx)
+            continue
+        if "stamp" in rule:
+            ctx[field] = level_of(auth if _creator.get() is not None else None)
             continue
         provider_id = provider_for(db, getattr(entity, "collection_id", None), rule["from_edge"])
         try:
@@ -443,17 +620,47 @@ def guard_update(db: Any, entity: Any) -> None:
             raise CreateRefused(409, "the stored values of " + ", ".join(fields)
                                 + " cannot be read here, so they cannot be changed")
     else:
+        frozen = _token_fields(rules, stored)
         for field in fields:
             before, after = stored.get(field), ctx.get(field)
+            if _blank(before) and field in frozen and ctx.get(field) not in (None, "", []):
+                raise CreateRefused(409, f"{field} is set when the credential is issued and "
+                                         "does not change")
             if _blank(before):
                 continue
             if _blank(after):
                 ctx[field] = before
             elif not _same(before, after):
                 raise CreateRefused(409, f"{field} is set on create and does not change")
+        _issue_on_fill(entity, rules, ctx, stored)
     if stamps:
         _apply_stamps(entity, stamps, ctx, stored)
     _put_ctx(entity, ctx, as_string)
+
+
+def _token_fields(rules: Dict[str, dict], stored: Dict[str, Any]) -> set:
+    """The fields of each issued token's rule: once a token is issued, none of them changes,
+    an empty one included."""
+    out: set = set()
+    for field, rule in rules.items():
+        if rule.get("stamp") == "token" and not _blank(stored.get(field)):
+            out.add(field)
+            out.update(rule[k] for k in ("hint", "acts", "reach", "actions", "ends") if rule.get(k))
+    return out
+
+
+def _issue_on_fill(entity: Any, rules: Dict[str, dict], ctx: Dict[str, Any],
+                   stored: Dict[str, Any]) -> None:
+    """An artifact created without saying what its token is holds none: the first update that
+    says it issues it, under the rules a create follows. The update never supplies the token's
+    hash or hint itself."""
+    for field, rule in rules.items():
+        if rule.get("stamp") != "token" or not _blank(stored.get(field)):
+            continue
+        _unissued(field, rule, ctx)
+        if _token_says(rule, ctx) and [k for k in ("acts", "reach", "actions", "ends")
+                                       if rule.get(k)]:
+            _token(entity, field, rule, ctx, _creator_auth(entity))
 
 
 # ── adopt ────────────────────────────────────────────────────────────────────────────────────
@@ -489,7 +696,7 @@ def adopt(db: Any, provider_id: str, collection_id: str, pattern: str, *, field:
         ictx, _ = _ctx_of(item.get("context"))
         rule = type_offers.on_create_rules(
             item.get("content_type") or ictx.get("content_type") or "").get(field)
-        if rule is None:
+        if rule is None or "from_edge" not in rule:
             continue
         if not _blank(ictx.get(field)):
             try:
@@ -550,4 +757,5 @@ def adopt(db: Any, provider_id: str, collection_id: str, pattern: str, *, field:
 
 
 __all__ = ["CreateRefused", "adopt", "apply_on_create", "creating_as", "guard_update",
-           "guarded_fields", "provider_for", "rules_for", "stamps_for", "strip_stamps"]
+           "guarded_fields", "issued_tokens", "parse_time", "provider_for", "rules_for",
+           "stamps_for", "strip_stamps", "token_hash"]

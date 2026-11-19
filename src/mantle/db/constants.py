@@ -10,7 +10,7 @@ import hashlib
 import json
 import math
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 
 def natural_leaves(n: int) -> int:

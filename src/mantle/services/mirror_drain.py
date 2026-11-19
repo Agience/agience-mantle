@@ -34,11 +34,11 @@ costs one blocked coroutine.
 **What this drain will not claim, and what will not claim it.** Both directions are settled by
 NAMES rather than by policy, and neither costs a check at run time.
 
-*Outward:* the drain narrows its window to `operator = 'op.content.mirror'` in SQL
+*What it claims:* the drain narrows its window to `operator = 'op.content.mirror'` in SQL
 (`pending_window(..., operator=...)`), so it never claims, and never has to put back, work it
 cannot do. That stays true however many operators later share this content type.
 
-*Inward:* `ember/runtime/pool.py::claim` selects on `(ct, status)` alone — it cannot filter on an
+*What claims it:* `ember/runtime/pool.py::claim` selects on `(ct, status)` alone — it cannot filter on an
 operator, and mantle cannot teach it to. So these tasks are simply not written under the content
 type it claims. `ember`'s pool is `application/vnd.agience.task+json`; this one is
 :data:`MIRROR_TASK_CT`, which nothing else selects on. An ember worker sharing this lattice reads

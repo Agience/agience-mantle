@@ -36,6 +36,7 @@ def parsed():
         container_id="container-owned-by-attacker",
         source_artifact_id="artifact-owned-by-victim",
         relationship=None,
+        before_id=None,
     )
 
 

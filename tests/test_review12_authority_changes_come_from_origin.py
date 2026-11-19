@@ -113,6 +113,28 @@ def test_a_grant_from_the_feed_holds_at_once_not_after_the_memo_s_ttl(db, monkey
     assert not dropped, "a pass that applied nothing drops nothing"
 
 
+def test_a_grant_from_the_feed_is_announced_on_its_item_after_the_memo_is_dropped(db, monkeypatch):
+    """An invitee's list learns of an accepted share when Mantle applies it, not at its next load:
+    the event names the item alone, and is sent once the memo no longer refuses it."""
+    from mantle.events import event_bus
+    from mantle.search.mantle import wiring
+    order = []
+    monkeypatch.setattr(wiring, "invalidate_grant_cache", lambda *a: order.append("memo"))
+    monkeypatch.setattr(event_bus, "publish_event_sync", order.append)
+    e1 = _entry(1, GENESIS, _grant_body("g-1"))
+    e2 = _entry(2, e1["entry_hash"], _grant_body("g-2", actions=("read", "update")))
+    assert authority_ledger.apply_remote(db, Feed([e1, e2])) == 2
+    assert order[0] == "memo"
+    events = order[1:]
+    assert len(events) == 1, "one announcement per item"
+    ev = events[0]
+    assert ev.name == authority_ledger.ACCESS_CHANGED and ev.artifact_id == "C1"
+    assert ev.payload == {"artifact_id": "C1"} and ev.container_id is None
+    order.clear()
+    assert authority_ledger.apply_remote(db, Feed([e1, e2])) == 0
+    assert order == [], "a pass that applied nothing announces nothing"
+
+
 def test_a_session_deny_and_an_edge_with_its_mask_are_applied(db):
     e1 = _entry(1, GENESIS, _grant_body("g-d", effect="deny"))
     e2 = _entry(2, e1["entry_hash"], {"kind": "edge.add", "src": "C1", "dst": "A1",

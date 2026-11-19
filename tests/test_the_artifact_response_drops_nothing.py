@@ -54,7 +54,8 @@ def test_the_declared_keys_are_ones_the_serialiser_actually_emits():
     a.created_by = "u"
     a.modified_by = "u"
     emitted = set(a.to_dict())
-    unknown = set(_ARTIFACT_KEYS) - emitted - {"origin_root"}
+    # `allowed_actions` is answered per caller by the route, not stored on the artifact.
+    unknown = set(_ARTIFACT_KEYS) - emitted - {"origin_root", "allowed_actions"}
     assert not unknown, (
         "declared keys the serialiser never emits for a populated artifact: %s" % sorted(unknown))
 

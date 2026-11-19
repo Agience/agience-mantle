@@ -160,6 +160,10 @@ class _Field:
     a string comparison would answer confidently and wrongly — so `>` on one is refused rather
     than served.
 
+    `families` marks a field whose values are media types: there an EQUALS value `text/*` stands
+    for every type under `text/`, and `*/*` for every type — the same family names the type
+    definitions carry.
+
     `needs_context` marks the readers that look inside the `context` blob. It is what lets the
     compiled predicate parse that JSON at most ONCE per doc no matter how many context-backed
     filters a query carries, and not at all when none does. Every reader takes `(doc, ctx)` —
@@ -167,20 +171,22 @@ class _Field:
     kinds of reader for a caller to keep straight.
     """
 
-    __slots__ = ("read", "ordered", "needs_context")
+    __slots__ = ("read", "ordered", "needs_context", "families")
 
     def __init__(self, read: Callable[[dict, dict], Any], *,
-                 ordered: bool = False, needs_context: bool = False) -> None:
+                 ordered: bool = False, needs_context: bool = False,
+                 families: bool = False) -> None:
         self.read = read
         self.ordered = ordered
         self.needs_context = needs_context
+        self.families = families
 
 
 FILTERABLE_FIELDS: Dict[str, _Field] = {
     "id":            _Field(lambda d, c: d.get("id") or d.get("_key")),
     "root_id":       _Field(lambda d, c: d.get("root_id")),
     "collection_id": _Field(lambda d, c: d.get("collection_id")),
-    "content_type":  _Field(lambda d, c: d.get("content_type")),
+    "content_type":  _Field(lambda d, c: d.get("content_type"), families=True),
     "owner_id":      _Field(lambda d, c: d.get("created_by")),
     "title":         _Field(_title, needs_context=True),
     "description":   _Field(_description, needs_context=True),
@@ -264,7 +270,8 @@ def _matches(spec: _Field, filt: FieldFilter, doc: dict, ctx: dict) -> bool:
     """Does this doc satisfy one filter, ignoring negation?
 
     EQUALS is case-insensitive and splits its value on commas, so `type:pdf,docx` is an
-    any-of — the shape the parser's own grammar examples use. EXACT (`field:="v"`) is
+    any-of — the shape the parser's own grammar examples use. On a media-type field
+    `type:text/*` is the family. EXACT (`field:="v"`) is
     case-sensitive and takes its value whole, which is the only way to select a value that
     contains a comma or differs from another only by case.
     """
@@ -284,6 +291,12 @@ def _matches(spec: _Field, filt: FieldFilter, doc: dict, ctx: dict) -> bool:
     wanted = {p.strip().lower() for p in filt.value.split(",") if p.strip()}
     if not wanted:
         return False
+    if spec.families:
+        if "*/*" in wanted:
+            return True
+        prefixes = tuple(w[:-1] for w in wanted if w.endswith("/*"))
+        if prefixes and any(v.lower().startswith(prefixes) for v in present):
+            return True
     return any(v.lower() in wanted for v in present)
 
 

@@ -10,6 +10,12 @@ _os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 # so an app started by a test would otherwise send them to whatever answers there. A test that is
 # about the ledger installs it itself (`tests/test_reach_changes_go_to_origin.py`).
 _os.environ.setdefault("MANTLE_AUTHORITY_LEDGER", "off")
+# The operator's shell may export a real mail sender (`EMAIL_PROVIDER=gmail`, its address and
+# credentials). None of it reaches this run or a process it starts; a send that still selects a real
+# provider raises (`email_service.refuse_a_real_provider_under_test`).
+for _name in ("EMAIL_PROVIDER", "PLATFORM_EMAIL_ADDRESS", "GMAIL_OAUTH_CLIENT_ID",
+              "GMAIL_OAUTH_CLIENT_SECRET", "GMAIL_OAUTH_REFRESH_TOKEN"):
+    _os.environ.pop(_name, None)
 del _os
 
 import itertools
@@ -291,11 +297,21 @@ def override_dependencies():
     yield
     app.dependency_overrides.clear()
 
+#: The platform types whose context is configuration, as Crystal's definitions declare them.
+READABLE_TYPES = {ct: {"content_type": ct, "readable_context": True} for ct in (
+    "application/vnd.agience.issuer+json",
+    "application/vnd.agience.anchor+json",
+    "application/vnd.agience.crosswalk+json",
+    "application/vnd.agience.subscription+json",
+)}
+
+
 @pytest.fixture(autouse=True)
 def _no_published_types():
-    """A test starts with no published type definitions, so every type reads the default offer."""
+    """A test starts with only the readable platform types published, so every other type reads
+    the default offer."""
     from mantle.services import type_offers
-    type_offers.set_definitions({})
+    type_offers.set_definitions(dict(READABLE_TYPES))
     yield
     type_offers.set_definitions({})
 

@@ -18,6 +18,7 @@ only job is to drift out of agreement with the verifier that faces it.
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 import uuid
@@ -27,7 +28,6 @@ from typing import Any, Dict, Optional
 from jose import jwt as _jwt
 
 _NAME = "mantle"
-_KID = "mantle-1"
 
 #: Default lifetime of a signed service JWT. Short enough that a leaked token is a
 #: window rather than a credential; long enough to survive one slow peer call.
@@ -90,7 +90,32 @@ def sign_service_jwt(audience: str = "mantle", ttl_seconds: int = _TTL,
     if additional_claims:
         for k, v in additional_claims.items():
             claims.setdefault(k, v)
-    return _jwt.encode(claims, _pem(), algorithm="RS256", headers={"kid": _KID})
+    return _jwt.encode(claims, _pem(), algorithm="RS256", headers={"kid": _kid()})
+
+
+#: `(pem, kid)`: the `kid` worked out once per key.
+_loaded_kid: Optional[tuple] = None
+
+
+def _kid() -> str:
+    """The `kid` Mantle's service JWT carries: the one Mantle's anchor in the authority manifest
+    states for this key, found by the key's RFC 7638 thumbprint, else that thumbprint. Either way
+    a verifier holding the manifest finds the key, and a new key carries a new name."""
+    global _loaded_kid
+    pem = _pem()
+    if _loaded_kid is not None and _loaded_kid[0] == pem:
+        return _loaded_kid[1]
+    from mantle.services.jwk_thumbprint import rsa_public_jwk, thumbprint
+    tp = thumbprint(rsa_public_jwk(_private_key().public_key()))
+    kid = tp
+    try:
+        manifest = json.loads((_keys_dir() / "authority.manifest.json").read_text())
+        keys = manifest["trust_anchors"][_NAME]["jwks"]["keys"]
+        kid = next((k["kid"] for k in keys if k.get("kid") and thumbprint(k) == tp), tp)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    _loaded_kid = (pem, kid)
+    return kid
 
 
 # -- signing bytes with Mantle's own key -------------------------------------

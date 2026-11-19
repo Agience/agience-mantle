@@ -441,6 +441,7 @@ def apply_remote(db, custodian=None) -> int:
     answer = feed(after)
     keys = _origin_keys()
     applied = 0
+    reached: list = []
     last = after
     for e in sorted(answer.get("entries") or [], key=lambda x: int(x["seq"])):
         seq = int(e["seq"])
@@ -452,11 +453,15 @@ def apply_remote(db, custodian=None) -> int:
             logger.error("ALARM authority ledger: %s; nothing from it on is applied", exc)
             break
         try:
-            applied += _apply_one(db, e)
+            changed = _apply_one(db, e)
         except Exception:  # noqa: BLE001 — not applied: the cursor stays before it
             logger.error("authority ledger: entry %s from Origin could not be applied; the feed "
                          "resumes from it", seq, exc_info=True)
             break
+        applied += changed
+        b = e.get("body") or {}
+        if changed and b.get("kind") == "grant" and b.get("resource_id"):
+            reached.append(str(b["resource_id"]))
         last, prev, chain_known = seq, digest, True
     if last != after:
         with conn.write() as cur:
@@ -472,7 +477,28 @@ def apply_remote(db, custodian=None) -> int:
             invalidate_grant_cache()
         except Exception:  # noqa: BLE001 — the memo then lapses at its TTL, as before
             logger.warning("authority ledger: the grant memo could not be dropped", exc_info=True)
+    _announce_access(reached)
     return applied + caught
+
+
+#: The event a feed-applied grant announces on the item it names. Its subject is that item, so it
+#: is delivered only to those who may read it now: an invitee learns at once that what they
+#: accepted is theirs to list.
+ACCESS_CHANGED = "access.changed"
+
+
+def _announce_access(resource_ids: list) -> None:
+    """Announce, once per item, that a grant on it was applied here. It names the item and
+    nothing of the grant."""
+    if not resource_ids:
+        return
+    try:
+        from mantle.events import event_bus
+        for rid in dict.fromkeys(resource_ids):
+            event_bus.publish_event_sync(event_bus.Event(
+                name=ACCESS_CHANGED, payload={"artifact_id": rid}, artifact_id=rid))
+    except Exception:  # noqa: BLE001 — a listing then catches up at its next read
+        logger.warning("authority ledger: access change not announced", exc_info=True)
 
 
 def feed_at_head(db, custodian) -> tuple:
@@ -657,18 +683,71 @@ def reach_digest(db) -> dict:
             "grants": len(grants), "edges": len(edges)}
 
 
+#: The first entry the feed had still to apply when a comparison was last put off. The same one
+#: still waiting a whole verify interval later is no race with the feed: it is compared then.
+_waiting_on: Optional[int] = None
+
+
+def _feed_pending(db, custodian) -> tuple:
+    """`(cursor, first)`: this store's feed cursor, and the first entry after it that the feed
+    applies here (`MANTLE_APPLIES`), or None. No feed, or no answer from it, is nothing pending:
+    the comparison is made as it was."""
+    try:
+        row = db.graph.db.read().execute(
+            "SELECT seq FROM authority_receipt WHERE subject = ?", (_APPLIED,)).fetchone()
+    except Exception:  # noqa: BLE001 — no receipt table: nothing applied yet
+        row = None
+    cursor = int(row[0]) if row else 0
+    feed = getattr(custodian, "ledger_feed", None)
+    if feed is None:
+        return cursor, None
+    try:
+        entries = (feed(cursor) or {}).get("entries") or []
+    except Exception:  # noqa: BLE001 — unanswered: compared as it was
+        return cursor, None
+    seqs = [int(e["seq"]) for e in entries
+            if int(e["seq"]) > cursor and e.get("credential_kind") in MANTLE_APPLIES]
+    return cursor, min(seqs) if seqs else None
+
+
+def _not_yet_applied(pending: tuple) -> bool:
+    """Is there an entry the feed has yet to apply, seen waiting for the first time? Then the
+    comparison is put off to the next interval."""
+    global _waiting_on
+    first = pending[1]
+    if first is None or first == _waiting_on:
+        _waiting_on = None
+        return False
+    _waiting_on = first
+    logger.info("authority ledger: reach compared with Origin's on the next interval; the feed "
+                "has entry %s still to apply", first)
+    return True
+
+
 def verify_with_origin(db, custodian=None) -> Optional[bool]:
-    """Compare this store's digest of reach with Origin's replica. A divergence is an alarm
-    (logged at ERROR): reach here is no longer what Origin co-signed. None when no Origin
-    answers the question."""
+    """Compare this store's digest of reach with Origin's replica, at the entry this store's feed
+    has applied. A divergence is an alarm (logged at ERROR): reach here is no longer what Origin
+    co-signed. None when no Origin answers the question, or when Origin holds entries the feed has
+    yet to apply (for example a new person's grants, written at Origin between two feed
+    passes, read as a divergence); an entry still waiting at the next interval is compared."""
     custodian = custodian or getattr(reach_journal._authority, "custodian", None)
     verify = getattr(custodian, "verify_reach", None)
     if verify is None:
+        return None
+    before = _feed_pending(db, custodian)
+    if _not_yet_applied(before):
         return None
     mine = reach_digest(db)
     answer = verify(mine) or {}
     if answer.get("match"):
         return True
+    # Origin's replica is at its head. Entries it wrote after this store's digest, or the feed
+    # applied while it was taken, make the two digests of different moments: not a divergence.
+    after = _feed_pending(db, custodian)
+    if after != before:
+        logger.info("authority ledger: reach compared with Origin's on the next interval; the "
+                    "ledger moved while it was compared")
+        return None
     theirs = answer.get("replica") or {}
     logger.error("ALARM authority ledger: this store's reach diverges from Origin's replica "
                  "(here %s grants, %s edges, digest %s; Origin %s grants, %s edges, digest %s)",
@@ -677,30 +756,30 @@ def verify_with_origin(db, custodian=None) -> Optional[bool]:
     return False
 
 
-def start_feed(db_factory, interval_s: float = FEED_INTERVAL_S):
+def start_feed(db_factory, interval_s: float = FEED_INTERVAL_S,
+               verify_interval_s: float = VERIFY_INTERVAL_S):
     """Read the ledger every `interval_s` seconds and apply what this node did not submit, and
-    every `VERIFY_INTERVAL_S` compare this store's reach with Origin's replica."""
+    every `verify_interval_s` compare this store's reach with Origin's replica. The comparison
+    digests every grant and containment edge, so it runs on a thread of its own: a grant made at
+    Origin (an accepted invite) is applied within one feed interval however long a digest takes."""
     stop = threading.Event()
 
-    def run():
-        import time as _time
-
-        verified = _time.monotonic()
+    def feed():
         while not stop.wait(interval_s):
             try:
                 apply_remote(db_factory())
             except Exception:  # noqa: BLE001 — retried on the next tick
                 logger.warning("authority ledger feed not applied", exc_info=True)
-            if _time.monotonic() - verified >= VERIFY_INTERVAL_S:
-                verified = _time.monotonic()
-                try:
-                    verify_with_origin(db_factory())
-                except Exception:  # noqa: BLE001 — asked again on the next interval
-                    logger.warning("authority ledger: reach not verified with Origin",
-                                   exc_info=True)
 
-    t = threading.Thread(target=run, name="authority-ledger-feed", daemon=True)
-    t.start()
+    def verify():
+        while not stop.wait(verify_interval_s):
+            try:
+                verify_with_origin(db_factory())
+            except Exception:  # noqa: BLE001 — asked again on the next interval
+                logger.warning("authority ledger: reach not verified with Origin", exc_info=True)
+
+    for target, name in ((feed, "authority-ledger-feed"), (verify, "authority-ledger-verify")):
+        threading.Thread(target=target, name=name, daemon=True).start()
     return stop
 
 

@@ -142,6 +142,15 @@ def _resolve_profile(user_id: str, email: Optional[str], name: Optional[str]):
     return email, name
 
 
+def _platform_principals() -> set:
+    """The ids the platform acts as, which are no account: the system principal and the platform
+    user. A request on either finds no reach of its own, and provisioning one as a first login
+    writes an Inbox, a person and grants that Origin has no person to co-sign."""
+    from mantle.config import AGIENCE_PLATFORM_USER_ID
+    from mantle.services.peer_signing import get_system_principal_id
+    return {str(i) for i in (get_system_principal_id(), AGIENCE_PLATFORM_USER_ID) if i}
+
+
 def provision_user(
     store_db: Database,
     user_id: str,
@@ -161,6 +170,10 @@ def provision_user(
     everything made. The grant memo is dropped afterwards, so what Origin granted opens at once."""
     if not user_id:
         logger.warning("provision_user called with empty user_id — skipping")
+        return
+    if str(user_id) in _platform_principals():
+        logger.info("provision_user: %s is a platform principal, not an account — skipping",
+                    user_id)
         return
     from mantle.services.acting_principal import acting_as
     with _account_lock(str(user_id)):
@@ -533,15 +546,30 @@ def _ensure_observations_container(store_db: Database, user_id: str) -> Optional
     return observation.ensure_observations_container(store_db, user_id)
 
 
+def inbox_of(store_db: Database, user_id: str) -> Optional[str]:
+    """The user's Inbox: the oldest workspace they made, or None before first login.
+
+    Their own, not merely one they can reach: a workspace someone shared with them is never
+    their Inbox, however old. The workspace listing marks this one and provisioning fills it,
+    so both read it here.
+    """
+    from mantle.services import workspace_service
+
+    own = [w for w in workspace_service.list_workspaces(store_db, user_id)
+           if str(getattr(w, "created_by", "") or "") == str(user_id)]
+    if not own:
+        return None
+    return min(own, key=lambda w: getattr(w, "created_time", "") or "").id
+
+
 def _ensure_inbox_workspace(store_db: Database, user_id: str) -> Optional[str]:
-    """Return the user's primary (oldest) workspace id, creating an "Inbox"
+    """Return the user's Inbox id (:func:`inbox_of`), creating an "Inbox"
     workspace on first login. ``create_workspace`` issues the owner grant."""
     from mantle.services import workspace_service
 
-    existing = workspace_service.list_workspaces(store_db, user_id)
+    existing = inbox_of(store_db, user_id)
     if existing:
-        primary = min(existing, key=lambda w: getattr(w, "created_time", "") or "")
-        return primary.id
+        return existing
     # The id is DERIVED, not minted. This block is check-then-act and nothing makes it
     # atomic, so two requests on a first login both see the empty list and both create.
     # With a fresh UUID each that left a second workspace owned and orphaned, resolved
@@ -553,8 +581,8 @@ def _ensure_inbox_workspace(store_db: Database, user_id: str) -> Optional[str]:
     # That is last-writer-wins, which is safe only because both racers write identical
     # content here; it is NOT an arbiter, so do not build create-then-catch on it.
     #
-    # Existing users are untouched: this runs only when the user has no workspace at
-    # all, so an Inbox already carrying a random UUID keeps it and needs no migration.
+    # Existing users are untouched: this runs only when the user has no workspace of
+    # their own, so an Inbox already carrying a random UUID keeps it and needs no migration.
     new_ws = workspace_service.create_workspace(
         store_db, user_id, "Inbox", artifact_id=inbox_workspace_id(user_id),
     )

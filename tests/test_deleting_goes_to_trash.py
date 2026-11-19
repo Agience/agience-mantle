@@ -290,3 +290,10 @@ def test_the_trash_listing_is_not_taken_for_an_artifact_id():
     trash_at = paths.index(("/artifacts/trash", ["GET"]))
     one_at = next(i for i, (p, m) in enumerate(paths) if p == "/artifacts/{artifact_id}" and "GET" in m)
     assert trash_at < one_at
+
+
+async def test_the_inbox_is_trashed_like_any_artifact(db, monkeypatch):
+    """Mantle holds no Inbox rule: the workspace type keeps it, and Crystal refuses the op."""
+    inbox, _root = _note(db, monkeypatch)
+    with acting_as(USER, principal_type="user"):
+        assert (await _trash(db, inbox))["state"] == "archived"

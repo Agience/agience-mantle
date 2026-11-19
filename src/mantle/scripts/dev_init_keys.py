@@ -71,10 +71,6 @@ from typing import Optional
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-#: The `kid` `services/peer_signing.py` stamps on every JWT it signs. The manifest's JWK must
-#: carry the same one or a verifier cannot select the key it needs.
-_MANTLE_KID = "mantle-1"
-
 #: 2048 is what `tests/conftest.py` generates and what the platform's own keysets use. Larger is
 #: slower to generate for no gain on a keyset whose lifetime is one developer's afternoon.
 _RSA_BITS = 2048
@@ -218,17 +214,20 @@ def _b64url(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
-def _public_jwk(public_key: rsa.RSAPublicKey, kid: str) -> dict:
-    """The RSA public key as a JWK, in the shape `services/oidc.py` reads out of the manifest."""
+def _public_jwk(public_key: rsa.RSAPublicKey) -> dict:
+    """The RSA public key as a JWK, in the shape `services/oidc.py` reads out of the manifest.
+    Its `kid` is the key's RFC 7638 thumbprint, the name `services/peer_signing.py` signs with."""
+    from mantle.services.jwk_thumbprint import thumbprint
     nums = public_key.public_numbers()
-    return {
+    jwk = {
         "kty": "RSA",
         "alg": "RS256",
         "use": "sig",
-        "kid": kid,
         "n": _b64url(nums.n.to_bytes((nums.n.bit_length() + 7) // 8, "big")),
         "e": _b64url(nums.e.to_bytes((nums.e.bit_length() + 7) // 8, "big")),
     }
+    jwk["kid"] = thumbprint(jwk)
+    return jwk
 
 
 def _fernet_key() -> str:
@@ -280,7 +279,7 @@ def build_keyset(*, issuer: str, node_uri: str) -> dict:
         "schema_version": 1,
         "issuer": issuer,
         "trust_anchors": {
-            "mantle": {"uri": node_uri, "jwks": {"keys": [_public_jwk(public_key, _MANTLE_KID)]}},
+            "mantle": {"uri": node_uri, "jwks": {"keys": [_public_jwk(public_key)]}},
         },
         "bootstrap_token_hash": None,
     }

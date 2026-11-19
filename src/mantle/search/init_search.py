@@ -329,7 +329,7 @@ def _reindex_all_artifacts(*, max_workers: Optional[int] = None, force: bool = F
                 try:
                     _tally(future.result())
                 except Exception as exc:
-                    failed += 1
+                    _tally(None)
                     logger.warning("Unexpected reindex error: %s", exc)
             # Both drop out of scope here, which is the point of the chunking.
             del futures, prepared

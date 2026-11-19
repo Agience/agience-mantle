@@ -21,6 +21,14 @@ import os
 
 import pytest
 
+
+def _read(path):
+    """The text of one source file, or None if it vanished mid-walk (a parallel worker's temp file)."""
+    try:
+        return io.open(path, encoding="utf-8").read()
+    except FileNotFoundError:
+        return None
+
 _ROUTER = "routers/artifacts_router.py"
 _SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "mantle")
 
@@ -49,7 +57,9 @@ def _in_process_calls():
             if not fn.endswith(".py") or fn == "artifacts_router.py":
                 continue
             path = os.path.join(dirpath, fn)
-            text = io.open(path, encoding="utf-8").read()
+            text = _read(path)
+            if text is None:
+                continue
             if "artifacts_router" not in text and "import artifacts" not in text:
                 continue
             try:
@@ -129,7 +139,9 @@ def _default_create_callers():
                 if not fn.endswith(".py"):
                     continue
                 path = os.path.join(dirpath, fn)
-                text = io.open(path, encoding="utf-8").read()
+                text = _read(path)
+                if text is None:
+                    continue
                 if "_default_create_artifact" not in text:
                     continue
                 try:

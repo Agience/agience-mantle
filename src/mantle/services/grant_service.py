@@ -240,7 +240,8 @@ def create_invite(
     the grant stores only a SHA-256 hash. Raises :class:`ValueError` for an
     unknown role. Mailing it is :func:`send_invite_email`'s, so the caller learns whether it went.
     """
-    preset = GrantEntity.permissions_for_role(role)
+    from mantle.services import role_presets
+    preset = role_presets.permissions_for_role(db, role)
 
     held = effective_flags(db, user_id, resource_id)
     granted = {f: bool(preset.get(f, False)) and held[f] for f in _ALL_FLAGS}

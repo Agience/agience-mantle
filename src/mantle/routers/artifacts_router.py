@@ -28,6 +28,7 @@
 #   PUT    /artifacts/{id}/content              → Proxied upload (encrypts on the byte path)
 #   PATCH  /artifacts/{id}/children/order       → Reorder a container's children
 #   POST   /artifacts/{id}/warm                 → Materialize a collection's latent artifacts
+#   GET    /artifacts/store-keys                → The context keys the store owns
 #   GET    /artifacts/{id}/access-log           → The artifact's own access history
 #
 # There is no move verb: an artifact's home is its membership edges, so moving one is
@@ -58,9 +59,10 @@ from mantle.search.lazy import INDEX_HINTS
 #: the authority on what state an artifact is in. `search.mantle.wiring`'s `VALID_SEGMENTS` is the
 #: index's own mirror of the same two states; reconciling the two reaches into the search arm and
 #: is not this route's call to take.
-from mantle.entities.artifact import Artifact as _ArtifactStates
+from mantle.entities.artifact import WORKSPACE_CONTENT_TYPE, Artifact as _ArtifactStates
 from mantle.db.constants import LEGACY_LIVE_STATES as _LEGACY_LIVE_STATES
 from mantle.services.mint_context import client_part as _mc_client_part
+from mantle.services import new_titles
 
 from mantle.db.store import Database
 from mantle.search.beacon.density import dense_excerpt, dense_windows
@@ -75,6 +77,7 @@ from mantle.db.backend import has_children as db_has_children, count_children as
 from mantle.services.dependencies import (
     get_auth,
     AuthContext,
+    allowed_actions,
     check_access,
     check_inbound_nonce,
     job_reach_of,
@@ -94,13 +97,14 @@ _PATCH_STATES = sorted(set(_ARTIFACT_STATES) | set(_PATCH_STATE_ALIASES))
 
 
 def _public_state(doc: Any) -> Any:
-    """Rewrite a legacy stored `committed` or `draft` on an outgoing document to `live`, in place.
+    """Name an outgoing document's state as one that exists (`Artifact.VALID_STATES`), in place.
 
-    A response names only the states that exist (`Artifact.VALID_STATES`). A store that has not
-    been migrated still holds the legacy values, and several routes return raw stored documents,
-    so the rewrite happens where a document leaves. A value on another axis (a grant's lifecycle)
-    is left alone."""
-    if isinstance(doc, dict) and doc.get("state") in _LEGACY_LIVE_STATES:
+    A legacy stored `committed` or `draft` leaves as `live`, and so does a document with no state
+    (`STATE_WHEN_ABSENT`): a client reads `live` or `archived` and never interprets either. A store
+    that has not been migrated still holds the legacy values, and several routes return raw stored
+    documents, so the rewrite happens where a document leaves. A value on another axis (a grant's
+    lifecycle) is left alone."""
+    if isinstance(doc, dict) and (not doc.get("state") or doc["state"] in _LEGACY_LIVE_STATES):
         doc["state"] = _ArtifactStates.STATE_LIVE
     return doc
 
@@ -233,6 +237,13 @@ class CreateArtifactRequest(BaseModel):
         return data
 
     container_id: Optional[str] = None   # optional: also add a membership edge into this collection
+    before_id: Optional[str] = Field(
+        None,
+        description=(
+            "With `container_id`: place the artifact just before this member of the container. "
+            "Omitted, or not a member, places it at the end. Mantle computes the order key."
+        ),
+    )
     source_artifact_id: Optional[str] = None  # link an existing artifact instead of creating one
     #: With `source_artifact_id`: the link's relationship — what the linked artifact IS to the
     #: container (`step1.collection_id`, `authorizer`), rather than plain membership. A typed link
@@ -592,6 +603,16 @@ class ArtifactRecallRequest(BaseModel):
             "null. `model_id` is `null`: nothing here retrieves by embedding."
         ),
     )
+    artifacts: bool = Field(
+        False,
+        description=(
+            "Also return `artifacts`: the artifact each hit names, read whole, one per root in hit"
+            " order, with the memberships a children listing carries. A version that several hits"
+            " name, or two versions of one root, come back once, at the first hit's place. A display"
+            " shows this list as it comes."
+            + _IGNORED_IN_CANDIDATES
+        ),
+    )
     candidate_budget: int = Field(
         200,
         ge=1,
@@ -643,6 +664,13 @@ class RecallHitResponse(BaseModel):
     content: Optional[str] = None
     tags: Optional[List[str]] = None
     highlights: Optional[Dict[str, List[str]]] = None
+    created_by: Optional[str] = Field(None, description="Who created the artifact.")
+    modified_time: Optional[str] = Field(None, description="When the artifact last changed.")
+    matched: Optional[List[str]] = Field(
+        None,
+        description="The query stems the narrowing found this artifact under, on every"
+                    " ordering that had query terms. A caller that orders the hits itself reads"
+                    " them; nothing here weights them.")
 
 
 class RecallCandidate(BaseModel):
@@ -715,6 +743,8 @@ class ArtifactRecallResponse(BaseModel):
     )
     from_: int = 0
     size: int
+    artifacts: Optional[List[Dict[str, Any]]] = Field(
+        None, description="The hits' artifacts, one per root in hit order, when the request asked for them.")
 
     @model_validator(mode="before")
     @classmethod
@@ -880,7 +910,7 @@ def _page(items: list, *, total: Optional[int], has_more: bool) -> Dict[str, Any
     on a truncated cone — page length is the only signal left and is used instead.
     """
     for item in items:
-        _public_state(item)
+        new_titles.name_as_shown(_public_state(item))
     return {"items": items, "total": total, "has_more": has_more}
 
 
@@ -1158,6 +1188,11 @@ class ArtifactResponse(BaseModel):
     name: Optional[str] = Field(None, description="`null` when the artifact has no name.")
     description: Optional[str] = Field(None, description="`null` when there is none.")
     content_type: Optional[str] = Field(None, description="`null` when none was supplied.")
+    allowed_actions: Optional[List[str]] = Field(
+        None,
+        description=("What the caller may do with this artifact (`read`, `update`, `delete`, "
+                     "`share`, `admin` and the rest of the action vocabulary). Answered on reads "
+                     "and listings; a client shows only these controls."))
     origin_root: Optional[str] = Field(
         None,
         description=("The root this artifact's grants descend from. Present only for a top-level "
@@ -1187,6 +1222,16 @@ def _without_seal(d: Dict[str, Any]) -> Dict[str, Any]:
     return d
 
 
+def _attach_allowed_actions(store_db: Database, auth: AuthContext, docs: List[dict]) -> None:
+    """Give each document the actions the caller may take on it, one grant memo per call."""
+    memo: Dict[str, list] = {}
+    for doc in docs:
+        aid = doc.get("id")
+        if not aid:
+            continue
+        doc["allowed_actions"] = allowed_actions(auth, aid, store_db, grant_memo=memo)
+
+
 def _artifact_body(doc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Fill the declared keys with `None` where absent, and drop nothing the document carries.
 
@@ -1202,7 +1247,7 @@ def _artifact_body(doc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     The result is that every key the document carries survives, and the declared ones are
     guaranteed present so a caller can rely on them without testing for existence.
     """
-    d = _without_seal(_public_state(dict(doc or {})))
+    d = new_titles.name_as_shown(_without_seal(_public_state(dict(doc or {}))))
     for k in _ARTIFACT_KEYS:
         d.setdefault(k, None)
     return d
@@ -1236,7 +1281,7 @@ def _artifact_detail_body(doc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     model promising two fields it cannot find. Deriving `_ARTIFACT_DETAIL_KEYS` from
     `ArtifactDetailResponse` guarantees a field added to the model on the same commit.
     """
-    d = _without_seal(_public_state(dict(doc or {})))
+    d = new_titles.name_as_shown(_without_seal(_public_state(dict(doc or {}))))
     for k in _ARTIFACT_DETAIL_KEYS:
         d.setdefault(k, None)
     return d
@@ -1379,7 +1424,7 @@ def _errors(*codes: int, ok: Optional[type] = None, created: Optional[type] = No
 # query vector, or both — and is for relevance-ranked queries; this is the flat-list
 # affordance, scoped through the canonical
 # LightConeResolver (same ACL path /recall uses internally).
-def _ids_of_content_type(store_db, content_type: str) -> set:
+def _ids_of_content_type(store_db, content_type: str) -> Dict[str, str]:
     """Every artifact id with this content type, from the `ix_v_ct` index.
 
     This is what makes filter-before-page affordable. The cost is proportional to how many
@@ -1390,14 +1435,17 @@ def _ids_of_content_type(store_db, content_type: str) -> set:
     snapshots sharing its root, so including them would make a listing report the same thing once
     per past version. The sensor artifacts are exactly this shape: one per property, re-versioned
     on every real change.
+
+    Each id maps to its `created_time`, read in the same pass, which is what `order=created`
+    sorts by without hydrating anything.
     """
-    ids = set()
+    ids: Dict[str, str] = {}
     for doc in store_db.artifacts.list_artifacts(content_type=content_type):
         if doc.get("state") == "archived":
             continue
         aid = doc.get("id")
         if aid:
-            ids.add(aid)
+            ids[aid] = str(doc.get("created_time") or "")
     return ids
 
 
@@ -1441,9 +1489,10 @@ async def list_trash(
     responses=_errors(400, 401, ok=PageResponse),
 )
 async def list_visible(
-    content_type: Optional[str] = Query(
+    content_type: Optional[List[str]] = Query(
         None,
-        description="Filter by exact content_type (MIME). Omit to list every accessible artifact."
+        description="Filter by exact content_type (MIME); repeat it to list artifacts of any of "
+                    "several types in one answer. Omit to list every accessible artifact."
                     + _FILTER_BEFORE_PAGE,
     ),
     action: str = Query(
@@ -1461,6 +1510,12 @@ async def list_visible(
         ),
         json_schema_extra={"enum": list(ACTIONS)},
     ),
+    order: Literal["id", "created"] = Query(
+        "id",
+        description="`id` pages in id order. `created` pages oldest first, and needs "
+                    "`content_type`: the typed index carries the time, so nothing is hydrated "
+                    "to sort.",
+    ),
     limit: int = Query(100, ge=1, le=1000, description="Page size."),
     offset: int = Query(0, ge=0, description="How many authorized artifacts to skip."),
     auth: AuthContext = Depends(get_auth),
@@ -1468,6 +1523,11 @@ async def list_visible(
 ):
     if not auth.user_id and not auth.bearer_grant:
         raise HTTPException(status_code=401, detail="Missing authorization")
+    named = [content_type] if isinstance(content_type, str) else list(content_type or ())
+    types = list(dict.fromkeys(t for t in named if t))
+    content_type = types[0] if len(types) == 1 else None
+    if order == "created" and not types:
+        raise HTTPException(status_code=400, detail="order=created needs content_type")
 
     from mantle.entities.grant import mask_of
 
@@ -1577,16 +1637,18 @@ async def list_visible(
     # Filtering first does not mean hydrating first. `vertex.list_artifacts(content_type=)` narrows
     # on the `ix_v_ct` index, so the candidate set is proportional to how many artifacts carry that
     # type rather than to how much the caller can see, and intersecting two id sets costs nothing.
-    if content_type:
-        typed = await offload_sync(_ids_of_content_type, store_db, content_type)
-        authorized = authorized & typed
+    typed: Dict[str, str] = {}
+    if types:
+        for t in types:
+            typed.update(await offload_sync(_ids_of_content_type, store_db, t))
+        authorized = authorized & typed.keys()
         if truncated_cone:
             # The cone was truncated, so `authorized` is empty and so is the intersection above.
             # Fall back to the scanning pager and keep filtering per document: correct but slow,
             # the same trade the truncation path makes everywhere else.
             authorized = set()
 
-    if truncated_cone and not content_type:
+    if truncated_cone and not types:
         # The set was never built, so there is nothing to sort: the page comes back already in id
         # order, which is the order `sorted(authorized)` produced.
         page = await offload_sync(
@@ -1602,6 +1664,9 @@ async def list_visible(
             action=action, offset=offset, limit=limit,
         )
         total = None
+    elif order == "created":
+        page = sorted(authorized, key=lambda a: (typed.get(a, ""), a))[offset:offset + limit]
+        total = len(authorized)
     else:
         page = sorted(authorized)[offset:offset + limit]
         #: The filtered count. The intersection above has already narrowed `authorized`, so this
@@ -1621,7 +1686,7 @@ async def list_visible(
         doc = hydrated.get(aid)
         if not doc:
             continue
-        if content_type and doc.get("content_type") != content_type:
+        if types and doc.get("content_type") not in types:
             continue
         results.append(doc)
     #: Computed from `total`, which is the filtered count: `page` is a slice of the filtered set,
@@ -1631,6 +1696,7 @@ async def list_visible(
     #:
     #: The truncated-cone path has no `total`, because the set it would count is the one the
     #: truncation exists to avoid building, so page length is the only signal available there.
+    await offload_sync(_attach_allowed_actions, store_db, auth, results)
     more = (offset + limit < total) if total is not None else (len(page) == limit)
     return _page(results, total=total, has_more=more)
 
@@ -1646,6 +1712,8 @@ class PlatformOperator(BaseModel):
 class PlatformOperatorsResponse(BaseModel):
     """Every operator the platform provides, and which of them the caller may invoke."""
     items: List[PlatformOperator]
+    search: Optional[str] = Field(
+        None, description="The platform Search artifact: what a Chat runs when it links no Search.")
 
 
 @router.get(
@@ -1682,7 +1750,7 @@ async def list_platform_operators(
             may = False
         items.append({"id": op_id, "slug": op["slug"], "server": op["server"], "tool": op["tool"],
                       "may_invoke": may})
-    return {"items": items}
+    return {"items": items, "search": platform_ops.platform_search_id() or None}
 
 
 # ---------- POST /artifacts — Create ----------
@@ -1745,14 +1813,20 @@ async def create_artifact(
     from mantle.services import on_create
     with on_create.creating_as(auth):
         result = await _default_create_artifact(body, auth, store_db, report=outcome)
+        issued = on_create.issued_tokens()
     if outcome.get("created") is False:
         response.status_code = status.HTTP_200_OK
 
     #: The whole document, with the declared keys guaranteed present. `_artifact_body` fills every
     #: declared key from the document, `null` where there is none, and drops nothing else the
     #: document carries — `created_by`, `modified_by`, `content_ref`, and on a task artifact
-    #: seventeen store-level fields.
-    return _artifact_body(result)
+    #: seventeen store-level fields. A type that issues a token answers it once, under `issued`
+    #: (`services.on_create`); it is stored only as its hash.
+    out = _artifact_body(result)
+    if issued:
+        out["issued"] = issued
+    await offload_sync(_attach_allowed_actions, store_db, auth, [out])
+    return out
 
 
 async def _default_create_artifact(
@@ -1824,6 +1898,14 @@ async def _default_create_artifact(
 
     sent_context = _context_as_stored(parsed.context)
     context_str = _merge_content_type_into_context(sent_context, parsed.content_type)
+    #: A new empty artifact its writer named nowhere is titled here, numbered against what sits
+    #: beside it (`new_titles`); its name is that title.
+    new_name = parsed.name
+    if (not parsed.identity and not parsed.source_artifact_id
+            and new_titles.needs_title(context_str, parsed.name, parsed.content)):
+        new_name = await offload_sync(_title_a_new_one, store_db, owner_id, parsed.content_type,
+                                      parsed.container_id)
+        context_str = new_titles.with_title(context_str, new_name)
     # Every create passes through here, top-level and child alike, so this is the one place the
     # store can guarantee an artifact is minted with the context it was minted in. See `_mint_context`.
     context_str, minted = _mint_context(
@@ -1896,7 +1978,7 @@ async def _default_create_artifact(
             db=store_db,
             user_id=owner_id,
             content_type=parsed.content_type,
-            name=parsed.name,
+            name=new_name,
             context=context_str or "",
             content=parsed.content or "",
             description=parsed.description,
@@ -1983,6 +2065,7 @@ async def _default_create_artifact(
         vector=vector,
         minted=minted,
         auth=auth,
+        before_id=parsed.before_id,
     )
     return entity.to_dict()
 
@@ -2041,6 +2124,12 @@ def _parse_supplied_vector(values: Optional[List[float]], space_id: Optional[str
         return validate_vector(values, space_id)
     except VectorIngressError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _placed_before(store_db: Database, container_id: str, before_id: Optional[str]) -> str:
+    """The order key that puts a member just before `before_id` (any version id or root id)."""
+    before = store.get_artifact(store_db, before_id) if before_id else None
+    return store.key_before(store_db, container_id, before.root_id if before else None)
 
 
 def _link_source_artifact(
@@ -2107,6 +2196,7 @@ def _link_source_artifact(
         store_db,
         parsed.container_id,
         root_id,
+        _placed_before(store_db, parsed.container_id, parsed.before_id),
         origin=False,
         propagate=propagate,
         relationship=parsed.relationship or None,
@@ -2129,6 +2219,22 @@ def _merge_content_type_into_context(
         except (json.JSONDecodeError, TypeError):
             return context_str
     return json.dumps({"content_type": content_type})
+
+
+def _title_a_new_one(db: Any, owner_id: Optional[str], content_type: Optional[str],
+                     container_id: Optional[str]) -> str:
+    """The first free title for a new artifact of `content_type`: among the members of
+    `container_id`, or for a top-level workspace among the owner's workspaces."""
+    from mantle.services import workspace_service
+    if container_id:
+        from mantle.db.lattice_api import list_collection_artifacts
+        beside = [new_titles.shown_title(d) for d in list_collection_artifacts(db, container_id)]
+    elif content_type == WORKSPACE_CONTENT_TYPE and owner_id:
+        beside = [new_titles.shown_title(e.to_dict())
+                  for e in workspace_service.list_workspaces(db, owner_id)]
+    else:
+        beside = []
+    return new_titles.next_free(new_titles.base_title(content_type), beside)
 
 
 def _mint_context(
@@ -2336,6 +2442,22 @@ async def use_credential(
             "endpoints": list(doc.get("credential_endpoints") or []), "verdict": verdict}
 
 
+class StoreKeysResponse(BaseModel):
+    """The context keys the store writes and a client never does."""
+    keys: List[str] = Field(..., description="Sorted. A write that names one is refused or has it removed.")
+
+
+@router.get("/store-keys",
+    responses=_errors(401, 500, ok=StoreKeysResponse),
+)
+async def store_keys(auth: AuthContext = Depends(get_auth)):
+    """The context keys the store owns: the mint's record, the rung, the content address and the
+    upload bookkeeping. An editor shows them read-only. Declared before `/{artifact_id}` so the
+    path is not read as an id."""
+    from mantle.services.mint_context import SERVER_OWNED_KEYS
+    return {"keys": sorted(SERVER_OWNED_KEYS)}
+
+
 @router.get("/{artifact_id}",
     responses=_errors(401, 404, 500,
         ok=ArtifactDetailResponse,
@@ -2416,6 +2538,7 @@ async def read_artifact(
     #: The fixed key set, plus the two fields a read computes, so the same artifact comes back in
     #: the same shape from a `GET` as from a `POST`.
     body = _artifact_detail_body(doc)
+    await offload_sync(_attach_allowed_actions, store_db, auth, [body])
     #: The whole document. `_artifact_body` guarantees the declared keys are present and drops
     #: nothing else the document carries. Returning it rather than a key literal means this
     #: route carries no statically documented envelope, which is the trade an open document
@@ -2584,13 +2707,13 @@ async def list_children(
 
     # Memberships (structural — pure edge traversal): a membership query per child on the page,
     # the keyed batch, offloaded whole.
-    from mantle.services.collection_service import attach_memberships
-    await offload_sync(attach_memberships, store_db, children)
+    await offload_sync(_attach_memberships, store_db, auth, children)
 
     # Normalize each child. Non-strict, as every list is: the rows were read without refusing,
     # and a body this reader can't open stays dropped rather than failing the page.
     for child in children:
         _normalize_artifact_doc(child, strict=False)
+    await offload_sync(_attach_allowed_actions, store_db, auth, children)
 
     return _page(children, total=None, has_more=has_more)
 
@@ -2615,7 +2738,10 @@ async def update_artifact(
     auth: AuthContext = Depends(get_auth),
     store_db: Database = Depends(get_store_db),
 ):
-    """Partially update an artifact or container."""
+    """Partially update an artifact or container.
+
+    An artifact created without saying what its token is gets it on the first update that says
+    so; that update answers the token once, under `issued` (`services.on_create`)."""
     #: Whose the new version is: the caller, or for a grant key the person who issued it. The key's
     #: own grants still decide whether it may update this artifact (`check_access` below).
     owner_id = auth.user_id or _key_issuer(auth, artifact_id)
@@ -2640,7 +2766,9 @@ async def update_artifact(
         # archived artifact is still refused below; it must be restored first.
         archived = await offload_sync(_find_archived_artifact, store_db, artifact_id)
         if archived:
-            return _artifact_body(_normalize_artifact_doc(archived))
+            again = _artifact_body(_normalize_artifact_doc(archived))
+            await offload_sync(_attach_allowed_actions, store_db, auth, [again])
+            return again
     if not doc:
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -2649,10 +2777,13 @@ async def update_artifact(
     #: unbounded update is the same gap by another verb.
     _refuse_oversize_inline(body.content, "PATCH /artifacts/{artifact_id}")
 
-    context = _strip_immutable_context_fields(doc, _context_as_stored(body.context))
+    context = _strip_immutable_context_fields(
+        doc, _context_as_stored(body.context))
+    # A blank title is saved as the content's first line, else the title it had.
+    context = new_titles.title_on_save(context, body.content, doc)
     vector = _parse_supplied_vector(body.vector, body.space_id)
 
-    from mantle.services import workspace_service
+    from mantle.services import on_create, workspace_service
 
     container_id = doc.get("collection_id")
     if not container_id:
@@ -2666,26 +2797,31 @@ async def update_artifact(
         # `state` is passed for the same reason: without it, archiving a top-level artifact
         # answers 200 and does nothing, leaving deletion as the only way to retire a superseded
         # copy — and deleting destroys the record it was retiring.
-        updated = await offload_sync(
-            workspace_service.update_workspace,
-            store_db,
-            owner_id,
-            artifact_id,
-            name=body.name,
-            description=body.description,
-            # The client's context is merged over the stored server-owned facets, never stored
-            # as sent (`mint_context.merge_caller_update`).
-            caller_context=context,
-            vector=vector,
-            content=body.content,
-            content_type=body.content_type,
-            state=body.state,
-        )
+        with on_create.creating_as(auth):
+            updated = await offload_sync(
+                workspace_service.update_workspace,
+                store_db,
+                owner_id,
+                artifact_id,
+                name=body.name,
+                description=body.description,
+                # The client's context is merged over the stored server-owned facets, never
+                # stored as sent (`mint_context.merge_caller_update`).
+                caller_context=context,
+                vector=vector,
+                content=body.content,
+                content_type=body.content_type,
+                state=body.state,
+            )
+            issued = on_create.issued_tokens()
         body = _artifact_body(updated.to_dict())
+        if issued:
+            body["issued"] = issued
         #: The whole document. `_artifact_body` guarantees the declared keys are present and drops
         #: nothing else the document carries. Returning it rather than a key literal means this
         #: route carries no statically documented envelope, which is the trade an open document
         #: requires: it cannot be declared as a closed one without becoming one.
+        await offload_sync(_attach_allowed_actions, store_db, auth, [body])
         return body
 
     # `name` and `description` are passed here for the same reason the top-level branch above
@@ -2693,25 +2829,31 @@ async def update_artifact(
     # and changed neither, while the identical call on a top-level artifact worked. Both are indexed
     # (`title` in the lexical arm IS `name`), so a renamed member also stayed findable only under
     # its old name.
-    updated = await offload_sync(
-        workspace_service.update_artifact,
-        store_db,
-        owner_id,
-        container_id,
-        artifact_id,
-        name=body.name,
-        description=body.description,
-        caller_context=context,
-        content=body.content,
-        state=body.state,
-        content_type=body.content_type,
-        vector=vector,
-        auth=auth,
-    )
+    with on_create.creating_as(auth):
+        updated = await offload_sync(
+            workspace_service.update_artifact,
+            store_db,
+            owner_id,
+            container_id,
+            artifact_id,
+            name=body.name,
+            description=body.description,
+            caller_context=context,
+            content=body.content,
+            state=body.state,
+            content_type=body.content_type,
+            vector=vector,
+            auth=auth,
+        )
+        issued = on_create.issued_tokens()
     #: Through `_artifact_body`, because a raw `to_dict` omits unset fields and this route
     #: declares `ok=`: without it the response shape would vary with the data while the spec
     #: promises the declared keys are always present.
-    return _artifact_body(updated.to_dict())
+    out = _artifact_body(updated.to_dict())
+    if issued:
+        out["issued"] = issued
+    await offload_sync(_attach_allowed_actions, store_db, auth, [out])
+    return out
 
 
 # ---------- POST /artifacts/{artifact_id}/trash ----------
@@ -3011,8 +3153,7 @@ async def list_links(
     rows = await offload_sync(store.list_links, store_db, artifact_id, direction=direction,
                               relationship=relationship)
     items, has_more = await _fill_readable_page(rows, offset, limit, auth, store_db)
-    from mantle.services.collection_service import attach_memberships
-    await offload_sync(attach_memberships, store_db, items)
+    await offload_sync(_attach_memberships, store_db, auth, items)
     for item in items:
         _normalize_artifact_doc(item, strict=False)
     return _page(items, total=None, has_more=has_more)
@@ -3328,6 +3469,16 @@ async def recall_artifacts(
         logger.error("Artifact recall error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail="Recall failed")
 
+    artifacts = None
+    if body.artifacts:
+        #: One version per root, at the first hit that names the root.
+        picked: dict = {}
+        for hit in result.hits:
+            picked.setdefault(hit.root_id or hit.doc_id, hit.version_id or hit.doc_id)
+        artifacts = await offload_sync(_fetch_authorized_docs, store_db, auth,
+                                       list(picked.values()), segment == "archived")
+        await offload_sync(_attach_memberships, store_db, auth, artifacts)
+
     return ArtifactRecallResponse(
         hits=[
             RecallHitResponse(
@@ -3354,6 +3505,9 @@ async def recall_artifacts(
                 highlights=(
                     {"content": dense_windows(hit.content or "")} if hit.content else None
                 ),
+                created_by=getattr(hit, "created_by", None),
+                modified_time=getattr(hit, "modified_time", None),
+                matched=(getattr(hit, "metadata", None) or {}).get("matched"),
             )
             for hit in result.hits
         ],
@@ -3365,6 +3519,7 @@ async def recall_artifacts(
         ordering=result.ordering,
         **{"from": body.from_},
         size=body.size,
+        artifacts=artifacts,
     )
 
 
@@ -3397,15 +3552,11 @@ class UploadInitiateRequest(CountsUnknownFields):
                     "cipher's: this node encrypts a body whole and AES-GCM accepts at "
                     "most 2**31 - 1 bytes per message.",
     )
-    order_key: Optional[str] = Field(
+    before_id: Optional[str] = Field(
         None,
         description=(
-            "Where this artifact sits among its container's members. A fractional index "
-            "rather than a position: an opaque string compared lexicographically, so a new "
-            "member can always be placed between two existing ones without renumbering "
-            "anything. Omit it — the ordinary case — and the server appends after the "
-            "current last key. Sending `1`, `2`, `3` does not extend the way it looks: once "
-            "the sequence reaches `10`, that key sorts before `2`."
+            "Place the artifact just before this member of the container. Omitted, or not a "
+            "member, places it at the end. Mantle computes the order key."
         ),
     )
     #: Object only, which is the canonical form. `create` and `update` also accept a deprecated
@@ -3497,9 +3648,21 @@ class UploadStatusRequest(CountsUnknownFields):
 
 
 class ReorderRequest(CountsUnknownFields):
-    """Reorder artifacts in a workspace."""
-    ordered_ids: List[str]
+    """Reorder a container's children: send `ordered_ids` (the whole sequence), or `move_ids`
+    with `before_id` (move those members, in that order, just before `before_id`, or last when it
+    is omitted). Exactly one of `ordered_ids` and `move_ids`."""
+    ordered_ids: Optional[List[str]] = None
+    move_ids: Optional[List[str]] = Field(default=None, min_length=1, max_length=_MAX_PAGE)
+    before_id: Optional[str] = None
     order_version: Optional[int] = None
+
+    @model_validator(mode="after")
+    def _one_shape(self):
+        if (self.ordered_ids is None) == (self.move_ids is None):
+            raise ValueError("send either ordered_ids or move_ids")
+        if self.ordered_ids is not None and self.before_id is not None:
+            raise ValueError("before_id goes with move_ids")
+        return self
 
 
 class BatchFetchRequest(CountsUnknownFields):
@@ -3617,6 +3780,27 @@ def _readable_members(children: list, auth: AuthContext, store_db: Database) -> 
     return keep
 
 
+def _attach_memberships(store_db: Database, auth: AuthContext, docs: list) -> None:
+    """Give each document its memberships (`attach_memberships`) and `containers`: the id and name
+    of every container holding it that *auth* may read, so a client shows where an artifact is
+    without naming containers itself.
+
+    A container the reader may not read is left out of `containers`, so its name never leaves
+    Mantle; its id stays in `container_ids`, which a membership change writes against. One grant
+    memo for the call, as in :func:`_readable_members`.
+    """
+    from mantle.services.collection_service import attach_memberships
+    attach_memberships(store_db, docs)
+    ids = list(dict.fromkeys(str(c) for d in docs for c in d.get("container_ids") or []))
+    memo: dict = {}
+    readable = [i for i in ids if _visible(auth, i, store_db, memo)]
+    held = _hydrate_batch(store_db, readable) if readable else {}
+    names = {str(i): _title_of(d) or d.get("name") or "" for i, d in held.items() if d}
+    for doc in docs:
+        doc["containers"] = [{"id": str(c), "name": names[str(c)]}
+                             for c in doc.get("container_ids") or [] if str(c) in names]
+
+
 def _fetch_authorized_docs(store_db: Database, auth: AuthContext, artifact_ids: List[str],
                            include_archived: bool = False) -> list:
     """Resolve each id and keep only what the caller may read.
@@ -3650,6 +3834,126 @@ def _fetch_authorized_docs(store_db: Database, auth: AuthContext, artifact_ids: 
     return results
 
 
+class MembershipRequest(BaseModel):
+    """Which artifacts, and the containers to put them in or take them out of."""
+    model_config = ConfigDict(extra="forbid")
+    artifact_ids: List[str] = Field(..., min_length=1, description="The artifacts (version or root ids).")
+    add: List[str] = Field(default_factory=list, description="Containers each artifact joins; one it is already in is left as it is.")
+    remove: List[str] = Field(default_factory=list, description="Containers each artifact leaves; one it is not in is left as it is.")
+    held: Optional[List[str]] = Field(None, description=(
+        "The containers the artifacts end in, as a picker shows them: each joins every one listed "
+        "and leaves every container holding all of them that is not listed. A container holding "
+        "only some of them stays as it is unless it is listed or in `cleared`."))
+    cleared: List[str] = Field(default_factory=list, description=(
+        "With `held`: containers holding some of the artifacts that every one of them leaves."))
+
+
+class MembershipItem(BaseModel):
+    id: str
+    root_id: str
+    container_ids: List[str] = Field(default_factory=list)
+    containers: List[Dict[str, Any]] = Field(default_factory=list)
+    committed_collection_ids: List[str] = Field(default_factory=list)
+
+
+class MembershipFailure(BaseModel):
+    artifact_id: str
+    container_id: str
+    detail: str
+
+
+class MembershipResponse(BaseModel):
+    """Where the artifacts are after the change: `all` holds every one of them, `some` holds at
+    least one and not all. `archived` lists the artifacts a removal archived (nothing else held
+    them); `failed` lists each change refused, and every other change was made."""
+    items: List[MembershipItem]
+    all: List[str]
+    some: List[str]
+    archived: List[str] = Field(default_factory=list)
+    failed: List[MembershipFailure] = Field(default_factory=list)
+
+
+def _held_by(docs: list) -> Tuple[List[str], List[str]]:
+    """The containers holding every document, and those holding some but not all."""
+    sets = [set(map(str, d.get("container_ids") or [])) for d in docs]
+    every = set.intersection(*sets) if sets else set()
+    anyone = set().union(*sets) if sets else set()
+    return sorted(every), sorted(anyone - every)
+
+
+@router.post("/memberships",
+    summary="Read or change where artifacts are held",
+    responses=_errors(401, 500, ok=MembershipResponse),
+)
+async def change_memberships(
+    body: MembershipRequest,
+    auth: AuthContext = Depends(get_auth),
+    store_db: Database = Depends(get_store_db),
+):
+    """Put the artifacts in each `add` container and take them out of each `remove` container,
+    then answer where they are held. `held` (with `cleared`) states the end result instead, as a
+    picker does. With none of these, it only answers.
+
+    Each change is checked as its own call would be: adding links the artifact as
+    `POST /artifacts` with `source_artifact_id` does, removing detaches it as
+    `DELETE /artifacts/{container}/children/{member}` does. A refused change is listed in
+    `failed` and the rest go ahead. An artifact the caller may not read is left out."""
+    if not auth.user_id:
+        raise HTTPException(status_code=401, detail="User identification required")
+    from mantle.services import workspace_service
+
+    async def read() -> list:
+        docs = await offload_sync(_fetch_authorized_docs, store_db, auth, body.artifact_ids)
+        await offload_sync(_attach_memberships, store_db, auth, docs)
+        return docs
+
+    docs = await read()
+    add, remove = list(map(str, body.add)), list(map(str, body.remove))
+    if body.held is not None:
+        held = list(map(str, body.held))
+        every, some = _held_by(docs)
+        stay = set(held) | (set(some) - set(map(str, body.cleared)))
+        add += held
+        remove += [c for c in every + some if c not in stay]
+    failed: List[Dict[str, str]] = []
+    archived: List[str] = []
+    for container_id in dict.fromkeys(add):
+        for doc in docs:
+            if container_id in map(str, doc.get("container_ids") or []):
+                continue
+            try:
+                await _default_create_artifact(
+                    CreateArtifactRequest(container_id=container_id, source_artifact_id=str(doc["id"])),
+                    auth, store_db)
+            except HTTPException as exc:
+                failed.append({"artifact_id": str(doc["id"]), "container_id": container_id,
+                               "detail": str(exc.detail)})
+    for container_id in dict.fromkeys(remove):
+        for doc in docs:
+            if container_id not in map(str, doc.get("container_ids") or []):
+                continue
+            root_id = str(doc.get("root_id") or doc["id"])
+            try:
+                left = await offload_sync(workspace_service.remove_artifact_from_container,
+                                          store_db, auth.user_id, container_id, root_id, auth)
+            except HTTPException as exc:
+                failed.append({"artifact_id": str(doc["id"]), "container_id": container_id,
+                               "detail": str(exc.detail)})
+                continue
+            if getattr(left, "state", None) == _ArtifactStates.STATE_ARCHIVED:
+                archived.append(str(doc["id"]))
+    if add or remove:
+        docs = await read()
+    every, some = _held_by(docs)
+    return {
+        "items": [{"id": str(d["id"]), "root_id": str(d.get("root_id") or d["id"]), "container_ids": [str(c) for c in d.get("container_ids") or []],
+                   "containers": d.get("containers") or [],
+                   "committed_collection_ids": [str(c) for c in d.get("committed_collection_ids") or []]}
+                  for d in docs],
+        "all": every, "some": some, "archived": archived, "failed": failed,
+    }
+
+
 @router.post("/batch",
     responses=_errors(401, 404, 500, ok=PageResponse),
 )
@@ -3666,8 +3970,7 @@ async def batch_fetch_artifacts(
                                  body.include_archived)
     # The same memberships the children listing carries. Search results are hydrated here, and
     # without them a card opened from search said it was in no collection (2026-10-17, staging).
-    from mantle.services.collection_service import attach_memberships
-    await offload_sync(attach_memberships, store_db, results)
+    await offload_sync(_attach_memberships, store_db, auth, results)
     #: `artifacts` retired for the one shape. A batch fetch is not paged — it answers exactly
     #: the ids asked for — so `has_more` is False by construction rather than by measurement.
     return _page(results, total=len(results), has_more=False)
@@ -3710,7 +4013,7 @@ async def upload_initiate(
             filename=body.filename,
             content_type=body.content_type,
             size=body.size,
-            order_key=body.order_key,
+            before_id=body.before_id,
             # A dict, as the service merges it into the upload's own context, with the
             # server-owned keys removed: this is a client's context like any other door's.
             context=_mc_client_part(body.context) or None,
@@ -4405,6 +4708,26 @@ def _reorder_children(store_db: Database, artifact_id: str, ordered_ids: List[st
     return store.reorder_collection_artifacts(store_db, artifact_id, ordered_roots)
 
 
+def _move_children(store_db: Database, artifact_id: str, move_ids: List[str],
+                   before_id: Optional[str]) -> int:
+    """Resolve the ids to roots and move them just before `before_id`; return edges updated.
+
+    A `before_id` that is one of the moved members has no place to go and applies to nothing,
+    so the route's all-or-nothing check refuses it."""
+    before = store.get_artifact(store_db, before_id) if before_id else None
+    if before_id and before is None:
+        return 0
+    before_root = before.root_id if before else None
+    roots: List[str] = []
+    for aid in move_ids:
+        a = store.get_artifact(store_db, aid)
+        if a:
+            roots.append(a.root_id)
+    if before_root is not None and before_root in roots:
+        return 0
+    return store.move_members_before(store_db, artifact_id, roots, before_root)
+
+
 @router.patch("/{artifact_id}/children/order",
     responses=_errors(401, 404, 409, 500, ok=ReorderResponse),
 )
@@ -4416,7 +4739,9 @@ async def reorder_children(
 ):
     """Reorder children of any artifact (any container).
 
-    Send the complete membership. `ordered_ids` is applied as a sequence rather than as a
+    To move members, send `move_ids` and `before_id`: the named members move, in the order
+    given, to sit just before `before_id` (last when it is omitted), and no other member's key
+    changes. To restate the order, send the complete membership as `ordered_ids`, which is applied as a sequence rather than as a
     specification of the whole order: `reorder_collection_artifacts` assigns monotonically
     increasing `order_key`s along the ids you send, starting at `after_key(None)` (`"U"`), and a
     member you do not name keeps the key it already has. The listing sorts by `order_key`, so a
@@ -4455,8 +4780,13 @@ async def reorder_children(
                 detail="The child order has changed since %s was issued (it is now %s). Re-read "
                        "the order and reapply." % (body.order_version, current))
 
-    applied = await offload_sync(_reorder_children, store_db, artifact_id, body.ordered_ids)
-    asked = len(body.ordered_ids)
+    if body.move_ids is not None:
+        applied = await offload_sync(_move_children, store_db, artifact_id, body.move_ids,
+                                     body.before_id)
+        asked = len(body.move_ids)
+    else:
+        applied = await offload_sync(_reorder_children, store_db, artifact_id, body.ordered_ids)
+        asked = len(body.ordered_ids)
     if applied != asked:
         # All or nothing. A reorder is one intent, so applying 7 of 10 produces an arrangement
         # nobody asked for — and the response would hand back an `order_version` certifying it.

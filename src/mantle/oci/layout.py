@@ -27,7 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Dict, Iterator, List, NamedTuple, Tuple
+from typing import Iterator, List, NamedTuple
 
 from mantle.oci.address import OciAddressError, parse_digest
 

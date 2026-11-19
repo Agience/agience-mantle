@@ -11,7 +11,7 @@ import pytest
 from fastapi import HTTPException
 
 from mantle.entities.grant import Grant
-from mantle.services import grant_service
+from mantle.services import grant_service, role_presets
 from mantle.services.acting_principal import acting_as
 from mantle.services.dependencies import AuthContext, check_access
 from mantle.services import workspace_service as ws
@@ -31,7 +31,7 @@ def _auth(user):
 
 
 def test_the_contributor_role_is_add_and_read():
-    assert Grant.permissions_for_role("contributor") == {"can_create": True, "can_read": True}
+    assert role_presets.permissions_for_role(None, "contributor") == {"can_create": True, "can_read": True}
 
 
 def test_a_contributor_reads_and_adds_and_cannot_change_anothers_card(db):

@@ -85,11 +85,13 @@ def test_a_timer_s_delegation_reaches_only_the_routes_its_work_calls():
                  ("GET", "/artifacts/platform-operators"), ("POST", "/artifacts/batch"),
                  # Crystal's gate before it runs the timer's target (BUG-041); `check_access`
                  # answers it, inside the reach.
-                 ("GET", "/grants/my-access")]:
+                 ("GET", "/grants/my-access"),
+                 # The event stream asks `check_access` of each event it sends.
+                 ("GET", "/events")]:
         assert _route(auth, m, p), (m, p)
     for m, p in [("GET", "/artifacts/visible"), ("POST", "/artifacts/recall"),
                  ("DELETE", "/artifacts/t"), ("POST", "/grants"),
-                 ("GET", "/events"), ("POST", "/artifacts/search")]:
+                 ("POST", "/events"), ("POST", "/artifacts/search")]:
         assert not _route(auth, m, p), (m, p)
     plain = D.AuthContext(principal_id=USER, principal_type="user", user_id=USER)
     assert _route(plain, "GET", "/artifacts/visible")                 # no reach, no bound
@@ -113,6 +115,40 @@ def test_lumen_patches_only_on_a_timer_s_delegation():
             D.enforce_narrowed_bounds(server(reach), NS(method="DELETE", url=NS(path="/artifacts/abc")))
     with pytest.raises(HTTPException):                                # a person's Lumen delegation
         D.enforce_narrowed_bounds(server(None), NS(method="PATCH", url=NS(path="/artifacts/abc")))
+
+
+def test_lumen_listens_on_the_event_stream_only_on_a_job_s_delegation():
+    def server(persona, reach):
+        return D.AuthContext(principal_id=USER, principal_type="user", user_id=USER,
+                             actor=f"agience-server-{persona}",
+                             delegation_aud=f"agience-server-{persona}", narrowed=True,
+                             scope=f"persona:{persona}", job_reach=reach)
+    events = NS(method="GET", url=NS(path="/events"))
+    D.enforce_token_bounds(server("lumen", ("t",)), events)
+    for persona, reach in (("lumen", None), ("crystal", ("t",)), ("sage", ("t",))):
+        with pytest.raises(HTTPException):
+            D.enforce_token_bounds(server(persona, reach), events)
+
+
+async def test_a_job_hears_only_the_events_its_reach_holds(db):
+    from mantle.routers import events_router as ev
+    space, runs, timer, other, record = await _space(db)
+    auth = _timer_auth(USER, (runs,))
+    assert ev._read_authorized(auth, runs, db) and ev._read_authorized(auth, record, db)
+    assert not ev._read_authorized(auth, other, db)
+    assert not ev._read_authorized(auth, space, db)
+
+
+def test_crystal_closes_a_run_only_on_a_job_s_delegation():
+    def server(reach):
+        return D.AuthContext(principal_id=USER, principal_type="user", user_id=USER,
+                             actor="agience-server-crystal", delegation_aud="agience-server-crystal",
+                             narrowed=True, scope="persona:crystal", job_reach=reach)
+    D.enforce_narrowed_bounds(server(("r",)), NS(method="PATCH", url=NS(path="/artifacts/abc")))
+    with pytest.raises(HTTPException):                                # a person's Crystal delegation
+        D.enforce_narrowed_bounds(server(None), NS(method="PATCH", url=NS(path="/artifacts/abc")))
+    with pytest.raises(HTTPException):
+        D.enforce_narrowed_bounds(server(("r",)), NS(method="DELETE", url=NS(path="/artifacts/abc")))
 
 
 async def test_a_timer_creates_nothing_at_the_top_level_and_archives_nothing(db):

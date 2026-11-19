@@ -5,6 +5,34 @@ All notable changes to `agience-mantle` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-18
+
+### Added
+- Create and update answers carry the actions the caller is allowed on the artifact, and artifact reads answer them too.
+- Roles are artifacts that Mantle reads, and Mantle answers its role presets.
+- Mantle answers memberships, orders new members, and moves a member before another (`before_id`).
+- A picker search finds containers by name, and an exact title match leads recall.
+- Collections that share a name, workspaces, the inbox and search panel filters are marked in answers.
+- A create can charge a budget, as a bounded add declared on create.
+- A key artifact issues its token on create or on first fill, and answers it once.
+- Applied grants are announced as `access.changed` events.
+
+### Changed
+- Mantle stores names as given and names new and blank-titled artifacts; a workspace made without a name is called New workspace.
+- Mantle reads; the search artifact ranks. Recall runs the query text as sent.
+- Readable types are a type flag, and a type filter takes a family such as `text/*`.
+- The new-account ceiling is an edge.
+- A parent is listed once however it was linked, and the home count reads only `contains` edges.
+- Mantle no longer holds inbox rules, display marks or `context_add`.
+
+### Fixed
+- Mantle refuses trashing the caller's inbox.
+- A platform principal is not provisioned as an account.
+- A reach conducts each id's own actions, and a job's delegation is held to its reach on every event.
+- The reach check with Origin runs on its own thread, so the feed never waits on it.
+- Thumbprint JSON is canonical; key ids, manifest rereads and CORS ordering are fixed.
+- A file that vanishes during a walk is skipped.
+
 ## [0.3.0] - 2026-11-16
 
 ### Breaking

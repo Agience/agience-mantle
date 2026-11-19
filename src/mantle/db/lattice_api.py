@@ -82,23 +82,34 @@ def after_key(a: Optional[str]) -> str:
 
 
 def mid_key(a: Optional[str], b: Optional[str]) -> str:
-    """Return a key strictly between (a, b)."""
-    pad = "U"
+    """Return a key strictly between (a, b); `None` is the open end on either side.
+
+    Keys are base-62 fractions read digit by digit, so a midpoint always exists unless `b` is
+    `a` followed only by zeros; then the key after `a` is returned."""
     if a is None and b is None:
-        return pad
-    if a is None:
-        a = ""
-    if b is None:
-        return a + pad
-    i = 0
-    while True:
-        ca = _ALPH.find(a[i]) if i < len(a) else _ALPH.find(pad)
-        cb = _ALPH.find(b[i]) if i < len(b) else len(_ALPH) - 1
-        if ca + 1 < cb:
-            return (a[:i] if i < len(a) else a) + _ALPH[(ca + cb) // 2]
-        i += 1
-        if i > max(len(a), len(b)) + 4:
-            return a + _ALPH[1]
+        return "U"
+    lo = a or ""
+    if b is not None and b <= lo:
+        return after_key(a)
+
+    def between(x: str, y: Optional[str]) -> str:
+        if y is not None:
+            n = 0
+            while n < len(y) and (x[n] if n < len(x) else "0") == y[n]:
+                n += 1
+            if n == len(y):
+                return after_key(x or None)
+            if n:
+                return y[:n] + between(x[n:], y[n:])
+        dx = _ALPH.find(x[0]) if x else 0
+        dy = _ALPH.find(y[0]) if y is not None else len(_ALPH)
+        if dy - dx > 1:
+            return _ALPH[(dx + dy) // 2]
+        if y is not None and len(y) > 1:
+            return y[0]
+        return _ALPH[dx] + between(x[1:], None)
+
+    return between(lo, b)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -674,6 +685,20 @@ def get_last_order_key(db: LatticeDatabase, collection_id: str) -> Optional[str]
     return max(keys) if keys else None
 
 
+def key_before(db: LatticeDatabase, collection_id: str, before_root_id: Optional[str]) -> str:
+    """An `order_key` that places a member just before `before_root_id` in this collection.
+
+    No `before_root_id`, or one that is not a member, places it at the end."""
+    pairs = sorted(
+        ((_eprop(e, "order_key") or "", str(e.get("dst") or ""))
+         for e in _membership_edges(db, collection_id)))
+    for index, (key, dst) in enumerate(pairs):
+        if before_root_id and dst == before_root_id and key:
+            prev = pairs[index - 1][0] if index > 0 else None
+            return mid_key(prev or None, key)
+    return after_key(max((k for k, _ in pairs if k), default=None))
+
+
 def order_fingerprint(db: LatticeDatabase, collection_id: str) -> int:
     """A version for this container's current child order — derived, never stored.
 
@@ -872,6 +897,21 @@ def reorder_collection_artifacts(db: LatticeDatabase, collection_id: str,
     return updated
 
 
+def move_members_before(db: LatticeDatabase, collection_id: str, root_ids: list,
+                        before_root_id: Optional[str]) -> int:
+    """Move members, in the order given, to sit just before `before_root_id` (or last when it is
+    None). Each one is placed with `key_before`, so the next lands between it and the target and
+    the group keeps its order. No other member's key changes. Returns edges updated; a
+    `before_root_id` that is not a member places nothing."""
+    if before_root_id is not None and _find_membership(db, collection_id, before_root_id) is None:
+        return 0
+    updated = 0
+    for rid in root_ids or []:
+        if set_edge_order_key(db, collection_id, rid, key_before(db, collection_id, before_root_id)):
+            updated += 1
+    return updated
+
+
 def list_collection_artifacts(db: LatticeDatabase, collection_id: str, *,
                               include_archived: bool = False) -> list:
     """Resolve a collection's contents via the membership edges: for each edge, the CURRENT version
@@ -972,8 +1012,8 @@ def list_links(db: LatticeDatabase, artifact_id: str, *, direction: str = "both"
 def count_other_containers_for_root(db: LatticeDatabase, root_id: str,
                                     excluding_collection_id: str) -> int:
     """How many other containers still hold this root — the shared-not-owned check run before a
-    destroy."""
-    edges = db.graph.edges_of(root_id, direction="in") or []
+    destroy. Only `contains` edges hold a root; a typed link to it is not a home."""
+    edges = db.graph.edges_of(root_id, label=_CONTAINS, direction="in") or []
     return sum(1 for e in edges if e.get("src") != excluding_collection_id)
 
 
@@ -2070,7 +2110,8 @@ __all__ = [
     "create_collection", "get_collection_by_id", "update_collection", "delete_collection",
     "get_last_order_key", "add_artifact_to_collection", "remove_artifact_from_collection",
     "origin_chain", "OriginChainUnterminated", "ORIGIN_WALK_CEILING",
-    "set_edge_order_key", "reorder_collection_artifacts", "list_collection_artifacts",
+    "set_edge_order_key", "reorder_collection_artifacts", "move_members_before",
+    "list_collection_artifacts",
     "count_other_containers_for_root",
     "GrantEntity",
     "create_grant", "get_grant_by_id", "update_grant",

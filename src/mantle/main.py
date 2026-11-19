@@ -94,6 +94,7 @@ from mantle.routers.held_reach_router import router as held_reach_router  # noqa
 from mantle.routers.system_router import router as system_router  # noqa: E402
 from mantle.routers.type_definitions_router import router as type_definitions_router  # noqa: E402
 from mantle.routers.mcp_router import mcp_router  # noqa: E402
+from mantle.routers.credentials_router import router as credentials_router  # noqa: E402
 from mantle.routers.oci_router import router as oci_router  # noqa: E402
 from mantle.routers.git_router import router as git_router  # noqa: E402
 # beacon_router, internal_personas_router, and stream_router are not mounted here — they are not
@@ -362,6 +363,19 @@ async def lifespan(app: FastAPI):
         logger.exception("Platform ID pre-resolution failed at startup (fatal)")
         raise
 
+    # The type definitions Crystal published (`PUT /type-definitions/{server}`): each type's `offer`
+    # says which fields the indexer reads for its title, description and tags, and which types keep
+    # their context readable. Loaded before the startup seeds write and before the index worker
+    # starts, so an issuer is not sealed and nothing is indexed under the default offer of a type
+    # that declares one. Non-fatal: without them every type reads the default.
+    try:
+        from mantle.services import type_offers
+        from mantle.services.system_identity import system_acting_context
+        with system_acting_context(scope="platform.types-load"):
+            type_offers.load_definitions(store_db)
+    except Exception:
+        logger.warning("Type definition load at startup failed (non-fatal)", exc_info=True)
+
     # Bootstrap-seeds the platform's own trust (manifest service anchors +
     # AUTHORITY_ISSUER as role=platform) and env AGIENCE_TRUSTED_ISSUERS (role=external)
     # into governable issuer artifacts (idempotent create-if-missing). Runs before the
@@ -433,18 +447,6 @@ async def lifespan(app: FastAPI):
             get_oidc_verifier().refresh_from_db(store_db)
     except Exception:
         logger.warning("Trusted-issuer load at startup failed (non-fatal)", exc_info=True)
-
-    # The type definitions Crystal published (`PUT /type-definitions/{server}`): each type's `offer`
-    # says which fields the indexer reads for its title, description and tags. Loaded before the
-    # index worker starts, so nothing is indexed under the default offer of a type that declares
-    # one. Non-fatal: without them every type reads the default.
-    try:
-        from mantle.services import type_offers
-        from mantle.services.system_identity import system_acting_context
-        with system_acting_context(scope="platform.types-load"):
-            type_offers.load_definitions(store_db)
-    except Exception:
-        logger.warning("Type definition load at startup failed (non-fatal)", exc_info=True)
 
     # Start the index worker before seeding so that enqueue_index_artifact()
     # dispatches to the async queue rather than falling back to synchronous
@@ -879,12 +881,6 @@ class _CorsFromSetting(CORSMiddleware):
         return origin.lower() in _CORS_ORIGINS
 
 
-app.add_middleware(
-    _CorsFromSetting,
-    allow_origins=_CORS_ORIGINS,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ----------------------------
 # Security headers — cheap hardening every scanner expects.
@@ -1097,8 +1093,8 @@ async def _rate_limit(request: Request, call_next):
     if _RL_MAX <= 0 or request.url.path in _RL_EXEMPT:
         return await call_next(request)
     if not _rl_admit(_rate_limit_client(request)):
-        # This middleware sits outside the CORS one, so its answer carries CORS itself, or the web
-        # app sees a CORS failure instead of the 429 (2026-11-11, staging acceptance of 2026.11.24).
+        # Its own CORS headers as well as the CORS middleware's, so the web app reads a 429 as a 429
+        # whatever order the middlewares are in.
         return JSONResponse(
             status_code=429,
             content={"detail": "Rate limit exceeded"},
@@ -1128,6 +1124,17 @@ class _WebSocketRateLimit:
 
 app.add_middleware(_WebSocketRateLimit)
 
+# CORS is added last, so it is the outermost of these: every answer the middlewares above give
+# (a 429, a refusal, an error a route raises) leaves through it and carries the web app's
+# Access-Control-Allow-Origin. Only an unhandled exception is answered outside it, by the
+# `Exception` handler, which adds the same headers itself.
+app.add_middleware(
+    _CorsFromSetting,
+    allow_origins=_CORS_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # SessionMiddleware lives in Origin alongside the OAuth flows. Mantle carries no OAuth
 # PKCE state cookie: it does not serve /auth/authorize.
 
@@ -1148,6 +1155,7 @@ app.include_router(held_reach_router)
 app.include_router(system_router)
 app.include_router(type_definitions_router)
 app.include_router(mcp_router)
+app.include_router(credentials_router)
 # `/v2` — the OCI distribution surface, read-only and by digest. The registry IS the lattice: an
 # image is a collection, a blob is content, and the address is the same number. This is what closes
 # `deploy/release.sh` stage 4's warning about itself ("the sovereign copy lands with the /v2 router;

@@ -441,6 +441,22 @@ class OriginShareCustodian:
             raise AuthorityRefused(resp.status_code, _detail(resp))
         return resp.json()
 
+    def definitions_grant(self) -> dict:
+        """Ask Origin for the platform's system principal's create grant on the platform operators'
+        collection. Origin decides and appends it as the operator's own entry; this store then
+        applies it from the ledger. Returns Origin's answer (`granted`, `seqs`)."""
+        path = "/internal/authority/definitions-grant"
+        body: dict = {}
+        headers = {"Authorization": "Bearer " + self._token("POST", path, {
+            "body_sha256": entry_digest(body)})}
+        try:
+            resp = self._client.post(f"{self._base}{path}", headers=headers, json=body)
+        except httpx.HTTPError as exc:
+            raise CustodianUnavailable(f"Origin is unreachable ({type(exc).__name__})") from exc
+        if resp.status_code != 200:
+            raise AuthorityRefused(resp.status_code, _detail(resp))
+        return resp.json()
+
     def seed_done(self, credential: str) -> None:
         """The seed pass is over: Origin revokes its seed credential, so it serves one pass."""
         _done(self, "/internal/authority/seed-done", credential)

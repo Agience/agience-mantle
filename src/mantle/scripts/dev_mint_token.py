@@ -28,7 +28,7 @@ against it.
 
 ## The token
 
-    header  {"kid": "mantle-1", "alg": "RS256"}
+    header  {"kid": <the anchor JWK's kid>, "alg": "RS256"}
     claims  {"iss": "mantle", "sub": <uuid>, "aud": <AUTHORITY_ISSUER>, "iat": …, "exp": …}
 
 `iss` is the anchor NAME, not a URL: `_load_manifest_anchors` registers each `trust_anchors` key as
@@ -65,10 +65,6 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 #: The anchor name `mantle-init-keys` writes into `authority.manifest.json`, and the `iss` the
 #: verifier selects a JWKS by. Same string as `services/peer_signing._NAME`.
 _ISSUER = "mantle"
-
-#: The `kid` on the manifest's JWK. Same string as `services/peer_signing._KID` and
-#: `dev_init_keys._MANTLE_KID`; a verifier that cannot select the key by kid rejects the token.
-_KID = "mantle-1"
 
 #: Files this command reads. All three, because a token minted from a private key whose public half
 #: is not the one in the manifest verifies nowhere, and the resulting 401 says only "Invalid token".
@@ -194,20 +190,38 @@ def manifest_anchor_matches(keys_dir: Path, key: rsa.RSAPrivateKey) -> Optional[
         manifest = json.loads((keys_dir / "authority.manifest.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return "authority.manifest.json is unreadable (%s)" % exc
-    anchor = ((manifest.get("trust_anchors") or {}).get(_ISSUER) or {})
-    keys = ((anchor.get("jwks") or {}).get("keys") or [])
-    jwk = next((k for k in keys if isinstance(k, dict) and k.get("kid") == _KID), None)
-    if jwk is None:
-        return ("authority.manifest.json has no trust_anchors.%s JWK with kid=%r, so this node "
-                "verifies nothing signed by mantle.private.pem" % (_ISSUER, _KID))
-
-    nums = key.public_key().public_numbers()
-    expected_n = _b64url(nums.n.to_bytes((nums.n.bit_length() + 7) // 8, "big"))
-    expected_e = _b64url(nums.e.to_bytes((nums.e.bit_length() + 7) // 8, "big"))
-    if jwk.get("n") != expected_n or jwk.get("e") != expected_e:
+    keys = _anchor_keys(manifest)
+    if not keys:
+        return ("authority.manifest.json has no trust_anchors.%s JWK, so this node "
+                "verifies nothing signed by mantle.private.pem" % _ISSUER)
+    if _anchor_jwk(keys, key) is None:
         return ("authority.manifest.json's %s anchor is a DIFFERENT public key from "
                 "mantle.private.pem, so a token signed here is rejected by this node" % _ISSUER)
     return None
+
+
+def _anchor_keys(manifest: dict) -> list:
+    anchor = ((manifest.get("trust_anchors") or {}).get(_ISSUER) or {})
+    return [k for k in ((anchor.get("jwks") or {}).get("keys") or []) if isinstance(k, dict)]
+
+
+def _anchor_jwk(keys: list, key: rsa.RSAPrivateKey) -> Optional[dict]:
+    """The anchor JWK that is `key`'s public half, matched by RFC 7638 thumbprint."""
+    from mantle.services.jwk_thumbprint import rsa_public_jwk, thumbprint
+    tp = thumbprint(rsa_public_jwk(key.public_key()))
+    return next((k for k in keys if thumbprint(k) == tp), None)
+
+
+def _kid(keys_dir: Path, key: rsa.RSAPrivateKey) -> str:
+    """The `kid` the token carries: the one the manifest states for this key, else its RFC 7638
+    thumbprint. The node's verifier selects the key by either."""
+    from mantle.services.jwk_thumbprint import rsa_public_jwk, thumbprint
+    try:
+        manifest = json.loads((keys_dir / "authority.manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        manifest = {}
+    jwk = _anchor_jwk(_anchor_keys(manifest), key) or {}
+    return str(jwk.get("kid") or thumbprint(rsa_public_jwk(key.public_key())))
 
 
 def mint(keys_dir: Path, *, subject: str, aud: str, ttl_seconds: int,
@@ -222,14 +236,15 @@ def mint(keys_dir: Path, *, subject: str, aud: str, ttl_seconds: int,
     """
     issued = int(time.time()) if now is None else int(now)
     exp = issued + int(ttl_seconds)
-    header = {"alg": "RS256", "kid": _KID, "typ": "JWT"}
+    private_key = _load_private_key(keys_dir)
+    header = {"alg": "RS256", "kid": _kid(keys_dir, private_key), "typ": "JWT"}
     claims = {"iss": _ISSUER, "sub": subject, "aud": aud, "iat": issued, "exp": exp}
 
     def _seg(obj) -> str:
         return _b64url(json.dumps(obj, separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode("utf-8"))
 
     signing_input = ("%s.%s" % (_seg(header), _seg(claims))).encode("ascii")
-    signature = _load_private_key(keys_dir).sign(
+    signature = private_key.sign(
         signing_input, padding.PKCS1v15(), hashes.SHA256())
     return "%s.%s" % (signing_input.decode("ascii"), _b64url(signature)), exp
 

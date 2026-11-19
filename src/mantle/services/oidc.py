@@ -29,6 +29,7 @@ import httpx
 from jose import jwt
 
 from mantle import config
+from mantle.services.jwk_thumbprint import names_key
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,11 @@ _FETCH_TIMEOUT_S = 5.0
 #: included. See `OidcVerifier._keys`.
 _JWKS_MIN_REFETCH_S = 30.0
 _ALGS = ["RS256", "RS384", "RS512", "ES256"]
+#: Minimum spacing between re-reads of the authority manifest on a `kid` miss or a signature that
+#: does not verify. A read is one small local file, so this is short: a rotated service key is
+#: taken from disk on the first token signed with it, and a flood of bad tokens reads the file at
+#: most once per window.
+_MANIFEST_REREAD_S = 5.0
 
 
 def _read_authority_manifest() -> Optional[dict]:
@@ -115,6 +121,7 @@ class OidcVerifier:
         self._fetch_locks: Dict[str, threading.Lock] = {}  # issuer -> held while fetching
         self._lock = threading.Lock()
         self._last_refresh = 0.0
+        self._manifest_read_at = float("-inf")
         # Build the trust maps from the env seed + manifest anchors (no DB yet).
         self._rebuild([])
 
@@ -272,19 +279,52 @@ class OidcVerifier:
         options = {"verify_aud": bool(aud)}
         try:
             return jwt.decode(token, jwk, algorithms=_ALGS, issuer=iss, audience=aud, options=options)
-        except Exception as exc:
-            logger.warning("oidc: verify failed for issuer=%s: %r", iss, exc)
+        except Exception as first:
+            err: Exception = first
+            # The manifest on disk may hold a newer key under the same `kid` (a service key
+            # rotated, its manifest rewritten): read it again and try the key it names now.
+            fresh = self._key_in(self._reread_manifest(iss), kid) if isinstance(cfg.get("jwks"), dict) else None
+            if fresh is not None and fresh != jwk:
+                try:
+                    return jwt.decode(token, fresh, algorithms=_ALGS, issuer=iss, audience=aud,
+                                      options=options)
+                except Exception as second:
+                    err = second
+            logger.warning("oidc: verify failed for issuer=%s kid=%r: %r", iss, kid, err)
             return None
 
     # -- JWKS resolution ----------------------------------------------------
 
+    @staticmethod
+    def _key_in(cfg: Optional[dict], kid: str) -> Optional[dict]:
+        """The inline key `kid` names in `cfg`, by its stated `kid` or its RFC 7638 thumbprint."""
+        jwks = (cfg or {}).get("jwks")
+        if not isinstance(jwks, dict):
+            return None
+        return next((k for k in jwks.get("keys", []) if names_key(k, kid)), None)
+
+    def _reread_manifest(self, iss: str) -> Optional[dict]:
+        """Read the authority manifest's anchors again, at most once per `_MANIFEST_REREAD_S`,
+        and answer `iss`'s entry as it stands after."""
+        with self._lock:
+            now = time.time()
+            due = (now - self._manifest_read_at) >= _MANIFEST_REREAD_S
+            if due:
+                self._manifest_read_at = now
+        if due:
+            self._load_manifest_anchors()
+        return self._by_iss.get(iss)
+
     def _resolve_key(self, iss: str, cfg: dict, kid: str) -> Optional[dict]:
+        """The key `kid` names, by its stated `kid` or its RFC 7638 thumbprint. A miss looks
+        once more: the manifest read again for an inline anchor, a refetch for a JWKS URL."""
         for key in self._keys(iss, cfg, force=False):
-            if key.get("kid") == kid:
+            if names_key(key, kid):
                 return key
-        # Miss → refresh once (handles key rotation).
+        if isinstance(cfg.get("jwks"), dict):
+            return self._key_in(self._reread_manifest(iss), kid)
         for key in self._keys(iss, cfg, force=True):
-            if key.get("kid") == kid:
+            if names_key(key, kid):
                 return key
         return None
 

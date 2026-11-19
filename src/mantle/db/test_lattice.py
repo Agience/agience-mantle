@@ -1045,7 +1045,6 @@ def test_created_time_is_never_ordered_or_filtered_on():
         "and the rest are unreconciled clocks. Use edge.order_key within a frame." % offenders)
 
     # The guard must have teeth: prove it fires on a real violation.
-    import re as _re
     probe = "SELECT id FROM vertex ORDER BY created_time DESC"
     low = " ".join(probe.lower().split())
     assert "order by created_time" in low, "the detector would not catch a real ORDER BY"
@@ -1819,7 +1818,6 @@ def test_the_lattice_store_has_no_network_dependency():
         # and it must function, not merely import
         lat = importlib.import_module("mantle.db")
         import os
-        import tempfile
         L = lat.open_lattice(os.path.join(_tmpdir("s38-"), "s38.db"), origin="s38")
         L.artifacts.put_artifact({"id": "x1", "content_type": "text/markdown",
                                   "state": "live", "content": "local only",

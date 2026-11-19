@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from mantle.db.store import Database
-from mantle.services.dependencies import AuthContext, get_auth, get_store_db
+from mantle.services.dependencies import AuthContext, get_auth, get_store_db, job_reach_of
 from mantle.routers import artifacts_router as artifacts
 
 logger = logging.getLogger(__name__)
@@ -461,6 +461,10 @@ TOOLS: List[Dict[str, Any]] = [
 _TOOLS_BY_NAME = {t["name"]: t for t in TOOLS}
 
 
+#: The tools that answer from the person's whole reach rather than by id.
+_WHOLE_REACH_TOOLS = frozenset({"list_artifacts", "recall"})
+
+
 async def _call_tool(name: str, args: Dict[str, Any], *, auth: AuthContext,
                      store_db: Database, request: Request) -> Any:
     """Dispatch a tool call into the REST handler that owns it.
@@ -473,6 +477,11 @@ async def _call_tool(name: str, args: Dict[str, Any], *, auth: AuthContext,
     dispatching into the REST handler inherits that handler's thread offload along with its
     authorization. A tool that read the store directly here would lose both at once.
     """
+    if name in _WHOLE_REACH_TOOLS and job_reach_of(auth) is not None:
+        # Listing and recall answer from the person's whole reach, not from a credential's
+        # (`dependencies.JOB_REACH_ROUTES`); a held credential addresses what it reaches by id.
+        raise HTTPException(status_code=403, detail=f"{name} answers from the person's whole "
+                            "reach; this credential reaches only the items it was granted")
     if name == "list_artifacts":
         return await artifacts.list_visible(
             content_type=args.get("content_type"),

@@ -362,6 +362,18 @@ def test_count_other_containers_for_root(db):
     assert api.count_other_containers_for_root(db, "root-S", "col-B") == 1
 
 
+def test_a_typed_link_is_not_a_home(db):
+    _mk_collection(db, "col-A")
+    _mk_collection(db, "view-V")
+    api.create_artifact(db, _version("t1", "root-T"))
+    api.add_artifact_to_collection(db, "col-A", "root-T")
+    api.add_artifact_to_collection(db, "view-V", "root-T", relationship="target")
+    assert api.count_other_containers_for_root(db, "root-T", "col-A") == 0
+    _mk_collection(db, "col-B")
+    api.add_artifact_to_collection(db, "col-B", "root-T")
+    assert api.count_other_containers_for_root(db, "root-T", "col-A") == 1
+
+
 # ── brick 4: grants — the CRUDEASIO authorization plane ──────────────────────
 def _grant(gid="g-1", **kw):
     fields = dict(id=gid, resource_id="col-A", grantee_type="user", grantee_id="user-1",

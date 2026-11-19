@@ -188,6 +188,17 @@ class TestWorkspaceCrud:
         assert ws.created_by == "user-1"
         ensure.assert_called_once_with(db, ws)
 
+    @pytest.mark.parametrize("name", ["", "   ", None])
+    def test_create_workspace_without_a_name_gets_the_default(self, name):
+        db = MagicMock()
+        with (
+            patch("mantle.services.workspace_service.store.create_collection"),
+            patch("mantle.services.collection_service.ensure_collection_descriptor"),
+            patch("mantle.services.workspace_service.store.upsert_user_collection_grant"),
+        ):
+            ws = ws_svc.create_workspace(db, "user-1", name)
+        assert ws.name == ws_svc.DEFAULT_WORKSPACE_NAME == "New workspace"
+
     def test_get_workspace_missing_404(self):
         db = MagicMock()
         with patch("mantle.services.workspace_service.store.get_collection_by_id", return_value=None):

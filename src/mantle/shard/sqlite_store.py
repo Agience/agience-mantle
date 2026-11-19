@@ -233,9 +233,9 @@ class SqliteGraphStore:
 
     def neighbors(self, node_id: str, label: Optional[str] = None, *, direction: str = "out") -> List[str]:
         if direction == "out":
-            q, col = "SELECT dst AS nid FROM edges WHERE src = ?", "src"
+            q = "SELECT dst AS nid FROM edges WHERE src = ?"
         elif direction == "in":
-            q, col = "SELECT src AS nid FROM edges WHERE dst = ?", "dst"
+            q = "SELECT src AS nid FROM edges WHERE dst = ?"
         else:
             outn = self.neighbors(node_id, label, direction="out")
             inn = self.neighbors(node_id, label, direction="in")

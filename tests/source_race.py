@@ -55,6 +55,15 @@ def workspace_root() -> pathlib.Path:
     return _WS
 
 
+def _base(rel: str) -> pathlib.Path:
+    """Mantle's own roots are read from this checkout, whatever its folder is named; the siblings
+    sit beside it in the workspace."""
+    own = "agience-mantle/"
+    if rel.startswith(own):
+        return pathlib.Path(__file__).resolve().parents[1] / rel[len(own):]
+    return workspace_root() / rel
+
+
 def mark_suite_start() -> None:
     """Called once from the session hook, so the baseline is the run's start and not import time."""
     global _SUITE_START
@@ -67,7 +76,7 @@ def files_moved_since(when: float, limit: int = 400) -> List[str]:
     moved: List[str] = []
     root = workspace_root()
     for rel in _ROOTS:
-        base = root / rel
+        base = _base(rel)
         if not base.is_dir():
             continue
         for dirpath, dirnames, filenames in os.walk(base):
